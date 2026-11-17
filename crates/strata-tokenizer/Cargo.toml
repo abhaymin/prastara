@@ -14,3 +14,4 @@ thiserror.workspace = true
 
 [dev-dependencies]
 strata-gguf = { path = "../strata-gguf" }
+serde_json.workspace = true
