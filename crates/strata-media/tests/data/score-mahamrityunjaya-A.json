@@ -1,0 +1,356 @@
+{
+ "name": "Mahamrityunjaya, melody A",
+ "style": "vedic",
+ "tonic": "C#",
+ "bpm": 168,
+ "beat_note": "laghu = 1 beat (an eighth at the bed's 84 bpm)",
+ "vibrato": "none",
+ "notes_help": "swaras relative to Sa; Dha_ = the Dha below Sa",
+ "source": "reference/research/CHANT-CRAFT.md",
+ "events": [
+  {
+   "text": "ॐ",
+   "latin": "Om",
+   "weight": "G",
+   "beats": 9,
+   "note": "Sa",
+   "link": true,
+   "help": "one continuous sound: the O opens into a long resonant m hum that keeps ringing and carries straight into tryam; no silence after it"
+  },
+  {
+   "text": "त्र्यम्",
+   "latin": "tryam",
+   "weight": "G",
+   "beats": 2,
+   "note": "Ga",
+   "glide_to": "Re"
+  },
+  {
+   "text": "ब",
+   "latin": "ba",
+   "weight": "L",
+   "beats": 1,
+   "note": "Re"
+  },
+  {
+   "text": "कं",
+   "latin": "kam",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "य",
+   "latin": "ya",
+   "weight": "L",
+   "beats": 1,
+   "note": "Re"
+  },
+  {
+   "text": "जा",
+   "latin": "jaa",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "म",
+   "latin": "ma",
+   "weight": "L",
+   "beats": 1,
+   "note": "Re"
+  },
+  {
+   "text": "हे",
+   "latin": "he",
+   "weight": "G",
+   "beats": 3,
+   "note": "Re"
+  },
+  {
+   "text": "सु",
+   "latin": "su",
+   "weight": "L",
+   "beats": 1,
+   "note": "Sa"
+  },
+  {
+   "text": "गन्",
+   "latin": "gan",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "धिं",
+   "latin": "dhim",
+   "weight": "G",
+   "beats": 2,
+   "note": "Ga",
+   "glide_to": "Re"
+  },
+  {
+   "text": "पुष्",
+   "latin": "push",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "टि",
+   "latin": "ti",
+   "weight": "L",
+   "beats": 1,
+   "note": "Sa"
+  },
+  {
+   "text": "वर्",
+   "latin": "var",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "ध",
+   "latin": "dha",
+   "weight": "L",
+   "beats": 1,
+   "note": "Ga"
+  },
+  {
+   "text": "नम्",
+   "latin": "nam",
+   "weight": "G",
+   "beats": 4,
+   "note": "Re"
+  },
+  {
+   "breath": 2,
+   "kind": "linked",
+   "help": "not a silent gap: the last note's resonance rings on and fades naturally, a soft audible breath, then the next phrase starts from that sound"
+  },
+  {
+   "text": "उर्",
+   "latin": "ur",
+   "weight": "G",
+   "beats": 2,
+   "note": "Sa"
+  },
+  {
+   "text": "वा",
+   "latin": "vaa",
+   "weight": "G",
+   "beats": 2,
+   "note": "Sa"
+  },
+  {
+   "text": "रु",
+   "latin": "ru",
+   "weight": "L",
+   "beats": 1,
+   "note": "Sa"
+  },
+  {
+   "text": "क",
+   "latin": "ka",
+   "weight": "L",
+   "beats": 1,
+   "note": "Re"
+  },
+  {
+   "text": "मि",
+   "latin": "mi",
+   "weight": "L",
+   "beats": 1,
+   "note": "Ga"
+  },
+  {
+   "text": "व",
+   "latin": "va",
+   "weight": "L",
+   "beats": 1,
+   "note": "Sa"
+  },
+  {
+   "text": "बन्",
+   "latin": "ban",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "ध",
+   "latin": "dha",
+   "weight": "L",
+   "beats": 1,
+   "note": "Ga"
+  },
+  {
+   "text": "नान्",
+   "latin": "naan",
+   "weight": "G",
+   "beats": 3,
+   "note": "Re"
+  },
+  {
+   "text": "मृत्",
+   "latin": "mrit",
+   "weight": "G",
+   "beats": 2,
+   "note": "Sa"
+  },
+  {
+   "text": "योर्",
+   "latin": "yor",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "मुक्",
+   "latin": "muk",
+   "weight": "G",
+   "beats": 2,
+   "note": "Ga",
+   "glide_to": "Re"
+  },
+  {
+   "text": "षी",
+   "latin": "shii",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "य",
+   "latin": "ya",
+   "weight": "L",
+   "beats": 1,
+   "note": "Sa"
+  },
+  {
+   "text": "मा",
+   "latin": "maa",
+   "weight": "G",
+   "beats": 2,
+   "note": "Re"
+  },
+  {
+   "text": "मृ",
+   "latin": "mri",
+   "weight": "L",
+   "beats": 1,
+   "note": "Re"
+  },
+  {
+   "text": "तात्",
+   "latin": "taat",
+   "weight": "G",
+   "beats": 4,
+   "note": "Ga",
+   "glide_to": "Re"
+  },
+  {
+   "breath": 3,
+   "kind": "linked",
+   "help": "not a silent gap: the last note's resonance rings on and fades naturally, a soft audible breath, then the next phrase starts from that sound"
+  }
+ ],
+ "words": [
+  {
+   "text": "ओम्",
+   "latin": "Om",
+   "events": [
+    0
+   ]
+  },
+  {
+   "text": "त्र्यम्बकं",
+   "latin": "Tryambakam",
+   "events": [
+    1,
+    2,
+    3
+   ]
+  },
+  {
+   "text": "यजामहे",
+   "latin": "Yajamahe",
+   "events": [
+    4,
+    5,
+    6,
+    7
+   ]
+  },
+  {
+   "text": "सुगन्धिं",
+   "latin": "Sugandhim",
+   "events": [
+    8,
+    9,
+    10
+   ]
+  },
+  {
+   "text": "पुष्टिवर्धनम्",
+   "latin": "Pushtivardhanam",
+   "events": [
+    11,
+    12,
+    13,
+    14,
+    15
+   ]
+  },
+  {
+   "text": "उर्वारुकमिव",
+   "latin": "Urvarukamiva",
+   "events": [
+    17,
+    18,
+    19,
+    20,
+    21,
+    22
+   ]
+  },
+  {
+   "text": "बन्धनान्",
+   "latin": "Bandhanaan",
+   "events": [
+    23,
+    24,
+    25
+   ]
+  },
+  {
+   "text": "मृत्योर्मुक्षीय",
+   "latin": "Mrityormukshiya",
+   "events": [
+    26,
+    27,
+    28,
+    29,
+    30
+   ]
+  },
+  {
+   "text": "मामृतात्",
+   "latin": "Maamritaat",
+   "events": [
+    31,
+    32,
+    33
+   ]
+  }
+ ],
+ "total_beats": 71,
+ "seconds": 25.36,
+ "text_help": "text is the closed-syllable split (the first consonant of a cluster inside a word closes the syllable before it); joined, a word's syllables give the word exactly",
+ "legato": "inside a word, every syllable flows into the next with no gap; between words, the word_gap; never cut a tail or a hum short",
+ "word_gap": {
+  "beats": 0.5,
+  "help": "a quarter of the bed's 84-bpm beat (0.18 s) at every word boundary, so each word is clear and words never run together. The last syllable's vowel rings and fades into the gap (never a hard cut) and the next word's first consonant starts cleanly. Taken from the end of the word's last syllable; Om and the breaths keep their ringing link."
+ }
+}
