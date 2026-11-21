@@ -418,6 +418,9 @@ pub struct SyllableEvent {
     pub note: String,
     #[serde(default)]
     pub glide_to: Option<String>,
+    /// carries straight into the next word with no word gap (Om)
+    #[serde(default)]
+    pub link: bool,
 }
 
 impl SyllableEvent {
@@ -504,17 +507,15 @@ fn cents_above(freq: f64, reference: f64) -> f64 { 1200.0 * (freq / reference).l
 /// the last quarter, linear between — so a take that glides exactly to the written note reads zero cents throughout.
 fn glide_ref_cents(glide_to: Option<&str>, note: &str, frac: f64) -> f64 {
     let Some(gt) = glide_to else { return 0.0 };
-    let g = 120.0 * (note_frequency(gt, 1.0) / note_frequency(note, 1.0)).log2(); // tonic-independent ratio
+    let g = 1200.0 * (note_frequency(gt, 1.0) / note_frequency(note, 1.0)).log2(); // in cents; tonic-independent
     if frac <= 0.5 { 0.0 } else if frac <= 0.75 { g * (frac - 0.5) / 0.25 } else { g }
 }
 
 /// The start and end (seconds into the take) of every event's slot, in order.
 ///
 /// Events start at `start_s`; each syllable lasts its beats and each rest/breath its count, one beat being 60/bpm seconds.
-/// A word gap is added only after a word's LAST event, so it never moves the events inside that word — every later event
-/// (the next word and on) starts later by the accumulated gap. Hence for event i:
-///   t0_i = start_s + sum_{j<i} duration_j + word_gap_beats * beat * (#words ending strictly before i),
-/// a constant advance per boundary, which the walk below realises as it goes (bpm defaults to 168 like the example).
+/// The word gap is taken from the END of a word's last syllable (the score's own rule: the beats stay on the grid), so that
+/// syllable's slot ends `word_gap` early, unless it carries straight on (`link`, Om).
 fn event_windows(score: &Score, start_s: f64) -> Vec<(f64, f64)> {
     let beat = 60.0 / score.bpm().max(f64::MIN_POSITIVE); // one beat is 60/bpm seconds, so slot times are in real seconds
     let mut word_last = vec![false; score.events.len()];
@@ -524,9 +525,10 @@ fn event_windows(score: &Score, start_s: f64) -> Vec<(f64, f64)> {
     let mut t = start_s;
     for (i, e) in score.events.iter().enumerate() {
         let dur = match e { Event::Syllable(ev) => ev.beats() * beat, Event::Rest(n) | Event::Breath(n) => *n as f64 * beat };
-        wins.push((t, t + dur));
+        let linked = matches!(e, Event::Syllable(ev) if ev.link);
+        let cut = if word_last[i] && !linked { gap_s.min(dur * 0.5) } else { 0.0 };
+        wins.push((t, t + dur - cut));
         t += dur;
-        if word_last[i] { t += gap_s; }
     }
     wins
 }
@@ -1261,7 +1263,7 @@ mod tests {
     const TONIC_HZ: f64 = 130.0;
 
     fn syllable(text: &str, note: &str) -> Event {
-        Event::Syllable(SyllableEvent { text: text.to_string(), latin: None, weight: Weight::Guru, beats: Some(4.0), note: note.to_string(), glide_to: None })
+        Event::Syllable(SyllableEvent { text: text.to_string(), latin: None, weight: Weight::Guru, beats: Some(4.0), note: note.to_string(), glide_to: None, link: false })
     }
 
     /// Four words (`Sa Ga Ma Pa`), one syllable each, long beats so each event's +-200 ms onset window sees only its own voice.
