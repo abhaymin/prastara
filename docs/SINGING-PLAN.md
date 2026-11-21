@@ -78,3 +78,17 @@ The owner's direction (2026-11-21):
 | M3 | `media sing` (PSOLA retime and re-pitch, glides, accents) and the dub | median pitch error under 50 cents and vowel timing under 40 ms; the words still heard; the owner's ear |
 | M4 | optional voice conversion (RVC, ONNX), only if M3 sounds robotic | the owner's yes to the download and the voice |
 | M5 | presets (Vedic, bhajan), the UI panel, `docs/MEDIA.md` | the owner's ear on a full piece |
+
+## Status and findings
+
+- **M1 and M0** are done: the syllabifier and `sing-check`.
+- **Divya's voice** sits at about 120–185 Hz. The spectrum confirms that this is her true pitch, so Sa = C#3 suits her.
+- **M2:** word mode and `media syllables` work.
+  - **The hum detector** was checked on real takes: six hums scored 0.78–0.90, and nine spoken words scored 0.23 or less.
+  - **The split is approximate.** It finds the right number of vowels, but some land tens of ms off, and a few are wrong
+    where vowels join through r, v, y or a nasal. Its confidence does not yet tell the good splits from the bad ones.
+  - **Parler ends words in a creaky voice.** A pitch tracker drops creak, so the split uses band loudness, not pitch.
+- **For M3:** anchor each vowel nucleus on its beat, and stretch each frame in proportion to how vowel-like it is. That way a
+  boundary a few tens of ms off moves where the stretch happens, but it never stretches a consonant.
+- **A robust split** needs a phoneme aligner, for example a wav2vec2 phoneme CTC model (Apache-2.0) run through ONNX. That
+  is a download, so it needs the owner's yes.

@@ -4,6 +4,7 @@
 //! clusters; each cluster gets a weight from its vowel (long vs short), any anusvara/visarga, or
 //! because it is closed. `matras` turns those weights into beat counts.
 
+use anyhow::{bail, Result};
 use serde_json::{json, Value};
 
 /// Consonant: U+0915–U+0939 or U+0958–U+095F.
@@ -745,6 +746,273 @@ fn longest_quiet_run(rms: &[(f64, f32)], lo: f64, hi: f64, thr: f32) -> Option<(
     best
 }
 
+// M2: split a spoken word into its syllables, and tell a steady hum from speech. It finds exactly one energy peak
+// (vowel nucleus) per text with the boundaries between them in the quiet dip (the consonant) that separates two vowels,
+// and scores how steady a take is so a hum can be retaken. Pure Rust, no model, no FFT: it reuses analyze.rs's pitch
+// picker for voicing and takes loudness and zero crossings from plain frames.
+
+/// One syllable of a word as split from its audio: where the syllable starts and ends, and the voiced vowel between them.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct Cut {
+    pub text: String,
+    pub start_s: f64,
+    pub vowel_start_s: f64,
+    pub vowel_end_s: f64,
+    pub end_s: f64,
+}
+
+/// A frame is silence below this fraction of the word's loudest frame, so the word's own span starts at its first loud frame.
+const SILENCE_FRAC: f64 = 0.03;
+/// How far a hum's per-frame pitch may sit from its median (cents) to still count as held.
+const HUM_PITCH_CENTS: f64 = 30.0;
+/// How much a hum's per-frame loudness may sit from its median ratio to still count as steady.
+const HUM_AMPLITUDE_FRAC: f64 = 0.25;
+
+/// The loudness frame used to sample a hum's pitch and crossing rate (20 ms).
+const HUM_FRAME_S: f64 = 0.02;
+
+/// Vowel-ness per 10 ms frame: the loudness between 250 Hz and 1.5 kHz, weighted by its share of the frame's loudness, smoothed over 30 ms.
+/// A vowel is loud and low; a fricative or a burst is mostly high; a closure is quiet. It needs no pitch, so a creaky vowel
+/// (which Parler voices often end in, and which a pitch tracker drops) still counts.
+fn vowelness(pcm: &[f32], rate: f64) -> Vec<f64> {
+    // two one-pole low-passes twice each: below 1.5 kHz, and below 250 Hz (the voice's fundamental and room rumble)
+    let low = |fc: f64| {
+        let a = (-2.0 * std::f64::consts::PI * fc / rate).exp();
+        let mut y: Vec<f64> = pcm.iter().map(|&v| v as f64).collect();
+        for _ in 0..2 {
+            let mut p = 0.0;
+            for v in y.iter_mut() { p = (1.0 - a) * *v + a * p; *v = p; }
+        }
+        y
+    };
+    let l15 = low(1500.0);
+    let l25 = low(250.0);
+    // the vowel band, 250-1500 Hz: a vowel's first formants; a nasal's murmur and a breath's rumble lie below it
+    let lp: Vec<f64> = l15.iter().zip(&l25).map(|(a, b)| a - b).collect();
+    let hop = ((rate * FRAME_S).round() as usize).max(1);
+    let raw: Vec<f64> = (0..pcm.len() / hop).map(|i| {
+        let (mut el, mut eh) = (0.0, 0.0);
+        for j in i * hop..(i + 1) * hop {
+            el += lp[j] * lp[j];
+            let h = pcm[j] as f64 - l15[j];
+            eh += h * h;
+        }
+        let (el, eh) = ((el / hop as f64).sqrt(), (eh / hop as f64).sqrt());
+        el * el / (el + eh + 1e-9)
+    }).collect();
+    (0..raw.len()).map(|i| {
+        let lo = i.saturating_sub(1);
+        let hi = (i + 1).min(raw.len().saturating_sub(1));
+        raw[lo..=hi].iter().sum::<f64>() / (hi - lo + 1) as f64
+    }).collect()
+}
+
+/// How strongly the expected place of each vowel (by syllable weight) counts against loudness when choosing nuclei.
+const LAMBDA: f64 = 0.5;
+/// A vowel nucleus is at least this share of the word's loudest vowel.
+const NUCLEUS_FLOOR: f64 = 0.1;
+
+/// The local maxima of `v` in [s0, s1] at or above `floor` of the peak, each with its prominence: how far it stands above the
+/// higher of the lowest points separating it from a taller peak (or from the edges).
+fn nucleus_candidates(v: &[f64], s0: usize, s1: usize, floor: f64) -> Vec<(usize, f64)> {
+    let pk = v.iter().cloned().fold(0f64, f64::max);
+    let mut c = Vec::new();
+    for i in s0..=s1 {
+        let l = if i > s0 { v[i - 1] } else { 0.0 };
+        let r = if i < s1 { v[i + 1] } else { 0.0 };
+        if v[i] < floor * pk || v[i] < l || v[i] <= r { continue; }
+        let side = |dir: i64| {
+            let (mut j, mut m) = (i as i64, v[i]);
+            loop {
+                j += dir;
+                if j < s0 as i64 || j > s1 as i64 { return 0.0; }
+                let x = v[j as usize];
+                if x > v[i] { return m; }
+                m = m.min(x);
+            }
+        };
+        c.push((i, v[i] - side(-1).max(side(1))));
+    }
+    c
+}
+
+/// Exactly `weights.len()` vowel nuclei in time order, at least 50 ms apart, chosen by dynamic programming to be prominent
+/// and near where the syllable weights expect them (laghu 1, guru 2, spread over the word's loud part: up to where 97% of
+/// its vowel energy has passed, so a faint tail neither holds a nucleus nor stretches the places). None when there are too few.
+fn pick_nuclei(v: &[f64], s0: usize, s1: usize, weights: &[f64], lambda: f64, floor: f64) -> Option<Vec<usize>> {
+    let n = weights.len();
+    let pk = v.iter().cloned().fold(0f64, f64::max).max(1e-12);
+    let total: f64 = v[s0..=s1].iter().sum::<f64>().max(1e-12);
+    let mut acc = 0.0;
+    let mut e1 = s1;
+    for i in s0..=s1 { acc += v[i]; if acc >= 0.97 * total { e1 = i; break; } }
+    let tot_w: f64 = weights.iter().sum::<f64>().max(1e-9);
+    let mut cum = 0.0;
+    let exp: Vec<f64> = weights.iter().map(|w| { let e = s0 as f64 + (e1 - s0) as f64 * (cum + w / 2.0) / tot_w; cum += w; e }).collect();
+    let span = ((e1 - s0) as f64).max(1.0);
+    let c = nucleus_candidates(v, s0, e1, floor);
+    let m = c.len();
+    if m < n { return None; }
+    const NEG: f64 = -1e18;
+    let mut dp = vec![vec![NEG; m]; n];
+    let mut back = vec![vec![usize::MAX; m]; n];
+    for (j, &(i, p)) in c.iter().enumerate() { dp[0][j] = p / pk - lambda * (i as f64 - exp[0]).abs() / span; }
+    for k in 1..n {
+        for (j, &(i, p)) in c.iter().enumerate() {
+            let mut best = (NEG, usize::MAX);
+            for jj in 0..j {
+                if c[jj].0 + 5 <= i && dp[k - 1][jj] > best.0 { best = (dp[k - 1][jj], jj); }
+            }
+            if best.1 != usize::MAX { dp[k][j] = best.0 + p / pk - lambda * (i as f64 - exp[k]).abs() / span; back[k][j] = best.1; }
+        }
+    }
+    let (mut j, best) = dp[n - 1].iter().enumerate().fold((0, NEG), |a, (j, &x)| if x > a.1 { (j, x) } else { a });
+    if best <= NEG / 2.0 { return None; }
+    let mut nu = vec![0; n];
+    for k in (0..n).rev() { nu[k] = c[j].0; j = back[k][j]; }
+    Some(nu)
+}
+
+/// How far to trust a split, 0..1: the share of nuclei that stay within 20 ms when the choice's two settings are moved
+/// (lambda 0.3/0.8, floor 0.07/0.15), times whether the prominent peaks found without knowing the count (prominence over a
+/// quarter of the peak) are as many as the syllables. A take below 0.6 is better spoken again than sung.
+fn split_confidence(v: &[f64], s0: usize, s1: usize, weights: &[f64], nuclei: &[usize]) -> f64 {
+    let pk = v.iter().cloned().fold(0f64, f64::max).max(1e-12);
+    let mut same = 0usize;
+    let mut tried = 0usize;
+    for (l, f) in [(0.3, NUCLEUS_FLOOR), (0.8, NUCLEUS_FLOOR), (LAMBDA, 0.07), (LAMBDA, 0.15)] {
+        tried += nuclei.len();
+        if let Some(o) = pick_nuclei(v, s0, s1, weights, l, f) {
+            same += o.iter().zip(nuclei).filter(|(a, b)| a.abs_diff(**b) <= 2).count();
+        }
+    }
+    let stable = same as f64 / tried.max(1) as f64;
+    let free = nucleus_candidates(v, s0, s1, NUCLEUS_FLOOR).iter().filter(|(_, p)| *p >= 0.25 * pk).count();
+    let count = if free == nuclei.len() { 1.0 } else { 0.75 };
+    (stable * count * 100.0).round() / 100.0
+}
+
+/// A syllable's boundaries in frames; its vowel is the voiced stretch around its nucleus above half peak.
+fn build_cuts(pcm: &[f32], rate: f64, texts: &[&str], weights: &[f64]) -> Result<Split> {
+    let n = texts.len();
+    if n == 0 { bail!("split: no syllables to find"); }
+    let v = vowelness(pcm, rate);
+    if v.len() < 3 { bail!("split: the audio is too short to split"); }
+    let peak = v.iter().cloned().fold(0f64, f64::max);
+    if peak <= 1e-6 { bail!("split: no voice in the audio to find syllables"); }
+    let silent = peak * SILENCE_FRAC;
+    let start_frame = v.iter().position(|&e| e > silent).unwrap_or(0);
+    let end_frame = v.iter().rposition(|&e| e > silent).unwrap_or(v.len() - 1).max(start_frame);
+    let en = &v;
+
+    let nuclei = pick_nuclei(&v, start_frame, end_frame, weights, LAMBDA, NUCLEUS_FLOOR)
+        .ok_or_else(|| anyhow::anyhow!("split: found fewer vowels than the {n} syllables"))?;
+    // each vowel: the run around its nucleus above half its own peak
+    let mut vowels: Vec<(usize, usize)> = Vec::new();
+    for (k, &nu) in nuclei.iter().enumerate() {
+        let lo_lim = if k > 0 { nuclei[k - 1] + 1 } else { start_frame };
+        let hi_lim = if k + 1 < n { nuclei[k + 1] - 1 } else { end_frame };
+        let half = 0.5 * v[nu];
+        let mut vs = nu;
+        while vs > lo_lim && v[vs - 1] > half { vs -= 1; }
+        let mut ve = nu;
+        while ve < hi_lim && v[ve + 1] > half { ve += 1; }
+        vowels.push((vs, ve));
+    }
+    // vowels that touch share their boundary at the lowest point between the two nuclei
+    for k in 0..n.saturating_sub(1) {
+        if vowels[k].1 + 1 >= vowels[k + 1].0 {
+            let (a, b) = (nuclei[k], nuclei[k + 1]);
+            let m = (a..=b).min_by(|&x, &y| en[x].partial_cmp(&en[y]).unwrap_or(std::cmp::Ordering::Equal)).unwrap();
+            vowels[k].1 = m.saturating_sub(1).max(vowels[k].0);
+            vowels[k + 1].0 = (m + 1).min(vowels[k + 1].1);
+        }
+    }
+    // a syllable starts where the vowel before it ends: its consonant is in front of its own vowel
+    let time = |i: usize| r2(i as f64 * FRAME_S);
+    let mut cuts = Vec::new();
+    for k in 0..n {
+        let s0 = if k == 0 { start_frame } else { vowels[k - 1].1 + 1 };
+        let s1 = if k + 1 == n { end_frame + 1 } else { vowels[k].1 + 1 };
+        cuts.push(Cut { text: texts[k].to_string(), start_s: time(s0), vowel_start_s: time(vowels[k].0),
+                        vowel_end_s: time(vowels[k].1 + 1), end_s: time(s1) });
+    }
+    let confidence = split_confidence(&v, start_frame, end_frame, weights, &nuclei);
+    Ok(Split { cuts, confidence })
+}
+
+/// A spoken word split into syllables, and how far to trust the split (0..1; below `SPLIT_TRUST` speak the word again).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Split {
+    pub cuts: Vec<Cut>,
+    pub confidence: f64,
+}
+
+/// The split confidence below which a take is better spoken again (another sub-seed) than sung.
+pub const SPLIT_TRUST: f64 = 0.6;
+
+/// Split a spoken word's audio into its syllables (`texts`): one vowel nucleus per text, chosen to be prominent in the vowel
+/// band (250-1500 Hz) and near where the syllable weights expect it; each syllable starts where the vowel before it ends,
+/// so its consonant is in front of its own vowel. Errors when there is no voice or fewer vowels than syllables.
+pub fn split(pcm: &[f32], rate: u32, texts: &[&str]) -> Result<Split> {
+    if pcm.is_empty() { bail!("split: the audio is empty"); }
+    let weights: Vec<f64> = texts.iter().map(|t| match weight(t) { Weight::Guru => 2.0, Weight::Laghu => 1.0 }).collect();
+    build_cuts(pcm, rate as f64, texts, &weights)
+}
+
+/// The 20 ms frames of a take: each frame's pitch (if voiced), its loudness and its zero-crossing rate.
+fn hum_frames(pcm: &[f32], rate: f64) -> Vec<(Option<f64>, f64, f64)> {
+    let hop = (rate * HUM_FRAME_S).round() as usize;
+    if pcm.len() < hop || hop == 0 { return vec![]; }
+    (0..pcm.len() / hop)
+        .map(|i| {
+            let w = &pcm[i * hop..((i + 1) * hop).min(pcm.len())];
+            let rms = rms_of(w) as f64;
+            let zc: usize = w.windows(2).filter(|p| (p[0] >= 0.0) != (p[1] >= 0.0)).count();
+            let pitch = crate::analyze::fundamental_frames(w, rate).into_iter().rev().find_map(|(f, _)| f);
+            (pitch, rms, zc as f64 / w.len().max(1) as f64)
+        })
+        .collect()
+}
+
+/// How steady the take is as a hum: the share of frames that hold one pitch and one loudness. A spoken word with consonants
+/// (unvoiced gaps, shifting pitch and volume) scores low; a single held note scores near one.
+pub fn hum_score(pcm: &[f32], rate: u32) -> f64 {
+    let frames = hum_frames(pcm, rate as f64);
+    if frames.is_empty() { return 0.0; }
+    let voiced: Vec<(f64, f64)> = frames.iter().filter_map(|(p, e, _)| p.map(|hz| (hz, *e))).collect();
+    if voiced.is_empty() { return 0.0; }
+    let mut pitches: Vec<f64> = voiced.iter().map(|(h, _)| *h).collect();
+    pitches.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = pitches[pitches.len() / 2];
+    let amps: Vec<f64> = voiced.iter().map(|(_, e)| *e).collect();
+    let a_med = median_clamp(&amps);
+    // how much the pitch spreads across the whole take (a steady hum barely shifts; a word steps between vowels).
+    let min_p = pitches.first().copied().unwrap();
+    let max_p = pitches.last().copied().unwrap();
+    let pitch_spread = cents_above(max_p, med).abs().max(cents_above(min_p, med).abs());
+    // a frame counts when its pitch is within one tolerance of the median and its loudness barely shifts.
+    let tr = HUM_PITCH_CENTS.max(pitch_spread * 0.25);
+    let ok = frames.iter().filter(|(p, e, _)| {
+        let Some(hz) = p else { return false; };
+        cents_above(*hz, med).abs() <= tr && ((e / a_med.max(1e-9)) - 1.0).abs() <= HUM_AMPLITUDE_FRAC
+    }).count();
+    (ok as f64 / frames.len() as f64).clamp(0.0, 1.0)
+}
+
+/// Whether the take is a hum: most of its frames hold one pitch and one loudness with no consonant gaps to split it.
+/// Measured on real Parler takes (2026-11-21): six hums scored 0.78-0.90 and nine spoken words 0.23 or less.
+pub fn is_hum(pcm: &[f32], rate: u32) -> bool { hum_score(pcm, rate) >= HUM_AT }
+
+/// The hum score at and above which a take is a hum.
+pub const HUM_AT: f64 = 0.5;
+
+fn median_clamp(x: &[f64]) -> f64 {
+    let mut y = x.to_vec();
+    y.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if y.is_empty() { 0.0 } else if y.len() % 2 == 1 { y[y.len() / 2] } else { (y[y.len() / 2 - 1] + y[y.len() / 2]) / 2.0 }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -898,6 +1166,89 @@ mod tests {
         assert_eq!(weight("\u{915}\u{902}"), Weight::Guru); // anusvara
         assert_eq!(weight("\u{939}\u{941}\u{901}"), Weight::Laghu); // chandrabindu only nasalises
         assert_eq!(weight("\u{92C}\u{928}\u{94D}"), Weight::Guru); // closed
+    }
+
+    // ---- M2: split and hum ---------------------------------------------------------------------------
+
+    /// Sample rate for the synthetic takes (harmonics stay under Nyquist, pitch inside analyze's 70..=500 Hz picker band).
+    const SR: f32 = 8_000.0;
+
+    fn pulse_train(freq: f32, dur_s: f32) -> Vec<f32> {
+        let n = (dur_s * SR) as usize;
+        (0..n).map(|i| {
+            let t = i as f32 / SR;
+            let mut s = 0.0f64;
+            for h in 1..=6u8 { s += (1.0 / h as f64) * (2.0f32 * std::f32::consts::PI * freq * h as f32 * t).sin() as f64; }
+            (s * 0.25) as f32 // a clean voiced tone: the vowel nucleus
+        }).collect()
+    }
+
+    fn noise_burst(dur_s: f32) -> Vec<f32> {
+        let n = (dur_s * SR) as usize;
+        (0..n).map(|i| {
+            let v = i.wrapping_mul(1_103_515_125usize).wrapping_add(12_345) >> 16;
+            let x = (v as i32 % 1000 - 500) as f32 / 1000.0 * 0.3f32; // quiet, unvoiced: the consonant between two vowels
+            x
+        }).collect()
+    }
+
+    /// Three voiced vowels (180/240/180 Hz pulse trains, 150 ms each) with 60 ms noise bursts between them and a tail of
+    /// silence — one word with three syllables.
+    fn synthetic_word() -> Vec<f32> {
+        let mut v = Vec::new();
+        v.extend(pulse_train(180.0, 0.150));
+        v.extend(noise_burst(0.060));
+        v.extend(pulse_train(240.0, 0.150));
+        v.extend(noise_burst(0.060));
+        v.extend(pulse_train(180.0, 0.150));
+        v.extend(std::iter::repeat(0f32).take((0.10 * SR) as usize)); // tail silence
+        v
+    }
+
+    /// A single steady note, constant amplitude throughout: a hum.
+    fn steady_tone() -> Vec<f32> {
+        let n = (2.5 * SR) as usize;
+        (0..n).map(|i| {
+            let t = i as f32 / SR;
+            let mut s = 0.0f64;
+            for h in 1..=6u8 { s += (1.0 / h as f64) * (2.0f32 * std::f32::consts::PI * 180.0f32 * h as f32 * t).sin() as f64; }
+            (s * 0.25) as f32
+        }).collect()
+    }
+
+    #[test]
+    fn a_three_vowel_word_is_split_into_three_with_boundaries_at_the_bursts() {
+        let pcm = synthetic_word();
+        let texts: Vec<&str> = vec!["a", "b", "c"];
+        let cuts = split(&pcm, SR as u32, &texts).expect("three voiced vowels split").cuts;
+        assert_eq!(cuts.len(), 3, "one nucleus per text: {cuts:?}");
+        // the bursts (150-210 ms and 360-420 ms) start the second and third syllables: each boundary is where the burst
+        // begins, and each vowel lies between the bursts, within 20 ms
+        let b0 = cuts[0].end_s;
+        let b1 = cuts[1].end_s;
+        assert_eq!(b0, cuts[1].start_s, "boundaries join the syllables");
+        assert_eq!(b1, cuts[2].start_s, "boundaries join the syllables");
+        assert!((b0 - 0.150).abs() < 0.02, "boundary one where the first burst begins: {cuts:?}");
+        assert!((b1 - 0.360).abs() < 0.02, "boundary two where the second burst begins: {cuts:?}");
+        assert!((cuts[1].vowel_start_s - 0.210).abs() < 0.02 && (cuts[2].vowel_start_s - 0.420).abs() < 0.02,
+                "each vowel starts after its consonant: {cuts:?}");
+        // each syllable's vowel is inside its own span and lasts more than a frame.
+        for c in &cuts {
+            assert!(c.start_s <= c.vowel_start_s && c.vowel_start_s <= c.vowel_end_s && c.vowel_end_s <= c.end_s, "ordering: {c:?}");
+            assert!((c.vowel_end_s - c.vowel_start_s) > 0.05, "a real vowel is voiced for a while: {c:?}");
+        }
+    }
+
+    #[test]
+    fn a_steady_tone_is_a_hum() {
+        let pcm = steady_tone();
+        assert!(is_hum(&pcm, SR as u32), "a single held note is a hum (score {}):", hum_score(&pcm, SR as u32));
+    }
+
+    #[test]
+    fn the_synthetic_word_is_not_a_hum() {
+        let pcm = synthetic_word();
+        assert!(!is_hum(&pcm, SR as u32), "a spoken word with consonants and shifting pitch is not a hum (score {}):", hum_score(&pcm, SR as u32));
     }
 
     // ---- sing::check synthesis and expectations ------------------------------------------------------

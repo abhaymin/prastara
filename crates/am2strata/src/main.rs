@@ -656,6 +656,7 @@ async fn main() -> Result<()> {
         .route("/v1/media/check", post(media_check::check_endpoint))
         .route("/v1/media/analyze", post(media_analyze::analyze_endpoint))
         .route("/v1/media/sing-check", post(media_sing_check::sing_check_endpoint))
+        .route("/v1/media/syllables", post(media_sing_check::syllables_endpoint))
         .route("/v1/media/dub", post(media_dub::dub_endpoint))
         .route("/api/jobs/{id}", get(media_jobs::status))
         .route("/v1/search/images", post(image_search::images))

@@ -38,7 +38,7 @@ struct Proc {
 /// The events that end a command.
 fn ends(event: &str) -> bool {
     matches!(event, "error" | "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "analysis" | "speech" | "song" | "removal" | "removed" | "accepted"
-             | "frames" | "sing_check")
+             | "frames" | "sing_check" | "syllables")
 }
 
 pub struct Media {

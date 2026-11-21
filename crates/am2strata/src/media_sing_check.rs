@@ -88,3 +88,30 @@ pub async fn sing_check_endpoint(State(s): State<AppState>, headers: HeaderMap, 
         Err(e) => error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")),
     }
 }
+
+/// POST /v1/media/syllables: a spoken word split into its syllables (`docs/SINGING-PLAN.md`, step 2). JSON
+/// `{"audio": <base64|data URL>, "text": <word>}` (split with the syllabifier) or `"texts": [syllables]`; the media engine's
+/// `syllables` op answers with each syllable's start, vowel and end, the hum score and how far the split can be trusted.
+pub async fn syllables_endpoint(State(s): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+    if !api_authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if !s.media.available() {
+        return error(StatusCode::NOT_IMPLEMENTED, "not_available", "the media engine is not built");
+    }
+    let src = body["audio"].as_str().unwrap_or("");
+    let raw = src.split_once(";base64,").map(|(_, b)| b).unwrap_or(src);
+    let Ok(audio) = base64::engine::general_purpose::STANDARD.decode(raw.trim()) else { return bad("\"audio\": base64 or a data: URL") };
+    if audio.is_empty() { return bad("send the word's audio as \"audio\""); }
+    if audio.len() > 20 * 1024 * 1024 { return bad("one word's audio: at most 20 MiB"); }
+    let mut cmd = json!({"op": "syllables", "audio": base64::engine::general_purpose::STANDARD.encode(&audio)});
+    match (body["texts"].as_array(), body["text"].as_str().filter(|t| !t.trim().is_empty())) {
+        (Some(t), _) if !t.is_empty() => cmd["texts"] = json!(t),
+        (_, Some(w)) => cmd["text"] = json!(w.trim()),
+        _ => return bad("send the word as \"text\", or its syllables as \"texts\""),
+    }
+    match s.media.call(cmd, |_| {}).await {
+        Ok(mut v) => { if let Some(o) = v.as_object_mut() { o.remove("event"); } Json(v).into_response() }
+        Err(e) => error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")),
+    }
+}

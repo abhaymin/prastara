@@ -209,6 +209,8 @@ const ROUTES: &[Row] = &[
     row("POST", "/v1/media/check", Client).json(r#"{}"#).note("nothing to check is a report saying so"),
     row("POST", "/v1/media/dub", Client).json(r#"{}"#).ok(400),
     row("POST", "/v1/media/analyze", Client).json(r#"{}"#).ok(400).note("no audio: nothing reaches the media engine"),
+    row("POST", "/v1/media/sing-check", Client).json(r#"{}"#).ok(400).note("no audio: nothing reaches the media engine"),
+    row("POST", "/v1/media/syllables", Client).json(r#"{}"#).ok(400).note("no audio: nothing reaches the media engine"),
     row("GET", "/api/jobs/{id}", Client).at("/api/jobs/mj-999").ok(404),
     row("GET", "/v1/media/jobs/{id}", Client).at("/v1/media/jobs/mj-999").ok(404),
     row("GET", "/v1/media/jobs/{id}/content", Client).at("/v1/media/jobs/mj-999/content").ok(404),

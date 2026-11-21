@@ -187,3 +187,46 @@ fn sing_check_endpoint_forwards_the_score_and_tonic_to_the_engine() {
     let no_key = reqwest::blocking::Client::new().post(format!("{}/v1/media/sing-check", s.base)).json(&json!({"audio": "AAAA"})).send().unwrap();
     assert_eq!(no_key.status().as_u16(), 401, "a request without a key is unauthorized");
 }
+
+/// Word mode (`"words"` in place of `"input"`): each word is spoken alone, as the word plus a danda, in the one voice
+/// and base seed, then split into syllables by the engine; the answer has one entry per word. The CLI writes one WAV per
+/// word and a words.json, and `media syllables` prints a word's cuts.
+#[test]
+fn speech_word_mode_speaks_each_word_alone_in_one_voice() {
+    let s = Server::start(&[Model::default()], &[], json!({}));
+    let (code, r) = s.post("/api/media/models/default", &json!({"model": "parler-tts-mini-v1"}));
+    assert_eq!(code, 200, "{r}");
+    let (code, j) = s.post("/v1/audio/speech", &json!({"model": "parler-tts-mini-v1", "language": "en", "voice": "Divya",
+                                                       "seed": 11, "words": ["ओम्", "त्र्यम्बकं।", "यजामहे"]}));
+    assert_eq!(code, 200, "word mode answers: {j}");
+    let w = j["words"].as_array().expect("a words list");
+    assert_eq!(w.len(), 3, "one entry per word: {j}");
+    assert_eq!(w[1]["text"], "त्र्यम्बकं", "the caller's danda is not doubled: {j}");
+    assert!(w.iter().all(|x| x["audio"].as_str().is_some_and(|a| !a.is_empty()) && x["syllables"].is_array() && x["seed"] == 11), "{j}");
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap_or_default();
+    let speaks: Vec<serde_json::Value> = rec.lines().filter_map(|l| serde_json::from_str(l).ok()).filter(|v: &serde_json::Value| v["op"] == "speak").collect();
+    assert_eq!(speaks.len(), 3, "one speak per word: {rec}");
+    assert!(speaks.iter().all(|v| v["voice"] == "Divya" && v["seed"] == 11 && v["temperature"] == 1.0
+                              && v["text"].as_str().is_some_and(|t| t.ends_with('।'))), "one voice, one seed, each ends in a danda: {speaks:?}");
+    assert!(rec.lines().any(|l| l.contains("\"op\":\"syllables\"") && l.contains("यजामहे")), "each take is split: {rec}");
+
+    // neither input nor words, or both, is refused
+    let (code, _) = s.post("/v1/audio/speech", &json!({"model": "parler-tts-mini-v1"}));
+    assert_eq!(code, 400, "no input and no words");
+    let (code, _) = s.post("/v1/audio/speech", &json!({"input": "x", "words": ["y"]}));
+    assert_eq!(code, 400, "input and words together");
+
+    // the CLI: one WAV per word plus the words.json
+    let dir = s.dir.join("words-cli");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = dir.join("w.wav");
+    let (ok, o, e) = run(&s, &["speak", "--words", "ओम्|यजामहे", "--model", "parler-tts-mini-v1", "--language", "en", "--seed", "11",
+                              "--out", out.to_str().unwrap()]);
+    assert!(ok, "speak --words: {o} {e}");
+    assert!(dir.join("w-0.wav").exists() && dir.join("w-1.wav").exists() && dir.join("w-words.json").exists(), "{o}");
+    let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("w-words.json")).unwrap()).unwrap();
+    assert!(meta["words"][0].get("audio").is_none(), "the json holds no audio: {meta}");
+    // media syllables prints the cuts
+    let (ok, o, e) = run(&s, &["syllables", "--text", "यजामहे", "--", dir.join("w-1.wav").to_str().unwrap()]);
+    assert!(ok && o.contains("vowel") && o.contains("trusted"), "syllables prints the cuts: {o} {e}");
+}

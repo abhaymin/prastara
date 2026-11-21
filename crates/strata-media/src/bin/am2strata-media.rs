@@ -19,6 +19,8 @@
 //!                                                         <- {"event":"analysis", "loudness","tempo","repeat","pitch","phrases", ...}
 //!   -> {"op":"sing_check","audio":"<base64 file>","score":{...Score},"tonic_hz"?,"start_s"?}  (CPU only: no model - pitch vs note, onset)
 //!                                                         <- {"event":"sing_check","events":[...],"faults":[...],"summary":{median_abs_cents,...}}
+//!   -> {"op":"syllables","audio":"<base64 file>","texts":[...]|"text":<word>}  (CPU only: a spoken word split into syllables)
+//!                                                         <- {"event":"syllables","syllables":[{text,start_s,vowel_start_s,vowel_end_s,end_s}],"hum_score","hum","confidence","trusted","seconds"}
 //!   -> {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>}  (MP4/H.264 in Rust, no ffmpeg)
 //!                                                         <- {"event":"frames","fps","duration_s","width","height","frames":[{"t":..,"png":"<base64>"}]}
 //!   -> {"op":"speak","model":"parler-tts-mini-v1","text":..,"voice"?,"seed"?,"device"?}
@@ -194,6 +196,39 @@ fn sing_check_op(_st: &mut State, cmd: &Value) -> Result<Value> {
     r["event"] = json!("sing_check");
     r["ms"] = json!(t0.elapsed().as_millis() as u64);
     Ok(r)
+}
+
+/// {"op":"syllables","audio":"<base64|data URL>","texts":[...]} or "text":<word> (split with the syllabifier): where each
+/// syllable of a spoken word starts and ends and where its vowel sits, for `media sing` to keep the consonant and stretch
+/// the vowel; plus how much the take is a steady hum. CPU only, no model. -> {"event":"syllables","syllables":[Cut...],
+/// "hum_score":x,"hum":bool,"seconds":s}
+fn syllables_op(cmd: &Value) -> Result<Value> {
+    let raw = match cmd["audio"].as_str() {
+        Some(s) if !s.is_empty() => s.split_once(";base64,").map(|(_, b)| b).unwrap_or(s),
+        _ => bail!("syllables: no \"audio\""),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw.trim()).context("audio: base64")?;
+    let (pcm, rate, _warnings) = audio::decode(bytes)?;
+    let texts: Vec<String> = match (cmd["texts"].as_array(), cmd["text"].as_str()) {
+        (Some(a), _) => a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect(),
+        (None, Some(w)) => sing::syllables(w).into_iter().map(|s| s.text).collect(),
+        _ => bail!("syllables: send \"texts\" (the word's syllables) or \"text\" (the word)"),
+    };
+    if texts.is_empty() { bail!("syllables: no syllables to find"); }
+    let refs: Vec<&str> = texts.iter().map(String::as_str).collect();
+    let hum = sing::hum_score(&pcm, rate);
+    let r = |x: f64| (x * 1000.0).round() / 1000.0;
+    let mut out = json!({"event": "syllables", "hum_score": r(hum), "hum": hum >= sing::HUM_AT,
+                         "seconds": r(pcm.len() as f64 / rate as f64)});
+    // a take that cannot be split (a hum, too few vowels) still answers, with an empty list and the reason, so word mode
+    // can speak it again
+    match sing::split(&pcm, rate, &refs) {
+        Ok(s) => { out["syllables"] = json!(s.cuts); out["confidence"] = json!(s.confidence);
+                   out["trusted"] = json!(!(hum >= sing::HUM_AT) && s.confidence >= sing::SPLIT_TRUST); }
+        Err(e) => { out["syllables"] = json!([]); out["confidence"] = json!(0.0); out["trusted"] = json!(false);
+                    out["problem"] = json!(e.to_string()); }
+    }
+    Ok(out)
 }
 
 fn speak(st: &mut State, cmd: &Value) -> Result<Value> {
@@ -1145,6 +1180,7 @@ fn main() {
                     let r = sing_check_op(&mut st, &cmd)?;
                     emit(r)
                 }
+                "syllables" => emit(syllables_op(&cmd)?),
                 "video_frames" => emit(video_frames(&cmd)?),
                 "speak" => {
                     let r = speak(&mut st, &cmd)?;

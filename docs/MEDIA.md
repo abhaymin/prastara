@@ -103,6 +103,16 @@ OpenAI's model names (`whisper-1`, `tts-1`, `tts-1-hd`) mean the models chosen i
 cover 8 languages. Indic Parler speaks Malayalam and 11 more Indian languages, and Chatterbox clones a voice.
 `POST /api/media/audio/device {"device": "auto" | "cpu" | "cuda"}` sets where speech runs.
 
+**Word mode,** for singing and chanting (`docs/SINGING-PLAN.md`): send `"words": ["ओम्", "त्र्यम्बकं", …]` in place of
+`"input"`.
+- **One voice:** each word is spoken alone, as the word plus "।". Every word uses the same `voice`, `temperature` (1.0
+  unless given) and base `seed`.
+- **Split and retake:** each take is split into its syllables (`/v1/media/syllables`). A take that is a hum, or whose split
+  isn't trusted, is spoken again with seed + 1000·k (k = 1..4). A word that never gives a clear take is a 422 that names it.
+- **The answer** is JSON, `{"words": [{text, audio (base64 WAV), seconds, seed, hum_score, confidence, syllables, takes}]}`.
+- **The CLI** is `am2strata-run media speak --words "ओम्|त्र्यम्बकं" --voice Divya --seed 11 --out w.wav`. It writes w-0.wav,
+  w-1.wav, … and w-words.json.
+
 ## Songs and music
 
 `POST /v1/audio/music` makes a sung song (ACE-Step 1.5, in Rust):
@@ -307,6 +317,17 @@ syllable's row, then the faults and the summary.
 
 Female text-to-speech voices can sit low. Indic Parler's Divya measures about 120–185 Hz; the spectrum confirms that this is
 the true fundamental, not an octave error. So Sa = C#3 (138.6 Hz) suits her with little re-pitching.
+
+## A spoken word's syllables
+
+`POST /v1/media/syllables` with `{"audio": <base64 WAV>, "text": "यजामहे"}` (or `"texts"`, the syllables) answers:
+- **`syllables`:** each syllable's `start_s`, `vowel_start_s`, `vowel_end_s` and `end_s`. A syllable starts where the vowel
+  before it ends, so its consonant stays in front of its own vowel.
+- **`hum_score`** (a hum is 0.5 or more), **`confidence`**, and **`trusted`**.
+
+It finds one vowel per syllable in the 250–1500 Hz band, the vowel's own band. It picks the most prominent peaks near
+where the syllable weights (laghu 1, guru 2) expect them. The cuts are approximate, often a few tens of ms off, and
+vowels joined by r, v, y or a nasal are the hardest. The CLI is `am2strata-run media syllables <word.wav> --text <word>`.
 
 ## Media from a chat
 

@@ -106,6 +106,15 @@ fn main() {
                 emit(serde_json::json!({"event":"sing_check","events":[],"faults":[],
                     "summary":{"median_abs_cents":0.0,"median_abs_onset_ms":0.0,"faults":0,"syllables":syllables}}));
             }
+            // media syllables: one cut per syllable asked for (or one for a whole word), never a hum
+            "syllables" => {
+                let n = cmd["texts"].as_array().map(Vec::len).unwrap_or(1).max(1);
+                let cuts: Vec<serde_json::Value> = (0..n).map(|k| { let t = k as f64 * 0.2;
+                    serde_json::json!({"text": cmd["texts"][k].as_str().or(cmd["text"].as_str()).unwrap_or(""),
+                                       "start_s": t, "vowel_start_s": t + 0.05, "vowel_end_s": t + 0.18, "end_s": t + 0.2}) }).collect();
+                emit(serde_json::json!({"event": "syllables", "syllables": cuts, "hum_score": 0.05, "hum": false,
+                                        "confidence": 1.0, "trusted": true, "seconds": 0.2 * n as f64}));
+            }
             "song" => {
                 for s in 1..=8u64 {
                     emit(serde_json::json!({"event": "step", "step": s, "total": 8}));

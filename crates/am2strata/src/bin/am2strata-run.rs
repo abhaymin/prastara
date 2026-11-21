@@ -438,7 +438,7 @@ enum Cmd {
     },
     /// media generation from a terminal (docs/GAPS-PLAN B; docs/MEDIA.md has every example):
     /// image "prompt" [--size WxH] [--model M] [--n N] --out file.png | video "prompt" [--frames N] [--size WxH] [--format mp4|gif|apng] [--model M] --out file |
-    /// speak "text" [--voice V] [--model M] --out file.wav | transcribe <file> [--language xx] [--response-format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
+    /// speak "text" [--voice V] [--model M] --out file.wav (or --words "a|b|c": each word alone, split into syllables; writes file-0.wav ... and file-words.json) | syllables <word.wav> --text <word> | sing-check <take> --score <score.json> [--from S] [--tonic-hz H] | transcribe <file> [--language xx] [--response-format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
     /// song "prompt" [--lyrics file.txt] [--seconds N] --out file.wav | check <file> [--expect "text"] [--language xx] (prints each finding; exit 1 when any is not ok) |
     /// dub <request.json> [--out file.wav] | produce <plan.json> [--out file.wav] (posts the plan, polls step N of M every 3 s, then downloads the content) |
     /// job <id> [--out file] (the job status; with --out also its /content) |

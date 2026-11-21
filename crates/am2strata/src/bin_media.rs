@@ -158,6 +158,8 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
 ///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
+///   syllables <word.wav> --text <word>   (a spoken word's syllables: start, vowel, end; hum score and confidence)
+///   speak --words "a|b|c" --out x.wav   (word mode: x-0.wav ... and x-words.json)
 ///   sing-check <file> --score <score.json> [--from S] [--tonic-hz H]   (per-syllable pitch error vs note, onset and word-to-word faults)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts, polls every 3 s for step N of M, then downloads the content)
@@ -217,6 +219,13 @@ pub struct MediaOpts {
     // for sing-check only: the song's score as a file to parse inline (it reaches the engine as an inline `score` object)
     #[arg(long)]
     score: Option<String>,
+    /// speak only: word mode, the words separated by "|" ("ओम्|त्र्यम्बकं"); each is spoken alone in the one voice and split
+    /// into its syllables, and --out x.wav writes x-0.wav, x-1.wav, ... and x-words.json
+    #[arg(long)]
+    words: Option<String>,
+    /// syllables only: the spoken word in the file
+    #[arg(long)]
+    text: Option<String>,
     // for sing-check only: the tonic (Sa) in hertz, so notes are read against the key the singer used (130 Hz where none given)
     #[arg(long)]
     tonic_hz: Option<f64>,
@@ -298,6 +307,7 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "check" => cmd_check(&client, &send, first.as_ref(), o, &url)?,
             "analyze" => cmd_analyze(&client, &send, first.as_ref(), o, &url)?,
             "sing-check" => cmd_sing_check(&client, &send, first.as_ref(), o, &url)?,
+            "syllables" => cmd_syllables(&client, &send, first.as_ref(), o, &url)?,
             "dub" => cmd_dub(&client, &send, &first, o, &url)?,
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
@@ -361,12 +371,60 @@ fn cmd_video(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
 fn cmd_speak(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
+    if let Some(words) = o.words.as_deref() { return cmd_speak_words(client, send, words, o, &out, url); }
     let mut body = speak_request(prompt.ok_or("speak needs text")?, o.voice.as_deref(), o.model.as_deref());
     with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/audio/speech")).json(&body))?;
     let bytes = r.bytes().map_err(|e| e.to_string())?;
     write_file(&out, &bytes)?;
     println!("saved {} ({} KB)", out.display(), bytes.len() / 1024);
+    Ok(())
+}
+
+/// `media speak --words "a|b|c" --out x.wav`: word mode. Writes x-0.wav, x-1.wav, ... and x-words.json (each word's length,
+/// seed, hum score and syllable cuts, without the audio).
+fn cmd_speak_words(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+                   words: &str, o: &MediaOpts, out: &Path, url: &str) -> Result<(), String> {
+    let list: Vec<&str> = words.split('|').map(str::trim).filter(|w| !w.is_empty()).collect();
+    if list.is_empty() { return Err("--words: one or more words, separated by |".into()); }
+    let mut body = serde_json::json!({"model": o.model.as_deref().unwrap_or("indic-parler-tts"), "words": list,
+                                      "voice": o.voice.as_deref().unwrap_or("Divya"), "response_format": "wav"});
+    if let Some(l) = o.language.as_deref() { body["language"] = serde_json::json!(l); }
+    with_seed(&mut body, o.seed);
+    let r = send(client.post(format!("{url}/v1/audio/speech")).json(&body))?;
+    let mut j: Value = r.json().map_err(|e| e.to_string())?;
+    let stem = out.with_extension("");
+    for (i, w) in j["words"].as_array_mut().ok_or("the server gave no words")?.iter_mut().enumerate() {
+        use base64::Engine as _;
+        let wav = base64::engine::general_purpose::STANDARD.decode(w["audio"].as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+        let p = PathBuf::from(format!("{}-{i}.wav", stem.display()));
+        write_file(&p, &wav)?;
+        if let Some(o) = w.as_object_mut() { o.remove("audio"); }
+        println!("{} {}  {:.2} s  seed {}  {} syllables", p.display(), w["text"].as_str().unwrap_or(""), w["seconds"].as_f64().unwrap_or(0.0),
+                 w["seed"], w["syllables"].as_array().map(Vec::len).unwrap_or(0));
+    }
+    let meta = PathBuf::from(format!("{}-words.json", stem.display()));
+    write_file(&meta, serde_json::to_string_pretty(&j).unwrap_or_default().as_bytes())?;
+    println!("saved {}", meta.display());
+    Ok(())
+}
+
+/// `media syllables <word.wav> --text <word>`: where each syllable of a spoken word starts, where its vowel is, and where it ends.
+fn cmd_syllables(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+                 first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    let (bytes, _) = read_bytes(&expand_path(Path::new(first.ok_or("syllables needs a word's audio file")?)))?;
+    let text = o.text.as_deref().ok_or("syllables needs --text <the word>")?;
+    let body = serde_json::json!({"audio": base64::engine::general_purpose::STANDARD.encode(&bytes), "text": text});
+    let j: Value = send(client.post(format!("{url}/v1/media/syllables")).json(&body))?.json().map_err(|e| e.to_string())?;
+    if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); return Ok(()); }
+    for c in j["syllables"].as_array().into_iter().flatten() {
+        println!("{:<10} {:>5.2}-{:<5.2} s  vowel {:.2}-{:.2}", c["text"].as_str().unwrap_or(""), c["start_s"].as_f64().unwrap_or(0.0),
+                 c["end_s"].as_f64().unwrap_or(0.0), c["vowel_start_s"].as_f64().unwrap_or(0.0), c["vowel_end_s"].as_f64().unwrap_or(0.0));
+    }
+    println!("hum score {}  confidence {}  {}", j["hum_score"], j["confidence"],
+             if j["trusted"] == true { "trusted" } else { "speak it again" });
+    if let Some(p) = j["problem"].as_str() { println!("{p}"); }
     Ok(())
 }
 

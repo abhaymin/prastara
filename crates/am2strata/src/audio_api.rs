@@ -340,8 +340,11 @@ async fn speech_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available", "the media engine is not built");
     }
+    if let Some(words) = req["words"].as_array() {
+        return Box::pin(speech_words(s, headers, req.clone(), words.clone())).await;
+    }
     let Some(text) = req["input"].as_str().filter(|t| !t.trim().is_empty()) else {
-        return bad("send {\"input\": \"the text to speak\"}");
+        return bad("send {\"input\": \"the text to speak\"} or {\"words\": [\"one\", \"word\", \"each\"]}");
     };
     // OpenAI stops at 4,096 characters (about 4.5 minutes); speech is made part by part here, so a longer text only
     // takes longer: 20,000 characters is about 20 minutes of speech
@@ -455,6 +458,61 @@ async fn speech_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Js
         .header("x-strata-file-id", file_id.unwrap_or_default())
         .header("x-strata-seconds", r["seconds"].to_string()).header("x-strata-model", model).header("x-strata-language", language).header("x-strata-language-found", detected)
         .body(Body::from(wav)).unwrap()
+}
+
+/// How many times word mode speaks a word again (seed + 1000·k) when the take is a hum or cannot be split.
+const WORD_RETAKES: u64 = 4;
+
+/// Word mode, `"words": [...]` in place of `"input"`: each word spoken alone as `word + "।"` in the one voice (the same voice,
+/// temperature, 1.0 unless given, and base seed), then split into its syllables by the media engine (`syllables`). A take
+/// that is a hum, or whose split is not trusted, is spoken again with seed + 1000·k (k = 1..4); a word that never gives a
+/// clear take is a 422 naming it. The answer carries each word's WAV (base64), length, seed, hum score and syllable cuts,
+/// for a beat grid or `media sing` (docs/SINGING-PLAN.md).
+async fn speech_words(s: AppState, headers: HeaderMap, req: Value, words: Vec<Value>) -> Response {
+    if req.get("input").is_some_and(|i| !i.is_null()) {
+        return bad("send \"input\" or \"words\", not both");
+    }
+    let words: Vec<String> = words.iter().filter_map(|w| w.as_str()).map(|w| w.trim().trim_end_matches('।').trim().to_string())
+        .filter(|w| !w.is_empty()).collect();
+    if words.is_empty() { return bad("words: one or more words to speak, each on its own"); }
+    if words.len() > 200 { return bad("words: at most 200 in one request"); }
+    let base_seed = req["seed"].as_u64().unwrap_or(0);
+    let mut out = Vec::new();
+    for w in &words {
+        let mut tried = Vec::new();
+        let mut kept: Option<Value> = None;
+        for k in 0..=WORD_RETAKES {
+            let seed = base_seed + 1000 * k;
+            let mut one = req.clone();
+            if let Some(o) = one.as_object_mut() { o.remove("words"); }
+            one["input"] = json!(format!("{w}।"));
+            one["seed"] = json!(seed);
+            one["check"] = json!(false);
+            if one["temperature"].is_null() { one["temperature"] = json!(1.0); }
+            let r = Box::pin(speech_now(State(s.clone()), headers.clone(), Json(one))).await;
+            if r.status() != StatusCode::OK { return r; }
+            let Ok(wav) = axum::body::to_bytes(r.into_body(), 64 * 1024 * 1024).await else {
+                return error(StatusCode::BAD_GATEWAY, "audio_error", "the speech could not be read back");
+            };
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&wav);
+            let split = match s.media.call(json!({"op": "syllables", "audio": b64, "text": w}), |_| {}).await {
+                Ok(v) => v,
+                Err(e) => return error(StatusCode::BAD_GATEWAY, "media_error", format!("{e:#}")),
+            };
+            tried.push(json!({"seed": seed, "hum_score": split["hum_score"], "confidence": split["confidence"]}));
+            let entry = json!({"text": w, "audio": b64, "seconds": split["seconds"], "seed": seed, "hum_score": split["hum_score"],
+                               "confidence": split["confidence"], "syllables": split["syllables"]});
+            if split["trusted"] == true { kept = Some(entry); break; }
+            if split["hum"] != true && kept.is_none() { kept = Some(entry); } // not a hum: kept if nothing better comes
+        }
+        match kept {
+            Some(mut e) => { e["takes"] = json!(tried); out.push(e) }
+            None => return error(StatusCode::UNPROCESSABLE_ENTITY, "speech_error",
+                                 format!("{w:?} came out as a hum in all {} takes (seeds {base_seed} + 1000·k): try another seed or voice",
+                                         WORD_RETAKES + 1)),
+        }
+    }
+    Json(json!({"words": out})).into_response()
 }
 
 /// POST /api/media/audio/device {"device": "auto" | "cpu" | "cuda"}
