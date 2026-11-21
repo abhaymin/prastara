@@ -107,6 +107,16 @@ fn media_cli_writes_and_reports_like_the_server() {
     assert!(ok && !out.is_empty(), "an analyze of a take prints music facts: stdout {out:?}, stderr {err:?}");
     assert!(out.contains("A3"), "the sustained A3 (220 Hz) is reported as the tonic: {out}");
 
+    // sing-check compares a take against its score, per syllable: it prints each row's pitch error and onset, any faults, and the
+    // summary. The mock echoes back how many events the score had, so the score round-tripping through the endpoint is checked here.
+    let take = dir.join("take.wav");
+    std::fs::write(&take, wav_16(8_000, &tone_then_silence(8_000, 24_000, 220.0, 0.3, 8_000))).unwrap();
+    let score = dir.join("score.json");
+    std::fs::write(&score, r#"{"events":[{"text":"Sa","note":"Sa"},{"text":"Ma","note":"Ma"},{"text":"Pa","note":"Pa"}]}"#).unwrap();
+    let (ok, out, err) = run(&s, &["sing-check", "--score", score.to_str().unwrap(), "--", take.to_str().unwrap()]);
+    assert!(ok && !out.is_empty(), "a sing-check prints a per-syllable report: stdout {out:?}, stderr {err:?}");
+    assert!(out.contains("syllables scored: 3"), "the score reached the engine and came back: {out}");
+
     // an unknown job id is refused with the server's message (it names the id) and a non-zero exit.
     let (ok, _, err) = run(&s, &["job", "--", "mj-999"]);
     assert!(!ok && !err.is_empty(), "unknown job exits non-zero: {err}");
@@ -145,5 +155,35 @@ fn analyze_endpoint_forwards_to_the_engine_and_carries_the_window() {
 
     // no key is refused, as with /v1/media/check
     let no_key = reqwest::blocking::Client::new().post(format!("{}/v1/media/analyze", s.base)).json(&json!({"audio": "AAAA"})).send().unwrap();
+    assert_eq!(no_key.status().as_u16(), 401, "a request without a key is unauthorized");
+}
+
+/// The endpoint forwards the audio and score to the media engine's `sing_check` op and returns its comparison without the `event`
+/// field (events[], faults[], summary{...}). `tonic_hz`/`start_s` reach the engine as they are forwarded, proving a call is wired;
+/// the mock also echoes back how many events the score held, so the round trip is visible.
+#[test]
+fn sing_check_endpoint_forwards_the_score_and_tonic_to_the_engine() {
+    let s = Server::start(&[Model::default()], &[], json!({}));
+
+    // a take (base64 WAV) plus a three-syllable score and the tonic + start, exactly like /v1/media/sing-check's documented body.
+    let take = wav_16(8_000, &tone_then_silence(8_000, 24_000, 220.0, 0.3, 8_000));
+    use base64::Engine as _;
+    let data_url = format!("data:audio/wav;base64,{}", base64::engine::general_purpose::STANDARD.encode(&take));
+    let (code, j) = s.post("/v1/media/sing-check", &json!({
+        "audio": data_url,
+        "score": {"events": [{"text":"Sa","note":"Sa"},{"text":"Ma","note":"Ma"},{"text":"Pa","note":"Pa"}]},
+        "tonic_hz": 130.0, "start_s": 5.0}));
+
+    assert_eq!(code, 200, "the sing-check endpoint answers: {j}");
+    assert!(j.get("event").is_none(), "the comparison comes back without its event field: {j}");
+    // the score reached the engine and came back through it (the mock echoes how many events it held) ...
+    assert_eq!(j["summary"]["syllables"].as_u64(), Some(3), "the score's syllables are reported: {j}");
+    // ... and tonic_hz + start_s reached the engine, recorded on its own command line (not only the mock being asked).
+    let rec = std::fs::read_to_string(s.dir.join("media-record.txt")).unwrap_or_default();
+    assert!(rec.lines().any(|l| l.contains("\"op\":\"sing_check\"") && l.contains("\"tonic_hz\":130") && l.contains("\"start_s\":5")),
+            "the sing_check command carried tonic_hz/start_s to the engine: {rec}");
+
+    // no key is refused, as with /v1/media/check and /v1/media/analyze
+    let no_key = reqwest::blocking::Client::new().post(format!("{}/v1/media/sing-check", s.base)).json(&json!({"audio": "AAAA"})).send().unwrap();
     assert_eq!(no_key.status().as_u16(), 401, "a request without a key is unauthorized");
 }

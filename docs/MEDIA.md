@@ -17,6 +17,7 @@ am2strata-run media transcribe take.wav --model whisper-base            # its te
 am2strata-run media song "warm acoustic ballad, female vocal" --lyrics words.txt --seconds 180 --out song.wav
 am2strata-run media check take.wav --expect "Welcome to the evening set."   # prints each finding; exit 1 when any is not ok
 am2strata-run media analyze take.wav --from 300 --seconds 120   # music facts of that window: tempo, repeat, tonic+range, swaras, phrases
+am2strata-run media sing-check sung.wav --score score-A.json --tonic-hz 138.6   # per syllable: cents off the note, vowel onset, faults
 am2strata-run media dub dub-request.json --out soundtrack.wav
 am2strata-run media produce plan.json --out set.wav                     # posts the plan, polls step N of M, then downloads it
 am2strata-run media job mj-1234 --out set.wav                           # its status; with --out also /content
@@ -279,6 +280,33 @@ The endpoint forwards the raw bytes to the engine's `analyze` op and returns its
 forwards `transcribe`). The answer carries `tempo` (bpm, confidence, whether it is a steady pulse), `repeat` (one verse's
 period and how many times it repeats), `pitch.tonic` (note + hertz) with the `range`, each `swara` as `{name, share}`, and a
 `phrases` list. Send the file as a multipart `file` or as base64 / a data URL in JSON.
+
+## Checking a sung take against its score
+
+`POST /v1/media/sing-check` measures a sung take against its score (`docs/SINGING-PLAN.md`), syllable by syllable. Like
+`analyze`, it is a CPU job in the media engine with no model:
+
+```json
+{"audio": "data:audio/wav;base64,…", "score": {"bpm": 168, "events": […], "words": […], "word_gap": {"beats": 0.5}},
+ "tonic_hz": 138.6, "start_s": 0}
+```
+
+- **`score`** is inline JSON, or a `score_path` on the server. **`tonic_hz`** is Sa (130 Hz when it isn't given), and
+  **`start_s`** is where the score's first beat falls in the take.
+- **The answer** has one row per syllable in `events`: its pitch error in cents against the note, its vowel onset against
+  the beat in ms, and how voiced it was.
+- **`faults`** names what breaks a linked, clear line:
+  - `gap_in_word`: a break of more than 60 ms inside a word;
+  - `no_word_gap`: a word boundary without a clear dip (under 9 dB);
+  - `hard_cut`: a word that ends abruptly instead of fading;
+  - `silent_syllable`: a syllable with no voice.
+- **`summary`** gives the medians and the fault count.
+
+The CLI is `am2strata-run media sing-check <take> --score <score.json> [--from S] [--tonic-hz H] [--json]`. It prints each
+syllable's row, then the faults and the summary.
+
+Female text-to-speech voices can sit low. Indic Parler's Divya measures about 120–185 Hz; the spectrum confirms that this is
+the true fundamental, not an octave error. So Sa = C#3 (138.6 Hz) suits her with little re-pitching.
 
 ## Media from a chat
 

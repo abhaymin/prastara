@@ -17,6 +17,8 @@
 //!                                                         <- {"event":"transcript","text":..,"language":..,"segments":[..],"duration":..}
 //!   -> {"op":"analyze","audio":"<base64 file>","from_s"?,"seconds"?}  (CPU only: no model - tempo, repeat period, tonic...)
 //!                                                         <- {"event":"analysis", "loudness","tempo","repeat","pitch","phrases", ...}
+//!   -> {"op":"sing_check","audio":"<base64 file>","score":{...Score},"tonic_hz"?,"start_s"?}  (CPU only: no model - pitch vs note, onset)
+//!                                                         <- {"event":"sing_check","events":[...],"faults":[...],"summary":{median_abs_cents,...}}
 //!   -> {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>}  (MP4/H.264 in Rust, no ffmpeg)
 //!                                                         <- {"event":"frames","fps","duration_s","width","height","frames":[{"t":..,"png":"<base64>"}]}
 //!   -> {"op":"speak","model":"parler-tts-mini-v1","text":..,"voice"?,"seed"?,"device"?}
@@ -44,6 +46,9 @@ use std::sync::{Arc, Mutex};
 mod audio;
 #[path = "../analyze.rs"]
 mod analyze;
+#[path = "../sing.rs"]
+#[allow(dead_code)] // the syllabifier is used by later ops (sing); this binary calls check() today
+mod sing;
 #[path = "../parler_hf.rs"]
 mod parler_hf;
 #[path = "../acestep/mod.rs"]
@@ -158,6 +163,36 @@ fn analyze_op(_st: &mut State, cmd: &Value) -> Result<Value> {
     if !warnings.is_empty() {
         r["warnings"] = json!(warnings);
     }
+    Ok(r)
+}
+
+/// {"op":"sing_check","audio":"<base64|data URL>","score":{...Score},"tonic_hz"?,"start_s?}: the per-syllable pitch error in
+/// cents, the vowel's onset (ms) against the beat and how voiced each syllable was, plus the faults that break the link between
+/// words (SINGING-PLAN: inside a word flows, between words there is a clear dip, no hard cut). CPU only - no model: it reuses
+/// analyze.rs's pitch picker over each event's fundamental measured against the note the score asks for. -> {"event":"sing_check",
+/// "events":[...],"faults":[...],"summary":{median_abs_cents, median_abs_onset_ms, faults, syllables}, ...}
+fn sing_check_op(_st: &mut State, cmd: &Value) -> Result<Value> {
+    let raw = match cmd["audio"].as_str() {
+        Some(s) if !s.is_empty() => s.split_once(";base64,").map(|(_, b)| b).unwrap_or(s),
+        _ => bail!("sing_check: no \"audio\""),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw.trim()).context("audio: base64")?;
+    let (pcm, rate, _warnings) = audio::decode(bytes)?;
+    // the score: inline JSON (`score`), or a file on disk (`score_path`) - either parses to the same Score.
+    let score: sing::Score = if cmd["score"].is_object() {
+        serde_json::from_value(cmd["score"].clone()).context("the song's score JSON")?
+    } else if let Some(path) = cmd["score_path"].as_str() {
+        sing::load_score(path)?
+    } else {
+        bail!("sing_check: send a \"score\" (JSON) or \"score_path\"");
+    };
+    // the tonic (Sa) every note is read against; 130 Hz (A below middle C) when not asked for, since a take has no drone here.
+    let tonic_hz = cmd["tonic_hz"].as_f64().filter(|t| *t > 0.0).unwrap_or(130.0);
+    let start_s = cmd["start_s"].as_f64().unwrap_or(0.0);
+    let t0 = std::time::Instant::now();
+    let mut r = sing::check(&pcm, rate, &score, start_s, tonic_hz);
+    r["event"] = json!("sing_check");
+    r["ms"] = json!(t0.elapsed().as_millis() as u64);
     Ok(r)
 }
 
@@ -1104,6 +1139,10 @@ fn main() {
                 }
                 "analyze" => {
                     let r = analyze_op(&mut st, &cmd)?;
+                    emit(r)
+                }
+                "sing_check" => {
+                    let r = sing_check_op(&mut st, &cmd)?;
                     emit(r)
                 }
                 "video_frames" => emit(video_frames(&cmd)?),

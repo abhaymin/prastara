@@ -158,6 +158,7 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
 ///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
+///   sing-check <file> --score <score.json> [--from S] [--tonic-hz H]   (per-syllable pitch error vs note, onset and word-to-word faults)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts, polls every 3 s for step N of M, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
@@ -209,9 +210,16 @@ pub struct MediaOpts {
     /// song length in seconds (10 to 600)
     #[arg(long, default_value_t = 60)]
     seconds: u32,
-    /// for analyze only: how far into the file to start (seconds); --seconds alone is parsed from the command line
+    /// for analyze and sing-check: how far into the file to start (seconds); parsed from the command line alone because a shared
+    /// clap field would clash with other actions. For sing-check it is where the score comparison begins (`start_s`).
     #[arg(long)]
     from: Option<f64>,
+    // for sing-check only: the song's score as a file to parse inline (it reaches the engine as an inline `score` object)
+    #[arg(long)]
+    score: Option<String>,
+    // for sing-check only: the tonic (Sa) in hertz, so notes are read against the key the singer used (130 Hz where none given)
+    #[arg(long)]
+    tonic_hz: Option<f64>,
     /// expected words for the check, so words_heard can be measured
     #[arg(long)]
     expect: Option<String>,
@@ -248,6 +256,7 @@ pub struct MediaOpts {
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
 ///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
+///   sing-check <file> --score <score.json> [--from S] [--tonic-hz H]   (per-syllable pitch error vs note, onset and word-to-word faults)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts the plan, polls step N of M every 3 s, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
@@ -288,6 +297,7 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "transcribe" => cmd_transcribe(&client, &send, first.as_ref(), o, &url)?,
             "check" => cmd_check(&client, &send, first.as_ref(), o, &url)?,
             "analyze" => cmd_analyze(&client, &send, first.as_ref(), o, &url)?,
+            "sing-check" => cmd_sing_check(&client, &send, first.as_ref(), o, &url)?,
             "dub" => cmd_dub(&client, &send, &first, o, &url)?,
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
@@ -452,6 +462,66 @@ fn cmd_analyze(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<r
     if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); }
     print_analyze(&j);
     Ok(())
+}
+
+/// {"media sing-check": the score comparison of a take against its song, per syllable}. The audio goes in as multipart `file`
+/// (a base64 data URL works too); `--score <score.json>` carries the song's score (inline JSON or a file, both accepted).
+/// `--from S` starts into the take and `--tonic-hz H` names the tonic (Sa) — parsed from the command line itself since they
+/// are sing-check's own fields. The friendly report prints each syllable's pitch error and onset, every fault, and the summary.
+fn cmd_sing_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+                  first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    use reqwest::blocking::multipart::{Form, Part};
+
+    let (bytes, name) = read_bytes(&expand_path(Path::new(first.ok_or("sing-check needs a take file")?)))?;
+    // the song's score comes from --score: a file holding its JSON (parsed inline so both are forwarded to the engine as `score`).
+    let score_text = std::fs::read_to_string(expand_path(Path::new(o.score.as_deref().ok_or("sing-check needs --score <score.json>")?))).map_err(|e| format!("{:?}: {e}", o.score))?;
+    // validate the file is parseable before sending it (it may be score text or a path); the raw text is forwarded as `score`.
+    serde_json::from_str::<serde_json::Value>(score_text.trim()).map_err(|e| format!("the score is not valid JSON: {e}"))?;
+    // where to start into the take and the tonic the notes are read against (130 Hz where no drone given), from clap's fields.
+    let start_s = o.from.unwrap_or(0.0);
+    let tonic_hz = o.tonic_hz.unwrap_or(0.0);
+
+    let mut form = Form::new()
+        .part("file", Part::bytes(bytes).file_name(name))
+        .text("score", score_text);
+    if start_s > 0.0 { form = form.text("start_s", format!("{start_s}")); }
+    if tonic_hz > 0.0 { form = form.text("tonic_hz", format!("{tonic_hz}")); }
+    let r = send(client.post(format!("{url}/v1/media/sing-check")).multipart(form))?;
+    let j: Value = r.json().map_err(|e| e.to_string())?;
+    if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); }
+    print_sing_check(&j);
+    Ok(())
+}
+
+/// The per-syllable score comparison of a take: each row's pitch error in cents and the vowel's onset against the beat, then every
+/// fault (an inside-word gap, a missing word-gap dip, a hard cut), and the summary (median pitch error, median onset, fault count).
+fn print_sing_check(j: &Value) {
+    if let Some(e) = j["error"].as_str() { println!("sing-check failed: {e}"); return; }
+
+    // every syllable's pitch error against its note and how close the vowel starts to the beat (a negative onset is before it)
+    if let Some(events) = j.get("events").and_then(Value::as_array) {
+        for row in events {
+            let text = row["text"].as_str().unwrap_or("");
+            let cents = row["pitch_cents"].as_f64();
+            let onset = row["onset_ms"].as_f64().map(|v| format!(" {:.0} ms", v)).unwrap_or_else(|| " —".into());
+            println!("  {} pitch {:.1} c{}{}", if text.is_empty() { "\u{25aa}" } else { text }, cents.unwrap_or(0.0), onset,
+                match row["voiced_share"].as_f64() { Some(s) => format!(" voiced {:.0}%", s * 100.0), None => String::new() });
+        }
+    }
+
+    // the faults that break the word-to-word link: a silence inside a word, or a boundary without a clear dip (or a hard cut)
+    if let Some(faults) = j.get("faults").and_then(Value::as_array) {
+        for f in faults {
+            println!("  fault: {} on {} at {:.1} s", f["kind"].as_str().unwrap_or("?"), f["text"].as_str().unwrap_or("?"), f["t"].as_f64().unwrap_or(0.0));
+        }
+    }
+
+    // the summary: how far off (median) and whether anything broke the link between words
+    if let Some(s) = j.get("summary") {
+        println!("pitch error median: {:.1} c  |  onset median: {:.0} ms  |  faults: {}  |  syllables scored: {}",
+            s["median_abs_cents"].as_f64().unwrap_or(0.0), s["median_abs_onset_ms"].as_f64().unwrap_or(0.0),
+            s["faults"].as_u64().unwrap_or(0), s["syllables"].as_u64().unwrap_or(0));
+    }
 }
 
 /// The music facts of an analyze answer: tempo (bpm, steady/unsteady), the verse's repeat period, the drone's tonic (note + hertz)

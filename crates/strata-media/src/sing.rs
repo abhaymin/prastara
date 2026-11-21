@@ -4,6 +4,8 @@
 //! clusters; each cluster gets a weight from its vowel (long vs short), any anusvara/visarga, or
 //! because it is closed. `matras` turns those weights into beat counts.
 
+use serde_json::{json, Value};
+
 /// Consonant: U+0915–U+0939 or U+0958–U+095F.
 fn is_consonant(c: char) -> bool {
     matches!(c as u32, 0x0915..=0x0939 | 0x0958..=0x095F)
@@ -353,7 +355,7 @@ pub fn syllables(text: &str) -> Vec<Syllable> {
 }
 
 /// A score event: a syllable with text, or a rest / breath of some length.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Event {
     Syllable(SyllableEvent),
     Rest(usize),
@@ -401,20 +403,59 @@ impl<'de> serde::Deserialize<'de> for Event {
     }
 }
 
-/// A syllable row of a score. Unknown fields (beats, note, glide_to, split, ...) are ignored.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+/// A syllable row of a score. `beats` is the note's length; `note` the swara (relative to Sa); `glide_to` a target the vowel
+/// slides to. Unknown fields are ignored.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct SyllableEvent {
     pub text: String,
     #[serde(default)]
     pub latin: Option<String>,
     pub weight: Weight,
+    #[serde(default)]
+    pub beats: Option<f64>,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub glide_to: Option<String>,
 }
 
-/// A singing score: its ordered events. Unknown top-level fields are ignored.
+impl SyllableEvent {
+    /// The syllable's length in beats when the score omits it (a laghu is one beat, a guru two).
+    pub fn beats(&self) -> f64 { self.beats.unwrap_or_else(|| match self.weight { Weight::Guru => 2.0, Weight::Laghu => 1.0 }) }
+}
+
+/// A word's events (indices into `Score.events`): membership used to place the word gap after its last syllable.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct Word {
+    pub text: String,
+    #[serde(default)]
+    pub latin: Option<String>,
+    #[serde(default)]
+    pub events: Vec<usize>,
+}
+
+/// The gap after each word's last syllable: a quarter beat here so words never run together.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct WordGap {
+    pub beats: f64,
+}
+
+/// A singing score: its ordered events, tempo (bpm), the words and the gap between them. Unknown top-level fields are ignored.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct Score {
     #[serde(default)]
     pub events: Vec<Event>,
+    #[serde(default)]
+    pub bpm: f64,
+    #[serde(default)]
+    pub words: Vec<Word>,
+    #[serde(default)]
+    pub word_gap: Option<WordGap>,
+}
+
+impl Score {
+    /// The tempo in beats per minute (168 is the example's pace), so one beat is 60/bpm seconds.
+    pub fn bpm(&self) -> f64 { if self.bpm > 0.0 { self.bpm } else { 168.0 } }
 }
 
 impl Score {
@@ -428,6 +469,280 @@ impl Score {
 pub fn load_score(path: &str) -> anyhow::Result<Score> {
     let data = std::fs::read_to_string(path)?;
     Ok(serde_json::from_str(&data)?)
+}
+
+// M0: `sing-check` — measure one sung take against its score, per syllable. Pure Rust, no model, no FFT: it reuses the
+// pitch picker from analyze.rs (a YIN-style autocorrelation) and measures loudness with plain frame RMS. It turns the
+// score into time slots, lines up each voice's fundamental against the note the score asks for, times the vowel onto the
+// beat and flags where the singer left a silence inside a word or cut a syllable instead of fading it (SINGING-PLAN: the
+// voice is linked, and every word is clear).
+
+/// The pitch-track frame length in seconds (analyze.rs's 10 ms frame).
+const FRAME_S: f64 = 0.01;
+/// The loudness frame length in seconds for the quiet-run and cut checks (20 ms).
+const FRAME_RMS_S: f64 = 0.02;
+
+/// A swara name's semitone above Sa (Sa 0, re 1, Re 2, ga 3, Ga 4, ma 5, Ma 6, Pa 7, dha 8, Dha 9, ni 10, Ni 11); a
+/// trailing `_` lowers it an octave (`Dha_`), matching the score's note names.
+fn swara_semitone(name: &str) -> i32 {
+    let (base, down) = match name.strip_suffix('_') { Some(r) => (r, true), None => (name, false) };
+    let semi = match base {
+        "Sa" => 0, "re" => 1, "Re" => 2, "ga" => 3, "Ga" => 4, "ma" => 5, "Ma" => 6,
+        "Pa" => 7, "dha" => 8, "Dha" => 9, "ni" => 10, "Ni" => 11, _ => 0,
+    };
+    if down { semi - 12 } else { semi }
+}
+
+/// A note's frequency in hertz: the swara's semitone above `tonic_hz` (Sa), an octave lower when its name ends in `_`.
+fn note_frequency(name: &str, tonic_hz: f64) -> f64 { tonic_hz * 2.0f64.powf(swara_semitone(name) as f64 / 12.0) }
+
+/// The cents of a frequency relative to `reference` (positive = sharp).
+fn cents_above(freq: f64, reference: f64) -> f64 { 1200.0 * (freq / reference).log2() }
+
+/// A syllable's target pitch error is measured against its note for the first half of the slot and against `glide_to` for
+/// the last quarter, linear between — so a take that glides exactly to the written note reads zero cents throughout.
+fn glide_ref_cents(glide_to: Option<&str>, note: &str, frac: f64) -> f64 {
+    let Some(gt) = glide_to else { return 0.0 };
+    let g = 120.0 * (note_frequency(gt, 1.0) / note_frequency(note, 1.0)).log2(); // tonic-independent ratio
+    if frac <= 0.5 { 0.0 } else if frac <= 0.75 { g * (frac - 0.5) / 0.25 } else { g }
+}
+
+/// The start and end (seconds into the take) of every event's slot, in order.
+///
+/// Events start at `start_s`; each syllable lasts its beats and each rest/breath its count, one beat being 60/bpm seconds.
+/// A word gap is added only after a word's LAST event, so it never moves the events inside that word — every later event
+/// (the next word and on) starts later by the accumulated gap. Hence for event i:
+///   t0_i = start_s + sum_{j<i} duration_j + word_gap_beats * beat * (#words ending strictly before i),
+/// a constant advance per boundary, which the walk below realises as it goes (bpm defaults to 168 like the example).
+fn event_windows(score: &Score, start_s: f64) -> Vec<(f64, f64)> {
+    let beat = 60.0 / score.bpm().max(f64::MIN_POSITIVE); // one beat is 60/bpm seconds, so slot times are in real seconds
+    let mut word_last = vec![false; score.events.len()];
+    for w in &score.words { if let Some(&last) = w.events.iter().max() { word_last[last] = true; } }
+    let gap_s = score.word_gap.as_ref().map(|g| g.beats * beat).unwrap_or(0.0);
+    let mut wins = Vec::with_capacity(score.events.len());
+    let mut t = start_s;
+    for (i, e) in score.events.iter().enumerate() {
+        let dur = match e { Event::Syllable(ev) => ev.beats() * beat, Event::Rest(n) | Event::Breath(n) => *n as f64 * beat };
+        wins.push((t, t + dur));
+        t += dur;
+        if word_last[i] { t += gap_s; }
+    }
+    wins
+}
+
+/// The RMS of each 20 ms frame across the whole take: `(center_time_s, rms)`, mono samples.
+fn rms_frames(pcm: &[f32], rate: f64) -> Vec<(f64, f32)> {
+    let hop = (rate * FRAME_RMS_S).round().max(1.0) as usize;
+    if pcm.len() < hop { return vec![]; }
+    (0..pcm.len() / hop)
+        .map(|i| (i as f64 * hop as f64 / rate, rms_of(&pcm[i * hop..((i + 1) * hop).min(pcm.len())])))
+        .collect()
+}
+
+fn rms_of(w: &[f32]) -> f32 { (w.iter().map(|v| v * v).sum::<f32>() / w.len().max(1) as f32).sqrt() }
+
+/// The p-th percentile of an f32 slice, sorted on entry.
+fn percentile_f32(mut x: Vec<f32>, p: f64) -> f32 {
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    if x.is_empty() { return 0.0; }
+    let rank = p * (x.len() - 1) as f64;
+    let lo = rank.floor() as usize;
+    let hi = rank.ceil() as usize;
+    if lo == hi { x[lo] } else { x[lo] + (x[hi] - x[lo]) * ((rank - lo as f64) as f32) }
+}
+
+/// The median of an f64 slice, sorted on entry (the cents / onset errors).
+fn median_f64(x: &mut [f64]) -> f64 {
+    x.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = x.len();
+    if n == 0 { return 0.0; }
+    if n % 2 == 1 { x[n / 2] } else { (x[n / 2 - 1] + x[n / 2]) / 2.0 }
+}
+
+fn r2(x: f64) -> f64 { (x * 100.0).round() / 100.0 }
+
+/// Check one take against its score: per-syllable pitch error, vowel onset and voiced share, plus the faults that break the
+/// link between words (SINGING-PLAN). Returns the events, the faults and a summary (`median_abs_cents`, `median_abs_onset_ms`,
+/// fault count, syllable count). Runs clean on an empty or short take.
+pub fn check(pcm: &[f32], rate: u32, score: &Score, start_s: f64, tonic_hz: f64) -> Value {
+    let rate = rate as f64;
+    if pcm.is_empty() {
+        return json!({"events": Vec::<Value>::new(), "faults": Vec::<Value>::new(),
+            "summary": {"median_abs_cents": 0.0, "median_abs_onset_ms": 0.0, "faults": 0, "syllables": 0}});
+    }
+    let wins = event_windows(score, start_s);
+    // the pitch track (fundamental per 10 ms) and loudness frames (RMS per 20 ms) over the whole take; a frame's time is its
+    // center, so slots (absolute seconds into the take) line up with them.
+    let frames = crate::analyze::fundamental_frames(pcm, rate);   // (Option<hz>, rms) at FRAME_S
+    let rms = rms_frames(pcm, rate);                              // (t, rms) at FRAME_RMS_S
+
+    // a frame is "quiet" when its RMS is under 10% of the take's loudness (the 95th percentile): that is what splits a real
+    // silence from a held note for the inside-a-word gap check.
+    let quiet_thr = 0.1 * percentile_f32(rms.iter().map(|(_, r)| *r).collect::<Vec<f32>>(), 0.95);
+
+    let mut rows = Vec::new();
+    let mut faults = Vec::new();
+    let mut pitch_errs = Vec::new();     // every middle-60% frame's |cents error|, for the summary
+    let mut onsets = Vec::new();
+    let mut syllable_count = 0usize;
+
+    for (i, e) in score.events.iter().enumerate() {
+        if e.text().is_none() { continue; }     // no row for a rest or a breath
+        let ev = match e { Event::Syllable(s) => s, _ => unreachable!() };
+        syllable_count += 1;
+        let (t0, t1) = wins[i];
+        let dur = (t1 - t0).max(FRAME_S);
+        let note_hz = note_frequency(&ev.note, tonic_hz);
+
+        // walk the pitch frames that fall in this slot: measure the ones in the middle 60% against the written pitch (which
+        // glides), take the first voiced frame near the beat for the onset, and count how much of the slot is voiced.
+        let n = frames.len();
+        let mut mid_cents = Vec::new();
+        let mut voiced_in_slot = 0usize;
+        let mut total_frames = 0usize;
+        let mut onset_ms: Option<f64> = None;
+        let mut med_rms = 0.0f64;
+        {
+            let mut slot_rms = Vec::new();
+            for fi in 0..n {
+                let tc = (fi as f64 + 0.5) * FRAME_S;      // frame center, absolute seconds into the take
+                if !(t0 <= tc && tc < t1) { continue; }
+                total_frames += 1;
+                slot_rms.push(rms.iter().find_map(|(t, r)| (*t >= t0 && *t < t1).then_some(*r)).unwrap_or(0.0));
+                if let Some(freq) = frames[fi].0 {
+                    voiced_in_slot += 1;
+                    let frac = (tc - t0) / dur;
+                    if 0.2 <= frac && frac < 0.8 {      // the middle 60% of the slot
+                        let err = cents_above(freq, note_hz).abs() - glide_ref_cents(ev.glide_to.as_deref(), &ev.note, frac).abs();
+                        mid_cents.push(err.max(0.0));
+                    }
+                }
+            }
+            if !slot_rms.is_empty() {
+                let mut m = slot_rms.iter().map(|v| *v as f64).collect::<Vec<f64>>();
+                med_rms = median_f64(&mut m);
+            }
+        }
+        // the first voiced frame within +/-200 ms of the beat, minus t0 (None if none is there)
+        if onset_ms.is_none() {
+            for fi in 0..n {
+                let tc = (fi as f64 + 0.5) * FRAME_S;
+                if !(t0 - 0.2 <= tc && tc <= t0 + 0.2) { continue; }
+                if frames[fi].0.is_some() { onset_ms = Some((tc - t0) * 1000.0); break; }
+            }
+        }
+        let voiced_share = if total_frames > 0 { voiced_in_slot as f64 / total_frames as f64 } else { 0.0 };
+        let pitch_cents = if mid_cents.is_empty() { Value::Null } else { json!(r2(median_f64(&mut mid_cents))) };
+        pitch_errs.extend(mid_cents);
+        onsets.push(onset_ms.map(|v| v.abs()).unwrap_or(0.0));
+
+        // a syllable with less than thirty percent of its slot voiced is effectively silent — the vowel was never sung.
+        if voiced_share < 0.3 {
+            faults.push(json!({"kind": "silent_syllable", "t": r2(t0), "text": ev.text}));
+        }
+
+        rows.push(json!({"text": ev.text, "t0": r2(t0), "t1": r2(t1), "note_hz": r2(note_hz),
+            "pitch_cents": pitch_cents, "onset_ms": onset_ms.map(|v| r2(v)), "voiced_share": r2(voiced_share)}));
+
+        // word-level faults: measured against the last syllable of this word (its neighbor into the gap).
+        let wlast = win_last_index(&score, i);
+        if wlast {
+            let med_last = med_rms;
+            // hard cut: loud enough right up to the end and then under 5% a frame (20 ms) later — it should have faded.
+            for k in rms_range(&rms, t0, t1) {
+                if k + 1 < rms.len() && rms[k].1 > 0.5 * med_last as f32 && rms[k + 1].1 < 0.05 * med_last as f32 {
+                    faults.push(json!({"kind": "hard_cut", "t": r2(rms[k].0), "text": word_text(&score, i)}));
+                    break;
+                }
+            }
+            // a word gap with no clear dip: the quietest 40 ms across the boundary must be at least 9 dB below the two neighbours.
+            if score.word_gap.is_some() {
+                let next = win_first_index(&score, i);
+                if next < wins.len() {
+                    let (gstart, gend) = (t1, wins[next].0);
+                    let med_neigh = rms_median_between(&rms, t0, t1).max(1e-9) + rms_median_between(&rms, wins[next].0, wins[next].1).max(1e-9);
+                    let quietest = rms_quietest_40ms(&rms, gstart, gend);
+                    if med_neigh > 0.0 && (20.0 * ((quietest as f64 / med_neigh).max(1e-9)).log10()) > -9.0 {
+                        faults.push(json!({"kind": "no_word_gap", "t": r2(gstart), "text": word_text(&score, i)}));
+                    }
+                }
+            }
+        }
+    }
+
+    // inside-a-word gap: a quiet run longer than 60 ms between a word's first and last syllable.
+    for w in &score.words {
+        if w.events.is_empty() { continue; }
+        let first = w.events[0];
+        let last = *w.events.iter().max().unwrap();
+        let (a, b) = (wins[first].0, wins[last].1);
+        if let Some((rt, run)) = longest_quiet_run(&rms, a, b, quiet_thr) {
+            if run > 0.06 { faults.push(json!({"kind": "gap_in_word", "t": r2(rt), "text": w.text.clone()})); }
+        }
+    }
+
+    json!({"events": rows, "faults": faults, "summary": {
+        "median_abs_cents": r2(median_f64(&mut pitch_errs)),
+        "median_abs_onset_ms": r2(median_f64(&mut onsets)),
+        "faults": faults.len(),
+        "syllables": syllable_count}})
+}
+
+/// Whether event index `i` is the last event of its word (used to place the word gap after it).
+fn win_last_index(score: &Score, i: usize) -> bool { score.words.iter().any(|w| w.events.last() == Some(&i)) }
+
+/// The index of the first event of the word that follows `i` (the next word's first syllable), for the neighbor RMS.
+fn win_first_index(score: &Score, i: usize) -> usize {
+    score.words.iter()
+        .filter(|w| w.events.iter().all(|&e| e > i))   // words whose events all come after `i`
+        .map(|w| *w.events.first().expect("word has events"))
+        .min()
+        .unwrap_or(i + 1)
+}
+
+/// The text of the word that owns event index `i` (for a fault reported at one of its boundaries).
+fn word_text(score: &Score, i: usize) -> String {
+    score.words.iter().find(|w| w.events.contains(&i)).map(|w| w.text.clone()).unwrap_or_else(|| score.events[i].text().unwrap_or("").to_string())
+}
+
+/// The rms-frame indices whose center lies in [lo, hi].
+fn rms_range(rms: &[(f64, f32)], lo: f64, hi: f64) -> Vec<usize> {
+    (0..rms.len()).filter(|&k| lo <= rms[k].0 && rms[k].0 < hi).collect()
+}
+
+/// The median RMS over frames whose center lies in [lo, hi].
+fn rms_median_between(rms: &[(f64, f32)], lo: f64, hi: f64) -> f64 {
+    let mut v = rms_range(rms, lo, hi).iter().map(|&k| rms[k].1 as f64).collect::<Vec<f64>>();
+    median_f64(&mut v)
+}
+
+/// The quietest 40 ms (mean of two adjacent frames) entirely within [lo, hi], for the word-gap dip check.
+fn rms_quietest_40ms(rms: &[(f64, f32)], lo: f64, hi: f64) -> f32 {
+    let mut best = f32::MAX;
+    for k in 0..rms.len().saturating_sub(1) {
+        let c0 = rms[k].0;
+        if c0 >= lo && (rms[k + 1].0) <= hi {
+            let mean = (rms[k].1 + rms[k + 1].1) / 2.0;
+            if mean < best { best = mean; }
+        }
+    }
+    if best == f32::MAX { 0.0 } else { best }
+}
+
+/// The (center, length_s) of the longest run of consecutive quiet frames (< `thr`) within [lo, hi], or None.
+fn longest_quiet_run(rms: &[(f64, f32)], lo: f64, hi: f64, thr: f32) -> Option<(f64, f64)> {
+    let mut best: Option<(f64, f64)> = None;
+    let mut run_start: Option<f64> = None;
+    let mut run_len = 0.0f64;
+    for &(t, r) in rms {
+        if t >= lo && t < hi && r < thr {
+            if run_start.is_none() { run_start = Some(t); }
+            run_len += FRAME_RMS_S;
+            let len = run_len;
+            if let Some((_, bl)) = best { if len > bl { best = Some((run_start.unwrap(), len)); } }
+        } else { run_start = None; run_len = 0.0; }
+    }
+    best
 }
 
 #[cfg(test)]
@@ -583,5 +898,129 @@ mod tests {
         assert_eq!(weight("\u{915}\u{902}"), Weight::Guru); // anusvara
         assert_eq!(weight("\u{939}\u{941}\u{901}"), Weight::Laghu); // chandrabindu only nasalises
         assert_eq!(weight("\u{92C}\u{928}\u{94D}"), Weight::Guru); // closed
+    }
+
+    // ---- sing::check synthesis and expectations ------------------------------------------------------
+
+    /// Every slot starts at the take origin (event_windows runs slots from here, which is where frame 0 also lands).
+    const TAKE_START_S: f64 = 0.0;
+    /// Sample rate: harmonics stay under Nyquist and pitch stays inside analyze's 70..=500 Hz band for the picker.
+    const SAMPLE_RATE: f64 = 16000.0;
+    /// The take's tonic (A below middle C), the reference every swara name is measured against.
+    const TONIC_HZ: f64 = 130.0;
+
+    fn syllable(text: &str, note: &str) -> Event {
+        Event::Syllable(SyllableEvent { text: text.to_string(), latin: None, weight: Weight::Guru, beats: Some(4.0), note: note.to_string(), glide_to: None })
+    }
+
+    /// Four words (`Sa Ga Ma Pa`), one syllable each, long beats so each event's +-200 ms onset window sees only its own voice.
+    fn right_take_score() -> Score {
+        Score {
+            bpm: 168.0,
+            word_gap: Some(WordGap { beats: 2.0 }),
+            events: vec![syllable("sa", "Ga"), syllable("ga", "Ma"), syllable("ma", "Pa"), syllable("pa", "Sa")],
+            words: vec![
+                Word { text: "sa".into(), latin: Some("sa").map(|s| s.to_string()), events: vec![0] },
+                Word { text: "ga".into(), latin: Some("ga").map(|s| s.to_string()), events: vec![1] },
+                Word { text: "ma".into(), latin: Some("ma").map(|s| s.to_string()), events: vec![2] },
+                Word { text: "pa".into(), latin: Some("pa").map(|s| s.to_string()), events: vec![3] },
+            ],
+        }
+    }
+
+    /// Three single-syllable words, used for the continuous-voice / hard-cut case.
+    fn continuous_take_score() -> Score {
+        Score {
+            bpm: 168.0,
+            word_gap: Some(WordGap { beats: 2.0 }),
+            events: vec![syllable("sa", "Ga"), syllable("ga", "Ma"), syllable("ma", "Pa")],
+            words: vec![
+                Word { text: "sa".into(), latin: Some("sa").map(|s| s.to_string()), events: vec![0] },
+                Word { text: "ga".into(), latin: Some("ga").map(|s| s.to_string()), events: vec![1] },
+                Word { text: "ma".into(), latin: Some("ma").map(|s| s.to_string()), events: vec![2] },
+            ],
+        }
+    }
+
+    /// Synthesize each syllable as fundamental + five harmonics, a 30 ms attack, and (when `fade_ms > 0`) a linear fade over the
+    /// final `fade_ms` of its slot. Pure tones on pitch; `freq_scale` shifts every note by that ratio. Gaps are left silent.
+    fn synthesize_tones(score: &Score, freq_scale: f64, fade_ms: f64) -> Vec<f32> {
+        let wins = event_windows(score, TAKE_START_S);
+        let end = wins.iter().map(|(_, t)| *t).fold(0f64, f64::max);
+        let mut pcm = vec![0.0f32; (end * SAMPLE_RATE) as usize + 1];
+        for (i, e) in score.events.iter().enumerate() {
+            if let Event::Syllable(s) = e {
+                let (t0, t1) = wins[i];
+                let base = note_frequency(&s.note, TONIC_HZ) * freq_scale;
+                for j in ((t0 * SAMPLE_RATE) as usize)..((t1 * SAMPLE_RATE) as usize) {
+                    let tc = (j as f64) / SAMPLE_RATE;
+                    let local = (tc - t0).max(0.0);
+                    let mut env = (local * 1000.0 / 30.0).min(1.0); // 30 ms attack ramp to full amplitude
+                    if fade_ms > 0.0 { env *= ((t1 - tc) * 1000.0 / fade_ms).clamp(0.0, 1.0); } // fade over the final `fade_ms`
+                    let phase = tc * base * std::f64::consts::TAU;
+                    let mut sum = 0.0f64;
+                    for h in 1..=6u8 { sum += (1.0 / h as f64) * (phase * h as f64).sin(); }
+                    pcm[j] += (0.5 * env * sum) as f32;
+                }
+            }
+        }
+        pcm
+    }
+
+    /// A continuous tone across all words at constant amplitude, so every gap stays voiced and no word gap is missing; the tone
+    /// drops to silence exactly at the end of `cut_word`'s syllable, leaving a single-frame hard cut there.
+    fn synthesize_continuous(score: &Score, cut_word: usize) -> Vec<f32> {
+        let wins = event_windows(score, TAKE_START_S);
+        let start = wins[0].0;
+        let w = cut_word.min(score.events.len() - 1);
+        let (t0_w, t1_w) = wins[w]; // the tone runs until this word's syllable ends, then stops — a hard cut there
+        let base = note_frequency(&score.events.last().unwrap().text().unwrap(), TONIC_HZ);
+        let tail = (t1_w - t0_w) + 1.0; // silence after the cut so the drop spans a real frame
+        let len = ((t1_w + tail) * SAMPLE_RATE) as usize + 1;
+        let mut pcm = vec![0.0f32; len];
+        for j in ((start * SAMPLE_RATE) as usize)..((t1_w * SAMPLE_RATE) as usize) {
+            let tc = (j as f64) / SAMPLE_RATE;
+            let phase = tc * base * std::f64::consts::TAU;
+            let mut sum = 0.0f64;
+            for h in 1..=6u8 { sum += (1.0 / h as f64) * (phase * h as f64).sin(); }
+            pcm[j] += (0.5 * sum) as f32; // no attack, no fade: the voice fills every gap and only stops at the hard cut
+        }
+        pcm
+    }
+
+    /// A take read exactly on pitch, on the beat, with nothing missing or cut — each word's last syllable fades into its quiet
+    /// gap, so there is neither a missing gap nor an abrupt cut.
+    #[test]
+    fn sing_check_right_take_is_clear() {
+        let score = right_take_score();
+        let pcm = synthesize_tones(&score, 1.0, 80.0); // pure tones; the last syllable of each word fades into its gap
+        let got = check(&pcm, SAMPLE_RATE as u32, &score, TAKE_START_S, TONIC_HZ);
+        let s = &got["summary"];
+        assert!(s["median_abs_cents"].as_f64().unwrap() < 10.0, "on pitch: {:?}", got);
+        assert!(s["median_abs_onset_ms"].as_f64().unwrap() < 25.0, "on the beat: {:?}", got);
+        assert_eq!(s["faults"].as_u64().unwrap(), 0, "no missing gaps or cuts: {:?}", got);
+        assert_eq!(s["syllables"].as_u64().unwrap(), 4);
+    }
+
+    /// The same take sung a semitone sharp: every note is shifted up one half step so the pitch error centers on ~100 cents.
+    #[test]
+    fn sing_check_a_semitone_sharp_reads_around_100_cents() {
+        let score = right_take_score();
+        let pcm = synthesize_tones(&score, 2f64.powf(1.0 / 12.0), 80.0); // each note raised a semitone
+        let got = check(&pcm, SAMPLE_RATE as u32, &score, TAKE_START_S, TONIC_HZ);
+        let cents = got["summary"]["median_abs_cents"].as_f64().unwrap();
+        assert!((90.0..=110.0).contains(&cents), "a semitone sharp is about 100 cents: {:?}", got);
+    }
+
+    /// A take whose gaps are filled with voice (no fade, so every boundary stays voiced) and where the last word is hard-cut
+    /// instead of faded: every voiced boundary is missing its gap, and the one cut word is flagged as a hard cut.
+    #[test]
+    fn sing_check_continuous_voice_with_one_hard_cut_reports_both() {
+        let score = continuous_take_score();
+        let pcm = synthesize_continuous(&score, 2); // voice fills every gap; hard-cut the last word
+        let got = check(&pcm, SAMPLE_RATE as u32, &score, TAKE_START_S, TONIC_HZ);
+        let faults: Vec<&serde_json::Value> = got["faults"].as_array().unwrap().iter().collect();
+        assert!(faults.iter().any(|f| f["kind"].as_str() == Some("no_word_gap")), "every voiced boundary is missing its gap: {:?}", got);
+        assert!(faults.iter().any(|f| f["kind"].as_str() == Some("hard_cut")), "the one cut word is flagged: {:?}", got);
     }
 }

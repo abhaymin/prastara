@@ -95,6 +95,17 @@ fn main() {
                         {"start_s": 8.0, "end_s": 12.0, "median_note": "A3", "notes": ["Sa"]}]});
                 emit(r);
             }
+            // media sing-check (CPU only, no model): a fixed, plausible score comparison for the tests; the real engine runs
+            // check() over the audio against the score. summary.syllables is the number of events in the received score, so a
+            // test can see the score reached the engine unchanged (as an inline object or via `score` text).
+            "sing_check" => {
+                let syllables = match &cmd["score"] {
+                    serde_json::Value::Array(a) => a.len(),
+                    _ => cmd["score"].get("events").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0),
+                };
+                emit(serde_json::json!({"event":"sing_check","events":[],"faults":[],
+                    "summary":{"median_abs_cents":0.0,"median_abs_onset_ms":0.0,"faults":0,"syllables":syllables}}));
+            }
             "song" => {
                 for s in 1..=8u64 {
                     emit(serde_json::json!({"event": "step", "step": s, "total": 8}));

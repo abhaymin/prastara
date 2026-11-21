@@ -308,7 +308,7 @@ fn repeat_obj(rms: &[f32], hop50: usize, section_s: f64) -> Value {
 /// The fundamental of each 10 ms frame by a YIN-style autocorrelation over PITCH_MIN_HZ..=PITCH_MAX_HZ (a drone's home note is
 /// the fundamental, not an overtone). Of the peaks it keeps the strongest one: where every harmonic lines up is the period
 /// itself, so this returns the true octave no matter which partial is loudest, and a neighbour side-lobe cannot read it high.
-fn fundamental_frames(x: &[f32], rate: f64) -> Vec<(Option<f64>, f32)> {
+pub(crate) fn fundamental_frames(x: &[f32], rate: f64) -> Vec<(Option<f64>, f32)> {
     let hop = (rate * FRAME_S).round().max(1.0) as usize;
     let win = ((rate * 0.04).round() as usize).max(((rate / PITCH_MIN_HZ) * 2.0).round() as usize);
     if hop == 0 || x.len() < hop * 2 { return vec![(None, 0.0)]; }
@@ -334,6 +334,7 @@ fn fundamental_frames(x: &[f32], rate: f64) -> Vec<(Option<f64>, f32)> {
                 .collect();
             let n = vals.len();
             if n < 2 { return (None, rms); }
+            // the primary pick: the first dip past dmin then the first peak after it — the pitch the voice reads for a clean tone
             let mut dip = 0usize;
             for i in 1..n.saturating_sub(1) { if vals[i] < vals[i - 1] && vals[i] <= vals[i + 1] { dip = i; break; } }
             let mut peak = dip;
@@ -346,9 +347,31 @@ fn fundamental_frames(x: &[f32], rate: f64) -> Vec<(Option<f64>, f32)> {
             let denom = left - 2.0 * best + right;
             let offset = if denom.abs() > 1e-6 { 0.5 * (left - right) / denom } else { 0.0 };
             let period = (dmin + peak) as f64 + offset;
-            // a frame is voiced only when the strongest peak is itself strong (silence has none)
-            if best < VOICE_FLOOR { return (None, rms); }
-            (Some(rate / period), rms)
+            // a frame is voiced only when the strongest peak is itself strong (silence has none); a tone whose fundamental is
+            // weaker than its harmonics gives this primary pick a weak sidelobe, so below it the fundamental is taken from where
+            // every partial lines up — the global maximum of the normalised autocorrelation — and, when the octave-above
+            // correlation is within 10% of that best, the higher pitch is preferred over the octave below it.
+            let (freq, voiced) = if best >= VOICE_FLOOR {
+                (Some(rate / period), true)
+            } else {
+                let mut gbest = -2.0f64;
+                let mut gpeak = 0usize;
+                for (i, &v) in vals.iter().enumerate() { if v > gbest { gbest = v; gpeak = i; } }
+                let glag = (dmin + gpeak) as f64;
+                let left = if gpeak > 0 { vals[gpeak - 1] } else { gbest };
+                let right = if gpeak + 1 < n { vals[gpeak + 1] } else { gbest };
+                let denom = left - 2.0 * gbest + right;
+                let offset = if denom.abs() > 1e-6 { 0.5 * (left - right) / denom } else { 0.0 };
+                let gperiod = glag + offset;
+                // the global peak can sit on the octave below a weak fundamental when its even harmonics also line up there
+                if gpeak >= 2 {
+                    let hi = ((dmin + gpeak) as f64 / 2.0).round() as usize;
+                    if hi >= dmin && hi <= dmax && vals[hi - dmin] >= 0.9 * gbest { return (Some(rate / hi as f64), rms); }
+                }
+                (if gbest >= VOICE_FLOOR { Some(rate / gperiod) } else { None }, gbest >= VOICE_FLOOR)
+            };
+            if !voiced { return (None, rms); }
+            (freq, rms)
         })
         .collect()
 }
@@ -624,6 +647,32 @@ mod tests {
         let mut v = (0..n).map(|i| 0.8 * (2.0 * std::f32::consts::PI * freq * (i as f32 / SR as f32)).sin()).collect::<Vec<_>>();
         v.extend(std::iter::repeat(0f32).take(tail));
         v
+    }
+
+    /// A 220 Hz tone with a weak fundamental (harmonic 1 at 10% of the strong harmonics 2-6), for the octave check.
+    fn weak_fundamental_220() -> Vec<f32> {
+        let n = SR as usize; // one second at the test rate
+        let amps: [f32; 6] = [0.1, 1.0, 1.0, 1.0, 1.0, 1.0]; // harmonic 1 weak, 2-6 strong
+        (0..n).map(|i| {
+            let t = i as f32 / SR as f32;
+            amps.iter().enumerate().fold(0f32, |acc, (k, &a)| { let h = (k + 1) as f32; acc + a * (2.0 * std::f32::consts::PI * 220.0 * h * t).sin() })
+        }).collect()
+    }
+
+    /// The octave check for `sing-check`'s pitch picker: the score comparison reads the fundamental, not a harmonic, so a tone
+    /// dominated by its second harmonic (harmonic 1 at 10%, harmonics 2-6 strong) must still report about 220 Hz, not its octave
+    /// below, 110. The original first-dip-then-first-peak pick locked onto a weak sidelobe (corr ~0.12) and reported it unvoiced;
+    /// the fallback to the global autocorrelation maximum now finds every partial aligned at the true fundamental.
+    #[test]
+    fn octave_of_a_weak_fundamental_reports_the_220_not_110() {
+        let s = weak_fundamental_220();
+        let frames = fundamental_frames(&s, SR as f64);
+        let voiced: Vec<f64> = frames.iter().filter_map(|(f, _)| *f).collect();
+        assert!(voiced.len() > 3, "a sustained weak-fundamental tone is voiced (got {}/{} frames)", voiced.len(), frames.len());
+        let mut sorted = voiced.clone();
+        sort_f64(&mut sorted);
+        let med = percentile_f64(&mut sorted, 0.5);
+        assert!((med - 220.0).abs() < 15.0, "a weak-fundamental 220 Hz tone reports 220, not 110: {} Hz", med);
     }
 
     /// The swaras a section gives, keyed by swara name -> share (for assertions).
