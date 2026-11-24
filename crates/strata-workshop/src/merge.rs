@@ -173,6 +173,19 @@ impl<'a> Merger<'a> {
             }
         }
 
+        // a looped model (Avarta): its gates are the adapter's when it trained them, else the base's as they were
+        let base_gates = self.base_dir.join(crate::model::LOOP_FILE);
+        let adps = candle_core::safetensors::load(self.adapter_dir.join(checkpoint::ADAPTER_FILE), &Device::Cpu)?;
+        let trained: std::collections::HashMap<String, Tensor> = adps.into_iter()
+            .filter_map(|(n, t)| n.split_once(".loop.gate.").map(|(_, p)| (format!("loop.gate.{p}"), t))).collect();
+        if !trained.is_empty() {
+            let mut gates = if base_gates.exists() { candle_core::safetensors::load(&base_gates, &Device::Cpu)? } else { Default::default() };
+            gates.extend(trained);
+            candle_core::safetensors::save(&gates, self.out_dir.join(crate::model::LOOP_FILE))?;
+        } else if base_gates.exists() {
+            std::fs::copy(&base_gates, self.out_dir.join(crate::model::LOOP_FILE))?;
+        }
+
         Ok(MergeReport { out_dir: self.out_dir.to_path_buf(), per_tensor: report })
     }
 }
@@ -200,6 +213,9 @@ fn build_adapters(adps: &std::collections::HashMap<String, Tensor>) -> Result<Ha
     let mut a_of: HashMap<String, Vec<f32>> = HashMap::new();
     let mut b_of: HashMap<String, Vec<f32>> = HashMap::new();
     for (name, t) in adps {
+        if name.contains(".loop.gate.") {
+            continue; // a looped model's gates: written to loop.safetensors, not folded into a weight
+        }
         let flat = t.flatten_all()?.to_vec1::<f32>()?;
         if name.ends_with(".lora_A.weight") {
             a_of.insert(peft_to_base_name(name).ok_or_else(|| anyhow!("{name}: not a LoRA matrix"))?, flat);

@@ -69,6 +69,48 @@ pub struct ModelConfig {
     pub rope_theta: f64,
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: bool,
+    /// Avarta: blocks `start..end` run `passes` times with the same weights (`"prastara_loop"` in config.json)
+    pub loop_: Option<LoopSpec>,
+}
+
+/// A loop over the core blocks (Avarta, docs/MULA-PLAN.md M1). Pass 1 is the base's own pass; every later pass p
+/// takes the previous pass's output x, runs the core again to y, and keeps `x + g_p ⊙ (y - x)`, where the gate g_p
+/// (one value per hidden channel, `loop.gate.<p>` in `loop.safetensors`) starts at zero: a model just converted
+/// gives exactly the base's logits, and training opens the gates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoopSpec {
+    pub start: usize,
+    pub end: usize,
+    pub passes: usize,
+}
+
+/// The file beside the weights that holds the loop's gates.
+pub const LOOP_FILE: &str = "loop.safetensors";
+
+impl LoopSpec {
+    pub fn from_json(v: &Value, layers: usize) -> Result<Option<LoopSpec>> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        let n = |k: &str| v[k].as_u64().map(|x| x as usize).ok_or_else(|| anyhow!("config.prastara_loop.{k} is missing or not a number"));
+        let l = LoopSpec { start: n("start")?, end: n("end")?, passes: n("passes")? };
+        l.check(layers)?;
+        Ok(Some(l))
+    }
+
+    pub fn check(&self, layers: usize) -> Result<()> {
+        if self.start >= self.end || self.end > layers {
+            bail!("the loop's blocks {}..{} must be a non-empty range inside the model's {layers}", self.start, self.end);
+        }
+        if self.passes < 2 || self.passes > 16 {
+            bail!("the loop's passes must be 2 to 16 (got {})", self.passes);
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({"start": self.start, "end": self.end, "passes": self.passes})
+    }
 }
 
 impl ModelConfig {
@@ -145,6 +187,7 @@ impl ModelConfig {
             rope_theta: rope["rope_theta"].as_f64().or(c["rope_theta"].as_f64()).unwrap_or(10000.0),
             max_position_embeddings: c["max_position_embeddings"].as_u64().map(|x| x as usize).unwrap_or(2048),
             tie_word_embeddings: c["tie_word_embeddings"].as_bool().unwrap_or(false),
+            loop_: LoopSpec::from_json(&c["prastara_loop"], n("num_hidden_layers")?)?,
         })
     }
 
@@ -501,6 +544,8 @@ pub struct LlamaModel {
     first_trained: usize,
     spec: Option<LoraSpec>,
     dev: Device,
+    /// the loop's gates, one `[hidden]` vector per pass after the first (empty without a loop)
+    loop_gates: Vec<Var>,
 }
 
 /// The weight files of a model folder, in order: `model.safetensors`, or the `model-0000i-of-0000n` shards.
@@ -601,7 +646,18 @@ impl LlamaModel {
         };
         let lm_head = if has_head && with_head { Some(matrix("lm_head.weight")?) } else { None };
         let norm = vector(&format!("{prefix}norm.weight"))?;
-        Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone() })
+        let mut loop_gates = Vec::new();
+        if let Some(l) = cfg.loop_ {
+            let saved = if dir.join(LOOP_FILE).exists() { candle_core::safetensors::load(dir.join(LOOP_FILE), dev)? } else { HashMap::new() };
+            for p in 1..l.passes {
+                let g = match saved.get(&format!("loop.gate.{p}")) {
+                    Some(t) => { expect(t, &[cfg.hidden_size], "loop gate")?; t.to_dtype(DType::F32)? }
+                    None => Tensor::zeros(cfg.hidden_size, DType::F32, dev)?,
+                };
+                loop_gates.push(Var::from_tensor(&g)?);
+            }
+        }
+        Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone(), loop_gates })
     }
 
     pub fn device(&self) -> &Device {
@@ -632,6 +688,12 @@ impl LlamaModel {
             }
         }
         let first = spec.first_trained(self.cfg.num_hidden_layers);
+        if let Some(l) = self.cfg.loop_ {
+            if first > l.start && first < l.end {
+                bail!("--train-layers {}: the first trained block {first} falls inside the loop {}..{}; train from block {} or above {}",
+                      spec.train_layers.unwrap_or(0), l.start, l.end, l.start, l.end - 1);
+            }
+        }
         for (i, block) in self.blocks.iter_mut().enumerate() {
             let Some(block) = block else { continue };
             for (ti, t) in Target::ALL.into_iter().enumerate() {
@@ -670,7 +732,23 @@ impl LlamaModel {
                 }
             }
         }
+        out.extend(self.trained_loop_gates());
         out
+    }
+
+    /// The loop's gates under their adapter names (`base_model.model.model.loop.gate.<p>`), when an adapter is
+    /// attached and the loop lies in its trained blocks: they train with it.
+    pub fn trained_loop_gates(&self) -> Vec<(String, Var)> {
+        match (self.cfg.loop_, &self.spec) {
+            (Some(l), Some(_)) if l.start >= self.first_trained => self.loop_gates.iter().enumerate()
+                .map(|(p, g)| (format!("base_model.model.model.loop.gate.{}", p + 1), g.clone())).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// The loop's gates as they are now, under their `loop.safetensors` names.
+    pub fn loop_gate_tensors(&self) -> BTreeMap<String, Tensor> {
+        self.loop_gates.iter().enumerate().map(|(p, g)| (format!("loop.gate.{}", p + 1), g.as_tensor().detach())).collect()
     }
 
     /// Attach a PEFT adapter folder (`adapter_config.json` + `adapter_model.safetensors`) as it is: the blocks and
@@ -709,6 +787,15 @@ impl LlamaModel {
                     (None, None) => None,
                     _ => bail!("{stem}: the adapter has only one of lora_A and lora_B"),
                 };
+            }
+        }
+        for p in 1..self.cfg.loop_.map_or(0, |l| l.passes) {
+            if let Some(g) = tensors.get(&format!("base_model.model.model.loop.gate.{p}")) {
+                if g.dims() != [self.cfg.hidden_size] {
+                    bail!("loop gate {p} has shape {:?}, the model's hidden size is {}", g.dims(), self.cfg.hidden_size);
+                }
+                self.loop_gates[p - 1] = Var::from_tensor(&g.to_dtype(DType::F32)?)?;
+                used += 1;
             }
         }
         if used != tensors.len() {
@@ -817,9 +904,27 @@ impl LlamaModel {
             bail!("an empty token sequence");
         }
         let (rope, mask) = (self.rope(seq)?, self.causal_mask(seq)?);
-        for i in range {
-            let block = self.blocks[i].as_ref().ok_or_else(|| anyhow!("block {i} is not in memory (the activation cache stands in for it)"))?;
-            x = self.block_forward(block, &x, &rope, &mask, ctx)?;
+        let block = |i: usize| self.blocks[i].as_ref().ok_or_else(|| anyhow!("block {i} is not in memory (the activation cache stands in for it)"));
+        if let Some(l) = self.cfg.loop_ {
+            if range.start > l.start && range.start < l.end {
+                bail!("blocks {}.. start inside the loop {}..{}: the loop's blocks must be run together", range.start, l.start, l.end);
+            }
+        }
+        for i in range.clone() {
+            x = self.block_forward(block(i)?, &x, &rope, &mask, ctx)?;
+            match self.cfg.loop_ {
+                Some(l) if i + 1 == l.end && range.start <= l.start => {
+                    for (p, g) in self.loop_gates.iter().enumerate() {
+                        let _ = p;
+                        let mut y = x.clone();
+                        for j in l.start..l.end {
+                            y = self.block_forward(block(j)?, &y, &rope, &mask, ctx)?;
+                        }
+                        x = (&x + (y - &x)?.broadcast_mul(g.as_tensor())?)?;
+                    }
+                }
+                _ => {}
+            }
         }
         Ok(x)
     }
@@ -934,4 +1039,45 @@ mod tests {
             assert!(biggest <= rows * o, "{dtype:?}: a gradient of {biggest} values, the weight has {}", o * i);
         }
     }
+}
+
+/// Avarta conversion (docs/MULA-PLAN.md M1): `out` becomes a copy of the model folder `model` whose blocks
+/// `start..end` run `passes` times. The weights are linked, not copied (copied where links are not possible);
+/// `config.json` gains `"prastara_loop"`, and `loop.safetensors` holds the gates, all zero, so the converted model's
+/// logits are exactly the base's until training opens them.
+pub fn make_looped(model: &Path, out: &Path, l: LoopSpec) -> Result<()> {
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(model.join("config.json"))
+        .with_context(|| format!("{}: no config.json", model.display()))?)?;
+    let parsed = ModelConfig::from_json(&cfg)?;
+    if parsed.loop_.is_some() {
+        bail!("{} is already looped ({:?}); convert its base instead", model.display(), parsed.loop_.unwrap());
+    }
+    l.check(parsed.num_hidden_layers)?;
+    if out.exists() && std::fs::read_dir(out)?.next().is_some() {
+        bail!("{} exists and is not empty", out.display());
+    }
+    std::fs::create_dir_all(out)?;
+    for e in std::fs::read_dir(model)? {
+        let e = e?;
+        let name = e.file_name();
+        if name == "config.json" || name == LOOP_FILE || !e.file_type()?.is_file() && !e.file_type()?.is_symlink() {
+            continue;
+        }
+        let src = std::fs::canonicalize(e.path())?;
+        let dst = out.join(&name);
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&src, &dst).is_ok();
+        #[cfg(not(unix))]
+        let linked = std::fs::hard_link(&src, &dst).is_ok();
+        if !linked {
+            std::fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
+        }
+    }
+    cfg["prastara_loop"] = l.to_json();
+    std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&cfg)?)?;
+    let zeros: HashMap<String, Tensor> = (1..l.passes)
+        .map(|p| Ok((format!("loop.gate.{p}"), Tensor::zeros(parsed.hidden_size, DType::F32, &Device::Cpu)?)))
+        .collect::<Result<_>>()?;
+    candle_core::safetensors::save(&zeros, out.join(LOOP_FILE))?;
+    Ok(())
 }

@@ -475,7 +475,7 @@ pub fn source_dtype(dir: &std::path::Path) -> Result<BaseDtype> {
 pub fn preset(name: &str) -> Option<ModelConfig> {
     let c = |family, vocab, hidden, inter, layers, heads, kv, positions, theta, tied| ModelConfig {
         family, vocab_size: vocab, hidden_size: hidden, intermediate_size: inter, num_hidden_layers: layers, num_attention_heads: heads,
-        num_key_value_heads: kv, head_dim: hidden / heads, rms_norm_eps: 1e-5, rope_theta: theta, max_position_embeddings: positions, tie_word_embeddings: tied,
+        num_key_value_heads: kv, head_dim: hidden / heads, rms_norm_eps: 1e-5, rope_theta: theta, max_position_embeddings: positions, tie_word_embeddings: tied, loop_: None,
     };
     Some(match name.to_ascii_lowercase().as_str() {
         "llama-2-7b" => c(Family::Llama, 32000, 4096, 11008, 32, 32, 32, 4096, 10000.0, false),

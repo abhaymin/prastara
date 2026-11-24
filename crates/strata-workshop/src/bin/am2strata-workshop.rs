@@ -45,6 +45,22 @@ struct Cli {
 enum Cmd {
     /// what a GGUF or a Hugging Face model folder holds
     Info { path: PathBuf },
+    /// Avarta: a looped copy of a Hugging Face model folder; blocks start..end run `passes` times with the same
+    /// weights, each extra pass behind a gate that starts closed (the copy gives the base's logits until trained)
+    Loop {
+        model: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// the first block of the loop
+        #[arg(long)]
+        start: usize,
+        /// the block after the loop's last
+        #[arg(long)]
+        end: usize,
+        /// how many times the loop runs (2 to 16)
+        #[arg(long, default_value_t = 2)]
+        passes: usize,
+    },
     /// a Hugging Face model folder (safetensors + config + tokenizer) to one GGUF, as llama.cpp's converter writes it
     Convert {
         dir: PathBuf,
@@ -701,6 +717,12 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 return Err(format!("no records kept: {why}"));
             }
             Ok((dst.clone(), "dataset".into()))
+        }
+        Cmd::Loop { model, out: dst, start, end, passes } => {
+            out.event(json!({"event": "start", "what": format!("loop blocks {start}..{end} of {} x{passes} as {}", model.display(), dst.display())}));
+            strata_workshop::model::make_looped(model, dst, strata_workshop::model::LoopSpec { start: *start, end: *end, passes: *passes })
+                .map_err(|e| e.to_string())?;
+            Ok((dst.clone(), "hf-model".into()))
         }
         Cmd::Merge { base, adapter, out: dst } => {
             out.event(json!({"event": "start", "what": format!("merge {} into {} as {}", adapter.display(), base.display(), dst.display())}));
