@@ -168,7 +168,7 @@ pub struct UpdateCheck {
 pub async fn check_update(dir: &Path, token: Option<String>) -> Result<UpdateCheck, String> {
     let path = dir.join(SOURCE_FILE);
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path)
-        .map_err(|_| "this model was not downloaded by am2Strata, so its source is not known".to_string())?)
+        .map_err(|_| "this model was not downloaded by Prastara, so its source is not known".to_string())?)
         .map_err(|e| format!("{}: {e}", path.display()))?;
     let repo = v["repo"].as_str().ok_or("the source record names no repository")?.to_string();
     let revision = v["revision"].as_str().unwrap_or("main").to_string();

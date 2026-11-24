@@ -5,7 +5,7 @@
 //! - `GET /api/computer/stream` (WebSocket; `wss://` on the HTTPS port): JPEG frames when the screen changes (about
 //!   8 a second at most), the state as JSON, and the operator's input. The key comes in the first message
 //!   (`{"type":"auth","key":...}`, a browser cannot set headers on a WebSocket; never in the URL) or the
-//!   Authorization header; the page must be am2Strata's own (the Origin is checked).
+//!   Authorization header; the page must be Prastara's own (the Origin is checked).
 //! - Input is accepted only while the operator has control (**Take control**); the agent's computer steps wait until
 //!   it is handed back (`Computers::step`). Closing the tab hands control back.
 //! - REST, for the CLI and scripts: `GET /api/computer/status`, `GET /api/computer/screenshot` (PNG),

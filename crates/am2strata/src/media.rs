@@ -172,7 +172,7 @@ pub fn ffmpeg_cached() -> bool {
 }
 
 /// What compose needs of ffmpeg, missing from this one: the filters (xfade, zoompan, overlay, fade, afade, tpad; the captions are
-/// drawn by am2Strata, so libass is not needed) and
+/// drawn by Prastara, so libass is not needed) and
 /// the H.264 and AAC encoders. Empty when it can compose. Homebrew's ffmpeg 9, for one, is built without libass, so it
 /// has no `subtitles` filter. Asked at most once a minute.
 pub fn compose_missing() -> Vec<&'static str> {

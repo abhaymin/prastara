@@ -483,7 +483,7 @@ impl McpServer {
             }
         };
         let init = json!({"protocolVersion": PROTOCOL, "capabilities": {},
-                          "clientInfo": {"name": "am2strata", "title": "am2Strata", "version": "1"}});
+                          "clientInfo": {"name": "am2strata", "title": "Prastara", "version": "1"}});
         let res = match t.request("initialize", init, timeout).await {
             Ok(r) => r,
             Err(e) => return self.failed(e, Some(t)).await,

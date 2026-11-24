@@ -1,7 +1,7 @@
-# am2Strata installer for Windows (x64 and Arm64): the latest release, checked against its SHA-256. No admin rights.
+# Prastara installer for Windows (x64 and Arm64): the latest release, checked against its SHA-256. No admin rights.
 #
-#   irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex
-#   & ([scriptblock]::Create((irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1))) -Version v0.2.0
+#   irm https://github.com/abhaymin/prastara/releases/latest/download/install.ps1 | iex
+#   & ([scriptblock]::Create((irm https://github.com/abhaymin/prastara/releases/latest/download/install.ps1))) -Version v0.2.0
 #
 #   -Version X    install release X instead of the latest
 #   -Dir DIR      install into DIR instead of %LOCALAPPDATA%\am2strata (models and settings stay there too)
@@ -33,15 +33,15 @@ function Install-Am2Strata {
     param([string]$Version, [string]$Dir, [string]$From, [bool]$Service, [bool]$NoService, [bool]$WithDeps, [bool]$Yes, [bool]$Uninstall)
     $ErrorActionPreference = "Stop"
     $ProgressPreference = "SilentlyContinue"   # Invoke-WebRequest is many times slower with its progress bar
-    $Repo = "abhaymin/am2strata"
+    $Repo = "abhaymin/prastara"
     $Data = if ($Dir) { $Dir } elseif ($env:AM2STRATA_DATA) { $env:AM2STRATA_DATA } else { Join-Path $env:LOCALAPPDATA "am2strata" }
     $Data = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Data)   # absolute, from where you are
     if ($Data -match '[%"&<>^|]') { throw "the folder $Data has a character the launchers cannot carry (one of % `" & < > ^ |): choose another" }
     $Apps = Join-Path $Data "app"
     $Bin = Join-Path $Data "bin"
-    $Shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "am2Strata.lnk"
-    $Startup = Join-Path ([Environment]::GetFolderPath("Startup")) "am2Strata server.lnk"
-    $Mark = "written by am2Strata's install.ps1"
+    $Shortcut = Join-Path ([Environment]::GetFolderPath("Programs")) "Prastara.lnk"
+    $Startup = Join-Path ([Environment]::GetFolderPath("Startup")) "Prastara server.lnk"
+    $Mark = "written by Prastara's install.ps1"
 
     function Set-UserPath([string]$dir, [bool]$add) {
         $p = [Environment]::GetEnvironmentVariable("Path", "User")
@@ -62,7 +62,7 @@ function Install-Am2Strata {
         [void](Remove-OurShortcut $Startup)
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Apps, $Bin
         Set-UserPath $Bin $false
-        Write-Host "Removed am2Strata. Your models and settings are still in $Data (delete that folder to remove them too)."
+        Write-Host "Removed Prastara. Your models and settings are still in $Data (delete that folder to remove them too)."
         return
     }
 
@@ -73,7 +73,7 @@ function Install-Am2Strata {
         $machineArch = [string](Get-ItemProperty "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" -ErrorAction Stop).PROCESSOR_ARCHITECTURE
     } catch { $machineArch = "" }
     $arch = Get-Am2StrataArch $env:PROCESSOR_ARCHITECTURE $env:PROCESSOR_ARCHITEW6432 $osArch $machineArch
-    if (-not $arch) { throw "am2Strata's Windows downloads are for 64-bit PCs (x64 and Arm64); this one says $env:PROCESSOR_ARCHITECTURE." }
+    if (-not $arch) { throw "Prastara's Windows downloads are for 64-bit PCs (x64 and Arm64); this one says $env:PROCESSOR_ARCHITECTURE." }
     # an Arm64 PC also runs the x64 download (emulated, slower): the second choice when a release has no Arm64 one
     $labels = if ($arch -eq "arm64") { @("windows-arm64", "windows-x86_64") } else { @("windows-x86_64") }
 
@@ -104,7 +104,7 @@ function Install-Am2Strata {
             $Url = "https://github.com/$Repo/releases/download/$Version"
             foreach ($candidate in $labels) {
                 $Name = "am2strata-" + $Version.TrimStart("v") + "-$candidate"
-                Write-Host "Downloading am2Strata $Version for $candidate..."
+                Write-Host "Downloading Prastara $Version for $candidate..."
                 try {
                     Invoke-WebRequest "$Url/$Name.zip" -OutFile "$Tmp\$Name.zip" -UseBasicParsing
                     $zip = "$Tmp\$Name.zip"
@@ -148,7 +148,7 @@ function Install-Am2Strata {
         $lnk.TargetPath = "$env:ComSpec"
         $lnk.Arguments = "/k start `"`" http://127.0.0.1:8000 & `"$Bin\am2strata.cmd`""
         $lnk.WorkingDirectory = $App
-        $lnk.Description = "am2Strata: AI models on this PC"
+        $lnk.Description = "Prastara: AI models on this PC"
         $lnk.Save()
 
         if ($Service) {
@@ -157,7 +157,7 @@ function Install-Am2Strata {
             $lnk.Arguments = "/c `"$Bin\am2strata.cmd`""
             $lnk.WorkingDirectory = $App
             $lnk.WindowStyle = 7     # minimized
-            $lnk.Description = "am2Strata's server, started when you sign in"
+            $lnk.Description = "Prastara's server, started when you sign in"
             $lnk.Save()
             Write-Host "The server starts when you sign in (a shortcut in your Startup folder: $Startup), once a model is there."
         } elseif ($NoService) {
@@ -166,7 +166,7 @@ function Install-Am2Strata {
     } finally {
         Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $Tmp
     }
-    Write-Host "Installed am2Strata $Version ($Label) in $App"
+    Write-Host "Installed Prastara $Version ($Label) in $App"
     if (Test-Path (Join-Path $Data "strata-*.json")) { Write-Host "Your models and settings in $Data were kept as they are." }
 
     # what the optional features need here: the product's own report, so the installer and `am2strata doctor` agree
@@ -208,7 +208,7 @@ function Install-Am2Strata {
             if ($go) {
                 foreach ($p in $pkgs) { & winget install -e --id $p }
             } else {
-                Write-Host "Not run. am2Strata works without it; the features above stay off until you install them."
+                Write-Host "Not run. Prastara works without it; the features above stay off until you install them."
             }
         }
     } elseif ($pkgs.Count -gt 0) {
@@ -220,7 +220,7 @@ function Install-Am2Strata {
     Write-Host "  am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M    # a small model to start with"
     Write-Host "  am2strata                                                           # then open http://127.0.0.1:8000"
     Write-Host "  am2strata doctor                                                    # this report again, any time"
-    Write-Host "Or start it from the Start menu: am2Strata. Uninstall: this installer with -Uninstall."
+    Write-Host "Or start it from the Start menu: Prastara. Uninstall: this installer with -Uninstall."
 }
 
 Install-Am2Strata -Version $Version -Dir $Dir -From $From -Service $Service.IsPresent -NoService $NoService.IsPresent `

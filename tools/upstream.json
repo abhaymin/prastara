@@ -1,5 +1,5 @@
 {
- "about": "What am2Strata ports from upstream, and the git blob each port is current with. `am2strata-run upstream-check` compares these with the upstream repositories now. After porting a change, update the blob (git hash-object <file> in the upstream checkout) and `at`.",
+ "about": "What Prastara ports from upstream, and the git blob each port is current with. `am2strata-run upstream-check` compares these with the upstream repositories now. After porting a change, update the blob (git hash-object <file> in the upstream checkout) and `at`.",
  "repos": {
   "polystrata": {
    "github": "VecSzn/PolyStrata",
@@ -57,7 +57,7 @@
    "rust": [
     "web/app.js"
    ],
-   "note": "am2Strata's web app has its own pages; upstream changes are adapted, not copied"
+   "note": "Prastara's web app has its own pages; upstream changes are adapted, not copied"
   },
   {
    "repo": "polystrata",
@@ -75,7 +75,7 @@
    "rust": [
     "crates/am2strata/src/mcp.rs"
    ],
-   "note": "its model catalog is setup's; am2Strata's own catalog is the Hub pull"
+   "note": "its model catalog is setup's; Prastara's own catalog is the Hub pull"
   },
   {
    "repo": "polystrata",

@@ -227,7 +227,7 @@ flipped a near-tie once enough experts were remote (the engine now has a portabl
 checked by a hash test that passes on both machines).
 
 
-## Tiel and Orca across the two machines (clean runs: am2Strata stopped on both)
+## Tiel and Orca across the two machines (clean runs: Prastara stopped on both)
 
 **Tiel (qwen35moe, 38.5 GB) on the 16 GB Mac**, 6 GiB of experts resident, a 512-token prompt of varied ids, 32
 tokens, 8 threads. Tokens identical in every run.

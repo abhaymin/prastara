@@ -9,7 +9,7 @@ use strata_template::ChatTemplate;
 const TPL: &str = "/home/abhaym/Development/am2strata-inkling/crates/strata-template/testdata/chat_template-inkling2.jinja";
 const CASES: &str = "/home/abhaym/Development/am2strata-inkling/crates/strata-template/testdata/templates-inkling2.json";
 
-/// PolyStrata / am2Strata canonicalize a tool call whose arguments came in as a JSON string into the parsed object the
+/// PolyStrata / Prastara canonicalize a tool call whose arguments came in as a JSON string into the parsed object the
 /// template's `raise_exception("...not a JSON string; canonicalize upstream")` guard expects, so do the same here.
 fn canonicalize(messages: &[Value]) -> Vec<Value> {
     messages

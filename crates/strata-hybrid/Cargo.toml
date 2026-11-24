@@ -1,6 +1,6 @@
 [package]
 name = "strata-hybrid"
-description = "am2Strata's Rust engine for Nemotron-H, Mistral / Mixtral and GLM-4.7-Flash / DeepSeek (MLA) models: strata engine protocol"
+description = "Prastara's Rust engine for Nemotron-H, Mistral / Mixtral and GLM-4.7-Flash / DeepSeek (MLA) models: strata engine protocol"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"

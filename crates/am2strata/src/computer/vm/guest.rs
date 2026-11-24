@@ -66,7 +66,7 @@ H=/home/$U
 install -d -o $U -g $U $H/.config/systemd/user/default.target.wants $H/.config/openbox $H/Applications $H/Desktop $H/Downloads $H/.local/share/applications
 cat > $H/.config/systemd/user/am2-xvnc.service <<EOF
 [Unit]
-Description=am2Strata sandbox display (Xvnc :1, localhost only)
+Description=Prastara sandbox display (Xvnc :1, localhost only)
 [Service]
 ExecStart=/usr/bin/Xvnc :1 -geometry {width}x{height} -depth 24 -localhost -SecurityTypes None -rfbport 5901 -AlwaysShared -AcceptSetDesktopSize=0
 Restart=always
@@ -75,7 +75,7 @@ WantedBy=default.target
 EOF
 cat > $H/.config/systemd/user/am2-session.service <<EOF
 [Unit]
-Description=am2Strata sandbox desktop session (openbox)
+Description=Prastara sandbox desktop session (openbox)
 After=am2-xvnc.service
 Requires=am2-xvnc.service
 [Service]
@@ -167,7 +167,7 @@ case "$1" in
         if (keep) print "address=/" d "/#" }}' $L/allow - > $L/block.conf
     rm -f $L/domains
     printf 'listen-address=127.0.0.2\nbind-interfaces\nno-hosts\nresolv-file=/run/systemd/resolve/resolv.conf\ncache-size=10000\nconf-file=%s/block.conf\n' $L > $L/dnsmasq.conf
-    printf '[Unit]\nDescription=am2Strata ad and tracker DNS filter\nAfter=systemd-resolved.service\n[Service]\nExecStart=/usr/sbin/dnsmasq -k --conf-file=%s/dnsmasq.conf\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' $L > /etc/systemd/system/am2-dns.service
+    printf '[Unit]\nDescription=Prastara ad and tracker DNS filter\nAfter=systemd-resolved.service\n[Service]\nExecStart=/usr/sbin/dnsmasq -k --conf-file=%s/dnsmasq.conf\nRestart=always\n[Install]\nWantedBy=multi-user.target\n' $L > /etc/systemd/system/am2-dns.service
     sed -i '/^# am2-ads begin$/,/^# am2-ads end$/d' /etc/hosts
     systemctl daemon-reload; systemctl enable am2-dns.service >/dev/null 2>&1; systemctl restart am2-dns.service
     for i in 1 2 3 4 5 6 7 8 9 10; do systemctl is-active -q am2-dns.service && break; sleep 0.5; done

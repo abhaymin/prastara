@@ -1,4 +1,4 @@
-//! The web app (am2Strata's web/, derived from PolyStrata's serve/web) and the endpoints it reads: health, the installed
+//! The web app (Prastara's web/, derived from PolyStrata's serve/web) and the endpoints it reads: health, the installed
 //! models and switching between them, shared settings, the run-config view, MCP and metrics.
 
 use crate::{authorized, error, AppState};
@@ -21,7 +21,7 @@ pub async fn health(State(s): State<AppState>) -> Json<Value> {
         "image_generation": s.media.available(),
         "hardware": s.mgr.hw,
         "adapted": cur.as_ref().map(|l| l.adapted.clone()).unwrap_or_default(),
-        "server": "am2Strata",
+        "server": "Prastara",
     }))
 }
 

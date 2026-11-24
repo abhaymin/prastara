@@ -859,7 +859,7 @@ fn sample_normal(gen: &mut SplitMix64) -> f32 {
 }
 
 /// The tiny fixture's chat template — metadata only, so its exact text does not matter for the GGUF; it renders real prompts
-/// the way am2Strata's server renders them. A fixed string keeps the file deterministic.
+/// the way Prastara's server renders them. A fixed string keeps the file deterministic.
 const CHAT_TEMPLATE: &str = "sys:<eff> user:<text>\nassistant::<answer><|end_message|>";
 
 /// Deterministic generator so `write` and a test's expected values agree exactly.

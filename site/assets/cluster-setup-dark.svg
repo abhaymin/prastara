@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800" font-family="Outfit, Inter, 'Segoe UI', Helvetica, Arial, sans-serif" role="img" aria-labelledby="t d">
-<title id="t">am2Strata cluster: pairing a worker with a master</title>
+<title id="t">Prastara cluster: pairing a worker with a master</title>
 <desc id="d">Two machines. The master holds the main API key and talks to clients; it keeps node-tls.json and cluster-workers.json. The worker keeps its own key, node-key and node-tls.json, and cluster-masters.json with only the hash of the key it gave. Steps: 1 install on both with a main api_key each; 2 make a worker with cluster role worker, started on 0.0.0.0, which shows a 6-digit code new every 10 minutes; 3 pair on the master in Settings, Cluster by typing the code (5 wrong codes lock pairing for 10 minutes); 4 use it: the master answers with the worker&#x27;s model and hands it overflow. After pairing, every connection is mutual TLS 1.3 with pinned certificates on port 8443. Remove a worker in Settings, Cluster, Remove.</desc>
 <rect width="1200" height="800" rx="28" fill="#1e1e2e"/>
 <text x="48" y="64" font-size="30" font-weight="700" text-anchor="start" fill="#cdd6f4">A cluster in four steps</text>

@@ -1,6 +1,6 @@
-# The am2Strata engine: one Rust engine for dense and MoE models
+# The Prastara engine: one Rust engine for dense and MoE models
 
-Goal: am2Strata's own engine applies Strata's logic to every model, dense or MoE, and any application can use it. The hot
+Goal: Prastara's own engine applies Strata's logic to every model, dense or MoE, and any application can use it. The hot
 part of a model sits in VRAM, the rest in pinned RAM or on the SSD, transfers overlap the compute, and the engine learns what
 is hot. PolyStrata's C++ engines stay the production path for each model until the Rust engine passes that model's gate, then
 the run config switches it. Nothing is removed before that.

@@ -1,4 +1,4 @@
-/* am2Strata UI — tokens (the approved redesign, design/Main.dc.html; derived from PolyStrata's UI kit, MIT).
+/* Prastara UI — tokens (the approved redesign, design/Main.dc.html; derived from PolyStrata's UI kit, MIT).
    <html data-theme="light|dark">: app.js resolves "system" to one of them from prefers-color-scheme and follows it.
    An accent picked in Settings › Appearance overrides --st-accent* on <html>. */
 

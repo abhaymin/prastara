@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>am2Strata — Settings, Knowledge (plan)</title>
+<title>Prastara — Settings, Knowledge (plan)</title>
 <script src="./support.js"></script>
 </head>
 <body>
@@ -180,7 +180,7 @@ class Component extends DCLogic {
         (s.tab === id ? 'color: var(--text); border-bottom: 2px solid ' + accent : 'color: var(--muted); border-bottom: 2px solid transparent') }));
     const badge = (on) => 'padding: 2px 8px; border-radius: 6px; font-size: 12px; font-weight: 700; ' + (on ? 'background: var(--ok-bg); color: var(--ok-fg)' : 'background: var(--warn-bg); color: var(--warn)');
     const collections = [
-      { name: 'PolyStrata and am2Strata docs', facts: 'docs/ · 212 files · 618 passages · snapshot 2.1 GB', state: 'Snapshot ready', badge: badge(true), auto: true, action: 'Update' },
+      { name: 'PolyStrata and Prastara docs', facts: 'docs/ · 212 files · 618 passages · snapshot 2.1 GB', state: 'Snapshot ready', badge: badge(true), auto: true, action: 'Update' },
       { name: 'Project notes', facts: '~/Documents/notes · 74 files · 431 passages', state: 'Indexed', badge: badge(true), auto: true, action: 'Make snapshot' },
       { name: 'Invoices 2026', facts: '38 PDFs · 235 passages · text + page pictures', state: 'Indexing 61%', badge: badge(false), auto: false, action: 'Pause' } ];
     const memory = [
@@ -188,7 +188,7 @@ class Component extends DCLogic {
       { fact: 'Prefer answers with code in Rust unless Python is asked for.', who: 'you · Oct 19', scope: 'web app' },
       { fact: 'Orca runs at about 60 tok/s warm; Tiel Q6 at about 100 tok/s.', who: 'Orca · Oct 20', scope: 'everyone' },
       { fact: 'The omp agent works in ~/Development/am2strata.', who: 'omp · Oct 21', scope: 'API key omp' },
-      { fact: 'PolyStrata stays untouched; am2Strata is the new edition.', who: 'you · Oct 20', scope: 'everyone' } ];
+      { fact: 'PolyStrata stays untouched; Prastara is the new edition.', who: 'you · Oct 20', scope: 'everyone' } ];
     const knobs = [{ label: 'Passages per request', value: 'up to 6' }, { label: 'Minimum relevance', value: '0.62' },
       { label: 'Token budget for added text', value: '3,000' }, { label: 'Cite sources in the answer', value: 'on' }];
     const clients = [{ name: 'This web app', note: 'chats in the browser', on: true }, { name: 'API key "omp"', note: 'the coding agent', on: true },

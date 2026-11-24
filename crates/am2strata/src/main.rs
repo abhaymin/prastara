@@ -1,4 +1,4 @@
-//! am2Strata: a local AI server, written in Rust.
+//! Prastara: a local AI server, written in Rust.
 //!
 //! Serves every installed model (the `strata-*.json` run configs of the models folder) through one address,
 //! switching between them on request, with the OpenAI (`/v1/chat/completions`) and Anthropic (`/v1/messages`) APIs,
@@ -77,7 +77,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tower_http::services::{ServeDir, ServeFile};
 
 #[derive(Parser)]
-#[command(name = "am2strata", version, about = "am2Strata: every installed model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
+#[command(name = "am2strata", version, about = "Prastara: every installed model behind one address - OpenAI, Anthropic and Responses APIs, MCP tools, the web app")]
 struct Args {
     /// folder with the strata-<model>.json run configs and the engines
     #[arg(long, default_value = "~/Development/PolyStrata")]
@@ -94,7 +94,7 @@ struct Args {
     /// API key (default: the default model's config api_key)
     #[arg(long)]
     api_key: Option<String>,
-    /// the web app's files (default: the am2Strata app, web/ in the folder the binary was built in)
+    /// the web app's files (default: the Prastara app, web/ in the folder the binary was built in)
     #[arg(long)]
     web_dir: Option<String>,
     /// keep the last 100 API calls (bodies, output, timings) in memory for /api-monitor (also "api_monitor": true
@@ -156,7 +156,7 @@ pub fn foreign_origin(state: &AppState, headers: &HeaderMap) -> bool {
 
 pub fn not_own_page(what: &str) -> Response {
     error(StatusCode::FORBIDDEN, "permission_error",
-          format!("{what} only from am2Strata's own page (or an origin in the config's trusted_origins)"))
+          format!("{what} only from Prastara's own page (or an origin in the config's trusted_origins)"))
 }
 
 /// The priority and client of a request, for the queue: high for this server's own page (a person waiting), normal
@@ -390,7 +390,7 @@ fn expand(p: &str) -> PathBuf {
     }
 }
 
-/// am2Strata's own web app: `web/` beside the binary or in a folder above it (target/release/am2strata ->
+/// Prastara's own web app: `web/` beside the binary or in a folder above it (target/release/am2strata ->
 /// <am2strata folder>/web), so the folder can be moved or renamed.
 fn own_web_dir() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
@@ -598,7 +598,7 @@ async fn main() -> Result<()> {
     workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest).set_server(&host, port, state.api_key.clone());
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
-        None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
+        None => own_web_dir().context("the Prastara web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
     };
     captions::set_font_dir(&web_dir); // the caption fonts ship in web/fonts/captions
     let app = Router::new()

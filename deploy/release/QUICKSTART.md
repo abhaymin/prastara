@@ -1,23 +1,23 @@
-# am2Strata quick start
+# Prastara quick start
 
 Run AI models on your own PC, with a web app and OpenAI- and Anthropic-compatible APIs. Nothing else to install: this download
 holds the server, the web app and a Rust engine.
 
 ## Install in one line
 
-This puts am2Strata under your home folder and `am2strata` on your PATH, with no admin rights or sudo, and checks the
+This puts Prastara under your home folder and `am2strata` on your PATH, with no admin rights or sudo, and checks the
 download's SHA-256.
 
 **Linux (x86_64, arm64) and macOS (Apple silicon, Intel):**
 
 ```bash
-curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/abhaymin/prastara/releases/latest/download/install.sh | sh
 ```
 
 **Windows (x64, Arm64), in PowerShell:**
 
 ```powershell
-irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex
+irm https://github.com/abhaymin/prastara/releases/latest/download/install.ps1 | iex
 ```
 
 Options: `--version X`, `--dir DIR`, `--service` (start at sign-in), `--with-deps` (install what the optional features
@@ -82,4 +82,4 @@ command that installs what is missing.
 
 By default the server only answers this PC. Before using `--host 0.0.0.0`, set an API key.
 
-Problems: <https://github.com/abhaymin/am2strata/issues>
+Problems: <https://github.com/abhaymin/prastara/issues>

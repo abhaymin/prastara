@@ -1,4 +1,4 @@
-# Songs in am2Strata (music with vocals)
+# Songs in Prastara (music with vocals)
 
 Owner's request (2026-11-09): make songs, not only speech. Chatterbox is a speech model: it cannot follow a melody, so
 singing needs a music model.

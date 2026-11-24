@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>am2Strata — canvas: sub-browser and board</title>
+<title>Prastara — canvas: sub-browser and board</title>
 <script src="./support.js"></script>
 </head>
 <body>
@@ -35,7 +35,7 @@ body{margin:0}
   <div style="flex: 1 1 auto; display: flex; min-height: 0">
 
     <section aria-label="Chat" style="flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; padding: 24px 32px; gap: 16px">
-      <div style="align-self: flex-end; max-width: 70%; padding: 10px 14px; border-radius: 14px 14px 4px 14px; background: var(--bubble); color: var(--bubble-fg)">Draw how a request flows through am2Strata, then build a small dashboard page for it.</div>
+      <div style="align-self: flex-end; max-width: 70%; padding: 10px 14px; border-radius: 14px 14px 4px 14px; background: var(--bubble); color: var(--bubble-fg)">Draw how a request flows through Prastara, then build a small dashboard page for it.</div>
       <div style="display: flex; flex-direction: column; gap: 12px; line-height: 1.55">
         <span>Here is the flow, and a page that shows it live:</span>
         <div style="border-radius: 10px; background: #141A22; color: #E6EDF3; overflow: hidden">
@@ -45,7 +45,7 @@ body{margin:0}
           </div>
           <pre style="margin: 0; padding: 12px 14px; font: 400 12.5px/1.6 'JetBrains Mono', monospace">%% animate
 flowchart LR
-  U[Browser] --&gt;|request| S[am2Strata]
+  U[Browser] --&gt;|request| S[Prastara]
   S --&gt; C{Cached?}
   C -- no --&gt; E[(Engine)]</pre>
         </div>
@@ -100,7 +100,7 @@ flowchart LR
             <div style="padding: 14px; border-radius: 10px; background: #1E293B"><span style="display: block; font-size: 12px; color: #94A3B8">Decode</span><span style="font-size: 26px; font-weight: 800">58 tok/s</span></div>
           </div>
           <svg role="img" aria-label="A bar chart of requests per minute" viewBox="0 0 520 160" style="width: 100%; height: 180px"><g fill="#3DD68C"><rect x="10" y="90" width="34" height="70" rx="4"></rect><rect x="60" y="60" width="34" height="100" rx="4"></rect><rect x="110" y="30" width="34" height="130" rx="4"></rect><rect x="160" y="80" width="34" height="80" rx="4"></rect><rect x="210" y="20" width="34" height="140" rx="4"></rect><rect x="260" y="50" width="34" height="110" rx="4"></rect><rect x="310" y="70" width="34" height="90" rx="4"></rect><rect x="360" y="40" width="34" height="120" rx="4"></rect><rect x="410" y="95" width="34" height="65" rx="4"></rect><rect x="460" y="35" width="34" height="125" rx="4"></rect></g></svg>
-          <span style="font-size: 13px; color: #94A3B8">The page runs sandboxed: scripts work, but it cannot reach am2Strata or this browser's data.</span>
+          <span style="font-size: 13px; color: #94A3B8">The page runs sandboxed: scripts work, but it cannot reach Prastara or this browser's data.</span>
         </div>
       </sc-if>
 
@@ -131,7 +131,7 @@ flowchart LR
             <div style="flex: 1 1 auto; display: grid; grid-template-columns: 34% 1fr; min-height: 0">
               <pre style="margin: 0; padding: 14px; border-right: 1px solid var(--border-soft); background: var(--panel-soft); font: 400 12.5px/1.6 'JetBrains Mono', monospace; color: var(--text)">%% animate
 flowchart LR
-  U[Browser] --&gt;|chat request| S[am2Strata]
+  U[Browser] --&gt;|chat request| S[Prastara]
   S --&gt; C{Cached?}
   C -- yes --&gt; A[Answer]
   C -- no --&gt; E[(Engine)]
@@ -139,14 +139,14 @@ flowchart LR
   E --&gt;|experts| R[System RAM]
   E --&gt;|tokens| A
   A --&gt;|SSE stream| U</pre>
-              <svg role="img" aria-label="Animated flowchart: browser to am2Strata, cache check, engine, GPU and RAM, answer back to the browser" viewBox="0 0 640 420" style="width: 100%; height: 100%">
+              <svg role="img" aria-label="Animated flowchart: browser to Prastara, cache check, engine, GPU and RAM, answer back to the browser" viewBox="0 0 640 420" style="width: 100%; height: 100%">
                 <g style="stroke: var(--muted); stroke-width: 2; fill: none; stroke-dasharray: 7 5; animation: am2dash .9s linear infinite">
                   <path d="M120 90 H210"></path><path d="M300 90 H360"></path><path d="M420 120 V200"></path><path d="M450 90 H520"></path>
                   <path d="M420 250 L330 330"></path><path d="M420 250 L520 330"></path><path d="M560 120 V300 H480"></path><path d="M70 120 V380 H560 V360"></path>
                 </g>
                 <g style="font: 600 13px Manrope, sans-serif; fill: var(--text)">
                   <rect x="20" y="62" width="100" height="56" rx="10" style="fill: var(--raised); stroke: var(--accent); stroke-width: 2"></rect><text x="70" y="95" text-anchor="middle">Browser</text>
-                  <rect x="210" y="62" width="90" height="56" rx="10" style="fill: var(--raised); stroke: var(--accent); stroke-width: 2"></rect><text x="255" y="95" text-anchor="middle">am2Strata</text>
+                  <rect x="210" y="62" width="90" height="56" rx="10" style="fill: var(--raised); stroke: var(--accent); stroke-width: 2"></rect><text x="255" y="95" text-anchor="middle">Prastara</text>
                   <polygon points="420,50 470,90 420,130 370,90" style="fill: var(--raised); stroke: var(--info); stroke-width: 2"></polygon><text x="420" y="95" text-anchor="middle">Cached?</text>
                   <rect x="520" y="62" width="90" height="56" rx="10" style="fill: var(--raised); stroke: var(--accent); stroke-width: 2"></rect><text x="565" y="95" text-anchor="middle">Answer</text>
                   <ellipse cx="420" cy="225" rx="56" ry="26" style="fill: var(--raised); stroke: var(--warn); stroke-width: 2"></ellipse><text x="420" y="230" text-anchor="middle">Engine</text>

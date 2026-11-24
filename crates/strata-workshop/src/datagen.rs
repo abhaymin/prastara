@@ -1,4 +1,4 @@
-//! Training data made by am2Strata's own model — the Workshop's data recipes (like Unsloth Studio's).
+//! Training data made by Prastara's own model — the Workshop's data recipes (like Unsloth Studio's).
 //!
 //! Recipes:
 //! - **qa**: from documents (text, Markdown, code, PDF): chunked, and for each chunk the model writes question–answer
@@ -410,7 +410,7 @@ pub fn card(s: &Settings, model: &str, r: &Report) -> String {
     format!(
 "# Dataset card: {name}
 
-Made by am2Strata's Workshop with the **{recipe}** recipe, using the model **{model}**.
+Made by Prastara's Workshop with the **{recipe}** recipe, using the model **{model}**.
 
 | | |
 |---|---|

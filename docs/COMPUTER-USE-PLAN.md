@@ -137,7 +137,7 @@ tool layer, tests and Settings work unchanged everywhere.
 
 ### 4. Safety built in
 
-- A visible **"am2Strata is using the computer"** indicator in the web app (a small pill near the chat) plus a **Stop** button
+- A visible **"Prastara is using the computer"** indicator in the web app (a small pill near the chat) plus a **Stop** button
   that ends the job at once; a **stop hotkey** (Ctrl+Shift+Q by default, configurable) sends `POST /api/computer/stop`. Both end
   the current run's tool loop exactly as the existing Stop does for the browser.
 - The rules check runs before every step (§2).

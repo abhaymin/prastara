@@ -1,6 +1,6 @@
 # Long requests: 5 minutes and more of speech, songs and video
 
-Owner's requirement (2026-11-09): am2Strata speaks for at least 5 minutes, makes songs that long, and makes video
+Owner's requirement (2026-11-09): Prastara speaks for at least 5 minutes, makes songs that long, and makes video
 that long, from one request.
 
 ## Where each stands
@@ -8,10 +8,10 @@ that long, from one request.
 | Kind | Limit before | Now | How it gets long |
 | --- | --- | --- | --- |
 | Speech | 4,096 characters (OpenAI's limit, about 4.5 min) | **20,000 characters (about 20 min)** | already made part by part (sentences), each part checked by Whisper and retaken when it adds or drops words |
-| Songs | not in am2Strata yet (ACE-Step in Rust: docs/ACESTEP-RUST-PLAN.md) | planned: **up to 10 min** | ACE-Step 1.5 makes 10 s to 10 min in one pass (8 min with its planner on a 16 GB card); measured 60 s in 12 s on one RTX 5060 Ti |
+| Songs | not in Prastara yet (ACE-Step in Rust: docs/ACESTEP-RUST-PLAN.md) | planned: **up to 10 min** | ACE-Step 1.5 makes 10 s to 10 min in one pass (8 min with its planner on a 16 GB card); measured 60 s in 12 s on one RTX 5060 Ti |
 | Video | 257 frames (about 10 to 16 s, model-dependent) | planned: **5 min and more** | segments chained: each next segment starts from the last frame of the one before (image-to-video), then joined |
 
-## Productions: am2Strata builds the whole piece itself (owner's requirement, 2026-11-10)
+## Productions: Prastara builds the whole piece itself (owner's requirement, 2026-11-10)
 
 **State (2026-11-11): audio productions built.** `POST /v1/media/productions` and the chat tool `produce` take a
 plan of speak, song and music parts.
@@ -43,7 +43,7 @@ plan of speak, song and music parts.
   - chapters in the file's own metadata.
 
 A request like "a 25-minute Diwali music set in Hindi, with a spoken welcome, and a video for it" must come back as
-one finished file, made by am2Strata from start to end, with nobody stitching parts by hand. So:
+one finished file, made by Prastara from start to end, with nobody stitching parts by hand. So:
 
 - **A production is one job made of parts.** `POST /v1/media/productions` (and the chat tool `produce`) takes a plan:
   ```json

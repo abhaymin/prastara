@@ -1,6 +1,6 @@
 [package]
 name = "strata-media"
-description = "am2Strata v2: image, video and voice generation in Rust (candle), with the strata placement techniques; built on mold's model implementations"
+description = "Prastara v2: image, video and voice generation in Rust (candle), with the strata placement techniques; built on mold's model implementations"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.93"

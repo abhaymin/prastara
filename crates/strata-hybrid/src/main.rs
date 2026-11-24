@@ -1,6 +1,6 @@
 //! am2strata-hybrid: an engine in Rust for the architectures in model.rs (Nemotron-H, Mistral / Mixtral, GLM-4.7-Flash,
 //! the DeepSeek family and Qwen3.5/3.6 MoE), speaking the strata
-//! engine protocol (docs/PROTOCOL.md) so am2Strata's server drives it like `strata` and `strata-poly`:
+//! engine protocol (docs/PROTOCOL.md) so Prastara's server drives it like `strata` and `strata-poly`:
 //!   am2strata-hybrid --serve --model <shard 1>.gguf [--max-context N] [--threads N]
 //!       [--pack DIR] [--expert-profile FILE] [--expert-profile-save FILE] [--resident-experts [--expert-ram-gib N]]
 //!       [--remote-experts HOST:PORT --remote-pin PIN --identity node-tls.json]     (another machine's memory, remote.rs)
@@ -150,7 +150,7 @@ fn main() {
         println!("{}", serde_json::Value::Array(list));
         return;
     }
-    // a node identity in the cluster's format (node-tls.json), for machines without am2Strata's server and for tests
+    // a node identity in the cluster's format (node-tls.json), for machines without Prastara's server and for tests
     if let Some(p) = arg("--make-identity") {
         match remote::Identity::make(std::path::Path::new(&p), &arg("--name").unwrap_or_else(|| "node".into())) {
             Ok(id) => { println!("{}", id.pin); return; }

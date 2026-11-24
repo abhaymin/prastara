@@ -1,4 +1,4 @@
-//! am2strata-media: the media engine process (images now; video and voice next), driven by am2Strata's server over
+//! am2strata-media: the media engine process (images now; video and voice next), driven by Prastara's server over
 //! JSON lines on stdin/stdout, as the text engines are driven over their line protocol. One request at a time.
 //!
 //!   -> {"op":"pull","model":"z-image-turbo:q8"}           <- {"event":"progress","file","file_index","files","done","total"} ...
@@ -29,7 +29,7 @@
 //!   -> {"op":"remove","model":...}       <- {"event":"removed","model","freed_bytes","removed":[...],"warnings":[...]}
 //!   any failure                                           <- {"event":"error","message":...}
 //!
-//! Models and their files come from mold's catalog, stored under $MOLD_HOME (am2Strata sets <Strata-data>/media).
+//! Models and their files come from mold's catalog, stored under $MOLD_HOME (Prastara sets <Strata-data>/media).
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -288,7 +288,7 @@ fn speak_chatterbox(_: &mut State, e: &'static audio::Entry, _: &Value) -> Resul
     bail!("{} runs on ONNX Runtime: this media engine was built without it (build with --features onnx)", e.name)
 }
 
-/// Models am2Strata adds to mold's catalog: another transformer on a family mold runs, with that family's shared
+/// Models Prastara adds to mold's catalog: another transformer on a family mold runs, with that family's shared
 /// files (text encoder, VAE, tokenizer) from the mold manifest named, and the licence those weights carry.
 struct Extra {
     name: &'static str,

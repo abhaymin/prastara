@@ -1,4 +1,4 @@
-# Server tools for every client: memory, web, media and MCP, run by am2Strata
+# Server tools for every client: memory, web, media and MCP, run by Prastara
 
 **State (2026-11-10):**
 - **Built:**
@@ -35,9 +35,9 @@
     - `"web_queries_per_turn": N`.
     Size and length are enforced on the API (403) and on the chat's media tools; past the search limit, the model is
     told so in the tool result. The main key is not limited. Tested: `a_client_profiles_size_length_and_search_limits_hold`.
-  - Settings › Clients is built (2026-11-11, read only: profiles with masked keys, from GET /api/clients); Settings › Connect saying which built-in tools am2Strata answers is still to do.
+  - Settings › Clients is built (2026-11-11, read only: profiles with masked keys, from GET /api/clients); Settings › Connect saying which built-in tools Prastara answers is still to do.
 
-The USP (owner, 2026-11-09): a client points at am2Strata, over the OpenAI, Anthropic or Responses API, locally or
+The USP (owner, 2026-11-09): a client points at Prastara, over the OpenAI, Anthropic or Responses API, locally or
 from another PC. It gets memory, web search, image, video and speech generation and the configured MCP tools,
 without setting up any of them. **The server runs the tools inside the call.** The client's configuration lives on
 the server.
@@ -74,9 +74,9 @@ the server.
   without a profile. A command (stdio) MCP server runs on this PC, so a profile gets it only by name, never with
   `mcp:*` (see MCP-UI-PLAN.md).
 
-## 2. The APIs' own built-in tools, answered by am2Strata
+## 2. The APIs' own built-in tools, answered by Prastara
 
-So an agent's own web-search button works against am2Strata as it does against the cloud:
+So an agent's own web-search button works against Prastara as it does against the cloud:
 - **Anthropic Messages:** the server tools `web_search_20250305` and `web_fetch_20250910` (Claude Code's WebSearch
   and WebFetch) run the server's search and fetch. They answer with `server_tool_use` and `web_search_tool_result` /
   `web_fetch_tool_result` blocks, and `usage.server_tool_use.web_search_requests`.
@@ -119,8 +119,8 @@ or with `unsloth start codex`, reaches the same memory, web, media and MCP tools
   picks the profile and its tools**. The header is optional, never needed.
 
 - `am2strata agentrun <agent> --url http://<host>:8000 --tools web,image` points the agent at the server with the
-  profile's key and header. Claude Code's WebSearch then goes to am2Strata's search, and Codex's `web_search` too.
-- Settings › Connect shows, per agent, which of its built-in tools am2Strata answers.
+  profile's key and header. Claude Code's WebSearch then goes to Prastara's search, and Codex's `web_search` too.
+- Settings › Connect shows, per agent, which of its built-in tools Prastara answers.
 
 ## Tests (mock engine, mock search, mock media)
 

@@ -1,9 +1,9 @@
-# am2Strata
+# Prastara
 
-![am2Strata: a local AI server in Rust, with a one-line install on Linux, macOS and Windows (x64 and Arm); OpenAI, Anthropic and Gemini APIs, API keys with usage, HTTPS and one live WebSocket; a Workshop for GGUF conversion, quantizing, LoRA merging and training data; a sandbox VM for computer use; coding agents, songs, voices, images and video](docs/media/banner.webp)
+![Prastara: a local AI server in Rust, with a one-line install on Linux, macOS and Windows (x64 and Arm); OpenAI, Anthropic and Gemini APIs, API keys with usage, HTTPS and one live WebSocket; a Workshop for GGUF conversion, quantizing, LoRA merging and training data; a sandbox VM for computer use; coding agents, songs, voices, images and video](docs/media/banner.webp)
 
-[![Release](https://img.shields.io/github/v/release/abhaymin/am2strata)](https://github.com/abhaymin/am2strata/releases/latest)
-[![GitHub stars](https://img.shields.io/github/stars/abhaymin/am2strata?style=flat&logo=github&label=Stars)](https://github.com/abhaymin/am2strata/stargazers)
+[![Release](https://img.shields.io/github/v/release/abhaymin/prastara)](https://github.com/abhaymin/prastara/releases/latest)
+[![GitHub stars](https://img.shields.io/github/stars/abhaymin/prastara?style=flat&logo=github&label=Stars)](https://github.com/abhaymin/prastara/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Sponsor](https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white)](https://github.com/sponsors/abhaymin)
 
@@ -16,13 +16,13 @@
 | ![Media Generation › Song: a festive Hindi Diwali song, 3 minutes, 3 takes](docs/media/screenshot-songs.webp) | ![Settings › Cluster: a Mac mini M4 paired as a worker, answering, encrypted (setup: docs/CLUSTER.md)](docs/media/screenshot-cluster.webp) | |
 
 <sub>Real screenshots of the web app (v0.1.1; Monitor and Songs v0.1.3; Cluster 2026-11-15 with a Mac mini M4 worker; the Workshop and Computer tabs are newer and not pictured yet) on a PC with two RTX 5060 Ti cards, running Tiel Coder 35B-A3B (Q8). The
-banner's background was made with am2Strata's media engine (Z-Image Turbo, Apache-2.0).</sub>
+banner's background was made with Prastara's media engine (Z-Image Turbo, Apache-2.0).</sub>
 
 **Watch:** [what's new in v0.1.4](https://youtu.be/HP4ztKaqOyo) (4 min: songs that sing their lyrics, MCP servers from
 the app, tools for every app, request routing) · [the full tour](https://youtu.be/OIHOplZPTmE) (10 min) ·
-[Peace and Harmony](https://youtu.be/37CjQ2mGrWo), a music video whose song, words and pictures am2Strata made.
+[Peace and Harmony](https://youtu.be/37CjQ2mGrWo), a music video whose song, words and pictures Prastara made.
 
-am2Strata is a local AI server written in Rust: the server, the tokenizer, chat templates, output parsing, the
+Prastara is a local AI server written in Rust: the server, the tokenizer, chat templates, output parsing, the
 Hugging Face downloader, the Workshop and the launcher. On NVIDIA cards, inference runs in native C++/CUDA engines;
 a Rust engine covers the CPU and, through wgpu, other GPUs.
 
@@ -32,7 +32,7 @@ settings. It is free and open source (MIT); see [Credits](#credits).
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/media/info-overview-dark.svg">
-  <img alt="am2Strata at a glance, in twelve cards: compatible APIs; bigger than RAM (hot experts in RAM, cold on the SSD, 2.5x llama.cpp's generation on a 16 GB Mac); cluster (pair a Mac or PC by code, small models on workers as experts); browser use; web app; Workshop; sandbox VM; Computer tab; coding agents; media; secure by default; install and verify on six platforms." src="docs/media/info-overview-light.svg">
+  <img alt="Prastara at a glance, in twelve cards: compatible APIs; bigger than RAM (hot experts in RAM, cold on the SSD, 2.5x llama.cpp's generation on a 16 GB Mac); cluster (pair a Mac or PC by code, small models on workers as experts); browser use; web app; Workshop; sandbox VM; Computer tab; coding agents; media; secure by default; install and verify on six platforms." src="docs/media/info-overview-light.svg">
 </picture>
 
 <picture>
@@ -45,7 +45,7 @@ settings. It is free and open source (MIT); see [Credits](#credits).
 | | |
 | --- | --- |
 | **Workshop** | Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result, all in Rust. Generate training data from your documents with the loaded model, then review and edit it. |
-| **Sandbox VM** | Computer use in its own small Debian virtual machine that am2Strata runs itself: the agent is root inside and can install anything, and your PC is untouched. Ad filtering (Pi-hole and AdGuard lists) and VPNs (Tailscale, NetBird, Mullvad, WireGuard, OpenVPN) inside it. Linux with KVM. |
+| **Sandbox VM** | Computer use in its own small Debian virtual machine that Prastara runs itself: the agent is root inside and can install anything, and your PC is untouched. Ad filtering (Pi-hole and AdGuard lists) and VPNs (Tailscale, NetBird, Mullvad, WireGuard, OpenVPN) inside it. Linux with KVM. |
 | **Computer tab** | Watch the desktop the agent works on, take control with your own mouse and keyboard, copy and paste across. |
 | **HTTPS and wss** | A self-signed, your own, or a Tailscale certificate, from Settings or one command. Plain HTTP keeps working beside it. |
 | **API keys and usage** | Make keys while the server runs, with tool sets, expiry, limits and allowed models; see requests and tokens per key and per model. |
@@ -58,25 +58,23 @@ channel) and [docs/REGRESSION.md](docs/REGRESSION.md).
 
 Plans and where each stands: [docs/LEDGER.md](docs/LEDGER.md).
 
-## Prastara: the name ahead
+## Why "Prastara"
 
-am2Strata is growing into **Prastara**: one platform that runs any model on any chip a machine has, made for the
-whole world. Until that app is ready, it keeps the name am2Strata.
-
-### Why "Prastara"
+Prastara was called am2Strata until version 0.2.0. It is one platform that runs any model on any chip a machine
+has, made for the whole world.
 
 **Prastara** (प्रस्तर, *prastara*) is Sanskrit for a stone or rock, and for something spread out flat: a layer, a
 bed, a level surface. It comes from *pra-* ("forth") and the root *stṛ* (स्तृ), "to spread, to lay out in layers".
 
 The same ancient root runs through Latin *sternere* ("to spread"), which gave English *stratum* and **strata**. So
-Prastara is Strata's own word in its oldest form. The project began as Strata, a way of laying a model out in layers
-across a machine: the hot parts on the GPU, the rest in memory and on disk. Prastara takes that idea to a new level.
+Prastara is the word *strata* in its oldest form, and that is what the platform does: it lays a model out in layers
+across a machine, the hot parts on the GPU and the rest in memory and on disk.
 
 A closely related word, *prastāra* (प्रस्तार), is the name Piṅgala's *Chandaḥśāstra* (around the 2nd century BCE)
 gives to the method of laying out every possible pattern in order, one of the earliest systematic enumerations in
 mathematics. Arranging the parts of a model across any hardware, in order, is what Prastara does.
 
-### The technology names
+## The technology names
 
 | Name | Sanskrit | Meaning | What it is |
 |---|---|---|---|
@@ -97,13 +95,13 @@ mathematics. Arranging the parts of a model across any hardware, in order, is wh
 **Linux (x86_64, arm64) and macOS (Apple silicon, Intel):**
 
 ```bash
-curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh
+curl -fsSL https://github.com/abhaymin/prastara/releases/latest/download/install.sh | sh
 ```
 
 **Windows (x64, Arm64), in PowerShell:**
 
 ```powershell
-irm https://github.com/abhaymin/am2strata/releases/latest/download/install.ps1 | iex
+irm https://github.com/abhaymin/prastara/releases/latest/download/install.ps1 | iex
 ```
 
 Then pull a small model and start the server:
@@ -148,7 +146,7 @@ Options go after `sh -s --`: `curl -fsSL .../install.sh | sh -s -- --service`. I
 "needs" names the Debian/Ubuntu packages (Homebrew's on macOS); the doctor report gives the command for your system.
 On Windows on Arm, a release without an Arm64 download installs the x64 one, which Windows runs emulated.
 
-You can also take the archive for your system from [Releases](https://github.com/abhaymin/am2strata/releases);
+You can also take the archive for your system from [Releases](https://github.com/abhaymin/prastara/releases);
 `QUICKSTART.md` inside takes a few minutes. These downloads run models on the CPU, or (see the table) on any GPU
 through wgpu, so they suit small models. The build from source below is the fast path, for NVIDIA cards.
 
@@ -157,10 +155,10 @@ through wgpu, so they suit small models. The build from source below is the fast
 ```bash
 am2strata agentrun opencode                      # or claude, codex, pi, qwen, aider, goose, gemini: one run, nothing changed
 am2strata agent setup codex --model <id>         # the agent's default from now on (its config backed up)
-am2strata agentrun claude --url http://<other-pc>:8000 --api-key ...   # another am2Strata
+am2strata agentrun claude --url http://<other-pc>:8000 --api-key ...   # another Prastara
 ```
 
-Claude Code, Codex, opencode, Pi, Factory Droid, Qwen Code, Aider, Goose and the Gemini CLI (through am2Strata's
+Claude Code, Codex, opencode, Pi, Factory Droid, Qwen Code, Aider, Goose and the Gemini CLI (through Prastara's
 Gemini API) are set up for you; Oh My Pi, Crush,
 Hermes, OpenClaw, Continue, Cline, Kilo Code, Zed and VS Code get the exact block to enter. See
 [docs/AGENTS.md](docs/AGENTS.md), or Settings › Connect › Coding agents.
@@ -170,7 +168,7 @@ Hermes, OpenClaw, Continue, Cline, Kilo Code, Zed and VS Code get the exact bloc
 ### Requirements
 
 - Linux and an NVIDIA GPU, with the C++/CUDA engines built (`strata`, `strata-poly`, `strata-vision`) and the run
-  configs (`strata-*.json`) beside them. By default am2Strata looks for both in `~/Development/PolyStrata`, and for
+  configs (`strata-*.json`) beside them. By default Prastara looks for both in `~/Development/PolyStrata`, and for
   models in `~/Development/Strata-data`.
 - Rust (stable). Optional: `ffmpeg` (video from API clients), `poppler-utils` (PDFs), `bubblewrap` (to run Python
   code from the chat in a sandbox).
@@ -293,7 +291,7 @@ MiniCPM-V and the others) over their line protocol.
 | Live channel `/v1/live` (pushes, requests over the socket, cancel) | done; the web app's chat streams over it (HTTP when not connected) | integration tests over ws and wss; live |
 | Installers and downloads for six platforms; `am2strata-run doctor` | done | built, installed, run and removed on GitHub's runners for each platform |
 | Regression suite (route contracts, response shapes, bug classes) and `am2strata-run regression` | done | CI; 20 of 20 checks against the live server |
-| Browser use for every client: forms, scraping into datasets, maps, site checks and tests; targets server, own Chrome, sandbox VM; Browser tab, CLI, `/v1/mcp/browser` ([docs/BROWSER-USE.md](docs/BROWSER-USE.md)) | done (after v0.1.8) | live tests on a real Chrome in CI; used by am2Strata to publish its own videos |
+| Browser use for every client: forms, scraping into datasets, maps, site checks and tests; targets server, own Chrome, sandbox VM; Browser tab, CLI, `/v1/mcp/browser` ([docs/BROWSER-USE.md](docs/BROWSER-USE.md)) | done (after v0.1.8) | live tests on a real Chrome in CI; used by Prastara to publish its own videos |
 | Media: images, video (chained past one clip), speech, songs, productions, dubbing, checks ([docs/MEDIA.md](docs/MEDIA.md)) | done; video productions, MP3 and the video checks without ffmpeg are not ([GAPS-PLAN](docs/GAPS-PLAN.md)) | live on the RTX 5060 Ti |
 | Client profiles: a key picks the tools ([docs/CLIENTS.md](docs/CLIENTS.md)) | done; editing in Settings is not | integration tests |
 | Hardware adaptation | GPU detection; refuses an engine not compiled for the card (with the fix); image encoder on the CPU below 15.5 GB of VRAM; encoder started before the engine so its VRAM is set aside | live on the RTX 5060 Ti |
@@ -303,12 +301,12 @@ this server, with 3,713 experts in VRAM; Orca's engine came up with an expert ca
 
 GPU builds: the C++/CUDA engines on the developer's PC are compiled for sm_86 and sm_120 (RTX 30 and RTX 50
 cards). Only the RTX 5060 Ti has been tested; an RTX 3060 should run the same build, but it has not been tried.
-am2Strata refuses an engine that is not compiled for the card, and says how to rebuild it.
+Prastara refuses an engine that is not compiled for the card, and says how to rebuild it.
 
 ## Tested on
 
 Everything above, the demo videos included, was built, tested and recorded on one PC. That PC also runs
-am2Strata day to day, as a user service that starts at boot.
+Prastara day to day, as a user service that starts at boot.
 
 | Part | What it is |
 | --- | --- |
@@ -341,7 +339,7 @@ Measured there, in normal use:
 
 Not tested yet on real hardware: macOS and Windows (the downloads are built for them, and the tests run there in
 CI), AMD and Intel GPUs, RTX 30 cards, and PCs with a single card under 16 GB. Reports from other machines are
-welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
+welcome in the [issues](https://github.com/abhaymin/prastara/issues).
 
 ## Not yet
 
@@ -349,7 +347,7 @@ welcome in the [issues](https://github.com/abhaymin/am2strata/issues).
   (`crates/strata-media`); the release downloads do not hold the media engine (its audio and video codecs have
   their own terms, see NOTICE). Images and video need an NVIDIA card (the `cuda` feature); speech to text and text
   to speech also run on the CPU, slowly for speech out. Tested on Linux only.
-- **Parallel slots and replicas:** not supported yet. am2Strata runs one request at a time on a model, and the
+- **Parallel slots and replicas:** not supported yet. Prastara runs one request at a time on a model, and the
   others wait in its queue (a paired cluster worker can take one).
 - **Training in the Workshop:** LoRA training of Llama-family models (Llama, Mistral, Qwen) works from the command
   line on the CPU (`am2strata-workshop train`, with `profile` and `autopilot` to fit the machine, and `soup.yaml`
@@ -382,12 +380,12 @@ The engine protocol is written down in [docs/PROTOCOL.md](docs/PROTOCOL.md).
 
 ## Support
 
-am2Strata is free and open source. If it is useful to you, you can support its development through
+Prastara is free and open source. If it is useful to you, you can support its development through
 [GitHub Sponsors](https://github.com/sponsors/abhaymin). Thank you.
 
 ## Credits
 
-am2Strata includes and derives from code of [Strata](https://github.com/Niko1221/Strata) and
+Prastara includes and derives from code of [Strata](https://github.com/Niko1221/Strata) and
 [PolyStrata](https://github.com/VecSzn/PolyStrata), both MIT (Copyright (c) 2026 Niko1221 and the Strata
 contributors): parts of the server, the tools and the web app, and the C++/CUDA engines, which are built from
 PolyStrata's source. Their licence text is in [web/LICENSE-PolyStrata.txt](web/LICENSE-PolyStrata.txt).
@@ -395,10 +393,10 @@ PolyStrata's source. Their licence text is in [web/LICENSE-PolyStrata.txt](web/L
 Thanks to [Unsloth](https://github.com/unslothai/unsloth) (Apache-2.0) for showing how one command can set up many
 coding agents on one local server: `unsloth start` with its many agent and model options is the model for
 `am2strata-run agent` / `agentrun` and Settings › Connect (written from scratch here; no Unsloth code is used).
-am2Strata also works as an endpoint for Unsloth Studio and `unsloth start`, and the Workshop merges Unsloth's LoRA
+Prastara also works as an endpoint for Unsloth Studio and `unsloth start`, and the Workshop merges Unsloth's LoRA
 adapters and writes training data in the `messages` format Unsloth reads.
 
-The other third-party work that am2Strata bundles, links or ports (Mermaid, the Outfit font, mold, the ggml
+The other third-party work that Prastara bundles, links or ports (Mermaid, the Outfit font, mold, the ggml
 quantizers, ACE-Step, Chatterbox, Parler-TTS and more) is listed with its licences in [NOTICE](NOTICE).
 
 ## License

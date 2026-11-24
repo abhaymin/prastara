@@ -1,4 +1,4 @@
-// web/app.js - the am2Strata web app (derived from PolyStrata's, MIT): Chat, Monitor, Settings, API calls. No framework, no network beyond this server.
+// web/app.js - the Prastara web app (derived from PolyStrata's, MIT): Chat, Monitor, Settings, API calls. No framework, no network beyond this server.
 // The Monitor tab rebuilds PR #22's dashboard idea (code-martin) on the server's own /metrics.
 "use strict";
 
@@ -1439,7 +1439,7 @@ function renderAbout(eng, hw, st) {
     `  -d '{"model": "${eng.id || eng.model}", "messages": [{"role": "user", "content": "Hello"}]}'`;
   facts($("facts-server"), [
     ["Address", base],
-    ["Server", "am2Strata (Rust)"],
+    ["Server", "Prastara (Rust)"],
     ["Model", eng.model ? `${eng.model}${eng.max_context ? ` · ${ctxfmt(eng.max_context)} context` : ""}` : "none loaded (the next request loads the default)"],
     ["API monitor", callsOn ? "on: the API calls tab keeps the last 100 calls in memory" : "off"],
     ["Video", health.video ? "frames cut on the server with ffmpeg; the web app decodes videos itself" : "the web app decodes videos itself; API clients need ffmpeg on the server"],
@@ -3088,7 +3088,7 @@ async function loadCluster() {
       (w.error ? `<div class="msg-error">${esc(w.error)}</div>` : "") +
       `<div class="mcp-server__tools">${(w.models || []).map((m) => `<span class="chip">${esc(m)}</span>`).join("") || '<span class="muted small">no models</span>'}</div></div>`).join("");
     html += (j.found || []).map((f) => `<div class="mcp-server"><div class="mcp-server__head"><strong>${esc(f.name)}</strong>` +
-      `<span class="st-badge st-badge--reading">Wants to join</span><span class="muted small">${esc(f.url)} · am2Strata ${esc(f.version)} · node ${esc(f.node_id.slice(0, 12))}</span></div>` +
+      `<span class="st-badge st-badge--reading">Wants to join</span><span class="muted small">${esc(f.url)} · Prastara ${esc(f.version)} · node ${esc(f.node_id.slice(0, 12))}</span></div>` +
       `<p><input class="st-input" inputmode="numeric" maxlength="6" placeholder="Its 6-digit code" data-code-for="${esc(f.node_id)}" style="width:10em"> ` +
       `<button class="st-btn st-btn--primary" data-pair="${esc(f.node_id)}">Pair</button></p></div>`).join("");
     if (j.role !== "worker") {
@@ -3419,7 +3419,7 @@ async function openCanvas(kind, code) {
   setMode("html");
   showHtml();
   canvasTab("page");
-  if (!issues.length) note("Sandboxed: scripts run, but the page cannot reach am2Strata or this browser's data.");
+  if (!issues.length) note("Sandboxed: scripts run, but the page cannot reach Prastara or this browser's data.");
   cv.url = await previewUrl(cv.html);                // for opening it in its own tab later
 }
 
@@ -3564,8 +3564,8 @@ function save(blob, name) {
 // ---- flows: Mermaid, drawn in a sandboxed frame with the library inline (the frame loads nothing)
 const DIAGRAMS = {
   flow: "flowchart TD\n  A([Request arrives]) --> B{Authorized?}\n  B -- no --> X[401 error]\n  B -- yes --> C{Model loaded?}\n  C -- no --> L[Load the engine] --> D\n  C -- yes --> D[Build the prompt]\n  D --> E[Generate tokens]\n  E --> F([Stream the answer])",
-  data: "%% animate\nflowchart LR\n  U[Browser] -->|chat request| S[am2Strata]\n  S -->|token ids| E[(Engine)]\n  E -->|KV cache| G[GPU VRAM]\n  E -->|experts| R[System RAM]\n  E -->|tokens| S\n  S -->|SSE stream| U",
-  seq: "sequenceDiagram\n  participant B as Browser\n  participant S as am2Strata\n  participant E as Engine\n  B->>S: POST /v1/chat/completions\n  S->>E: GEN prompt ids\n  loop each token\n    E-->>S: TOK id\n    S-->>B: data: delta\n  end\n  E-->>S: DONE timings\n  S-->>B: [DONE]",
+  data: "%% animate\nflowchart LR\n  U[Browser] -->|chat request| S[Prastara]\n  S -->|token ids| E[(Engine)]\n  E -->|KV cache| G[GPU VRAM]\n  E -->|experts| R[System RAM]\n  E -->|tokens| S\n  S -->|SSE stream| U",
+  seq: "sequenceDiagram\n  participant B as Browser\n  participant S as Prastara\n  participant E as Engine\n  B->>S: POST /v1/chat/completions\n  S->>E: GEN prompt ids\n  loop each token\n    E-->>S: TOK id\n    S-->>B: data: delta\n  end\n  E-->>S: DONE timings\n  S-->>B: [DONE]",
   state: "stateDiagram-v2\n  [*] --> Idle\n  Idle --> Reading: request\n  Reading --> Generating: prompt read\n  Generating --> Idle: done\n  Generating --> Idle: stopped\n  Reading --> Error: too long\n  Error --> Idle",
   class: "classDiagram\n  class Manager {\n    +models()\n    +load(id)\n    +unload()\n  }\n  class Engine {\n    +generate(ids)\n    +stop()\n  }\n  class Server\n  Server --> Manager\n  Manager --> Engine : drives",
   machine: "%% animate\nflowchart LR\n  subgraph Input\n    A[Camera] --> B[Frame grabber]\n  end\n  subgraph Processing\n    B --> C[Resize] --> D[Vision encoder]\n    D --> E[Language model]\n  end\n  subgraph Output\n    E --> F[Answer]\n    E --> G[(Log)]\n  end",
@@ -4464,11 +4464,11 @@ var APPS = {       // var: start-up reaches renderAppSetup before this line when
   "Unsloth": (b) => ["In a terminal, to start an agent (claude, codex, opencode, hermes, openclaw, pi or dsh) on this server. For Unsloth Studio's own chat: Settings > Connections > Add Provider > llama.cpp, with the same address followed by /v1 and the same key.",
     `export UNSLOTH_STUDIO_URL=${b}\nexport UNSLOTH_API_KEY=YOUR_API_KEY\nunsloth start claude`],
   "Codex CLI": (b, m) => ["In ~/.codex/config.toml, with AM2STRATA_API_KEY set in your shell:",
-    `model = "${m}"\nmodel_provider = "am2strata"\n\n[model_providers.am2strata]\nname = "am2Strata"\nbase_url = "${b}/v1"\nenv_key = "AM2STRATA_API_KEY"\nwire_api = "responses"`],
+    `model = "${m}"\nmodel_provider = "am2strata"\n\n[model_providers.am2strata]\nname = "Prastara"\nbase_url = "${b}/v1"\nenv_key = "AM2STRATA_API_KEY"\nwire_api = "responses"`],
   "opencode": (b, m) => ["In opencode.json:",
-    JSON.stringify({provider: {am2strata: {npm: "@ai-sdk/openai-compatible", name: "am2Strata", options: {baseURL: `${b}/v1`, apiKey: "YOUR_API_KEY"}, models: {[m]: {name: m}}}}}, null, 2)],
+    JSON.stringify({provider: {am2strata: {npm: "@ai-sdk/openai-compatible", name: "Prastara", options: {baseURL: `${b}/v1`, apiKey: "YOUR_API_KEY"}, models: {[m]: {name: m}}}}}, null, 2)],
   "Continue": (b, m) => ["In ~/.continue/config.yaml:",
-    `models:\n  - name: am2Strata\n    provider: openai\n    model: ${m}\n    apiBase: ${b}/v1\n    apiKey: YOUR_API_KEY`],
+    `models:\n  - name: Prastara\n    provider: openai\n    model: ${m}\n    apiBase: ${b}/v1\n    apiKey: YOUR_API_KEY`],
   "Cline / Roo Code": (b, m) => ["In the extension's settings, choose API provider: OpenAI Compatible, then:",
     `Base URL: ${b}/v1\nAPI key:  YOUR_API_KEY\nModel ID: ${m}`],
   "Open WebUI": (b) => ["As environment variables for Open WebUI:",
@@ -4893,7 +4893,7 @@ function cvDisconnect() { if (cvWs) { const w = cvWs; cvWs = null; w.close(); } 
 function cvRender(m) {
   cvState = m;
   const you = m.operator_in_control;
-  $("cv-who").textContent = you ? "You have control" : "am2Strata may act";
+  $("cv-who").textContent = you ? "You have control" : "Prastara may act";
   $("cv-who").className = `st-badge ${you ? "st-badge--generating" : ""}`;
   $("cv-info").textContent = m.target === "vm" ? `${m.width}×${m.height}${m.agent ? " · the agent works here" : ""}` : `display ${m.display} · ${m.width}×${m.height} · ${m.mode}`;
   $("cv-take").textContent = you ? "Hand back" : "Take control";

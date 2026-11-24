@@ -1,4 +1,4 @@
-# Clusters: several machines as one am2Strata
+# Clusters: several machines as one Prastara
 
 Owner's request (2026-11-10): machines on the same network, or remote ones the user pairs with keys (peer to peer),
 work together. A model's layers are shared across them, for quicker requests and longer context, as exo and other
@@ -55,7 +55,7 @@ order of the work. Each step is measured on real machines before the next starts
 
 - **Configuration:** the master's run config has
   `"cluster": {"workers": {"pc2": {"url": "http://host:8000", "key": "env:PC2_KEY"}}}`. A worker is an ordinary
-  am2Strata with its own API key, which only the master is given.
+  Prastara with its own API key, which only the master is given.
 - **Polling:** the master asks each worker for its models and queue every 5 s. A worker that has not answered for
   15 s gets no new work.
 - **Routing:** a chat (`/v1/chat/completions`, `/v1/messages`, `/v1/responses`, `/v1/completions`) goes to a worker
@@ -101,7 +101,7 @@ order of the work. Each step is measured on real machines before the next starts
 ## The parts
 
 1. **Nodes and joining.**
-   - Every am2Strata can be a node: `"cluster": {"role": "node"}`, or the Settings › Cluster page.
+   - Every Prastara can be a node: `"cluster": {"role": "node"}`, or the Settings › Cluster page.
    - **On the same network**, nodes find each other by mDNS (`_am2strata._tcp`). A new node shows as "wants to join"
      until the user accepts it on the main machine. Nothing joins by itself.
    - **Remote machines** pair with keys: each node has an ed25519 key pair; pairing exchanges public keys once, by a
@@ -163,7 +163,7 @@ order of the work. Each step is measured on real machines before the next starts
       **Rule:** an expert goes remote only when the round trip plus the remote compute beats reading it from the
       NVMe.
    1. **An expert host on the worker** (Rust, `am2strata-hybrid --serve-experts`).
-      - The worker's am2Strata starts it when its master asks.
+      - The worker's Prastara starts it when its master asks.
       - The master sends each assigned expert's tensors once over the pinned-TLS channel. The worker keeps them in RAM,
         cached on its disk by the model's hash.
       - It answers batched requests: {layer, the tokens' hidden states, each token's experts and weights} → their
@@ -214,9 +214,9 @@ order of the work. Each step is measured on real machines before the next starts
      2026-11-16) and whole requests routed to workers.
 
    **Media jobs on workers (owner, 2026-11-16): renders shared across machines.**
-   - **The ask:** video rendering run by am2Strata across the cluster, with the Mac helping, before upload.
+   - **The ask:** video rendering run by Prastara across the cluster, with the Mac helping, before upload.
    - **Today:** a media job (image, video, compose, speech) runs on the machine that received it; only chats are routed
-     to workers. Promo videos are rendered by scripts outside am2Strata.
+     to workers. Promo videos are rendered by scripts outside Prastara.
    - **Plan:**
      - `/v1/media/videos/compose` splits a render into independent segments;
      - the master sends a share of them to ready workers over the pinned cluster link (worker form, like experts), joins
@@ -268,7 +268,7 @@ order of the work. Each step is measured on real machines before the next starts
 
 The cluster has one **master** and any number of **workers**:
 - **The master:**
-  - is the am2Strata people and apps talk to; it holds the API keys, client profiles, memory, MCP servers and the
+  - is the Prastara people and apps talk to; it holds the API keys, client profiles, memory, MCP servers and the
     queue;
   - routes each request to a worker (phase 1) or splits a model across workers (phase 2);
   - streams the answer back.
@@ -345,7 +345,7 @@ The numbers go in this file before the feature is called done.
 ## One machine (owner, 2026-11-19)
 
 The owner's aim: the machines bond into **one larger machine**. Models, data, tools, compute, memory, storage and
-caches are shared through am2Strata's own pipeline. Each machine is the **main** one for the people using it, and the
+caches are shared through Prastara's own pipeline. Each machine is the **main** one for the people using it, and the
 others are its subordinates; this works both ways, so the PC uses the Mac and the Mac uses the PC. It must work with
 **any number** of machines, not just two.
 
@@ -358,7 +358,7 @@ It goes in phases. Each phase is measured before anything is claimed (see "Measu
 | C | Tools travel with a request | a routed request keeps its caller's tool sets (`x-strata-routed-tools`); memory and MCP stay on the main machine | built, 1c3f457 |
 | D | Both ways | each machine pairs with the other as its master too, so either can be the main one; the masters list and the workers list already allow it, and pairing in both directions is tested | next |
 | E | Tools across machines | a tool that exists on one machine only (its browser, its desktop, an MCP server, a model) is called from the other over the pinned link: a `remote_tool` call that the receiving side runs for its master's key, with the results streamed back | next |
-| F | Models and data shared | a model or media file on one machine is copied to another by am2Strata itself: content-addressed (the media library ids are hashes already), resumable, over the pinned TLS link, checked by hash, so no machine downloads the same model twice from the internet | next |
+| F | Models and data shared | a model or media file on one machine is copied to another by Prastara itself: content-addressed (the media library ids are hashes already), resumable, over the pinned TLS link, checked by hash, so no machine downloads the same model twice from the internet | next |
 | G | Caches shared | a prompt's KV prefix (the system prompt of an agent, a long document) made on one machine is reused by the other when it is cheaper to send than to recompute; embeddings and web-fetch caches are shared by key | after F |
 | H | Compute and memory pooled | one model split by layers across machines (phase 2 above: pipeline parallel, KV kept where its layers are). This is what pools memory: a model bigger than one machine runs at all, and the context is longer | after F, measured against llama.cpp RPC |
 | I | Storage pooled | a job's files are kept where they were made and read through the main machine (they already are, for media jobs); the free disk of each machine is shown and used by F | after F |
@@ -374,7 +374,7 @@ It goes in phases. Each phase is measured before anything is claimed (see "Measu
 
 ## Native media pipeline (owner, 2026-11-19)
 
-Compose and thumbnails need ffmpeg today, a tool to install on every machine. The aim: am2Strata's media engine does
+Compose and thumbnails need ffmpeg today, a tool to install on every machine. The aim: Prastara's media engine does
 this itself, in Rust, so a new machine needs nothing else. Parts:
 - **Decode:**
   - symphonia for audio (already in strata-media);

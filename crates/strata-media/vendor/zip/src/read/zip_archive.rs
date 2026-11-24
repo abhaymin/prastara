@@ -517,7 +517,7 @@ impl<R: Read + Seek> ZipArchive<R> {
             .map(|(file_name_raw, data)| data.name(file_name_raw))
     }
 
-    /// am2Strata: zip 8's `file_names()`, as `ZipFile::name()` (AM2STRATA.md).
+    /// Prastara: zip 8's `file_names()`, as `ZipFile::name()` (AM2STRATA.md).
     pub fn file_names(&self) -> impl Iterator<Item = &str> {
         self.shared
             .files

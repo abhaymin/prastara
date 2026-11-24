@@ -1,5 +1,5 @@
 #!/bin/sh
-# am2Strata from a release: runs from this folder and keeps models and settings in $AM2STRATA_DATA.
+# Prastara from a release: runs from this folder and keeps models and settings in $AM2STRATA_DATA.
 #   ./am2strata                          start the server (http://127.0.0.1:8000)
 #   ./am2strata pull <repo> [<quant>]    download a model from Hugging Face; no quant lists what the repository has
 #   ./am2strata doctor                   what this PC is ready for (PDFs, the browser tool, the Computer tab...) and what is missing

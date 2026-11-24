@@ -376,7 +376,7 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
         }
     }
     // mux the picture chain with the audio and the captions and cards burned in, one MP4 (H.264 + AAC, faststart).
-    // The captions are drawn by am2Strata (captions.rs) and laid on with ffmpeg's overlay, which every ffmpeg has;
+    // The captions are drawn by Prastara (captions.rs) and laid on with ffmpeg's overlay, which every ffmpeg has;
     // "captions_engine": "libass" uses the subtitles filter instead
     let out = dir.join(format!("{id}.mp4"));
     let picp = pictures.display().to_string();
@@ -583,7 +583,7 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
     Ok(("image/jpeg".into(), bytes, json!({"width": w, "height": h})))
 }
 
-/// The thumbnail itself, drawn by am2Strata (no ffmpeg): the picture filled to the frame and darkened towards the
+/// The thumbnail itself, drawn by Prastara (no ffmpeg): the picture filled to the frame and darkened towards the
 /// bottom so the words read, then the lines in bold, big and shaped (any script), each with a dark outline, stacked
 /// upwards from the lower third; the first line is the biggest. A tag, if any, sits small above them.
 pub fn thumbnail_picture(image: &[u8], w: u32, h: u32, lines: &[(String, String)], tag: Option<&str>) -> Result<Vec<u8>, String> {
@@ -726,7 +726,7 @@ mod tests {
     #[test]
     fn compose_needs_no_libass_only_stock_filters() {
         // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
-        // Homebrew's ffmpeg 9 has no libass (no subtitles filter): with captions drawn by am2Strata it composes all the same
+        // Homebrew's ffmpeg 9 has no libass (no subtitles filter): with captions drawn by Prastara it composes all the same
         let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade\n ... deflicker V->V even\n ... framerate V->V blend";
         let encoders = " V....D libx264  H.264\n A....D aac   AAC";
         assert_eq!(crate::media::missing_for_compose(filters, encoders), ["overlay"]);
@@ -926,9 +926,9 @@ mod tests {
     fn the_captions_are_written_as_ass_for_libass() {
         let captions = vec![
             crate::captions::Caption::new(0.5, 2.5, "Hello world", crate::captions::Place::Low, 1.0),
-            crate::captions::Caption::new(3.0, 5.0, "made by am2Strata", crate::captions::Place::Low, 1.0),
+            crate::captions::Caption::new(3.0, 5.0, "made by Prastara", crate::captions::Place::Low, 1.0),
         ];
-        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"), 200.0);
+        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("Prastara · free and open source"), 200.0);
         // ASS's own line format: "Dialogue: Layer,Start,End,Style,...", so libass shows them (a "0=" was skipped)
         assert!(ass.contains("Dialogue: 0,0:00:00.50,0:00:02.50,Cap,"), "{ass}");
         assert!(ass.contains("Dialogue: 0,0:03:10.00,0:03:20.00,Ttl,"), "a long video's end card is its last 10 s: {ass}");
@@ -939,7 +939,7 @@ mod tests {
         assert!(ass.contains("Style: Cap,DejaVu Sans,"), "the caption style is centred low");
         assert!(ass.contains("0:00:00.50") && ass.contains("0:00:02.50"), "each caption carries its start and end");
         assert!(ass.contains("\\fad(250,250)"), "a caption fades in and out so it does not snap");
-        assert!(ass.contains("Peace and Harmony") && ass.contains("am2Strata · free and open source"), "the cards are burned in too");
+        assert!(ass.contains("Peace and Harmony") && ass.contains("Prastara · free and open source"), "the cards are burned in too");
 
         // a centre word rides the second style (Word), vertically centred, scaled by its size; a top line goes to the top
         let centre = ass_script(1920, 1080, &[crate::captions::Caption::new(1.0, 3.0, "Harmony", crate::captions::Place::Centre, 2.0)], None, None, 4.0);

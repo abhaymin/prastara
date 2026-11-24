@@ -1445,7 +1445,7 @@ fn an_answer_for_a_client_that_went_away_does_not_go_to_the_next_request() {
     assert_eq!((code, r["task"].as_str()), (200, Some("transcribe")), "{r}");
 }
 
-/// 2026-11-19, am2Strata's producer: a `media image` client with a 60 s timeout gave up while the picture was made;
+/// 2026-11-19, Prastara's producer: a `media image` client with a 60 s timeout gave up while the picture was made;
 /// the handler (and its GPU turn) was dropped, the queue gave the GPU to the next chat, and the text model was started
 /// again and again over the media engine still working on the GPU. Now the job keeps its turn until it is done.
 #[test]
@@ -2617,7 +2617,7 @@ fn the_connect_page_lists_the_coding_agents_for_this_server_or_another() {
     assert!(get("cursor-agent")["why"].as_str().is_some());
     assert_eq!(r["model"], Model::default().id, "the loaded model");
     assert!(!r.to_string().contains(KEY), "the key is never in a guide");
-    // another am2Strata, with another model
+    // another Prastara, with another model
     let (_, r) = s.get("/api/agents?url=http://192.168.1.20:8000/&model=tiel", true);
     assert_eq!((r["url"].as_str(), r["model"].as_str()), (Some("http://192.168.1.20:8000"), Some("tiel")));
     let pi = r["agents"].as_array().unwrap().iter().find(|a| a["name"] == "omp").unwrap().clone();

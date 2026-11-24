@@ -166,7 +166,7 @@ impl WebTools {
 
     fn client() -> Result<reqwest::Client, String> {
         reqwest::Client::builder()
-            .user_agent("Mozilla/5.0 (X11; Linux x86_64) am2Strata")
+            .user_agent("Mozilla/5.0 (X11; Linux x86_64) Prastara")
             .timeout(Duration::from_secs(20))
             .build()
             .map_err(|e| e.to_string())

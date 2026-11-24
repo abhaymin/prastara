@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>am2Strata</title>
+<title>Prastara</title>
 <script src="./support.js"></script>
 </head>
 <body>
@@ -282,7 +282,7 @@ body{margin:0}
           </div>
           <div style="background: var(--panel); border: 1px solid var(--border); border-radius: 12px">
             <div style="display: flex; align-items: center; gap: 16px; padding: 14px 18px; border-bottom: 1px solid var(--border-soft)"><div style="flex: 1 1 auto"><div style="font-weight: 600">API monitor</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">Keep the last 100 API calls (bodies, output, timings) in memory for the API calls tab. No headers or keys are kept.</div></div><button type="button" role="switch" aria-checked="true" aria-label="API monitor" style="width: 44px; height: 26px; border-radius: 13px; border: 0; background: var(--accent); position: relative"><span style="position: absolute; top: 3px; left: 21px; width: 20px; height: 20px; border-radius: 50%; background: var(--on-accent)"></span></button></div>
-            <div style="display: flex; align-items: center; gap: 16px; padding: 14px 18px"><div style="flex: 1 1 auto"><div style="font-weight: 600">Start at boot</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">Make am2Strata the boot service in place of strata-orca (same configs and models). Off: PolyStrata starts at boot.</div></div><button type="button" role="switch" aria-checked="false" aria-label="Start at boot" style="width: 44px; height: 26px; border-radius: 13px; border: 1px solid var(--border-strong); background: var(--raised); position: relative"><span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--muted)"></span></button></div>
+            <div style="display: flex; align-items: center; gap: 16px; padding: 14px 18px"><div style="flex: 1 1 auto"><div style="font-weight: 600">Start at boot</div><div style="font-size: 12px; color: var(--muted); margin-top: 2px">Make Prastara the boot service in place of strata-orca (same configs and models). Off: PolyStrata starts at boot.</div></div><button type="button" role="switch" aria-checked="false" aria-label="Start at boot" style="width: 44px; height: 26px; border-radius: 13px; border: 1px solid var(--border-strong); background: var(--raised); position: relative"><span style="position: absolute; top: 3px; left: 3px; width: 18px; height: 18px; border-radius: 50%; background: var(--muted)"></span></button></div>
           </div>
         </div>
       </sc-if>
@@ -442,7 +442,7 @@ class Component extends DCLogic {
       { label: 'Decode', value: '91.8', unit: 'tok/s', note: 'last request 93.2', bar: bar(62, accent) },
       { label: 'Prefill', value: '887', unit: 'tok/s', note: '97,547-token prompt in 110 s', bar: bar(55, 'var(--info)') },
       { label: 'VRAM', value: '15.1', unit: '/ 16 GB', note: '5,760 experts cached (10.4 GB)', bar: bar(94, 'var(--warn)') },
-      { label: 'System RAM', value: '55.2', unit: '/ 60 GB', note: 'engine 52.2 GB · am2Strata 29 MB', bar: bar(92, 'var(--warn)') },
+      { label: 'System RAM', value: '55.2', unit: '/ 60 GB', note: 'engine 52.2 GB · Prastara 29 MB', bar: bar(92, 'var(--warn)') },
       { label: 'GPU load', value: '96', unit: '%', note: 'RTX 5060 Ti · sm_120', bar: bar(96, accent) },
       { label: 'GPU temp', value: '58', unit: '°C', note: 'power 142 of 180 W', bar: bar(58, accent) },
       { label: 'Conversation cache', value: '99', unit: '% reused', note: 'follow-up read 25 new tokens', bar: bar(99, 'var(--info)') },

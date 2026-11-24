@@ -1,6 +1,6 @@
 # Clients: keys, profiles and the tools a key gets
 
-A client is an app, a person or a machine that calls am2Strata with its own key. The key picks a **profile**, and the
+A client is an app, a person or a machine that calls Prastara with its own key. The key picks a **profile**, and the
 profile picks the server's tools that the client's requests get, with no flag in the request. That way an agent that
 can send only an address and a key gets the tools: Claude Code, Codex, opencode, and anything OpenAI- or
 Anthropic-compatible.

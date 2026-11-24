@@ -18,7 +18,7 @@ const SERVICE: &str = "Unsloth UI Backend";
 
 /// GET /api/health. It answers to no key, as Unsloth's does: the CLI asks before it has one.
 pub async fn health() -> Json<Value> {
-    Json(json!({"status": "healthy", "service": SERVICE, "server": "am2Strata"}))
+    Json(json!({"status": "healthy", "service": SERVICE, "server": "Prastara"}))
 }
 
 /// The model a request runs on: the loaded one, else the default one, which the first request loads again.
@@ -65,7 +65,7 @@ pub async fn load(State(s): State<AppState>, headers: HeaderMap, Json(req): Json
     let knobs = unknown_settings(&req);
     if !knobs.is_empty() {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error",
-                     format!("am2Strata takes these from the model's run config, so leave them out or change them in Settings: {}", knobs.join(", ")));
+                     format!("Prastara takes these from the model's run config, so leave them out or change them in Settings: {}", knobs.join(", ")));
     }
     let before = s.mgr.current().await.map(|l| l.entry.id.clone());
     match s.mgr.load(name).await {

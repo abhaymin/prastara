@@ -1,4 +1,4 @@
-# Chatterbox in am2Strata's media engine
+# Chatterbox in Prastara's media engine
 
 Goal: Resemble AI's Chatterbox text-to-speech (MIT), native in `crates/strata-media` on candle like Whisper and
 Parler. It gives:

@@ -1,19 +1,19 @@
 # Code-drawn films (owner, 2026-11-19)
 
-A film whose every frame is drawn in code: canvas or WebGL scenes, rendered frame by frame in am2Strata's own headless
-browser, with narration (Chatterbox or Parler), music (ACE-Step) and captions laid on by am2Strata's compose. It uses
+A film whose every frame is drawn in code: canvas or WebGL scenes, rendered frame by frame in Prastara's own headless
+browser, with narration (Chatterbox or Parler), music (ACE-Step) and captions laid on by Prastara's compose. It uses
 no video model and no stock footage. This suits explainers, product demos, infographics, data stories and the
 release videos, where diagrams, type and exact timing matter more than painted scenes. Generated pictures and clips
 stay the way for songs and moods.
 
 Lemo-Opuscar (github.com/lemomo-ai/lemo-opuscar) prompted the idea. Its code is MIT, but its style guides and prompts
-are CC BY-NC 4.0, and putting them into a product needs a commercial licence. So am2Strata ships **its own** scene kit
+are CC BY-NC 4.0, and putting them into a product needs a commercial licence. So Prastara ships **its own** scene kit
 and styles, written from scratch. Nothing of Opuscar's docs or prompts is copied.
 
 ## Why a scene kit, not free-form drawing code
 
 Opuscar relies on a frontier model writing each film's drawing code, and it says other models may not reproduce its
-styles well. am2Strata's producer runs on a local model. So the hard part goes into a tested library, and the model
+styles well. Prastara's producer runs on a local model. So the hard part goes into a tested library, and the model
 writes a **scene list** (JSON) that the library draws. The model writes code only for a scene the kit cannot express.
 A small model fills in a list reliably; it does not write good WebGL.
 
@@ -21,7 +21,7 @@ A small model fills in a list reliably; it does not write good WebGL.
 
 | # | Part | What | Where |
 |---|---|---|---|
-| 1 | **Frame renderer** | `POST /v1/media/films` `{"page": html or files, "seconds", "fps", "size", "audio"?, "captions"?, "title_card"?, "end_card"?}` gives a media job. am2Strata opens the page in its headless browser at the exact size. The page exports `window.film = {duration, draw(t)}`. For each frame the renderer calls `draw(t)` with an exact time (no real clock, no timers: deterministic) and captures the frame (CDP `Page.captureScreenshot` into PNG, or the canvas read back), then sends the frames into compose's encoder with the audio and captions. Pages run with no network: fonts and assets are served from the job. | `crates/am2strata/src/films.rs`, `browser.rs` |
+| 1 | **Frame renderer** | `POST /v1/media/films` `{"page": html or files, "seconds", "fps", "size", "audio"?, "captions"?, "title_card"?, "end_card"?}` gives a media job. Prastara opens the page in its headless browser at the exact size. The page exports `window.film = {duration, draw(t)}`. For each frame the renderer calls `draw(t)` with an exact time (no real clock, no timers: deterministic) and captures the frame (CDP `Page.captureScreenshot` into PNG, or the canvas read back), then sends the frames into compose's encoder with the audio and captions. Pages run with no network: fonts and assets are served from the job. | `crates/am2strata/src/films.rs`, `browser.rs` |
 | 2 | **Stills for the judge** | `media film --stills 8` renders 8 frames as PNGs without encoding, so the producer and the judge can check a film before the minutes of a full render. | the same |
 | 3 | **Scene kit** | `web/films/kit.js` (MIT, ours), drawing in canvas 2D first. Components: title, kinetic type, a bullet build, a bar/line/pie chart that animates, a flow diagram with nodes and arrows, a machine/cluster diagram (boxes linked, packets moving), a terminal typing a command and its output, a UI screenshot with a pan, zoom and highlight, a code block with lines lighting up, a number counter, a comparison table, a map pin, and a lower third. Each component: `(t, props) -> draws`, with easing and enter/exit. | `web/films/` |
 | 4 | **Styles** (ours) | 5 to start: **Blueprint** (white lines on blue, grid); **Isometric Infographic** (soft 3D blocks); **Terminal Night** (dark mono, green and amber); **Paper Explainer** (warm paper, ink lines, a handwritten feel); **Clean Product** (white, one accent colour, big type). Each style is a palette, fonts (shipped with their licences), line weights, motion rules and a `STYLE.md`, plus a short demo film made with the kit. | `web/films/styles/` |

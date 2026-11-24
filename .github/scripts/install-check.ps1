@@ -9,8 +9,8 @@ $Install = Join-Path $Root "deploy\release\install.ps1"
 $Ver = (Select-String -Path (Join-Path $Root "Cargo.toml") -Pattern '^version = "(.*)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 $Dir = Join-Path $env:LOCALAPPDATA "am2strata"
 $Bin = Join-Path $Dir "bin"
-$Startup = Join-Path ([Environment]::GetFolderPath("Startup")) "am2Strata server.lnk"
-$Menu = Join-Path ([Environment]::GetFolderPath("Programs")) "am2Strata.lnk"
+$Startup = Join-Path ([Environment]::GetFolderPath("Startup")) "Prastara server.lnk"
+$Menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Prastara.lnk"
 function Step([string]$s) { Write-Host ""; Write-Host "== $s" }
 function Die([string]$s) { throw "install-check: $s" }
 # a native command's output as one string, whatever it exits with (the launcher's "no model yet" exits 1)
@@ -53,7 +53,7 @@ Step "install (as the one-line form runs it: a script block), picking this PC's 
 $log = & ([scriptblock]::Create((Get-Content $Install -Raw))) -From $Dist 6>&1 | ForEach-Object { "$_" }
 $log | ForEach-Object { Write-Host $_ }
 $text = $log -join "`n"
-if ($text -notmatch [regex]::Escape("Installed am2Strata v$Ver ($Label)")) { Die "it did not install $Label" }
+if ($text -notmatch [regex]::Escape("Installed Prastara v$Ver ($Label)")) { Die "it did not install $Label" }
 if ($text -notmatch "ready\s+HTTPS") { Die "the installer printed no doctor report" }
 $App = Join-Path $Dir "app\am2strata-$Ver-$Label"
 if (-not (Test-Path "$App\poppler\bin\pdftotext.exe")) { Die "no bundled poppler" }

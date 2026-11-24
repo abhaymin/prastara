@@ -448,7 +448,7 @@ impl Conn {
 
     async fn ready(&mut self) -> bool {
         let topics: Vec<&str> = TOPICS.iter().copied().filter(|t| self.role.may(t)).collect();
-        let mut v = json!({"type": "ready", "role": self.role.name(), "topics": topics, "server": "am2Strata", "version": env!("CARGO_PKG_VERSION")});
+        let mut v = json!({"type": "ready", "role": self.role.name(), "topics": topics, "server": "Prastara", "version": env!("CARGO_PKG_VERSION")});
         if let Role::Client(name) = &self.role {
             v["client"] = json!(name);
         }

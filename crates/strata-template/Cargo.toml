@@ -1,6 +1,6 @@
 [package]
 name = "strata-template"
-description = "Chat template rendering (Jinja) for the am2Strata server"
+description = "Chat template rendering (Jinja) for the Prastara server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

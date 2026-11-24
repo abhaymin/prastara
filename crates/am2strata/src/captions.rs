@@ -1,4 +1,4 @@
-//! Captions and title cards drawn by am2Strata itself, so compose needs no libass (Homebrew's ffmpeg has none, and
+//! Captions and title cards drawn by Prastara itself, so compose needs no libass (Homebrew's ffmpeg has none, and
 //! a new machine needs fewer tools). Text is shaped with rustybuzz (Devanagari and Malayalam need shaping: conjuncts,
 //! vowel signs before the consonant) and drawn with ab_glyph into a small RGBA box picture. ffmpeg's `overlay`, which
 //! every build has, then lays each box on the video for its own seconds, fading in and out over a quarter second.

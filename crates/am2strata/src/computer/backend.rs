@@ -322,8 +322,8 @@ mod linux {
     /// display number back on a pipe, so there is no window between choosing a number and starting Xvfb for another server to
     /// take it (and we never talk to a display we did not start). Returns the running child and the display name it wrote
     /// (`:NN`); `-nolisten tcp` keeps it off TCP, and if Xvfb exits early or writes nothing within 5 s this returns an error.
-    /// Sandbox displays left by an am2Strata that died without cleaning up (a crash, an out-of-memory kill, SIGKILL):
-    /// Xvfb with exactly our arguments whose parent is no longer an am2Strata server. Stopped before a new one starts,
+    /// Sandbox displays left by an Prastara that died without cleaning up (a crash, an out-of-memory kill, SIGKILL):
+    /// Xvfb with exactly our arguments whose parent is no longer an Prastara server. Stopped before a new one starts,
     /// so they do not pile up. Another running server's display (its parent is that server) is never touched.
     fn reap_orphan_sandboxes() {
         let Ok(rd) = std::fs::read_dir("/proc") else { return };

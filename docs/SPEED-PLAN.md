@@ -2,9 +2,9 @@
 
 basalt (github.com/jesdga95/basalt, MIT) is a Strata downstream that runs big MoE models fast with their experts
 mostly in system RAM. Its kernels are CUDA for Blackwell (sm_120) only. The owner's rule: **take its ideas into
-am2Strata, but every feature must work on every GPU am2Strata supports, not just RTX 50x0.**
+Prastara, but every feature must work on every GPU Prastara supports, not just RTX 50x0.**
 
-am2Strata's engine (strata-hybrid, kernels in strata-gpu) is already written for that. Its kernels are **CubeCL**:
+Prastara's engine (strata-hybrid, kernels in strata-gpu) is already written for that. Its kernels are **CubeCL**:
 one Rust source compiled at run time for CUDA (NVIDIA, any generation), HIP (AMD ROCm) and wgpu (any Vulkan, Metal
 or DX12 GPU, integrated ones included), with a native Metal path for Apple GPUs. So each feature below is built on
 CubeCL and host-side Rust, never as backend-specific code. A backend-specific fast path, such as a CUDA graph, is
@@ -15,7 +15,7 @@ only ever an option on top of a portable path that works without it.
 | Engine | Orca (qwen4exp, IQ3_XXS) on 2x RTX 5060 Ti |
 |---|---|
 | the live C++ engine (PolyStrata, CUDA only) | ~72 tok/s mean (median 84); 91-98% of experts from VRAM; 84% draft acceptance, 1.24 drafts per window |
-| am2Strata's Rust engine | ~0.4 tok/s, CPU only: no IQ3_XXS or IQ2_S GPU kernel, so no expert can go on a GPU |
+| Prastara's Rust engine | ~0.4 tok/s, CPU only: no IQ3_XXS or IQ2_S GPU kernel, so no expert can go on a GPU |
 | basalt, self-reported | conversation-like decode ~90-165 tok/s, mostly from a VRAM expert cache plus drafting |
 
 ## The features, each for every backend
@@ -37,13 +37,13 @@ engine takes **basalt's own approach** as a fast tier. It is picked at run time 
 capability, and every other GPU keeps the portable path above. The portable path stays the reference: the Blackwell
 tier must give the same tokens (the parity gate) and be measurably faster, or it is not used.
 
-| Blackwell feature (as basalt does it) | In am2Strata |
+| Blackwell feature (as basalt does it) | In Prastara |
 |---|---|
 | Kernels tuned for sm_120: its tile sizes, warp layout and async copies (cp.async / TMA) for the expert products | CubeCL's CUDA target first, tuned for sm_120, with tensor-core matrix ops (CubeCL `cmma`) for prefill |
 | **NVFP4 weights** on Blackwell's FP4 tensor cores | Optional. A Workshop quantize step writes NVFP4 (our own GGUF writer), and an FP4 matrix kernel runs where the card has FP4 tensor cores. On 16 GB cards basalt measured no gain (156.6 against IQ3_XXS's 229.6), so it is for the bigger cards (32 GB and up), measured first |
 | basalt's tuned decode settings for sm_120: draft depth, window cost table, PCIe share | The same host logic as the portable path, with sm_120's measured costs as its starting table |
 
-**The open choice (the owner's):** basalt's fastest kernels are hand-written CUDA C++. am2Strata is all Rust (its
+**The open choice (the owner's):** basalt's fastest kernels are hand-written CUDA C++. Prastara is all Rust (its
 GPU code is CubeCL).
 - **(a) CubeCL only.** The Blackwell tier is written in CubeCL with its CUDA-only features. It stays all Rust, but
   may fall short of basalt where CubeCL cannot express a Blackwell instruction (FP4 MMA, TMA).

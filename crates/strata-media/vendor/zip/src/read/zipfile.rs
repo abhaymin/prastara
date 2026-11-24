@@ -83,7 +83,7 @@ macro_rules! zip_file_methods {
             self.get_metadata().name(&self.file_name_raw)
         }
 
-        /// am2Strata: zip 8's `name()`, which candle and mold call (AM2STRATA.md). A name that is not UTF-8 reads as
+        /// Prastara: zip 8's `name()`, which candle and mold call (AM2STRATA.md). A name that is not UTF-8 reads as
         /// U+FFFD, so it matches nothing, rather than as a guess; `decoded_name` also decodes CP437.
         pub fn name(&self) -> &str {
             std::str::from_utf8(&self.file_name_raw).unwrap_or("\u{FFFD}")

@@ -554,7 +554,7 @@ mod tests {
 
     // ---------------------------------------------------------------------------------------------------------------
     // Regressions (docs/REGRESSION.md): bugs fixed in review of PR #13
-    // (https://github.com/abhaymin/am2strata/pull/13). Every bug fix adds its test here.
+    // (https://github.com/abhaymin/prastara/pull/13). Every bug fix adds its test here.
     // ---------------------------------------------------------------------------------------------------------------
 
     /// `chunk` on its own thread with a deadline: a chunker that loops forever fails the test in two seconds instead

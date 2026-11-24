@@ -1,7 +1,7 @@
 # llama.cpp as the reference for am2strata-hybrid
 
 `am2strata-hybrid` (crates/strata-hybrid) is checked against llama.cpp, used here only as a test oracle - it is never
-built into or run by am2Strata. The oracle is a copy of PolyStrata's bundled llama.cpp (PolyStrata itself is not
+built into or run by Prastara. The oracle is a copy of PolyStrata's bundled llama.cpp (PolyStrata itself is not
 changed), built for the CPU, with one patch.
 
 ## Build the oracle
@@ -29,7 +29,7 @@ layers, 496 in the header) keep each layer's expert count only in the tensor sha
   (llama.cpp's own top two within `TIE`, default 0.25, and the engine's choice one of them). `ENGINE_ARGS` go to the
   engine (e.g. `--pack DIR --resident-experts`).
 - `cargo test --release --manifest-path crates/strata-media/Cargo.toml -p strata-hybrid -- --ignored` with
-  `STRATA_MODELS=a.gguf:b.gguf`: the tokenizer test (am2Strata's tokenizer, extracted from each GGUF, against
+  `STRATA_MODELS=a.gguf:b.gguf`: the tokenizer test (Prastara's tokenizer, extracted from each GGUF, against
   llama.cpp's ids on a set of texts) and the forward test (parity.sh per model).
 
 The oracle runs without llama.cpp's CPU repack (`use_extra_bufts = false`), which would copy the whole model into RAM: Orca's

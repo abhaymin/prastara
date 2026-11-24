@@ -24,6 +24,6 @@ cat > "$DEST/poppler/README.txt" <<EOF
 Poppler $VER for Windows (pdftotext, pdftoppm), as built by https://github.com/oschwartz10612/poppler-windows ($TAG).
 Poppler is free software under the GNU General Public License, version 2 or later: share/poppler/COPYING*.
 Its source: https://poppler.freedesktop.org/poppler-$VER.tar.xz, and the build recipe at the link above.
-am2Strata runs these programs as they are, to read PDF files; they are not part of am2Strata's own MIT-licensed code.
+Prastara runs these programs as they are, to read PDF files; they are not part of Prastara's own MIT-licensed code.
 EOF
 echo "poppler $VER -> $DEST/poppler"

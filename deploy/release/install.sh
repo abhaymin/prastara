@@ -1,23 +1,23 @@
 #!/bin/sh
-# am2Strata installer for Linux (x86_64, arm64) and macOS (Apple silicon, Intel): the latest release, checked against
+# Prastara installer for Linux (x86_64, arm64) and macOS (Apple silicon, Intel): the latest release, checked against
 # its SHA-256. No sudo: everything goes under your home folder.
 #
-#   curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh
+#   curl -fsSL https://github.com/abhaymin/prastara/releases/latest/download/install.sh | sh
 #   curl -fsSL .../install.sh | sh -s -- [options]
 #
 # See usage() below for the options. The program goes into ~/.local/share/am2strata/app, your models and settings stay
 # beside it in ~/.local/share/am2strata, and `am2strata`, `am2strata-run` and `am2strata-workshop` go into ~/.local/bin.
 set -eu
 
-REPO=abhaymin/am2strata
+REPO=abhaymin/prastara
 UNIT=am2strata-app.service                 # the systemd user service --service makes (Linux)
 AGENT=io.github.abhaymin.am2strata         # the launchd agent --service makes (macOS)
-MARK="# written by am2Strata's install.sh"  # in every file this script writes outside its own folder: only those are removed
+MARK="# written by Prastara's install.sh"  # in every file this script writes outside its own folder: only those are removed
 MIN_GLIBC=2.35                             # the Linux downloads are built on Ubuntu 22.04
 
 usage() {
     cat <<EOF
-am2Strata installer (Linux x86_64/arm64, macOS Apple silicon/Intel)
+Prastara installer (Linux x86_64/arm64, macOS Apple silicon/Intel)
 
   curl -fsSL https://github.com/$REPO/releases/latest/download/install.sh | sh
   curl -fsSL .../install.sh | sh -s -- [options]
@@ -88,7 +88,7 @@ check_dir() {
 }
 
 # is this one of the files we wrote? (never remove anything else of that name)
-ours() { [ -f "$1" ] && grep -q "am2Strata's install.sh" "$1" 2>/dev/null; }
+ours() { [ -f "$1" ] && grep -q "Prastara's install.sh" "$1" 2>/dev/null; }
 
 service_remove() {
     unit_file="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user/$UNIT"
@@ -115,7 +115,7 @@ service_install() {
             cat > "$unit_dir/$UNIT" <<EOF
 $MARK
 [Unit]
-Description=am2Strata
+Description=Prastara
 After=network-online.target
 ConditionPathExistsGlob=$DIR/strata-*.json
 
@@ -186,7 +186,7 @@ uninstall() {
     # the launcher of installers before this one: a two-line wrapper naming this folder
     if [ -f "$BIN/am2strata" ] && grep -q "exec \"$APPS/current/am2strata\"" "$BIN/am2strata" 2>/dev/null; then rm -f "$BIN/am2strata"; fi
     rm -rf "$APPS"
-    say "Removed am2Strata. Your models and settings are still in $DIR (delete that folder to remove them too)."
+    say "Removed Prastara. Your models and settings are still in $DIR (delete that folder to remove them too)."
 }
 
 have_chrome() {
@@ -237,7 +237,7 @@ shell_doctor() {
         MISSING=""
     }
     MISSING=""
-    say "am2Strata on $LABEL"
+    say "Prastara on $LABEL"
     say ""
     printf '  %-9s %-31s %s\n' ready "HTTPS" "built in"
     need pdftotext poppler-utils poppler-utils poppler poppler
@@ -339,10 +339,10 @@ doctor() {
             say ""
             "$run" doctor --data-dir "$DIR/data" 2>/dev/null || true
         else
-            say "That command failed; am2Strata itself is installed and works without the optional features."
+            say "That command failed; Prastara itself is installed and works without the optional features."
         fi
     else
-        say "Not run. am2Strata works without it; the features above stay off until you install them."
+        say "Not run. Prastara works without it; the features above stay off until you install them."
     fi
 }
 
@@ -423,7 +423,7 @@ main() {
         url=https://github.com/$REPO/releases/download/$VERSION
         ARCHIVE=$TMP/$NAME.tar.gz
         SUMFILE=$ARCHIVE.sha256
-        say "Downloading am2Strata $VERSION for $LABEL..."
+        say "Downloading Prastara $VERSION for $LABEL..."
         curl -fL --progress-bar -o "$ARCHIVE" "$url/$NAME.tar.gz" \
             || fail "no download $NAME.tar.gz in release $VERSION ($url): that release may be from before $LABEL was built; see https://github.com/$REPO/releases"
         curl -fsSL -o "$SUMFILE" "$url/$NAME.tar.gz.sha256" || fail "release $VERSION has no checksum file for $NAME: nothing was installed"
@@ -462,7 +462,7 @@ EOF
     for d in "$APPS"/am2strata-*; do
         [ "$d" = "$APPS/$NAME" ] || rm -rf "$d"
     done
-    say "Installed am2Strata $VERSION in $APPS/$NAME"
+    say "Installed Prastara $VERSION in $APPS/$NAME"
     if ls "$DIR"/strata-*.json >/dev/null 2>&1; then say "Your models and settings in $DIR were kept as they are."; fi
 
     if [ "$BROWSER" = 1 ]; then fetch_browser; fi

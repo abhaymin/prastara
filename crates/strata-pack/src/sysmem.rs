@@ -1,5 +1,5 @@
 //! This machine's RAM, in MiB, on Linux (/proc/meminfo), macOS (hw.memsize, host_statistics64) and Windows
-//! (GlobalMemoryStatusEx). The one place RAM is read: am2Strata's server (mem.rs) and the Rust engine use it.
+//! (GlobalMemoryStatusEx). The one place RAM is read: Prastara's server (mem.rs) and the Rust engine use it.
 
 /// Total RAM this PC has (MiB; 0 when it cannot tell): /proc/meminfo here, hw.memsize on macOS, GlobalMemoryStatusEx on Windows.
 pub fn total_mib() -> u64 {

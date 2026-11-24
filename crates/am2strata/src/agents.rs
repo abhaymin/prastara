@@ -1,9 +1,9 @@
-//! Coding agents on am2Strata, on this PC or another one (`am2strata agent ...`, GET /api/agents): what
+//! Coding agents on Prastara, on this PC or another one (`am2strata agent ...`, GET /api/agents): what
 //! `unsloth start` and OmniRoute's `run` / `setup-<tool>` do, for this server.
 //!
-//! - **start**: the agent runs once against am2Strata, set up for that run only (environment variables, flags, or a
+//! - **start**: the agent runs once against Prastara, set up for that run only (environment variables, flags, or a
 //!   config in a temporary folder); nothing of the user's changes.
-//! - **setup**: the agent's own config file gets an am2Strata provider and its default model (the model override).
+//! - **setup**: the agent's own config file gets an Prastara provider and its default model (the model override).
 //!   The file is backed up first (<file>.am2strata-backup) and `reset` puts it back. The API key stays out of the
 //!   file: the config names the variable AM2STRATA_API_KEY, which the user's shell sets.
 //! - **guide**: what to enter, for agents whose config is a settings page or a format not written here.
@@ -67,7 +67,7 @@ pub const AGENTS: &[Agent] = &[
     Agent { name: "goose", label: "Goose", exe: "goose", api: "openai", support: Support::Start,
             checked: "Goose's OpenAI provider variables (OPENAI_HOST, OPENAI_BASE_PATH)" },
     Agent { name: "gemini", label: "Gemini CLI", exe: "gemini", api: "gemini", support: Support::Start,
-            checked: "am2Strata's /v1beta Gemini API (tested with Google's request shapes); the CLI's GOOGLE_GEMINI_BASE_URL, as OmniRoute runs it" },
+            checked: "Prastara's /v1beta Gemini API (tested with Google's request shapes); the CLI's GOOGLE_GEMINI_BASE_URL, as OmniRoute runs it" },
     Agent { name: "omp", label: "Oh My Pi", exe: "omp", api: "openai", support: Support::Guide,
             checked: "Oh My Pi's README (~/.omp/agent/models.yml)" },
     Agent { name: "crush", label: "Crush", exe: "crush", api: "openai", support: Support::Guide,
@@ -87,7 +87,7 @@ pub const AGENTS: &[Agent] = &[
     Agent { name: "vscode", label: "VS Code (Copilot Chat)", exe: "code", api: "openai", support: Support::Guide,
             checked: "Copilot Chat's custom OpenAI-compatible model entry" },
     Agent { name: "agy", label: "Antigravity CLI", exe: "agy", api: "-", support: Support::No(
-        "Antigravity takes no custom model endpoint; OmniRoute reaches it only by intercepting its traffic (MITM), which am2Strata does not do"),
+        "Antigravity takes no custom model endpoint; OmniRoute reaches it only by intercepting its traffic (MITM), which Prastara does not do"),
             checked: "-" },
     Agent { name: "cursor-agent", label: "Cursor CLI", exe: "cursor-agent", api: "-", support: Support::No(
         "the Cursor CLI documents no custom base URL; its models run on Cursor's servers"),
@@ -239,7 +239,7 @@ pub fn start(name: &str, t: &Target, tmp: &Path) -> Result<Plan, String> {
 }
 
 fn codex_provider_toml(t: &Target) -> String {
-    let mut s = format!("name = \"am2Strata\", base_url = \"{}\", wire_api = \"responses\"", t.v1());
+    let mut s = format!("name = \"Prastara\", base_url = \"{}\", wire_api = \"responses\"", t.v1());
     if t.key.is_some() {
         s.push_str(&format!(", env_key = \"{KEY_VAR}\""));
     }
@@ -249,7 +249,7 @@ fn codex_provider_toml(t: &Target) -> String {
     s
 }
 
-/// Codex's -c overrides: an am2Strata provider for this run, and the model.
+/// Codex's -c overrides: an Prastara provider for this run, and the model.
 fn codex_overrides(t: &Target) -> Vec<String> {
     vec!["-c".into(), format!("model_providers.{PROVIDER}={{ {} }}", codex_provider_toml(t)),
          "-c".into(), format!("model_provider=\"{PROVIDER}\""),
@@ -270,7 +270,7 @@ fn opencode_config(t: &Target) -> Value {
         models.insert(m.to_string(), json!({"name": m}));
     }
     json!({"$schema": "https://opencode.ai/config.json",
-           "provider": {PROVIDER: {"npm": "@ai-sdk/openai-compatible", "name": "am2Strata",
+           "provider": {PROVIDER: {"npm": "@ai-sdk/openai-compatible", "name": "Prastara",
                                    "options": opencode_options(t),
                                    "models": models}},
            "model": format!("{PROVIDER}/{}", t.model),
@@ -362,9 +362,9 @@ pub fn setup(name: &str, t: &Target, home: &Path) -> Result<Vec<Change>, String>
         })?]),
         "droid" => Ok(vec![json_change(home.join(".factory/settings.json"), &|v| {
             let mut list: Vec<Value> = v["customModels"].as_array().cloned().unwrap_or_default();
-            list.retain(|m| !m["displayName"].as_str().is_some_and(|d| d.starts_with("am2Strata: ")));
+            list.retain(|m| !m["displayName"].as_str().is_some_and(|d| (d.starts_with("Prastara: ") || d.starts_with("am2Strata: "))));
             let mut add = |m: &str| {
-                let mut e = json!({"model": m, "displayName": format!("am2Strata: {m}"), "baseUrl": t.root(), "provider": "anthropic"});
+                let mut e = json!({"model": m, "displayName": format!("Prastara: {m}"), "baseUrl": t.root(), "provider": "anthropic"});
                 if t.key.is_some() {
                     e["apiKey"] = json!(format!("${{{KEY_VAR}}}"));
                 }
@@ -388,7 +388,7 @@ pub fn setup(name: &str, t: &Target, home: &Path) -> Result<Vec<Change>, String>
 const BEGIN: &str = "# >>> am2strata (am2strata agent setup codex; agent reset codex removes it)";
 const END: &str = "# <<< am2strata";
 
-/// Codex's config.toml with am2Strata as the default provider. Top-level keys must come before the first table, so
+/// Codex's config.toml with Prastara as the default provider. Top-level keys must come before the first table, so
 /// the block goes first; a `model` or `model_provider` the user had is commented out (reset brings it back).
 fn codex_toml(old: &str, t: &Target) -> String {
     let mut rest = String::new();
@@ -489,7 +489,7 @@ pub fn guide(name: &str, t: &Target) -> Result<String, String> {
             "For one run (nothing of yours changes):\n  {}\nAs the default from now on (your config is backed up; `agent reset {}` restores it):\n  {}\n{}",
             cmd("start"), a.name, cmd("setup"),
             if t.key.is_some() { format!("Both read the key from {KEY_VAR} in your shell.") } else { String::new() }),
-        "droid" => format!("{}\nThen pick \"am2Strata: {}\" with /model in droid.", cmd("setup"), t.model),
+        "droid" => format!("{}\nThen pick \"Prastara: {}\" with /model in droid.", cmd("setup"), t.model),
         "qwen" | "aider" | "goose" | "gemini" => {
             let p = start(a.name, t, Path::new("/tmp")).unwrap();
             let vars: Vec<String> = p.env.iter().filter(|(k, _)| k != KEY_VAR)
@@ -499,8 +499,8 @@ pub fn guide(name: &str, t: &Target) -> Result<String, String> {
         }
         "omp" => format!("In ~/.omp/agent/models.yml:\nproviders:\n  am2strata:\n    baseUrl: {}\n    api: openai-completions\n    apiKey: {}\n    models:\n      - id: {}\nThen choose am2strata/{} in omp.", t.v1(), key, t.model, t.model),
         "crush" => format!("In ~/.config/crush/crush.json, under \"providers\":\n\"am2strata\": {{ \"type\": \"openai\", \"base_url\": \"{}\", \"api_key\": \"{}\", \"models\": [{{ \"id\": \"{}\", \"name\": \"{}\" }}] }}", t.v1(), key, t.model, t.model),
-        "continue" => format!("In ~/.continue/config.yaml, under models:\n  - name: am2Strata\n    provider: openai\n    model: {}\n    apiBase: {}\n    apiKey: {}", t.model, t.v1(), key),
-        "zed" => format!("In Zed's settings.json:\n\"language_models\": {{ \"openai_compatible\": {{ \"am2Strata\": {{ \"api_url\": \"{}\", \"available_models\": [{{ \"name\": \"{}\", \"max_tokens\": 131072 }}] }} }} }}\nZed asks for the key ({key}) the first time.", t.v1(), t.model),
+        "continue" => format!("In ~/.continue/config.yaml, under models:\n  - name: Prastara\n    provider: openai\n    model: {}\n    apiBase: {}\n    apiKey: {}", t.model, t.v1(), key),
+        "zed" => format!("In Zed's settings.json:\n\"language_models\": {{ \"openai_compatible\": {{ \"Prastara\": {{ \"api_url\": \"{}\", \"available_models\": [{{ \"name\": \"{}\", \"max_tokens\": 131072 }}] }} }} }}\nZed asks for the key ({key}) the first time.", t.v1(), t.model),
         "hermes" | "openclaw" | "cline" | "kilocode" | "vscode" => format!(
             "In {}'s model settings, add an OpenAI-compatible provider:\n  Base URL: {}\n  API key:  {}\n  Model:    {}", a.label, t.v1(), key, t.model),
         _ => match a.support {
@@ -571,7 +571,7 @@ mod tests {
     #[test]
     fn codex_gets_a_provider_for_the_run_and_a_block_in_its_config() {
         let p = start("codex", &t(true), Path::new("/tmp")).unwrap();
-        assert!(p.args.contains(&"model_providers.am2strata={ name = \"am2Strata\", base_url = \"http://10.0.0.5:8000/v1\", wire_api = \"responses\", env_key = \"AM2STRATA_API_KEY\" }".to_string()), "{:?}", p.args);
+        assert!(p.args.contains(&"model_providers.am2strata={ name = \"Prastara\", base_url = \"http://10.0.0.5:8000/v1\", wire_api = \"responses\", env_key = \"AM2STRATA_API_KEY\" }".to_string()), "{:?}", p.args);
         let old = "model = \"gpt-5\"\napproval_policy = \"never\"\n\n[model_providers.am2strata]\nname = \"old\"\n";
         let new = codex_toml(old, &t(true));
         assert!(new.starts_with(BEGIN) && new.contains("model = \"tiel\"") && new.contains("# am2strata: model = \"gpt-5\""), "{new}");

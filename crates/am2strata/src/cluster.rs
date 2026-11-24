@@ -1,5 +1,5 @@
-//! Clusters (docs/CLUSTER-PLAN.md, "Master and workers"). A master is the am2Strata people and apps talk to, holding
-//! the keys, profiles, memory, MCP servers and the queue. Its workers are other am2Strata servers that run engines
+//! Clusters (docs/CLUSTER-PLAN.md, "Master and workers"). A master is the Prastara people and apps talk to, holding
+//! the keys, profiles, memory, MCP servers and the queue. Its workers are other Prastara servers that run engines
 //! only. A chat request goes to a worker when this PC does not have its model and a worker does, or when this PC is
 //! busy and a worker holds the same model loaded and idle; the answer is streamed back through the master, which
 //! keeps its own records of it (phase 1, request routing).
@@ -1230,7 +1230,7 @@ mod tests {
         // the main key's plain chat (the web app's) may go to another loaded model, with no extra headers
         let plain = Routing { profile: None, needs_master: false, tools: false, overflow_any: false, media_in: false };
         assert!(plain.plain_chat() && plain.headers().is_empty());
-        // a request with a picture or a video (am2Strata's judge sends frames to a vision model) never goes to another
+        // a request with a picture or a video (Prastara's judge sends frames to a vision model) never goes to another
         // loaded model, which may not read images
         let judge = json!({"model": "minicpm-v", "messages": [{"role": "user", "content": [{"type": "text", "text": "brief"},
                            {"type": "video_url", "video_url": {"url": "data:video/mp4;base64,AA"}}]}]});

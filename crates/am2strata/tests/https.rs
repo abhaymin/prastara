@@ -146,7 +146,7 @@ fn a_forged_host_is_refused_not_redirected() {
     let r = c.get(format!("{}/v1/models", s.base)).header("host", format!("localhost:{}", s.port)).send().unwrap();
     assert_eq!(r.status(), 308);
     assert_eq!(r.headers()["location"], format!("https://localhost:{port}/v1/models").as_str());
-    // a malformed Host does not crash the server (hyper may refuse it before am2Strata sees it: either is fine)
+    // a malformed Host does not crash the server (hyper may refuse it before Prastara sees it: either is fine)
     if let Ok(r) = c.get(format!("{}/v1/models", s.base)).header("host", "[fd7a::1").send() {
         assert!(r.headers().get("location").is_none_or(|l| !l.to_str().unwrap().contains("fd7a")), "no redirect to it");
     }

@@ -1,4 +1,4 @@
-// am2Strata's native Metal kernels (macOS): the same products and steps as kernels.rs, written in MSL so they can use
+// Prastara's native Metal kernels (macOS): the same products and steps as kernels.rs, written in MSL so they can use
 // SIMD-group reductions and run a whole token inside one command buffer. Weights stay in their GGUF encoding and are
 // dequantized as they are read, exactly as strata_pack::quants does on the CPU; only the order of the sums differs.
 //

@@ -63,7 +63,7 @@ impl Identity {
         Ok(Identity { cert, key, pin })
     }
 
-    /// A new self-signed identity in the cluster's format (for tests and for machines without am2Strata's server).
+    /// A new self-signed identity in the cluster's format (for tests and for machines without Prastara's server).
     pub fn make(path: &std::path::Path, name: &str) -> Result<Identity, String> {
         use base64::Engine as _;
         let b64 = base64::engine::general_purpose::STANDARD;

@@ -22,7 +22,7 @@ pub enum Error {
     Config { path: String, source: Box<dyn std::error::Error + Send + Sync> },
     #[error("starting the engine {exe}: {source}")]
     Spawn { exe: String, source: std::io::Error },
-    #[error("the model's engine stopped unexpectedly (it may have run out of memory, or crashed); am2Strata starts it \
+    #[error("the model's engine stopped unexpectedly (it may have run out of memory, or crashed); Prastara starts it \
              again for the next request: send this one again")]
     Died,
     #[error("the engine did not become ready within {0:?}")]

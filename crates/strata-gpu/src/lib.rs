@@ -1,4 +1,4 @@
-//! strata-gpu: am2Strata's GPU layer, in Rust (CubeCL) - see docs/GPU-PLAN.md.
+//! strata-gpu: Prastara's GPU layer, in Rust (CubeCL) - see docs/GPU-PLAN.md.
 //!
 //! - [`list`] the GPUs every runtime here can use: CUDA (NVIDIA), HIP (AMD ROCm) and wgpu (Vulkan: NVIDIA, AMD and
 //!   Intel, integrated ones included), and the CPU runtime;

@@ -28,7 +28,7 @@ pub struct Hardware {
 }
 
 impl Hardware {
-    /// nvidia-smi for the cards, /proc/meminfo for the RAM (Linux only: am2Strata's server fills `ram_mib` from its
+    /// nvidia-smi for the cards, /proc/meminfo for the RAM (Linux only: Prastara's server fills `ram_mib` from its
     /// cross-platform mem.rs on every OS). Missing tools leave the fields empty.
     pub fn detect() -> Self {
         let mut gpus = Vec::new();

@@ -55,7 +55,7 @@ pub async fn show(State(s): State<AppState>, Path(id): Path<String>) -> Response
     let Some(html) = s.previews.get(&id) else {
         return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                 "<!doctype html><title>Gone</title><p style=\"font-family:sans-serif\">This preview is no longer kept \
-                 (am2Strata keeps the last 64 and forgets them when it restarts). Open it again from the chat.</p>").into_response();
+                 (Prastara keeps the last 64 and forgets them when it restarts). Open it again from the chat.</p>").into_response();
     };
     let mut r = (StatusCode::OK, html).into_response();
     let h = r.headers_mut();

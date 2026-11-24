@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 workspace = "../strata-hybrid"
-description = "am2Strata's GPU kernels in Rust (CubeCL): one source for NVIDIA (CUDA), AMD (ROCm/HIP) and any Vulkan GPU (wgpu), integrated ones included"
+description = "Prastara's GPU kernels in Rust (CubeCL): one source for NVIDIA (CUDA), AMD (ROCm/HIP) and any Vulkan GPU (wgpu), integrated ones included"
 
 [features]
 default = ["cuda", "hip", "wgpu"]

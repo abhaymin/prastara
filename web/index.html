@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>am2Strata</title>
+<title>Prastara</title>
 <link rel="icon" href="web/favicon.svg" type="image/svg+xml">
 <link rel="stylesheet" href="web/tokens.css">
 <link rel="stylesheet" href="web/components.css">
@@ -23,9 +23,9 @@
 <header class="st-header">
   <button class="st-btn st-btn--icon narrow-only" id="menu-btn" aria-label="Show chats" aria-expanded="false">
     <svg class="st-icon"><use href="web/sprite.svg#i-menu"/></svg></button>
-  <a class="st-header__brand" href="#chat" aria-label="am2Strata, chat">
+  <a class="st-header__brand" href="#chat" aria-label="Prastara, chat">
     <svg class="logo" width="30" height="30" viewBox="0 0 64 64" aria-hidden="true"><rect x="2" y="2" width="60" height="60" rx="16" class="logo-tile"/><rect x="14" y="16" width="36" height="8" rx="4" class="logo-bar"/><rect x="14" y="28" width="26" height="8" rx="4" class="logo-bar" opacity=".7"/><rect x="14" y="40" width="16" height="8" rx="4" class="logo-bar" opacity=".45"/><circle cx="45" cy="44" r="5" class="logo-spark"/></svg>
-    <span>am<b>2</b>Strata</span><span class="brand-ver" id="brand-ver" title="The am2Strata version this server runs"></span></a>
+    <span>am<b>2</b>Strata</span><span class="brand-ver" id="brand-ver" title="The Prastara version this server runs"></span></a>
   <nav class="st-tabs main-tabs" role="tablist" aria-label="Views">
     <button class="st-tab" role="tab" id="tab-btn-chat" aria-controls="view-chat" aria-selected="true" data-tab="chat">
       <svg class="st-icon st-icon--sm"><use href="web/sprite.svg#i-chat"/></svg>Chat</button>
@@ -637,7 +637,7 @@
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-quantize">Quantize</button></div>
           </div>
           <div class="st-card ws-panel" data-ws-panel="install" hidden>
-            <div class="ws-panel__head"><span class="card-title">Install as a model am2Strata runs</span>
+            <div class="ws-panel__head"><span class="card-title">Install as a model Prastara runs</span>
               <p class="muted small">Writes its run config and tokenizer folder, as a downloaded model gets, with the engine for
                 its architecture (refused, with the reason, if no engine runs it). It then shows in the model list.</p></div>
             <div class="ws-form">
@@ -761,11 +761,11 @@
       </div>
       <div class="cv-screen"><canvas id="cv-canvas" tabindex="0" aria-label="The desktop"></canvas></div>
       <p class="muted small">This is the private desktop computer use works on (never this PC's own screen). While
-        <b>you have control</b>, your mouse and keyboard go to it and am2Strata's steps wait; hand it back to let a job go
+        <b>you have control</b>, your mouse and keyboard go to it and Prastara's steps wait; hand it back to let a job go
         on. Closing this tab hands it back. Copy and paste need this page on HTTPS (Settings › Secure connection).
         From a terminal: <code>am2strata-run computer status|screenshot|take|give|paste|copy|type|open</code> and
         <code>am2strata-run vm status|start|stop|apps|install|exec</code>. The <b>Sandbox VM</b> is a Debian virtual machine
-        am2Strata runs itself: anything can be installed in it (apt, Flathub, .deb, AppImage), and it only gets CPU this PC
+        Prastara runs itself: anything can be installed in it (apt, Flathub, .deb, AppImage), and it only gets CPU this PC
         is not using.</p>
     </div>
   </section>
@@ -887,7 +887,7 @@
             <p class="muted small">Other apps read the same from <code>GET /api/system</code>, and a master's workers from <code>GET /api/cluster/system</code> (with the API key, if the server has one).</p>
           </div>
           <div class="st-card"><span class="card-title">Start at boot</span>
-            <p class="muted small">To make am2Strata the service that starts at boot (it takes the place of a strata-orca service, if this PC has one), run in the am2strata folder:</p>
+            <p class="muted small">To make Prastara the service that starts at boot (it takes the place of a strata-orca service, if this PC has one), run in the am2strata folder:</p>
             <pre class="snippet"><code>cargo run -q --release --bin am2strata-run -- install --port 8000</code><button class="st-btn st-btn--icon" data-copy="cargo run -q --release --bin am2strata-run -- install --port 8000" aria-label="Copy"><svg class="st-icon"><use href="web/sprite.svg#i-copy"/></svg></button></pre>
             <p class="muted small"><code>am2strata-run uninstall</code> removes it again, and gives a strata-orca service its place back.</p>
           </div>
@@ -1038,8 +1038,8 @@
         <section class="set-panel" id="sec-cluster" aria-labelledby="h-cluster" hidden>
           <h2 id="h-cluster">Cluster</h2>
           <div class="st-card"><span class="card-title">Workers</span>
-            <p class="muted small">A master is the am2Strata people and apps talk to; it keeps the keys, memory and queue. A
-              worker is another am2Strata that runs models for it: set <code>"cluster": {"role": "worker"}</code> in its run
+            <p class="muted small">A master is the Prastara people and apps talk to; it keeps the keys, memory and queue. A
+              worker is another Prastara that runs models for it: set <code>"cluster": {"role": "worker"}</code> in its run
               config. Workers on this network show here as "wants to join"; type the 6-digit code the worker shows to pair it.
               Nothing joins by itself. A chat goes to a worker when only the worker has its model, or when this PC is busy and
               a worker has the same model loaded and idle; the answer comes back through here.</p>
@@ -1137,7 +1137,7 @@
           </div>
           <div class="st-card" id="agents-card">
             <span class="card-title">Coding agents</span>
-            <p class="muted small">Point a coding agent at this server or another am2Strata, with the model you choose. In a terminal,
+            <p class="muted small">Point a coding agent at this server or another Prastara, with the model you choose. In a terminal,
               <code>am2strata agentrun &lt;agent&gt;</code> runs it once (nothing of yours changes) and
               <code>agent setup &lt;agent&gt;</code> makes it the agent's default (its config is backed up; <code>agent reset</code> restores it).
               The key is read from <code>AM2STRATA_API_KEY</code>, never written into a file.</p>
@@ -1149,7 +1149,7 @@
             </div>
             <div class="agents-list" id="agents-list"><p class="muted">Loading&hellip;</p></div>
           </div>
-            <p class="muted small">am2Strata (MIT). Includes code derived from <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata</a> and
+            <p class="muted small">Prastara (MIT). Includes code derived from <a href="https://github.com/Niko1221/Strata" target="_blank" rel="noopener noreferrer">Strata</a> and
               <a href="https://github.com/VecSzn/PolyStrata" target="_blank" rel="noopener noreferrer">PolyStrata</a> (MIT, <a href="/web/LICENSE-PolyStrata.txt" target="_blank">license</a>).</p>
           </section>
 
@@ -1186,7 +1186,7 @@
               <div class="st-field">
                 <label class="st-label">Mode <span class="muted small">how the model acts in the desktop</span></label>
                 <div class="seg seg--4" id="cu-mode" role="radiogroup" aria-label="Desktop mode">
-                  <button type="button" role="radio" data-v="sandbox" aria-checked="true">Sandbox</button><button type="button" role="radio" data-v="vm" title="A Debian virtual machine am2Strata runs: the agent is root in it and may install anything; this PC is untouched">Sandbox VM</button><button type="button" role="radio" data-v="watch-only">Watch only</button>
+                  <button type="button" role="radio" data-v="sandbox" aria-checked="true">Sandbox</button><button type="button" role="radio" data-v="vm" title="A Debian virtual machine Prastara runs: the agent is root in it and may install anything; this PC is untouched">Sandbox VM</button><button type="button" role="radio" data-v="watch-only">Watch only</button>
                   <button type="button" role="radio" data-v="assist">Assist <span class="muted small">(ask)</span></button><button type="button" role="radio" data-v="trusted-job">Trusted job</button></div></div>
               <div class="st-field"><label class="st-label">Allowed apps<br><span class="muted small">the sandbox desktop may open, one per line or comma-separated</span></label>
                 <textarea class="st-input mono" id="cu-apps" rows="2" placeholder="firefox&#10;LibreOffice"></textarea></div>
@@ -1312,7 +1312,7 @@
         </div>
       </div>
     </div>
-    <p class="muted small calls-off" id="calls-off" hidden>The API monitor is off: start am2Strata with <code>--api-monitor</code> (am2strata-run does
+    <p class="muted small calls-off" id="calls-off" hidden>The API monitor is off: start Prastara with <code>--api-monitor</code> (am2strata-run does
       by default) or set <code>"api_monitor": true</code> in the config.</p>
   </section>
 </main>

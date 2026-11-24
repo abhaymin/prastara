@@ -1,6 +1,6 @@
-# ACE-Step 1.5 in Rust (songs in am2Strata)
+# ACE-Step 1.5 in Rust (songs in Prastara)
 
-Owner's decision (2026-11-09): songs are made inside am2Strata, in Rust (candle), not by calling ACE-Step's Python, and
+Owner's decision (2026-11-09): songs are made inside Prastara, in Rust (candle), not by calling ACE-Step's Python, and
 they get their own section in the web app, with songs in many languages. The Python install in
 `~/Development/ref/ACE-Step-1.5` is only the reference the port is checked against.
 

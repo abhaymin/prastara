@@ -1,6 +1,6 @@
-# Model optimizers: am2Strata tunes each model's run settings for this machine
+# Model optimizers: Prastara tunes each model's run settings for this machine
 
-Owner's request (2026-11-11): am2Strata should optimise the models it runs on Strata's engines, so each model runs as
+Owner's request (2026-11-11): Prastara should optimise the models it runs on Strata's engines, so each model runs as
 fast as this machine allows, within its memory, with no hand tuning.
 
 **State: steps 1-5 built, and measured on this PC (2026-11-11); the cluster split (step 6) waits for CLUSTER-PLAN phase 2.** Step 4:

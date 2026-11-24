@@ -22,7 +22,7 @@ am2strata-run media produce plan.json --out set.wav                     # posts 
 am2strata-run media job mj-1234 --out set.wav                           # its status; with --out also /content
 ```
 
-- **Where they point:** pass `--url <server>` and `--api-key <key>`, or export `AM2STRATA_URL` and `AM2STRATA_API_KEY`. With neither, the command uses this PC's local server (from its run configs) and that server's key — the one listed in Settings › Clients. For another am2Strata (a sandbox, a second PC), set `AM2STRATA_URL` to the address it is serving at (its `serve --host/--port`, or what `am2strata agent list` shows for it) and `AM2STRATA_API_KEY` to a key issued for that server.
+- **Where they point:** pass `--url <server>` and `--api-key <key>`, or export `AM2STRATA_URL` and `AM2STRATA_API_KEY`. With neither, the command uses this PC's local server (from its run configs) and that server's key — the one listed in Settings › Clients. For another Prastara (a sandbox, a second PC), set `AM2STRATA_URL` to the address it is serving at (its `serve --host/--port`, or what `am2strata agent list` shows for it) and `AM2STRATA_API_KEY` to a key issued for that server.
 
 ## Images
 
@@ -188,7 +188,7 @@ These need ffmpeg on the server.
 
 - **`POST /v1/media/videos/compose`:**
   `{"audio", "shots": [{"image"} | {"clip"}, …], "captions"?: [[start_s, end_s, text] | [start_s, end_s, text, {"place", "size"}]], "title_card"?, "end_card"?, "engine"?: "native"|"libass", "size"?: "1920x1080", "crossfade_s"?: 0.8}`.
-  Images are slowly zoomed, clips are fitted, joins crossfade, captions are burnt in (by am2Strata with ffmpeg's
+  Images are slowly zoomed, clips are fitted, joins crossfade, captions are burnt in (by Prastara with ffmpeg's
   `overlay`, or by libass on `"captions_engine": "libass"`). The result is one MP4 (H.264 and AAC).
 - **`POST /v1/media/thumbnails`:** `{"image", "lines": [[text, "white" | "gold"]], "tag"}`. The result is one
   1280×720 JPEG with big type over a dark gradient.
@@ -213,7 +213,7 @@ in the centre at the same time:
   the same interval overlap in time and both are drawn.
 - `"size"` scales the type (`1.0` = today's 58 px at a 1080 short side; `0.5`–`3.0` are allowed). A size `2.0` box is
   about twice as tall as a size `1.0` one.
-- The default engine draws them with am2Strata and ffmpeg's `overlay`; on `"captions_engine": "libass"` the centre word
+- The default engine draws them with Prastara and ffmpeg's `overlay`; on `"captions_engine": "libass"` the centre word
   rides a second ASS style (centred, sized by its `size`). Only the low captions go to `captions.srt`.
 
 ## Dubbing

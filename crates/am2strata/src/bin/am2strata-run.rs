@@ -1,4 +1,4 @@
-//! am2strata-run: the launcher (it replaced run.py; am2Strata has no Python).
+//! am2strata-run: the launcher (it replaced run.py; Prastara has no Python).
 //!
 //!   cargo run -q --release --bin am2strata-run -- serve --port 8001          in the foreground
 //!   cargo run -q --release --bin am2strata-run -- serve --take-over --port 8000
@@ -8,7 +8,7 @@
 //!                                       it stops (however it stops: a crash, stop-temp-service, a reboot)
 //!   cargo run -q --release --bin am2strata-run -- stop-temp-service
 //!   cargo run -q --release --bin am2strata-run -- install --port 8000
-//!                                       make am2Strata the service that starts at boot in place of strata-orca
+//!                                       make Prastara the service that starts at boot in place of strata-orca
 //!   cargo run -q --release --bin am2strata-run -- uninstall      give the boot service back to strata-orca
 //!   cargo run -q --release --bin am2strata-run -- test           the whole test suite (no GPU)
 //!   cargo run -q --release --bin am2strata-run -- pull unsloth/Qwen3.6-35B-A3B-GGUF            list its quantizations
@@ -46,7 +46,7 @@ const TEMP_UNIT: &str = "am2strata";
 const BOOT_UNIT: &str = "am2strata-boot";
 
 #[derive(Parser)]
-#[command(name = "am2strata-run", version, about = "Run am2Strata: in the foreground, as a temporary service, or as the boot service")]
+#[command(name = "am2strata-run", version, about = "Run Prastara: in the foreground, as a temporary service, or as the boot service")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -69,12 +69,12 @@ enum Cmd {
     },
     /// stop the temporary service; strata-orca starts again
     StopTempService,
-    /// make am2Strata the service that starts at boot, in place of strata-orca
+    /// make Prastara the service that starts at boot, in place of strata-orca
     Install {
         #[command(flatten)]
         s: ServerArgs,
     },
-    /// remove am2Strata's boot service and enable strata-orca again
+    /// remove Prastara's boot service and enable strata-orca again
     Uninstall,
     /// run the whole test suite (no GPU)
     Test,
@@ -91,11 +91,11 @@ enum Cmd {
     },
     /// download a model from Hugging Face and write its run config (no --quant: list what the repository offers)
     Pull(PullArgs),
-    /// coding agents on am2Strata, this PC's or another's: list | start <agent> | setup <agent> | reset <agent> | show <agent>
+    /// coding agents on Prastara, this PC's or another's: list | start <agent> | setup <agent> | reset <agent> | show <agent>
     Agent(AgentArgs),
-    /// run a coding agent on am2Strata once, as `unsloth start <agent>` does: `agentrun opencode`,
+    /// run a coding agent on Prastara once, as `unsloth start <agent>` does: `agentrun opencode`,
     /// `agentrun claude --model tiel --continue`; --model, --small-model, --url, --api-key and --dry-run are
-    /// am2Strata's, every other argument goes to the agent
+    /// Prastara's, every other argument goes to the agent
     #[command(disable_help_flag = true)]
     Agentrun {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
@@ -275,7 +275,7 @@ enum Cmd {
         #[arg(long, default_value = "~/Development/PolyStrata")]
         models_dir: String,
     },
-    /// the sandbox VM (a Debian virtual machine am2Strata runs; anything may be installed in it):
+    /// the sandbox VM (a Debian virtual machine Prastara runs; anything may be installed in it):
     /// status | start | stop | pause | shutdown | setup | download | reset --yes | apps | install <app> |
     /// install --kind apt|flatpak|deb|appimage <target> | remove … | open <app> | exec [--root] <command> |
     /// settings key=value … | ads on|off [--lists pihole,adguard] [allowed.domain …] | snapshot [name] | snapshots |
@@ -614,7 +614,7 @@ struct AgentArgs {
     /// claude, codex, opencode, pi, droid, qwen, aider, goose, omp, crush, hermes, openclaw, continue, cline,
     /// kilocode, zed, vscode (agy and cursor-agent take no custom endpoint)
     agent: Option<String>,
-    /// another am2Strata, e.g. http://192.168.1.20:8000 (default: this PC's, from the run configs)
+    /// another Prastara, e.g. http://192.168.1.20:8000 (default: this PC's, from the run configs)
     #[arg(long, env = "AM2STRATA_URL")]
     url: Option<String>,
     /// that server's API key (default: this PC's run config's)
@@ -824,13 +824,13 @@ fn temp_service(s: &ServerArgs) -> ExitCode {
     }
     quiet_systemctl(&["reset-failed", TEMP_UNIT]);
     if active(BOOT_UNIT) {
-        say(format!("{BOOT_UNIT} (am2Strata's boot service) is running already"));
+        say(format!("{BOOT_UNIT} (Prastara's boot service) is running already"));
         return ExitCode::FAILURE;
     }
     free_gpu();
     let root = root().display().to_string();
     let mut unit = vec!["systemd-run".to_string(), "--user".into(), format!("--unit={TEMP_UNIT}"),
-                        "--description=am2Strata (temporary)".into(), format!("--working-directory={root}"),
+                        "--description=Prastara (temporary)".into(), format!("--working-directory={root}"),
                         format!("--property=Conflicts={SERVICE}.service"),
                         format!("--property=ExecStopPost=/usr/bin/systemctl --user start {SERVICE}.service"),
                         "--property=KillSignal=SIGINT".into(), "--property=TimeoutStopSec=90".into()];
@@ -852,14 +852,14 @@ fn unit_dir() -> PathBuf {
     PathBuf::from(expand("~/.config/systemd/user"))
 }
 
-/// The boot service: the same place in the system as strata-orca (port, configs, models, linger), am2Strata's binary.
+/// The boot service: the same place in the system as strata-orca (port, configs, models, linger), Prastara's binary.
 fn install(s: &ServerArgs) -> ExitCode {
     if !build() || !check(s) {
         return ExitCode::FAILURE;
     }
     let cmd = server_cmd(s).iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }).collect::<Vec<_>>().join(" ");
     let text = format!(
-        "[Unit]\nDescription=am2Strata server (port {port}); replaces {SERVICE} while installed\nAfter=network-online.target\n\
+        "[Unit]\nDescription=Prastara server (port {port}); replaces {SERVICE} while installed\nAfter=network-online.target\n\
          Conflicts={SERVICE}.service\n\n[Service]\nType=simple\nWorkingDirectory={root}\nExecStartPre={wait} wait-gpus\n\
          TimeoutStartSec=240\nExecStart={cmd}\nKillSignal=SIGINT\n\
          Restart=on-failure\nRestartSec=15\nTimeoutStopSec=90\n\n[Install]\nWantedBy=default.target\n",
@@ -884,7 +884,7 @@ fn install(s: &ServerArgs) -> ExitCode {
         say(format!("{BOOT_UNIT} did not become ready; see journalctl --user -u {BOOT_UNIT}. `am2strata-run uninstall` restores {SERVICE}"));
         return ExitCode::FAILURE;
     }
-    say(format!("am2Strata now starts at boot ({BOOT_UNIT}); {SERVICE} is disabled. Undo: am2strata-run uninstall"));
+    say(format!("Prastara now starts at boot ({BOOT_UNIT}); {SERVICE} is disabled. Undo: am2strata-run uninstall"));
     ExitCode::SUCCESS
 }
 
@@ -940,7 +940,7 @@ async fn pull_async(p: PullArgs) -> Result<(), String> {
     if p.quant.is_none() && p.file.is_empty() {
         let qs = strata_hub::pull::list(&repo, token).await?;
         if qs.is_empty() {
-            return Err(format!("{repo} has no GGUF files (am2Strata runs GGUF models)"));
+            return Err(format!("{repo} has no GGUF files (Prastara runs GGUF models)"));
         }
         say("quantizations (pass one with --quant):");
         for (q, size, n) in qs {
@@ -1223,7 +1223,7 @@ fn expand_path(p: &std::path::Path) -> PathBuf {
 }
 
 /// The media engine's pull: its catalog's files for `model`, into <data-dir>/media (resumable, SHA-256 checked).
-/// `upstream-check`: per repository of tools/upstream.json, how far its branch is from the commit am2Strata ported
+/// `upstream-check`: per repository of tools/upstream.json, how far its branch is from the commit Prastara ported
 /// (PolyStrata: also the local checkout), Strata's newest tag against the version PolyStrata carries, and per ported
 /// file whether upstream's blob changed since. Read-only: GitHub's API (GITHUB_TOKEN if set) and `git` in the checkout.
 fn upstream_check(manifest: Option<PathBuf>) -> ExitCode {
@@ -1820,7 +1820,7 @@ fn computer_cmd(action: &str, arg: Option<String>, url: Option<String>, api_key:
             "copy" => print!("{}", j["text"].as_str().unwrap_or("")),
             "status" | "take" | "give" => println!("computer use: {}, mode {}, {}{}",
                 if j["on"] == true { "on" } else { "off" }, j["mode"].as_str().unwrap_or("?"),
-                if j["operator_in_control"] == true { "you have control" } else { "am2Strata may act" },
+                if j["operator_in_control"] == true { "you have control" } else { "Prastara may act" },
                 j["apps"].as_array().filter(|a| !a.is_empty()).map(|a| format!(", apps: {}", a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "))).unwrap_or_default()),
             _ => println!("done"),
         }
@@ -2355,7 +2355,7 @@ fn agent(a: AgentArgs) -> ExitCode {
     }
 }
 
-/// `agentrun <agent> [options] [agent arguments]`: am2Strata's own options wherever they are, the rest (and all after
+/// `agentrun <agent> [options] [agent arguments]`: Prastara's own options wherever they are, the rest (and all after
 /// `--`) for the agent, in their order.
 fn agentrun_args(args: Vec<String>) -> Result<AgentArgs, String> {
     const USAGE: &str = "usage: am2strata agentrun <agent> [--model M] [--small-model M] [--url U] [--api-key K] [--tools web,image] [--dry-run] [agent arguments]\n\

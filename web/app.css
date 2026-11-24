@@ -1,4 +1,4 @@
-/* am2Strata web app - layout on top of tokens.css + components.css. The approved design: design/Main.dc.html.
+/* Prastara web app - layout on top of tokens.css + components.css. The approved design: design/Main.dc.html.
    Colours, type, radii and shadows come only from the tokens, so the light, dark and system themes are one set. */
 [hidden] { display: none !important; }
 html, body { height: 100%; }
@@ -17,7 +17,7 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 /* ---------------------------------------------------------------- header */
 .st-header { position: relative; z-index: 3; flex: none; }
 .st-header__brand:hover { text-decoration: none; }
-/* the version beside the name, so it is clear which am2Strata a page talks to */
+/* the version beside the name, so it is clear which Prastara a page talks to */
 .brand-ver { margin-left: 6px; padding: 1px 7px; border: 1px solid var(--st-line-soft); border-radius: 999px; font-size: 11px;
   font-weight: 600; color: var(--st-ink-muted); letter-spacing: .02em; align-self: center; }
 .brand-ver:empty { display: none; }

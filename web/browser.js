@@ -235,7 +235,7 @@
     el("bv-chat-target").value = store.get("am2-browser-chat-target", "");
     el("bv-chat-target").onchange = () => store.set("am2-browser-chat-target", el("bv-chat-target").value);
     const base = location.origin;
-    el("bv-mcp").textContent = `MCP address (Streamable HTTP):\n  ${base}/v1/mcp/browser            (?target=server|mine|sandbox)\n\nClaude Code:\n  claude mcp add --transport http am2strata-browser ${base}/v1/mcp/browser \\\n    --header "Authorization: Bearer <your am2Strata key>"\n\nOther clients (opencode, Cursor, VS Code…): an HTTP MCP server at that address\nwith the same Authorization header.\n\nCLI:\n  am2strata-run browser open https://example.com\n  am2strata-run browser extract --kind table --dataset prices\n  am2strata-run browser test site-test.json --junit report.xml`;
+    el("bv-mcp").textContent = `MCP address (Streamable HTTP):\n  ${base}/v1/mcp/browser            (?target=server|mine|sandbox)\n\nClaude Code:\n  claude mcp add --transport http am2strata-browser ${base}/v1/mcp/browser \\\n    --header "Authorization: Bearer <your Prastara key>"\n\nOther clients (opencode, Cursor, VS Code…): an HTTP MCP server at that address\nwith the same Authorization header.\n\nCLI:\n  am2strata-run browser open https://example.com\n  am2strata-run browser extract --kind table --dataset prices\n  am2strata-run browser test site-test.json --junit report.xml`;
   }
 
   function schedule() {

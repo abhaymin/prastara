@@ -1,7 +1,7 @@
 //! Specialist models the main model consults in the same turn: one server tool, `ask_expert(expert, question, context?)`.
 //! The request carries the user's original request (the last user message of the chat) as well as the sub-question, so an
 //! expert sees the whole job and not only the planner's brief. Each expert is one of two forms (`experts` in the run config):
-//! an OpenAI-compatible endpoint (another am2Strata, a cluster node or llama-server) as `{"url","model"}` — its key, when it
+//! an OpenAI-compatible endpoint (another Prastara, a cluster node or llama-server) as `{"url","model"}` — its key, when it
 //! has one, comes from the environment variable `key_env` names and is never read into the struct, logged or returned; or a
 //! paired cluster worker's model as `{"worker","model"}`, reached over that worker's pinned mutual-TLS client with the key
 //! pairing gave (no new client, no config key read). A config entry must have exactly one of `url` or `worker`. A worker-form
@@ -332,7 +332,7 @@ fn body_for(raw: &str) -> String {
 
 fn http_client() -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (X11; Linux x86_64) am2Strata")
+        .user_agent("Mozilla/5.0 (X11; Linux x86_64) Prastara")
         .build()
         .map_err(|e| e.to_string())
 }

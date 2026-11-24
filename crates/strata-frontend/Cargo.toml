@@ -1,6 +1,6 @@
 [package]
 name = "strata-frontend"
-description = "Request normalization, prompt building and output parsing for the am2Strata server"
+description = "Request normalization, prompt building and output parsing for the Prastara server"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

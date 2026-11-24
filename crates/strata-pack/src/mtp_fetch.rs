@@ -165,7 +165,7 @@ impl Source {
                                every tensor is still checked against the pinned SHA256", self.revision);
                     self.repo = self.repo.replace(&format!("/resolve/{}/", self.revision), "/resolve/main/");
                 } else {
-                    return Err(format!("the pinned version of the checkpoint ({}) is no longer on Hugging Face: update am2Strata \
+                    return Err(format!("the pinned version of the checkpoint ({}) is no longer on Hugging Face: update Prastara \
                                         (or set STRATA_ALLOW_UNPINNED=1 to read its current files)", self.revision));
                 }
             }

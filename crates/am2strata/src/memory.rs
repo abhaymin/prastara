@@ -369,7 +369,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("am2-mem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let m = Memory::open(&dir);
-        m.add("The project is called am2Strata", "all", "user").unwrap();
+        m.add("The project is called Prastara", "all", "user").unwrap();
         m.add("Key A likes short answers", "key:aaaa", "api").unwrap();
         assert_eq!(m.visible("key:bbbb").len(), 1, "another key does not see key A's fact");
         let r = m.call("remember", &json!({"fact": "Deploys go to the 5060 Ti box"}), "web", None);

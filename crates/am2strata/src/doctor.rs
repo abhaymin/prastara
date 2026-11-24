@@ -198,7 +198,7 @@ pub fn install_hint(os: &str, pkg_linux: &str, pkg_brew: &str, pkg_winget: &str)
 
 /// The report as text.
 pub fn render(host: &Host, features: &[Feature], version: &str) -> String {
-    let mut s = format!("am2Strata {version} on {} {}\n\n", host.os, host.arch);
+    let mut s = format!("Prastara {version} on {} {}\n\n", host.os, host.arch);
     for f in features {
         let state = match f.state { State::Ready => "ready", State::Missing => "missing", State::NotHere => "not here" };
         let mut detail = f.note.clone();

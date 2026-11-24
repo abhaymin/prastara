@@ -1,4 +1,4 @@
-//! The sandbox VM: a small Debian 13 virtual machine am2Strata runs itself (QEMU + KVM, no root, no Docker), for
+//! The sandbox VM: a small Debian 13 virtual machine Prastara runs itself (QEMU + KVM, no root, no Docker), for
 //! computer use with no limits inside it — the agent is root there and may install or remove anything (apt, Flathub,
 //! a .deb, an AppImage), while the host is untouched: its own kernel, its own disk (a copy-on-write layer over the
 //! Debian cloud image), user-mode networking with nothing reachable from outside, and no GPU.

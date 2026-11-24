@@ -24,7 +24,7 @@ rm -rf "$BAD"
 
 step "install (the default folders), picking this PC's download by itself"
 sh "$INSTALL" --from "$DIST" --no-browser | tee "$HOME/install.log"
-grep -q "Installed am2Strata v$VER in $DIR/app/am2strata-$VER-$LABEL" "$HOME/install.log" || die "it did not install $LABEL"
+grep -q "Installed Prastara v$VER in $DIR/app/am2strata-$VER-$LABEL" "$HOME/install.log" || die "it did not install $LABEL"
 grep -q "ready     HTTPS" "$HOME/install.log" || die "the installer printed no doctor report"
 
 step "the commands"

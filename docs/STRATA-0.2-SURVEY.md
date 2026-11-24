@@ -1,4 +1,4 @@
-# Strata 0.1.45 to 0.2.8: what matters for am2Strata
+# Strata 0.1.45 to 0.2.8: what matters for Prastara
 
 Survey of Strata's release notes, 2026-10-30, for roadmap item 4 in [V2-PLAN.md](V2-PLAN.md). PolyStrata and its engines carry
 Strata 0.1.45, so none of the engine work below has reached this PC. The figures are Strata's own, from its release notes,
@@ -20,7 +20,7 @@ not measured here. Target machine: two RTX 5060 Ti 16 GB (sm_120), one on OCuLin
 ## Packs
 
 Strata 0.2's Hadamard-folded packs (native_experts v5) and the trellis expert types (TQ2_T, TQK6, TQK7, the Gyro models) need
-engine support. am2Strata refuses v5 packs by name until an engine reads them. Existing packs here keep working.
+engine support. Prastara refuses v5 packs by name until an engine reads them. Existing packs here keep working.
 
 ## Not for this PC
 
@@ -35,7 +35,7 @@ engine, and they arrive whole when PolyStrata merges Strata 0.2, after which the
 (`git pull --ff-only`, build, swap with a rename). `am2strata-run upstream-check` shows when that happens. Rewriting them in
 Rust would duplicate work that is still moving upstream every few days.
 
-Two things are am2Strata's own to do meanwhile:
+Two things are Prastara's own to do meanwhile:
 - the Main / Helper idea for two unequal links: the order of the cards and the layer split are already settings in a run
   config, so this can be measured with `"gpu"` and `"layer_split"` before any code;
 - `am2strata-hybrid` stays the long-term Rust engine (docs/GPU-PLAN.md) and can take ideas from this list one at a time, each

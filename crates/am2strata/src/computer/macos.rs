@@ -138,10 +138,10 @@ fn ax_text(e: AXUIElementRef, attr: &str) -> Option<String> {
 #[derive(Debug, Default)]
 pub struct MacBackend;
 
-const NEED_ACCESSIBILITY: &str = "macOS has not allowed am2Strata to control the Mac yet: the owner must turn on \
-    am2strata in System Settings › Privacy & Security › Accessibility (then restart am2Strata)";
-const NEED_SCREEN: &str = "macOS has not allowed am2Strata to see the screen yet: the owner must turn on am2strata in \
-    System Settings › Privacy & Security › Screen Recording (then restart am2Strata)";
+const NEED_ACCESSIBILITY: &str = "macOS has not allowed Prastara to control the Mac yet: the owner must turn on \
+    am2strata in System Settings › Privacy & Security › Accessibility (then restart Prastara)";
+const NEED_SCREEN: &str = "macOS has not allowed Prastara to see the screen yet: the owner must turn on am2strata in \
+    System Settings › Privacy & Security › Screen Recording (then restart Prastara)";
 
 impl MacBackend {
     pub fn new() -> MacBackend { MacBackend }

@@ -266,7 +266,7 @@ pub fn ensure_self_signed(dir: &Path, names: &[String]) -> Result<(PathBuf, Path
         return Ok((cert, key));
     }
     let mut params = rcgen::CertificateParams::new(names.to_vec()).map_err(|e| format!("certificate names: {e}"))?;
-    params.distinguished_name.push(rcgen::DnType::CommonName, "am2Strata (self-signed)");
+    params.distinguished_name.push(rcgen::DnType::CommonName, "Prastara (self-signed)");
     params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     params.not_after = rcgen::date_time_ymd(2036, 1, 1);
     let kp = rcgen::KeyPair::generate().map_err(|e| format!("key: {e}"))?;

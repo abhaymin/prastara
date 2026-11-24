@@ -1,6 +1,6 @@
 # Inkling 2 Mini: run it, and pack it
 
-**Request (2026-11-21):** am2Strata supports Inkling 2 Mini, and can pack and consume models of this kind.
+**Request (2026-11-21):** Prastara supports Inkling 2 Mini, and can pack and consume models of this kind.
 
 ## The model
 
@@ -34,7 +34,7 @@ with a small batch. It is the oracle for every gate below.
 |---|---|---|
 | I1 | The tokenizer (`inkling2`) and the chat template | the reference's token ids for the golden texts; the reference's prompt for each golden request |
 | I2 | Output parsing: reasoning, answer and tool calls from the model's own tokens | the golden raw outputs give the same reasoning, content and tool calls as the reference server |
-| I3 | A bridge engine: llama.cpp's library behind am2Strata's engine protocol, for any architecture llama.cpp runs | the same tokens as the reference at temperature 0; STOP ends with DONE; the same tokens with and without the conversation cache |
+| I3 | A bridge engine: llama.cpp's library behind Prastara's engine protocol, for any architecture llama.cpp runs | the same tokens as the reference at temperature 0; STOP ends with DONE; the same tokens with and without the conversation cache |
 | I4 | The server: the catalog entry, `reasoning_effort`, the run config, `pull` | a chat, a tool call and a streamed answer through `/v1/chat/completions` and `/v1/messages` |
 | I5 | Vision through the bridge | an image question answered as the reference answers it |
 | I6 | The Rust engine: `inkling2_loop` in `am2strata-hybrid`, CPU first | teacher-forced parity with the reference on a tiny random model and on the real file |
@@ -45,12 +45,12 @@ I3 makes the model usable while I6 and I8 are built; it is not the end state.
 
 ## Direction (owner, 2026-11-23): native only
 
-**"I don't want llama.cpp as part of am2Strata. I want the full feature in am2Strata, not an extension."**
+**"I don't want llama.cpp as part of Prastara. I want the full feature in Prastara, not an extension."**
 
 The bridge (I3, I5: `crates/strata-llama`, the `LLAMA_ARCHS` routing in `strata-hub`, the repo config's bridge and
 image-encoder entries) is scaffolding. It stays local and unpublished, keeps the model usable meanwhile, and is deleted
 when the native engine passes I8's gate. llama.cpp remains only what it is for every other architecture: an external
-test oracle, never linked into or shipped with am2Strata.
+test oracle, never linked into or shipped with Prastara.
 
 **`main` is Rust only (owner, 2026-11-24): "not to leave main system in any other language".** So on `main` the
 bridge is already gone: no `crates/strata-llama`, no `LLAMA_ARCHS` routing, and Inkling's repo config and `pull`
@@ -72,7 +72,7 @@ Order of work, each with its gate:
 
 ## Training looped models in the Workshop (owner, 2026-11-21)
 
-The Workshop's fine-tuning (candle, in Rust) learns this architecture too, so am2Strata can train and tune models of
+The Workshop's fine-tuning (candle, in Rust) learns this architecture too, so Prastara can train and tune models of
 this kind itself.
 
 | Step | What | Gate |
@@ -80,7 +80,7 @@ this kind itself.
 | W1 | The forward pass in candle, with the loop: the 12 core layers run 3 times with the same weights, each pass with its own convolution state and the controllers' messages between passes | the same logits as the reference on the tiny random model |
 | W2 | LoRA training on it: adapters on attention, the experts and the loop controllers; a shared core layer gets one adapter used by all 3 passes, its gradient summed over the passes | the loss falls on a small set; a merged adapter gives the same tokens as base plus adapter in the reference |
 | W3 | Memory: gradient checkpointing per pass and expert-sparse gradients, so a tune fits beside this PC's other work | measured peak memory and speed on the real model, reported before any long run |
-| W4 | Export and reuse: the adapter as a GGUF LoRA (the kind llama.cpp loads), merge, quantize, and the run config | the exported adapter loads in the reference and in am2Strata's engine and gives the same tokens |
+| W4 | Export and reuse: the adapter as a GGUF LoRA (the kind llama.cpp loads), merge, quantize, and the run config | the exported adapter loads in the reference and in Prastara's engine and gives the same tokens |
 
 W1 needs I6's model code; W2 to W4 follow the Workshop's existing LoRA path (`strata-workshop`).
 
@@ -97,7 +97,7 @@ W1 needs I6's model code; W2 to W4 follow the Workshop's existing LoRA path (`st
   - an embedding width of 128, 8 experts with 2 used, and the real tokenizer.
 
   The oracle runs it on the CPU.
-- **Types:** am2Strata's reader and `strata-pack` know every type in the real file: F32, Q8_0, Q5_0 and Q4_K. The
+- **Types:** Prastara's reader and `strata-pack` know every type in the real file: F32, Q8_0, Q5_0 and Q4_K. The
   engine's GPU kernels for Q5_0 are not checked yet (I8).
 - **I2 golden:** `golden/raw_outputs.json` keeps the token ids. Reasoning sits between special tokens (200008 …
   200010), then the answer (200004 … 200010), then 200006 ends the turn. The answer text alone loses that structure, so
@@ -245,7 +245,7 @@ W1 needs I6's model code; W2 to W4 follow the Workshop's existing LoRA path (`st
   - the image encoder (on the CPU), from the given mmproj or an `mmproj*.gguf` beside the model.
 
   A native Rust-engine pack still waits on I6.
-- **Gate:** the same picture and question, greedy, through am2Strata (CPU, port 8093) and stock llama-server with
+- **Gate:** the same picture and question, greedy, through Prastara (CPU, port 8093) and stock llama-server with
   `--mmproj` (CPU, port 8094).
   - **The prompt:** identical. The 78 ids match, with `<|content_image|>` (200005) followed by the 40 picture tokens.
   - **Case 1** (what building, and the time of day): the replies split at the 4th token. The reference's own top two

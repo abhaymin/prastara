@@ -1,6 +1,6 @@
 # Model Workshop — train, convert, and make Strata-ready models in Rust
 
-Owner's decision (2026-11-14): am2Strata should *build* models like Unsloth Studio does — fine-tune an HF model into
+Owner's decision (2026-11-14): Prastara should *build* models like Unsloth Studio does — fine-tune an HF model into
 a LoRA adapter, merge it to a full GGUF, quantize it, and turn it into something the Strata engine runs — all in Rust,
 with a "Workshop" tab in the web app. This plan records **what already exists** so we build on it, the **design**, the
 **build order** (each step one commit, each with its tests), and the **risks**. Nothing here is coded yet; this is the
@@ -72,7 +72,7 @@ piece has been flagged (`── MISSING ──`).
 
 ### Unsloth compatibility (`am2strata/src/unsloth.rs`) — already present
 - `/api/inference/*` (`health`, `loaded-models`, `status`, `load`) mimic Unsloth's UI Backend so its CLI points an agent at
-  am2Strata. The task's remote-training path (`UNSLOTH_STUDIO_URL` + key) goes here too: a job that does not fit locally is
+  Prastara. The task's remote-training path (`UNSLOTH_STUDIO_URL` + key) goes here too: a job that does not fit locally is
   forwarded to an external Unsloth server, then merged/converted/strata-ready *in Rust* locally (see "How it fits").
 
 ### Feature-flag / settings pattern (`am2strata/src/settings.rs`, `main.rs`)

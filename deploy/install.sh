@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install am2Strata on this machine: build it, put the run configs in place, optionally make it the boot service.
+# Install Prastara on this machine: build it, put the run configs in place, optionally make it the boot service.
 #
 #   deploy/install.sh [--strata-home DIR] [--strata-data DIR] [--port N] [--host ADDR]
 #                     [--api-key KEY | --new-key] [--model ID] [--service] [--force]
@@ -41,7 +41,7 @@ for t in pdftotext ffmpeg bwrap; do command -v $t >/dev/null || warn "optional: 
 [ -x "$STRATA_HOME/engine-poly/strata-poly" ] || [ -x "$STRATA_HOME/engine/strata" ] \
   || warn "no engines in $STRATA_HOME (engine/strata, engine-poly/strata-poly): see deploy/build-engines.sh"
 
-say "building am2Strata (release)"
+say "building Prastara (release)"
 (cd "$ROOT" && cargo build --release --bins)
 
 mkdir -p "$STRATA_HOME" "$STRATA_DATA/models" "$STRATA_DATA/packs"

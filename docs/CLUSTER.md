@@ -1,6 +1,6 @@
 # Set up a cluster
 
-Several machines working as one am2Strata. People and apps talk to one machine, the **master**. Other machines,
+Several machines working as one Prastara. People and apps talk to one machine, the **master**. Other machines,
 **workers**, answer for it. This page gives the exact steps, every key involved and where it is kept, and what a
 cluster does and does not do today. The design and the work still to come are in [CLUSTER-PLAN.md](CLUSTER-PLAN.md).
 
@@ -28,7 +28,7 @@ cluster does and does not do today. The design and the work still to come are in
 
 | | Master | Each worker |
 |---|---|---|
-| am2Strata | installed, with a model | installed, with a model |
+| Prastara | installed, with a model | installed, with a model |
 | Network | reaches the worker's API port (default 8000) and its cluster port (default API + 443 = 8443) | listens beyond itself: `--host 0.0.0.0` |
 | A VPN between them | optional on your own LAN; **recommended** otherwise (Tailscale, WireGuard) | same |
 | A main API key | yes, your own long random value | yes, its own; it never leaves the worker |
@@ -36,14 +36,14 @@ cluster does and does not do today. The design and the work still to come are in
 ### The keys and secrets, and where each one lives
 
 None of these is ever shown on this page, in a screenshot or in a video. You make the two main keys yourself; the
-rest are made by am2Strata and stay on the machine that made them.
+rest are made by Prastara and stay on the machine that made them.
 
 | What | Where | Made by | Who sees it |
 |---|---|---|---|
 | Master's main API key | the master's run config, `"api_key"` | you (a long random value, e.g. `openssl rand -hex 32`) | you and the apps you give it to; never sent to a worker |
 | Worker's main API key | the worker's run config, `"api_key"` | you | only you, on the worker |
-| Node identity (ed25519) | `<data>/node-key`, file mode 0600 | am2Strata, on first start | nobody: it never leaves the machine |
-| Node certificate | `<data>/node-tls.json`, 0600 | am2Strata, on first start | its SHA-256 (the **pin**) is swapped when pairing |
+| Node identity (ed25519) | `<data>/node-key`, file mode 0600 | Prastara, on first start | nobody: it never leaves the machine |
+| Node certificate | `<data>/node-tls.json`, 0600 | Prastara, on first start | its SHA-256 (the **pin**) is swapped when pairing |
 | Pairing code (6 digits) | the worker's log and its Settings › Cluster | the worker; new every 10 minutes and after each use | you type it into the master once |
 | The master's key on the worker | the master's `<data>/cluster-workers.json` (0600); the worker keeps only its **SHA-256** in `cluster-masters.json` (0600) | the worker, when the right code arrives; answered once | only the master |
 | HTTPS certificate (optional) | `<data>/server-tls/` | `am2strata-run tls self-signed` or `tls tailscale` | browsers and apps that use the worker's own HTTPS |
@@ -55,7 +55,7 @@ rest are made by am2Strata and stay on the machine that made them.
 ### 1. Install on both machines
 
 ```bash
-curl -fsSL https://github.com/abhaymin/am2strata/releases/latest/download/install.sh | sh -s -- --service
+curl -fsSL https://github.com/abhaymin/prastara/releases/latest/download/install.sh | sh -s -- --service
 am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M   # or a model that suits the machine
 ```
 
@@ -171,7 +171,7 @@ am2strata-run tls self-signed --http local-only   # or self-signed: compare its 
   Certificate Transparency logs, and that cannot be undone.
 - **Older versions lose the master.** In releases up to v0.1.8, `local-only` or `redirect` on a worker also redirected
   the master's requests on the cluster port, and the master then lost the worker ("the worker's certificate is not
-  the one paired"). Fixed in [#55](https://github.com/abhaymin/am2strata/pull/55). On an older worker, keep `"http":
+  the one paired"). Fixed in [#55](https://github.com/abhaymin/prastara/pull/55). On an older worker, keep `"http":
   "keep"` or update it first.
 
 ### Remove a worker

@@ -1,4 +1,4 @@
-# am2Strata v2: images, video and voice in Rust, and every model type
+# Prastara v2: images, video and voice in Rust, and every model type
 
 Status: started (v2.0). UI mockups: `design/V2*.dc.html` (Create › Image / Video / Voice, Settings › Models, Monitor).
 
@@ -138,11 +138,11 @@ checkout (default ~/Development/am2strata).
 
 `am2strata-run upstream-check` compares the ports with PolyStrata and Strata (`tools/upstream.json`). As of
 2026-10-30 they are current with PolyStrata main (20d839db, v0.1.45-poly.6) and with Strata 0.2.8's server files
-(serve/frontend.py, serve/server.py). Strata's `main` is that tag. Every upstream update is meant to reach am2Strata:
+(serve/frontend.py, serve/server.py). Strata's `main` is that tag. Every upstream update is meant to reach Prastara:
 run the check when working here, port what changed, then update `tools/upstream.json`.
 
 What the check does not cover is the engines. PolyStrata and its engines still carry Strata 0.1.45, so Strata 0.2's
-packs (native_experts v5, Hadamard-folded) are refused by name, and am2Strata's per-layer pruned packs are
+packs (native_experts v5, Hadamard-folded) are refused by name, and Prastara's per-layer pruned packs are
 `am2strata native experts p1`.
 
 ## Roadmap: Strata's engine work and two GPUs
@@ -151,7 +151,7 @@ Planned, in order. Nothing here is started unless it says so.
 
 The long-term engine plan, one Rust engine for dense and MoE models, is [ENGINE-PLAN.md](ENGINE-PLAN.md).
 
-1. **Two GPUs across a reboot.** Done so far: Orca splits over both cards, am2Strata is the boot service, a card that
+1. **Two GPUs across a reboot.** Done so far: Orca splits over both cards, Prastara is the boot service, a card that
    is missing at load is dropped with a note. `gpu-usb4-recover` is installed. Still needed: a reboot test. Gate: after a cold boot both cards are up and Orca is split, with no hand steps.
 2. **Check poly.6 on real models.** Sage measured: the rebuilt `strata-poly` decodes at 150-155 tok/s, the same as the previous
    engine at 149-156 tok/s. Clover is still to try; it needs a download.
@@ -165,7 +165,7 @@ The long-term engine plan, one Rust engine for dense and MoE models, is [ENGINE-
 5. **Smaller ports from Strata 0.2.8's server: done.** Leftover engines are ended and waited for before a start (#4051), any
    DeepSeek pre-tokenizer gets DSML calls (#4137), and repaired tool arguments and stray `</think>` tags are logged and counted
    in `/metrics/prometheus`.
-6. **Coral Edge TPU (optional).** am2Strata never requires it: without one, or without its driver, everything works and
+6. **Coral Edge TPU (optional).** Prastara never requires it: without one, or without its driver, everything works and
    Settings shows it as "no driver loaded". This PC has one on PCIe (`1ac1:089a`).
    - Driver first: `gasket` / `apex` is not in the apt sources here and may need a fork to build on Linux 7. Needs root to
      install, and a permission to test-build third-party source. Gate: `/dev/apex_0` appears and Settings shows it ready

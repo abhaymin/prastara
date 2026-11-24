@@ -543,7 +543,7 @@ async fn one_check(b: &Browsers, page: &Page, c: &Value, d: &Diag, body: &str) -
 
 async fn check_links(b: &Browsers, links: &[String]) -> Vec<String> {
     let client = reqwest::Client::builder().timeout(Duration::from_secs(10)).redirect(reqwest::redirect::Policy::limited(5))
-        .user_agent("Mozilla/5.0 (am2Strata link check)").build().unwrap();
+        .user_agent("Mozilla/5.0 (Prastara link check)").build().unwrap();
     let private = b.settings.private_urls;
     let jobs = links.iter().cloned().map(|u| {
         let client = client.clone();

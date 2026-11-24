@@ -25,7 +25,7 @@ added, edited, removed or tested from the app (owner's report, 2026-11-09).
   config's servers show as "from the run config" and stay read-only in the app.
   - Header values and environment values are stored as given. The app shows them masked (`••••`) and never sends
     them back in full.
-- **Changes apply at once:** a saved change starts, restarts or stops that one server, with no restart of am2Strata.
+- **Changes apply at once:** a saved change starts, restarts or stops that one server, with no restart of Prastara.
   The tools a chat may call update with it.
 
 ## Safety: a command server runs a program on this PC

@@ -32,7 +32,7 @@ use strata_workshop::profile::{self, AutopilotInput, Machine, ProfileInput};
 use strata_workshop::{convert, datagen, merge, quantize_gguf, soup};
 
 #[derive(Parser)]
-#[command(name = "am2strata-workshop", about = "Convert, quantize and merge models in Rust (am2Strata's Workshop)")]
+#[command(name = "am2strata-workshop", about = "Convert, quantize and merge models in Rust (Prastara's Workshop)")]
 struct Cli {
     /// one JSON event per line on stdout (for the server and scripts)
     #[arg(long, global = true)]

@@ -2,7 +2,7 @@
 //! on the models installed on this machine; ignored by default (they need the models and the oracle):
 //!   STRATA_MODELS="a.gguf:b.gguf" cargo test --release --manifest-path crates/strata-media/Cargo.toml \
 //!       -p strata-hybrid -- --ignored --nocapture
-//! - tokenizer: the tokenizer am2Strata extracts from each GGUF gives llama.cpp's ids for a set of texts;
+//! - tokenizer: the tokenizer Prastara extracts from each GGUF gives llama.cpp's ids for a set of texts;
 //! - forward pass: tools/reference-llamacpp/parity.sh (greedy decoding with teacher forcing, near-ties allowed).
 
 use std::path::{Path, PathBuf};

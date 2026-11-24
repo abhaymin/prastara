@@ -56,8 +56,8 @@ def overview(P):
         ("Install and verify", "six platforms", "pink", ["One line: Linux, macOS, Windows", "x64 and Arm, checksum verified", "doctor shows what each needs"]),
     ]
     W, H, cw, ch, gx, gy, x0, y0 = 1600, 1060, 352, 226, 24, 24, 64, 190
-    o = head(W, H, "am2Strata: what is in it", "; ".join(t[0] + ": " + " ".join(t[3]) for t in tiles), P)
-    o += [T(64, 100, "am2Strata", P, "ink", 60, 700), T(64, 144, "A local AI server in Rust: what is in it (November 2026)", P, size=24)]
+    o = head(W, H, "Prastara: what is in it", "; ".join(t[0] + ": " + " ".join(t[3]) for t in tiles), P)
+    o += [T(64, 100, "Prastara", P, "ink", 60, 700), T(64, 144, "A local AI server in Rust: what is in it (November 2026)", P, size=24)]
     for i, (t, tag, c, lines) in enumerate(tiles):
         x, y = x0 + (i % 4) * (cw + gx), y0 + (i // 4) * (ch + gy)
         tw = len(tag) * 8.6 + 26
@@ -66,20 +66,20 @@ def overview(P):
                  + f'<rect x="28" y="76" width="{tw:.0f}" height="26" rx="13" fill="none" stroke="{P["ui"][c]}"/>'
                  + T(round(28 + tw / 2), 94, tag, P, c, 14, 600, "middle")
                  + "".join(T(28, 138 + k * 30, l, P) for k, l in enumerate(lines)) + '</g>')
-    o += [T(64, H - 44, "Free and open source (MIT)", P, "teal", 22, 600), T(64, H - 16, "github.com/abhaymin/am2strata · am2strata.am2.ai", P, size=18), '</svg>']
+    o += [T(64, H - 44, "Free and open source (MIT)", P, "teal", 22, 600), T(64, H - 16, "github.com/abhaymin/prastara · prastara.am2.ai", P, size=18), '</svg>']
     return "\n".join(o)
 
 
 def tiers(P):
     W, H = 1600, 960
-    o = head(W, H, "Bigger than your RAM: how am2Strata runs a model that does not fit",
+    o = head(W, H, "Bigger than your RAM: how Prastara runs a model that does not fit",
              "Three tiers. The weights every token uses sit in GPU memory or RAM; the experts a learned profile ranks hot are pinned in "
              "RAM; the cold experts stay on the SSD and are read in parallel only when the router picks them. Measured on a Mac mini M4 "
-             "with 16 GB running GLM-4.7-Flash (17.5 GB): am2Strata generates 8.9 tokens per second without swapping, llama.cpp 3.6 with "
-             "plain mmap and 2.05 by default while writing about 98 GB of swap. Prompt: am2Strata 16.9, llama.cpp 17.3 (mmap) and 11.4 "
+             "with 16 GB running GLM-4.7-Flash (17.5 GB): Prastara generates 8.9 tokens per second without swapping, llama.cpp 3.6 with "
+             "plain mmap and 2.05 by default while writing about 98 GB of swap. Prompt: Prastara 16.9, llama.cpp 17.3 (mmap) and 11.4 "
              "(default).", P)
     o += [T(64, 92, "Bigger than your RAM", P, "ink", 46, 700),
-          T(64, 134, "A mixture-of-experts model uses only a few experts per token. am2Strata keeps those close and leaves the rest on the SSD.", P, size=22),
+          T(64, 134, "A mixture-of-experts model uses only a few experts per token. Prastara keeps those close and leaves the rest on the SSD.", P, size=22),
           '<g transform="translate(64 190)">']
     slabs = [("teal", "GPU memory and RAM", ["Attention, shared experts, the output head:", "the weights every token uses, always resident"]),
              ("blue", "Hot experts in RAM", ["A learned profile ranks them; they are pinned so", "the OS cannot evict them (98% of routing hits here)"]),
@@ -111,22 +111,22 @@ def tiers(P):
                   f'<rect x="230" y="{yy - 20}" width="{w:.0f}" height="30" rx="8" fill="{P["ui"]["teal"] if us else P["muted"]}"/>',
                   T(546, yy + 2, label, P, "teal" if us else "muted", 18, 700 if us else 400)]
         return g
-    o += bars(146, "Generation, tokens per second", [("am2Strata", 8.9, "8.9", True), ("llama.cpp, mmap", 3.58, "3.6", False),
+    o += bars(146, "Generation, tokens per second", [("Prastara", 8.9, "8.9", True), ("llama.cpp, mmap", 3.58, "3.6", False),
                                                      ("llama.cpp, default", 2.05, "2.05", False)], 9)
-    o += bars(364, "Prompt, tokens per second", [("am2Strata", 16.85, "16.9", True), ("llama.cpp, mmap", 17.31, "17.3", False),
+    o += bars(364, "Prompt, tokens per second", [("Prastara", 16.85, "16.9", True), ("llama.cpp, mmap", 17.31, "17.3", False),
                                                  ("llama.cpp, default", 11.39, "11.4", False)], 18)
     o += [f'<line x1="36" y1="550" x2="640" y2="550" stroke="{P["line"]}" stroke-width="2"/>',
           f'<text x="36" y="586" font-size="20" fill="{P["ink"]}"><tspan font-weight="700" fill="{P["teal"]}">2.5x</tspan> llama.cpp\'s generation, no swapping</text>',
           T(36, 614, "llama.cpp's default swapped ~98 GB; Metal ran out of memory.", P, "ink", 20),
-          T(36, 642, "am2Strata at 8-10 threads; llama.cpp measured at 4. Tokens checked against llama.cpp.", P, size=15),
-          '</g>', T(64, 920, "am2Strata · free and open source (MIT) · github.com/abhaymin/am2strata · numbers in docs/HYBRID-SPEED.md", P, size=16),
+          T(36, 642, "Prastara at 8-10 threads; llama.cpp measured at 4. Tokens checked against llama.cpp.", P, size=15),
+          '</g>', T(64, 920, "Prastara · free and open source (MIT) · github.com/abhaymin/prastara · numbers in docs/HYBRID-SPEED.md", P, size=16),
           '</svg>']
     return "\n".join(o)
 
 
 def cluster(P):
     W, H = 1200, 800
-    o = head(W, H, "am2Strata cluster: pairing a worker with a master",
+    o = head(W, H, "Prastara cluster: pairing a worker with a master",
              "Two machines. The master holds the main API key and talks to clients; it keeps node-tls.json and cluster-workers.json. "
              "The worker keeps its own key, node-key and node-tls.json, and cluster-masters.json with only the hash of the key it gave. "
              "Steps: 1 install on both with a main api_key each; 2 make a worker with cluster role worker, started on 0.0.0.0, which shows "

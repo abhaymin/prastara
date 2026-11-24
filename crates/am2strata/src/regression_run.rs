@@ -560,7 +560,7 @@ pub fn run(o: Options) -> bool {
                        "rows": rows.iter().map(|x| json!({"check": x.name, "result": word(x.outcome).to_lowercase(), "ms": x.ms as u64, "detail": x.detail})).collect::<Vec<_>>()});
         println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
     } else {
-        println!("am2Strata regression ({}) against {}", if o.full { "full" } else { "quick" }, r.mask(&r.url));
+        println!("Prastara regression ({}) against {}", if o.full { "full" } else { "quick" }, r.mask(&r.url));
         let w = rows.iter().map(|x| x.name.chars().count()).max().unwrap_or(10);
         for x in &rows {
             println!("  {}  {:<w$}  {:>7} ms  {}", word(x.outcome), x.name, x.ms, x.detail);

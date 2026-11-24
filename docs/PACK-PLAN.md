@@ -2,7 +2,7 @@
 
 **Request (owner, 2026-11-23):** a pack that puts the model's GGUF and its image files into a single package, with the
 expert layers arranged so that the model loads quickly and runs fast. It must work from a quantized model, from the full
-unquantized model, and from safetensors. It is am2Strata's own format, built so that it can be released separately as
+unquantized model, and from safetensors. It is Prastara's own format, built so that it can be released separately as
 open source.
 
 **"Imatrix for image" (owner, confirmed 2026-11-23):** for GGUF models it is the image projector, the `mmproj` file
@@ -89,7 +89,7 @@ P2 onward needs the native engine for the architecture (for Inkling: I6 and I8 i
 
 ## Status (2026-11-23)
 
-Owner: start the code inside am2Strata first; it is split into its own release later.
+Owner: start the code inside Prastara first; it is split into its own release later.
 
 - **P0 and P1 are done** (CLI only; the Workshop step is P6).
   - `crates/am2pack` (AGPL-3.0, no dependency on the rest of the repository) and `docs/PACK-FORMAT.md`.
@@ -229,7 +229,7 @@ to the GGUF.
 4. Licences (owner, 2026-11-23: "pick best on AGPL 3"; the choice below is Claude's, made on that word):
    - `am2pack` is `AGPL-3.0-only` (version 3 as asked; the owner holds the whole copyright and can add a later
      version or another licence at any time, which "or later" would have given away to whatever version comes).
-   - am2Strata's own code stays MIT. Reading and writing packs is a cargo feature (`pack` in `am2strata`, `aipac`
+   - Prastara's own code stays MIT. Reading and writing packs is a cargo feature (`pack` in `am2strata`, `aipac`
      in `strata-hybrid`), on by default.
    - A binary built with the feature contains `am2pack`, so it is distributed under the AGPL's terms (its source
      offered, also to users over a network). Built with `--no-default-features` it is MIT alone and reads no packs.

@@ -1,6 +1,6 @@
 [package]
 name = "strata-hub"
-description = "Hugging Face model downloads for am2Strata (token optional, resumable, SHA-256 checked) and run-config writing"
+description = "Hugging Face model downloads for Prastara (token optional, resumable, SHA-256 checked) and run-config writing"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

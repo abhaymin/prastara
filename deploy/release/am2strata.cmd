@@ -1,5 +1,5 @@
 @echo off
-rem am2Strata from a release: runs from this folder and keeps models and settings in %%AM2STRATA_DATA%%.
+rem Prastara from a release: runs from this folder and keeps models and settings in %%AM2STRATA_DATA%%.
 rem   am2strata                        start the server (http://127.0.0.1:8000)
 rem   am2strata pull ^<repo^> [^<quant^>]  download a model from Hugging Face; no quant lists what the repository has
 rem   am2strata agent list^|start^|setup^|reset^|show ^<agent^>  coding agents on this server or another (--url)

@@ -1,6 +1,6 @@
 # Browser use
 
-am2Strata drives a real web browser for a chat, an API client, an MCP client or a coding agent. The server adds the
+Prastara drives a real web browser for a chat, an API client, an MCP client or a coding agent. The server adds the
 browser tools to a request and runs them itself, the same way it runs the image, video and audio tools. Nothing has to
 be installed or configured on the caller's side, and the steps, page text and screenshots come back in the answer.
 

@@ -1,6 +1,6 @@
 # The regression suite
 
-What keeps am2Strata from breaking something that worked: a contract for every route, the shapes the
+What keeps Prastara from breaking something that worked: a contract for every route, the shapes the
 compatibility APIs answer in, one test for every class of bug fixed before, and a checklist to run against
 the deployed server after an update.
 

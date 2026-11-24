@@ -1,6 +1,6 @@
 # Production: no crash, no silent failure, overload told plainly
 
-Owner's requirement (2026-11-10): am2Strata handles errors gracefully, manages memory and model preferences without
+Owner's requirement (2026-11-10): Prastara handles errors gracefully, manages memory and model preferences without
 crashing, warns the user plainly when the PC is overloaded, and does not fail during delivery.
 
 ## What the code does today (audit, 2026-11-10)

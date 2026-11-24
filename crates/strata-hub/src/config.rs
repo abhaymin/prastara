@@ -148,7 +148,7 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
     let bundled = bundled_engine();
     let no_poly = !poly.join(format!("strata-poly{}", std::env::consts::EXE_SUFFIX)).exists();
     if HYBRID_ARCHS.iter().any(|(a, _)| *a == arch) || (no_poly && bundled.is_some() && RUST_FALLBACK_ARCHS.iter().any(|(a, _)| *a == arch)) {
-        // the Rust engine: its pack is built on the first load (am2Strata runs iq-pack before starting the engine), the
+        // the Rust engine: its pack is built on the first load (Prastara runs iq-pack before starting the engine), the
         // expert profile is learned while it runs, and the hottest experts stay in RAM
         let ctx = context.unwrap_or(ctx.min(32768));
         let mut args = vec![json!("--model"), json!(model), json!("--max-context"), json!(ctx.to_string()), json!("--pack"), json!(pack)];

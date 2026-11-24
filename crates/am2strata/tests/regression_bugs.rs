@@ -2,7 +2,7 @@
 //! it came from. The rule: EVERY BUG FIX ADDS A TEST HERE (or, for a library crate, a `regress_…` unit test beside
 //! the fix, listed at the end of this file), so the same bug cannot come back unseen.
 //!
-//! Pull requests: https://github.com/abhaymin/am2strata/pull/<n>
+//! Pull requests: https://github.com/abhaymin/prastara/pull/<n>
 
 mod common;
 
@@ -236,7 +236,7 @@ fn pr12_a_malformed_host_never_panics_the_server() {
         // (/health is never redirected, so the redirecting server is asked for a path that is)
         for (srv, what, path) in [(&s, "redirecting", "/v1/models"), (&plain, "plain", "/health")] {
             let got = raw_http(srv.port, &format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"));
-            // hyper may refuse a Host it cannot parse before am2Strata sees it (400), or close: both are fine
+            // hyper may refuse a Host it cannot parse before Prastara sees it (400), or close: both are fine
             if let Some((status, head)) = got {
                 assert!(status < 500, "Host {host:?} on the {what} server: {status}\n{head}");
                 // a redirect, if any, goes to this PC only: localhost or an IP literal, never a name the Host carried in
