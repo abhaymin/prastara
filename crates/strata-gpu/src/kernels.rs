@@ -22,6 +22,11 @@ pub mod kind {
     pub const Q4_K: u32 = 5;
     pub const Q5_K: u32 = 6;
     pub const Q6_K: u32 = 7;
+    /// IQ3_XXS: 256 values in 98 bytes (an f16 scale, 64 grid indices, 8 words of signs and scales). Its 256-entry
+    /// grid travels at the front of the matrix's own buffer ([`TABLE_BYTES`]), so every backend reads it the same way.
+    pub const IQ3_XXS: u32 = 8;
+    /// Q5_0: 32 values in 22 bytes (an f16 scale, 4 bytes of fifth bits, 16 bytes of nibbles), values minus 16.
+    pub const Q5_0: u32 = 9;
 }
 
 /// (values per block, bytes per block, kind) of a GGUF type name this crate has a kernel for.
@@ -32,11 +37,35 @@ pub fn geometry(ty: &str) -> Option<(u32, u32, u32)> {
         "BF16" => (32, 64, kind::BF16),
         "Q8_0" => (32, 34, kind::Q8_0),
         "Q4_0" => (32, 18, kind::Q4_0),
+        "Q5_0" => (32, 22, kind::Q5_0),
         "Q4_K" => (256, 144, kind::Q4_K),
         "Q5_K" => (256, 176, kind::Q5_K),
         "Q6_K" => (256, 210, kind::Q6_K),
+        "IQ3_XXS" => (256, 98, kind::IQ3_XXS),
         _ => return None,
     })
+}
+
+/// Bytes of lookup table at the front of a matrix of kind `k` (its grid), before its first row.
+pub const fn table_bytes(k: u32) -> u32 {
+    if k == kind::IQ3_XXS { 1024 } else { 0 }
+}
+
+/// The table a matrix of kind `ty` carries at its front, as little-endian bytes (empty for most kinds).
+pub fn table_for(ty: &str) -> Vec<u8> {
+    match ty {
+        "IQ3_XXS" => strata_pack::grids::IQ3XXS_GRID.iter().flat_map(|g| g.to_le_bytes()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// IQ2_XS's sign table, which IQ3_XXS uses too: the 7 bits given, and an eighth that makes the count of minus signs even.
+#[cube]
+fn ksigns(i: u32) -> u32 {
+    let mut p = i ^ (i >> 4);
+    p ^= p >> 2;
+    p ^= p >> 1;
+    i | ((p & 1) << 7)
 }
 
 /// Byte `off` of the weights.
@@ -108,6 +137,17 @@ fn block_dot(w: &Array<u32>, o: u32, x: &Array<f32>, xo: u32, #[comptime] k: u32
             acc += (f32::cast_from(b >> 4) - 8.0) * x[(xo + 16 + j) as usize];
         }
         acc *= d;
+    } else if comptime![k == kind::Q5_0] {
+        let d = half(w, o);
+        let qh = byte(w, o + 2) | (byte(w, o + 3) << 8) | (byte(w, o + 4) << 16) | (byte(w, o + 5) << 24);
+        for j in 0..16u32 {
+            let b = byte(w, o + 6 + j);
+            let lo = (b & 0x0f) | (((qh >> j) & 1) << 4);
+            let hi = (b >> 4) | (((qh >> (j + 16)) & 1) << 4);
+            acc += (f32::cast_from(lo) - 16.0) * x[(xo + j) as usize];
+            acc += (f32::cast_from(hi) - 16.0) * x[(xo + 16 + j) as usize];
+        }
+        acc *= d;
     } else if comptime![k == kind::Q4_K || k == kind::Q5_K] {
         // 8 groups of 32: a 6-bit scale and min each (packed in 12 bytes), then 4-bit values (+ a 5th bit for Q5_K)
         let d = half(w, o);
@@ -166,7 +206,7 @@ fn block_dot(w: &Array<u32>, o: u32, x: &Array<f32>, xo: u32, #[comptime] k: u32
 #[cube]
 fn group_dot(w: &Array<u32>, o: u32, g: u32, x: &Array<f32>, xo: u32, #[comptime] k: u32) -> f32 {
     let mut acc = f32::new(0.0);
-    if comptime![k == kind::F32 || k == kind::F16 || k == kind::BF16 || k == kind::Q8_0 || k == kind::Q4_0] {
+    if comptime![k == kind::F32 || k == kind::F16 || k == kind::BF16 || k == kind::Q8_0 || k == kind::Q4_0 || k == kind::Q5_0] {
         // these blocks are 32 values: the group is the block
         acc = block_dot(w, o, x, xo, k);
     } else if comptime![k == kind::Q4_K || k == kind::Q5_K] {
@@ -206,6 +246,20 @@ fn group_dot(w: &Array<u32>, o: u32, g: u32, x: &Array<f32>, xo: u32, #[comptime
             }
         }
         acc = d * f32::cast_from(sc) * part - dmin * f32::cast_from(mn) * xs;
+    } else if comptime![k == kind::IQ3_XXS] {
+        // group g of 8: its 8 grid indices (each 4 values) at 2 + 8g, its signs and scale in the word at 66 + 4g
+        let d = half(w, o);
+        let sw = byte(w, o + 66 + 4 * g) | (byte(w, o + 67 + 4 * g) << 8) | (byte(w, o + 68 + 4 * g) << 16) | (byte(w, o + 69 + 4 * g) << 24);
+        let db = d * (f32::new(0.5) + f32::cast_from(sw >> 28)) * f32::new(0.5);
+        for l in 0..4u32 {
+            let ks = ksigns((sw >> (7 * l)) & 0x7f);
+            for j in 0..8u32 {
+                let gi = byte(w, o + 2 + 8 * g + 2 * l + j / 4);
+                let gv = (w[gi as usize] >> (8 * (j % 4))) & 0xff; // the grid is the buffer's first 256 words
+                let s = f32::new(1.0) - f32::new(2.0) * f32::cast_from((ks >> j) & 1);
+                acc += db * f32::cast_from(gv) * s * x[(xo + 8 * l + j) as usize];
+            }
+        }
     } else if comptime![k == kind::Q6_K] {
         let d = half(w, o + 208);
         let hh = g / 4;
@@ -246,7 +300,7 @@ pub fn matvec(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32, col
         while gi < ng {
             let b = gi / groups_per_block;
             let g = gi % groups_per_block;
-            acc += group_dot(w, row * row_bytes + b * bytes_per_block, g, x, t * cols + gi * 32, k);
+            acc += group_dot(w, comptime![table_bytes(k)] + row * row_bytes + b * bytes_per_block, g, x, t * cols + gi * 32, k);
             gi += 32;
         }
     }

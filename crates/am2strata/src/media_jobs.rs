@@ -156,6 +156,10 @@ impl Jobs {
     /// Run again the jobs the server stopped in (after `bind`).
     pub fn resume(&self, jobs: Vec<(u64, &'static str, Value)>) {
         for (n, kind, req) in jobs {
+            if let Some(w) = req["remote"].as_str() {
+                self.finish(n, Err(format!("this server restarted while worker {w} was making it; make it again")));
+                continue;
+            }
             tracing::info!("media job mj-{n} ({kind}) was not finished when the server stopped: it runs again");
             let s = self.app().clone();
             tokio::spawn(crate::queue::PRIORITY.scope(crate::queue::Priority::Low,
@@ -203,12 +207,19 @@ impl Jobs {
         if ok("video") {
             let v = &caps["kinds"]["video"];
             t.push(json!({"name": "generate_video", "description": format!(
-                "Make a short video clip on this PC from a text description. It is queued and appears in the chat after \
-                 your answer (it takes minutes): say that it is on its way. Sizes: {}; frames up to {}.", v["sizes"], v["max_frames"]),
+                "Make a video on this PC, of any length up to 15 minutes, as ONE file in ONE call: give `seconds` for its length, \
+                 or `scenes` (each a prompt and its seconds) for a story in several scenes. The clips are made and joined inside \
+                 the server as one background job, each continued from the one before; never split a long video into several \
+                 calls. It appears in the chat after your answer (a long one takes a while): say that it is on its way. \
+                 Sizes: {}; one clip is up to {} frames.", v["sizes"], v["max_frames"]),
                 "parameters": {"type": "object", "properties": {
-                    "prompt": {"type": "string", "description": "a detailed description of the scene and its motion"},
-                    "frames": {"type": "integer", "description": "number of frames (default the model's)"},
-                    "size": {"type": "string", "description": "WIDTHxHEIGHT"}}, "required": ["prompt"]}}));
+                    "prompt": {"type": "string", "description": "a detailed description of the scene and its motion (one scene)"},
+                    "seconds": {"type": "number", "description": "the whole video's length in seconds (one scene), up to 900"},
+                    "scenes": {"type": "array", "description": "a longer story: the scenes in order, each {\"prompt\", \"seconds\"}",
+                               "items": {"type": "object", "properties": {"prompt": {"type": "string"}, "seconds": {"type": "number"}},
+                                         "required": ["prompt", "seconds"]}},
+                    "frames": {"type": "integer", "description": "one short clip's frames instead of seconds (rarely needed)"},
+                    "size": {"type": "string", "description": "WIDTHxHEIGHT"}}}}));
         }
         if ok("music") {
             let genres: Vec<&str> = crate::music::GENRES.iter().map(|g| g.0).collect();
@@ -305,6 +316,17 @@ impl Jobs {
     /// GET /api/media/capabilities: per kind, the model in use, whether it is downloaded and fits this PC, its sizes
     /// and limits, and the time the last job of it took.
     pub async fn capabilities(&self) -> Value {
+        let mut v = self.capabilities_of_engine().await;
+        // compose and thumbnails need only ffmpeg (a cluster master sends them to a worker that has it)
+        let missing = crate::media::compose_missing();
+        v["compose"] = json!(missing.is_empty());
+        if !missing.is_empty() {
+            v["compose_missing"] = json!(missing);
+        }
+        v
+    }
+
+    async fn capabilities_of_engine(&self) -> Value {
         if let Some((at, v)) = self.caps.lock().unwrap().clone() {
             if at.elapsed() < Duration::from_secs(60) || self.app().media.busy() {
                 return self.with_speeds(v);
@@ -321,7 +343,7 @@ impl Jobs {
         let models = list["models"].as_array().cloned().unwrap_or_default();
         let find = |name: &str| models.iter().find(|m| m["name"] == name).cloned();
         // the text model is stopped for a GPU job, so the whole VRAM is the media model's; mold offloads past it
-        let vram_gb: f64 = s.mgr.hw.gpus.iter().map(|g| g.vram_mib as f64 / 1024.0).sum();
+        let vram_gb: f64 = gpu_memory_gb(&s.mgr.hw, s.media.gpu_kind().as_deref());
         let mut kinds = serde_json::Map::new();
         for (kind, model) in [("image", s.media.model()), ("video", s.media.video_model()), ("tts", s.media.tts_model()),
                               ("stt", s.media.stt_model())] {
@@ -357,7 +379,8 @@ impl Jobs {
         if let Some(m) = find(crate::music::MODEL) {
             let downloaded = m["downloaded"] == true;
             // a GPU of 7 GB or more makes a minute of song in seconds; without one it runs on the CPU, slowly
-            let gpu = s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000);
+            let gpu = s.mgr.hw.gpus.iter().any(|g| g.vram_mib >= 7000)
+                || (s.media.gpu_kind().as_deref() == Some("metal") && vram_gb >= 7.0);
             let mut k = json!({"model": crate::music::MODEL, "downloaded": downloaded, "size_gb": m["size_gb"], "fits": true,
                                "usable": downloaded, "gpu": gpu, "max_seconds": 600});
             if !downloaded {
@@ -431,7 +454,9 @@ impl Jobs {
         };
         let fail = |t: String| json!({"ok": false, "text": t, "chars": t.len(), "truncated": false, "ms": 0});
         // instrumental music needs a genre or a style
-        let given = args[key].as_str().or_else(|| if kind == "music" { args["style"].as_str() } else { None });
+        let given = args[key].as_str().or_else(|| if kind == "music" { args["style"].as_str() } else { None })
+            // a video in scenes: its first scene's prompt names it
+            .or_else(|| if kind == "video" { args["scenes"][0]["prompt"].as_str() } else { None });
         let Some(prompt) = given.map(str::trim).filter(|p| !p.is_empty()) else {
             return fail(format!("error: {name} needs \"{key}\"{}", if kind == "music" { " or \"style\"" } else { "" }));
         };
@@ -462,6 +487,16 @@ impl Jobs {
             }
             "video" => {
                 let mut r = json!({"prompt": prompt});
+                // one long video in one job: its length, or its scenes (the server chains the clips into one file)
+                if let Some(secs) = args["seconds"].as_f64() {
+                    if !(1.0..=900.0).contains(&secs) {
+                        return fail("error: seconds is 1 to 900 (15 minutes)".into());
+                    }
+                    r["seconds"] = json!(secs);
+                }
+                if let Some(sc) = args["scenes"].as_array().filter(|a| !a.is_empty()) {
+                    r["scenes"] = json!(sc);
+                }
                 if let Some(f) = args["frames"].as_u64() {
                     let max = k["max_frames"].as_u64().unwrap_or(81);
                     if f > max {
@@ -707,6 +742,38 @@ impl Jobs {
     }
 
     /// Update a job's meta (a compose's progress, or a production's current part).
+    /// A job a cluster worker makes (cluster.rs follows it there): queued here under this server's own id, so the
+    /// caller polls this server as for any job. Its request is not kept (the worker has it); a restart ends it.
+    pub fn submit_remote(&self, kind: &'static str, req: &Value, worker: &str, remote_id: &str) -> (u64, Value) {
+        let n = {
+            let mut g = self.next.lock().unwrap();
+            *g += 1;
+            if let Some(dir) = self.dir.get() {
+                let _ = std::fs::write(dir.join("next"), g.to_string());
+            }
+            *g - 1
+        };
+        let id = format!("mj-{n}");
+        let shots = req["shots"].as_array().map(Vec::len).unwrap_or(0);
+        let prompt = if kind == "compose" { format!("{shots} shots") } else { "thumbnail".to_string() };
+        let job = Job { id: id.clone(), kind, model: "compose".into(), prompt, created: crate::now(), state: "queued", error: None,
+                        mime: None, data: None, meta: json!({"worker": worker, "remote_id": remote_id, "now": "on worker"}),
+                        seconds: None, req: json!({"remote": worker, "remote_id": remote_id}), file: None };
+        self.save(&job);
+        self.jobs.lock().unwrap().insert(n, job);
+        (n, json!({"id": id, "kind": kind_of(kind), "model": "compose", "shots": shots, "url": format!("/api/jobs/{id}")}))
+    }
+
+    /// A worker's job finished: its file (or why not) recorded here.
+    pub fn finish_remote(&self, n: u64, r: Result<(String, Vec<u8>, Value), String>) {
+        self.finish(n, r);
+    }
+
+    /// Jobs of these kinds queued or running here (not those a worker makes).
+    pub fn active(&self, kinds: &[&str]) -> usize {
+        self.jobs.lock().unwrap().values().filter(|j| j.state == "queued" && kinds.contains(&j.kind) && j.req.get("remote").is_none()).count()
+    }
+
     pub fn set_meta(&self, n: u64, meta: Value) {
         let mut jobs = self.jobs.lock().unwrap();
         if let Some(j) = jobs.get_mut(&n) {
@@ -751,7 +818,7 @@ impl Jobs {
         ids.iter().filter_map(|id| self.status(id)).collect()
     }
 
-    fn status(&self, id: &str) -> Option<Value> {
+    pub fn status(&self, id: &str) -> Option<Value> {
         let n: u64 = id.strip_prefix("mj-")?.parse().ok()?;
         let jobs = self.jobs.lock().unwrap();
         let j = jobs.get(&n)?;
@@ -771,6 +838,12 @@ impl Jobs {
                 if let Some((st, tot)) = self.app().mgr.monitor.media_progress() {
                     v["step"] = json!(st);
                     v["steps"] = json!(tot);
+                }
+                // a long job: its clip now and the clips finished (the web app's card appends them)
+                if let Some(d) = self.app().mgr.monitor.media_detail() {
+                    for k in ["stage", "stages", "log", "elapsed_s"] {
+                        v[k] = d[k].clone();
+                    }
                 }
             } else if let Some(w) = q["waiting"].as_array().and_then(|a| a.iter().find(|w| w["label"] == j.id.as_str())) {
                 v["position"] = w["position"].clone();
@@ -887,6 +960,19 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
                     let take = ((ctx * crate::production::RATE as f64) as usize * 2).min(prev.len());
                     b["continue_from"] = json!(base64::engine::general_purpose::STANDARD.encode(crate::production::wav(&prev[prev.len() - take..])));
                 }
+                if *kind == "audio" {
+                    // a file already made: read it, nothing is generated
+                    let src = body["file"].as_str().unwrap_or("").trim();
+                    let got = match s.media_jobs.bytes(src) {
+                        Some(b) => Ok(b),
+                        None => crate::media::load_source(src).await.map_err(|e| format!("{e:#}")),
+                    };
+                    let got = got.map_err(|e| format!("part {} of {total} (audio): {e}", i + 1))?;
+                    if let Some(f) = &kept {
+                        let _ = std::fs::write(f, &got);
+                    }
+                    got
+                } else {
                 let r = match *kind {
                     "speak" => crate::audio_api::speech(State(s.clone()), own_key(s), Json(b)).await,
                     _ => crate::music::music(State(s.clone()), own_key(s), Json(b)).await,
@@ -906,6 +992,7 @@ async fn run_production(s: &AppState, n: u64, plan: &Value) -> Result<(String, V
                     let _ = std::fs::write(f, &body_bytes);
                 }
                 body_bytes
+                }
             }
         };
         let (rate, ch, samples) = crate::production::read_wav(&bytes).map_err(|e| format!("part {}: {e}", i + 1))?;
@@ -1015,6 +1102,13 @@ pub async fn productions(State(s): State<AppState>, headers: HeaderMap, Json(req
         Ok(job) => Json(job).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
     }
+}
+
+/// The memory a media model may use on the GPU: the cards' VRAM, or on Apple Silicon (a Metal engine, no NVIDIA card)
+/// three quarters of the shared memory, which is about what macOS lets the GPU keep (its recommended working set).
+pub(crate) fn gpu_memory_gb(hw: &strata_engine::hardware::Hardware, kind: Option<&str>) -> f64 {
+    let cards: f64 = hw.gpus.iter().map(|g| g.vram_mib as f64 / 1024.0).sum();
+    if cards > 0.0 || kind != Some("metal") { cards } else { hw.ram_mib as f64 / 1024.0 * 0.75 }
 }
 
 pub async fn capabilities(State(s): State<AppState>, headers: HeaderMap) -> Response {

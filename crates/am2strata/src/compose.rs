@@ -104,32 +104,50 @@ fn ass_time(t: f64) -> String {
     format!("{}:{:02}:{:02}.{:02}", whole / 3600, (whole % 3600) / 60, whole % 60, (secs * 100.0).round() as u64 % 100)
 }
 
-/// The captions and the title/end cards as an ASS script burned in with libass: the captions centred low (each fading
-/// in and out over a quarter second, like song_video.py), the title at the start and the end card at the end. Empty when
-/// there is nothing to show.
-pub fn ass_script(w: u32, h: u32, captions: &[(f64, f64, String)], open: Option<&str>, end: Option<&str>, total: f64) -> String {
+/// The captions and the title/end cards as an ASS script burned in with libass: two styles. Low captions sit centred
+/// 120 px above the bottom (Cap, each fading in and out over a quarter second, like song_video.py); a centre word or a
+/// top line goes on the Word style (centred, Alignment 5 by default — forced to the top with `\an8` when asked), its
+/// font scaled by the caption's `size`. The title at the start and the end card at the end use the Ttl style. Empty
+/// when there is nothing to show.
+pub fn ass_script(w: u32, h: u32, captions: &[crate::captions::Caption], open: Option<&str>, end: Option<&str>, total: f64) -> String {
     let mut out = format!(
         "[Script Info]\nScriptType: v4.00+\nPlayResX: {}\nPlayResY: {}\n\n[V4+ Styles]\nFormat: Name, Fontname, \
          Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, \
          ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n\
-         Style: Cap,DejaVu Sans,58,&H00FAF8F5,&H00FFFFFF,&H00180A06,&H96180A06,1,0,0,0,100,100,0,0,3,14,0,2,80,80,120,1\n\
-         Style: Ttl,DejaVu Sans,96,&H00FAF8F5,&H00FFFFFF,&H00180A06,&H96180A06,1,0,0,0,100,100,0,0,3,18,0,5,80,80,0,1\n\n\
+         Style: Cap,DejaVu Sans,58,&H00FAF8F5,&H00FFFFFF,&H4D180A06,&H4D180A06,1,0,0,0,100,100,0,0,3,14,0,2,80,80,120,1\n\
+         Style: Word,DejaVu Sans,70,&H00FAF8F5,&H00FFFFFF,&H4D180A06,&H4D180A06,1,0,0,0,100,100,0,0,3,14,0,5,80,80,0,1\n\
+         Style: Ttl,DejaVu Sans,96,&H00FAF8F5,&H00FFFFFF,&H4D180A06,&H4D180A06,1,0,0,0,100,100,0,0,3,18,0,5,80,80,0,1\n\n\
          [Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n",
         w, h,
     );
-    for (a, b, text) in captions {
-        if *b <= *a {
+    for cap in captions {
+        if cap.b <= cap.a || cap.text.trim().is_empty() {
             continue;
         }
-        // each caption fades in and out over a quarter second so it does not snap on its change
-        let t = format!("{{\\fad(250,250)}}{}", ass_text(text));
-        out.push_str(&format!("Dialogue: 0,{},{},Cap,,0,0,120,,{}\n", ass_time(*a), ass_time(*b), t));
+        // low stays on the Cap style (Alignment 2, 120 px margin); centre/top ride the Word style (Alignment 5); a top
+        // line is forced higher with an `\an8` override. The font scales by size (58 px * size) so it matches captions.rs.
+        let (style, mv) = match cap.place {
+            crate::captions::Place::Low => ("Cap", "120"),
+            crate::captions::Place::Centre | crate::captions::Place::Top => ("Word", "0"),
+        };
+        // the ASS override block {\fs<size>}, plus, for a top line, {\an8}; each caption fades in and out over a quarter
+        // second so it does not snap on its change, then the caption text follows
+        let fs = (cap.size * 58.0).round() as u64;
+        let mut ovr = format!("{{\\fs{fs}}}",);
+        if cap.place == crate::captions::Place::Top { ovr.push_str(r"\an8"); }
+        ovr.push_str("\\fad(250,250)");
+        let t = format!("{}{}", ovr, ass_text(&cap.text));
+        // the Dialogue carries style (Cap/Low or Word/Centre+Top) and its own vertical margin, then the text with its overrides;
+        // all fields are named so the commas line up as ASS expects: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        out.push_str(&format!("Dialogue: 0,{start},{end},{style},,0,0,{mv},,{text}\n",
+            start = ass_time(cap.a), end = ass_time(cap.b), style = style, mv = mv, text = t));
     }
+    let (title_end, end_len) = crate::captions::card_times(total);
     if let Some(t) = open {
-        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time(0.5), ass_time(9.0_f64.min(total)), ass_text(t)));
+        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time(0.5), ass_time(title_end), ass_text(t)));
     }
     if let Some(t) = end {
-        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time((total - 10.0).max(0.0)), ass_time(total), ass_text(t)));
+        out.push_str(&format!("Dialogue: 0,{},{},Ttl,,0,0,0,,{{\\fad(400,400)}}{}\n", ass_time((total - end_len).max(0.0)), ass_time(total), ass_text(t)));
     }
     out
 }
@@ -257,27 +275,47 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     }
     let dir = crate::media::tempdir().map_err(|e| format!("could not make a temp folder: {e}"))?;
     let id = format!("mj-{n}");
-    // the caption events, and the title/end cards (optional)
-    let captions: Vec<(f64, f64, String)> = req["captions"].as_array().map(|a| {
+    // the caption events, and the title/end cards (optional). Each caption is [start_s, end_s, text] or
+    // [start_s, end_s, text, {"place": "low"|"centre"|"top", "size": 1.0}]; a centre word overlaps the low line(s).
+    let captions: Vec<crate::captions::Caption> = req["captions"].as_array().map(|a| {
         a.iter().filter_map(|c| {
             let arr = c.as_array()?;
             let a = arr.first()?.as_f64()?;
             let b = arr.get(1)?.as_f64()?;
             let text = arr.get(2).and_then(|t| t.as_str()).unwrap_or("").to_string();
-            if text.is_empty() || b <= a { None } else { Some((a, b, text)) }
+            // the optional fourth element carries place and size (default low, 1.0)
+            let mut place = crate::captions::Place::Low;
+            let mut size = 1.0f32;
+            if let Some(meta) = arr.get(3).and_then(Value::as_object) {
+                place = crate::captions::Place::parse(meta.get("place").and_then(Value::as_str).unwrap_or("low"));
+                if let Some(s) = meta.get("size").and_then(Value::as_f64) { size = s as f32; }
+            }
+            if text.trim().is_empty() || b <= a { None } else { Some(crate::captions::Caption::new(a, b, text, place, size)) }
         }).collect::<Vec<_>>()
     }).unwrap_or_default();
     // the shots' lengths: their own when given, else spread over the audio (with crossfades)
-    let total_s = duration_of(&dir, "audio.wav", &audio).await?;
+    let whole_s = duration_of(&dir, "audio.wav", &audio).await?;
+    // a part of the audio (a Short from the chorus): audio_from seconds in, for audio_seconds; captions are timed in it
+    let (from, total_s) = audio_part(whole_s, req["audio_from"].as_f64(), req["audio_seconds"].as_f64())?;
     let ass = ass_script(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str(), total_s);
     let subs = dir.join("subs.ass");
     std::fs::write(&subs, &ass).map_err(|e| format!("could not write the captions: {e}"))?;
-    let per_shot: Vec<Option<f64>> = shots.iter().map(|sh| sh["seconds"].as_f64()).collect();
-    let durations = if per_shot.iter().all(|d| d.is_some()) {
-        per_shot.iter().map(|d| d.unwrap_or(5.0)).collect()
-    } else {
-        spread_over(total_s, cross, shots.len())
-    };
+    // each shot's file, its kind, and a clip's own length (a clip plays its motion, never a frozen last frame)
+    let mut srcs: Vec<(std::path::PathBuf, &'static str, Option<f64>)> = Vec::new();
+    for (i, sh) in shots.iter().enumerate() {
+        let raw = sh.get("image").or_else(|| sh.get("clip")).and_then(Value::as_str).unwrap_or("");
+        let bytes = source_bytes(s, if sh.get("clip").is_some() { "clip" } else { "image" }, &Value::from(raw)).await?;
+        let kind = kind_of_bytes(&bytes);
+        let ext = if kind == "clip" { "mp4" } else { "png" };
+        let name = format!("src-{i}.{ext}");
+        let len = if kind == "clip" { duration_of(&dir, &name, &bytes).await.ok() } else {
+            std::fs::write(dir.join(&name), &bytes).map_err(|e| format!("could not write the {kind}: {e}"))?;
+            None
+        };
+        srcs.push((dir.join(name), kind, len));
+    }
+    let plan: Vec<(Option<f64>, Option<f64>)> = shots.iter().zip(&srcs).map(|(sh, (_, _, len))| (sh["seconds"].as_f64(), *len)).collect();
+    let durations = layout(total_s, cross, &plan);
     // a shot over its given length: images still play their whole zoom (clips are held on the last frame when short)
     let played = total_length(&durations, cross); // what the joined footage actually plays; cap to it
     let _ = join_offsets(&durations, cross);
@@ -285,19 +323,14 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     s.media_jobs.set_meta(n, json!({"part": 0, "parts": shots.len(), "now": "compose"}));
     // make each input a temp file (a data URL is decoded to bytes above; the rest are paths / job ids already resolved)
     let mut inputs = Vec::new();
-    for (i, sh) in shots.iter().enumerate() {
-        let raw = sh.get("image").or_else(|| sh.get("clip")).and_then(Value::as_str).unwrap_or("");
-        let bytes = source_bytes(s, if sh.get("clip").is_some() { "clip" } else { "image" }, &Value::from(raw)).await?;
-        let kind = kind_of_bytes(&bytes);
-        let ext = if kind == "clip" { "mp4" } else { "png" };
-        let src = dir.join(format!("src-{i}.{ext}"));
-        std::fs::write(&src, &bytes).map_err(|e| format!("could not write the {kind}: {e}"))?;
+    for (i, (src, kind, clip_len)) in srcs.iter().enumerate() {
+        let (src, kind) = (src.clone(), *kind);
         let out = dir.join(format!("shot-{:02}.mp4", i));
         let frames = frames_for(durations[i]);
         let (w2, h2) = (w * 2, h * 2);
         if kind == "clip" {
             // fitted to the frame, held on its last frame if shorter than the shot (so a short clip still fills it)
-            let fit = format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},fps={FPS},tpad=stop_mode=clone:stop_duration=0.5,format=yuv420p");
+            let fit = clip_filter(w, h, durations[i], *clip_len);
             let srcp = src.display().to_string();
             let outp = out.display().to_string();
             run_ffmpeg(&["-i", srcp.as_str(), "-vf", fit.as_str(), "-frames:v", frames.to_string().as_str(), "-an", "-c:v", "libx264", "-crf", "18", outp.as_str()]).await?;
@@ -336,18 +369,138 @@ pub async fn make(s: &AppState, n: u64, req: &Value) -> Result<(String, Vec<u8>,
     let args: Vec<&str> = inps.iter().map(String::as_str).collect();
     run_ffmpeg(&args).await?;
 
-    // mux the picture chain with the audio, captions burned in by libass, one MP4 (H.264 + AAC, faststart)
+    // the joined pictures must play as long as planned (a chain cut short would leave a long video with a still end)
+    if let Some(got) = probe_seconds(&pictures).await {
+        if got + 1.0 < played {
+            return Err(format!("the joined pictures play {got:.1} s of the {played:.1} s planned; not finished"));
+        }
+    }
+    // mux the picture chain with the audio and the captions and cards burned in, one MP4 (H.264 + AAC, faststart).
+    // The captions are drawn by am2Strata (captions.rs) and laid on with ffmpeg's overlay, which every ffmpeg has;
+    // "captions_engine": "libass" uses the subtitles filter instead
     let out = dir.join(format!("{id}.mp4"));
     let picp = pictures.display().to_string();
     let audiop = dir.join("audio.wav").display().to_string();
-    let subsp = subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:");
-    let fc = format!("[0:v]subtitles='{}'[v];[1:a]atrim=0:setpts=N/SR/TB,afade=t=out:st={}:d=4[a]", subsp, played.max(4.0) - 4.0);
-    run_ffmpeg(&["-i", picp.as_str(), "-i", audiop.as_str(), "-filter_complex", fc.as_str(), "-map", "[v]", "-map", "[a]", "-t", played.to_string().as_str(), "-r", FPS.to_string().as_str(), "-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart", out.display().to_string().as_str()]).await?;
+    let mut args: Vec<String> = vec!["-i".into(), picp, "-i".into(), audiop];
+    let fc = if req["captions_engine"].as_str() == Some("libass") {
+        let subsp = subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:");
+        final_filter(&subsp, played, from)
+    } else {
+        let ovs = crate::captions::overlays(w, h, &captions, req["title_card"].as_str(), req["end_card"].as_str(), total_s)?;
+        for (k, o) in ovs.iter().enumerate() {
+            let f = dir.join(format!("cap-{k:03}.png"));
+            std::fs::write(&f, &o.png).map_err(|e| format!("could not write a caption: {e}"))?;
+            args.extend(["-loop", "1", "-framerate", "30", "-t"].map(String::from));
+            args.push(format!("{:.3}", (o.b - o.a).max(0.3)));
+            args.push("-i".into());
+            args.push(f.display().to_string());
+        }
+        crate::captions::overlay_filter(&ovs, 2, played, from)
+    };
+    args.extend(["-filter_complex".to_string(), fc, "-map".into(), "[v]".into(), "-map".into(), "[a]".into(), "-t".into(), played.to_string(),
+                 "-r".into(), FPS.to_string(), "-c:v".into(), "libx264".into(), "-preset".into(), "medium".into(), "-crf".into(), "18".into(),
+                 "-pix_fmt".into(), "yuv420p".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-movflags".into(), "+faststart".into(),
+                 out.display().to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    run_ffmpeg(&refs).await?;
 
     // read the finished video while its temp folder still exists, then free the temporary clips and the whole dir (a restart keeps it)
     let bytes = std::fs::read(&out).map_err(|e| format!("could not read the finished video: {e}"))?;
     let _ = std::fs::remove_dir_all(&dir);
-    Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": played.round() / 10.0, "shots": inputs.len(), "captions": captions.len()})))
+    Ok(("video/mp4".into(), bytes, json!({"width": w, "height": h, "seconds": (played * 10.0).round() / 10.0, "shots": inputs.len(), "captions": captions.len(),
+                                   "captions_srt": srt(&captions)})))
+}
+
+/// A clip fitted to the frame and held on its last frame for as long as its shot plays (a 5 s clip in a 14 s shot
+/// fills all 14 s; held only briefly, the crossfade chain ended early and the video stopped long before the audio).
+pub fn clip_filter(w: u32, h: u32, shot_s: f64, clip_s: Option<f64>) -> String {
+    // slowed to fill its shot, by up to MAX_SLOW (calm motion slowed reads as calm; frozen reads as broken); evened
+    // out first, as generated clips flicker from frame to frame. A shot longer than that plays the clip forward and
+    // back again (and again), so its picture keeps moving to the end instead of freezing on the last frame.
+    let (bounce, slow) = clip_plan(shot_s, clip_s);
+    let motion = if bounce > 0 {
+        format!("split[cf][cb];[cb]reverse[cr];[cf][cr]concat=n=2:v=1:a=0{},", if bounce > 1 { format!(",loop=loop={}:size=32767:start=0", bounce - 1) } else { String::new() })
+    } else { String::new() };
+    // the new frames between a slowed clip's own are blended (a 16 fps Wan clip slowed 1.6x at 30 fps would show each
+    // picture three frames in a row: a judder the check sees as jumps)
+    format!("deflicker=size=5,{motion}setpts={slow:.4}*PTS,framerate=fps={FPS}:interp_start=0:interp_end=255:scene=100,\
+             scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},tpad=stop_mode=clone:stop_duration={:.3},format=yuv420p",
+            shot_s.max(0.5) + 1.0)
+}
+
+/// How a clip fills its shot: (forward-and-back plays, 0 for none, and the slow-down). A clip that fits slowed by up to
+/// MAX_SLOW just slows; a longer shot plays it forward and back as many times as needed, slowed the least it can be.
+pub fn clip_plan(shot_s: f64, clip_s: Option<f64>) -> (u32, f64) {
+    let Some(c) = clip_s.filter(|c| *c > 0.1) else { return (0, 1.0) };
+    if shot_s <= c * MAX_SLOW {
+        return (0, (shot_s / c).clamp(1.0, MAX_SLOW));
+    }
+    let bounce = (shot_s / (2.0 * c * MAX_SLOW)).ceil().max(1.0) as u32;
+    (bounce, (shot_s / (2.0 * c * bounce as f64)).clamp(1.0, MAX_SLOW))
+}
+
+/// The most a clip is slowed to fill its shot.
+pub const MAX_SLOW: f64 = 1.6;
+
+/// Each shot's length. Shots given "seconds" keep them. A clip plays its own length, slowed by up to MAX_SLOW, but never
+/// more than an even share. The images take the rest of the audio, evenly, so no clip is held on a frozen frame. When
+/// every shot is a clip, they share the audio evenly (and the last frames hold).
+pub fn layout(total_s: f64, crossfade: f64, shots: &[(Option<f64>, Option<f64>)]) -> Vec<f64> {
+    let n = shots.len();
+    if n == 0 { return vec![]; }
+    if shots.iter().all(|(given, _)| given.is_some()) {
+        return shots.iter().map(|(g, _)| g.unwrap_or(5.0)).collect();
+    }
+    let xf = crossfade.clamp(0.0, 8.0);
+    let budget = (total_s + xf * (n as f64 - 1.0)).max(1.0);
+    let even = budget / n as f64;
+    let mut out: Vec<Option<f64>> = shots.iter().map(|(given, clip)| given.or_else(|| clip.map(|c| (c * MAX_SLOW).min(even).max(xf + 0.5)))).collect();
+    let free: Vec<usize> = (0..n).filter(|&i| out[i].is_none()).collect();
+    if free.is_empty() {
+        // only clips (and given lengths): spread what is left over the clips
+        return spread_over(total_s, crossfade, n);
+    }
+    let used: f64 = out.iter().flatten().sum();
+    let each = ((budget - used) / free.len() as f64).max(xf + 1.0);
+    for i in free { out[i] = Some(each); }
+    out.into_iter().map(|d| d.unwrap_or(each)).collect()
+}
+
+/// A video file's video-stream length in seconds, by ffprobe.
+async fn probe_seconds(f: &std::path::Path) -> Option<f64> {
+    let o = TokioCommand::new(crate::server_tls::program("ffprobe"))
+        .args(["-v", "error", "-select_streams", "v:0", "-count_packets", "-show_entries", "stream=nb_read_packets", "-of", "default=nw=1:nk=1"])
+        .arg(f).output().await.ok()?;
+    let frames: f64 = String::from_utf8_lossy(&o.stdout).trim().parse().ok()?;
+    Some(frames / FPS as f64)
+}
+
+/// The captions as SubRip text (GET /v1/media/jobs/{id}/captions.srt; YouTube takes it as the video's subtitles). Only
+/// the low captions are kept: a centre word or a top line is not a verse line to show under the video.
+pub fn srt(captions: &[crate::captions::Caption]) -> String {
+    let ts = |t: f64| { let ms = (t.max(0.0) * 1000.0).round() as u64; format!("{:02}:{:02}:{:02},{:03}", ms / 3_600_000, ms / 60_000 % 60, ms / 1000 % 60, ms % 1000) };
+    captions.iter().filter(|c| c.place == crate::captions::Place::Low)
+        .enumerate().map(|(i, c)| format!("{}\n{} --> {}\n{}\n", i + 1, ts(c.a), ts(c.b), c.text.trim())).collect::<Vec<_>>().join("\n")
+}
+
+/// The last pass's filtergraph: the captions burned into the joined pictures, and the audio from its start with a 4 s
+/// fade out at the end. `subs` is the ASS file's path already escaped for a filter option.
+pub fn final_filter(subs: &str, played: f64, audio_from: f64) -> String {
+    format!("[0:v]subtitles=filename='{}'[v];[1:a]atrim=start={:.3},asetpts=N/SR/TB,afade=t=out:st={:.3}:d=4[a]", subs, audio_from.max(0.0),
+            played.max(4.0) - 4.0)
+}
+
+/// The part of the audio a video plays: (start, length) from `audio_from` and `audio_seconds` within the whole length.
+pub fn audio_part(whole: f64, from: Option<f64>, seconds: Option<f64>) -> Result<(f64, f64), String> {
+    let from = from.unwrap_or(0.0);
+    if !(0.0..whole).contains(&from) {
+        return Err(format!("audio_from: {from} s is not inside the audio ({whole:.1} s)"));
+    }
+    let len = seconds.map(|s| s.min(whole - from)).unwrap_or(whole - from);
+    if len < 1.0 {
+        return Err("audio_seconds: at least 1 s of audio is needed".into());
+    }
+    Ok((from, len))
 }
 
 /// The xfade chain that joins the shots in order, each beginning one crossfade before the previous ends (so their joins
@@ -359,6 +512,14 @@ pub fn xfade_chain(durations: &[f64], crossfade: f64) -> String {
         return String::new();
     }
     let xf = crossfade.clamp(0.0, 8.0);
+    // hard cuts: xfade cannot take a zero duration (the join stopped after the first shot), so the shots are
+    // concatenated in order instead
+    if xf < 0.04 {
+        let n = durations.len();
+        if n == 1 { return String::from("[0:v]"); }
+        let ins: String = (0..n).map(|k| format!("[{k}:v]")).collect();
+        return format!("{ins}concat=n={n}:v=1:a=0[v];[v]");
+    }
     // each shot's start in the final timeline: sum of the earlier lengths, minus a crossfade per join so far
     let mut starts = Vec::with_capacity(durations.len());
     let mut acc = 0.0f64;
@@ -374,7 +535,9 @@ pub fn xfade_chain(durations: &[f64], crossfade: f64) -> String {
         parts.push(format!("{}[{}:v]xfade=transition=fade:duration={:.3}:offset={:.3}{}", last, k, xf, starts[k], out));
         last = out;
     }
-    if parts.is_empty() { String::from("[0:v]") } else { parts.join("") }
+    // filter chains are separated by ';' (ffmpeg reads two chains run together as trailing garbage), and the caller's
+    // next filter reads the joined stream as its own chain from the [v] label
+    if parts.is_empty() { String::from("[0:v]") } else { format!("{};[v]", parts.join(";")) }
 }
 
 /// ffmpeg reads a drawtext option between its quotes (e.g. `text='…'`), where inside those quotes a backslash still opens an
@@ -396,16 +559,12 @@ fn drawtext_escape(s: &str) -> String {
 /// Make the thumbnail: one 1280×720 JPEG, the image with a left-dark gradient and big Outfit words drawn over it by
 /// ffmpeg's drawtext (the heavy type with a dark stroke, like thumbs.py). Returns the JPEG bytes.
 pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8>, Value), String> {
-    if !crate::media::ffmpeg_available() {
-        return Err(format!("this server cannot make a thumbnail: install ffmpeg ({})",
-            crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")).into());
-    }
     let (w, h) = (THUMB_W, THUMB_H);
     let image = source_bytes(s, "image", &req["image"]).await?;
     if kind_of_bytes(&image) != "image" {
         return Err("image: send a picture (PNG or JPEG), not a video".into());
     }
-    // the lines of words and the optional tag line beneath them
+    // the lines of words and the optional tag line above them
     let mut lines: Vec<(String, String)> = Vec::new();
     if let Some(arr) = req["lines"].as_array() {
         for l in arr {
@@ -418,38 +577,43 @@ pub async fn make_thumbnail(s: &AppState, req: &Value) -> Result<(String, Vec<u8
     if lines.is_empty() {
         return Err("lines: give the words to show, as [[text, \"white\"|\"gold\"]]".into());
     }
-    let tag = req["tag"].as_str().filter(|t| !t.trim().is_empty());
+    let tag = req["tag"].as_str().map(str::trim).filter(|t| !t.is_empty()).map(str::to_string);
+    let bytes = tokio::task::spawn_blocking(move || thumbnail_picture(&image, w, h, &lines, tag.as_deref()))
+        .await.map_err(|e| format!("the thumbnail could not be drawn: {e}"))??;
+    Ok(("image/jpeg".into(), bytes, json!({"width": w, "height": h})))
+}
 
-    let dir = crate::media::tempdir().map_err(|e| format!("could not make a temp folder: {e}"))?;
-    let id = format!("mj-{}", std::process::id()); // thumbnails keep nothing, so a plain id is fine here
-    let _ = &id;
-    let image_ = dir.join("image.jpg");
-    std::fs::write(&image_, &image).map_err(|e| format!("could not write the image: {e}"))?;
-    let font = outfit_font();
-    let out = dir.join("thumb.jpg");
-
-    // big words, centred, one row below the next: drawtext for each, with a dark shadow for the stroke look
-    let rows = thumbnail_lines(&lines, tag);
-    let base_y = (h as f64 * 0.72) as i32; // the lowest line's baseline
-    let mut draws = Vec::new();
-    for (row, (text, colour)) in rows {
-        let y = base_y - (row as i32) * 150;
-        let color = match colour.as_str() { "gold" => "ffd65a", _ => "ffffff" };
-        // each line is centred and placed a row below the last, with a dark shadow for the stroke look on any picture. The
-        // options are built as a list and joined with ':' so an absent fontfile leaves no empty field (drawtext=text=...,
-        // not drawtext=:text=...); a found Outfit font only leads with its fontfile
-        draws.push(thumbnail_drawtext(&text, &font, color, y));
+/// The thumbnail itself, drawn by am2Strata (no ffmpeg): the picture filled to the frame and darkened towards the
+/// bottom so the words read, then the lines in bold, big and shaped (any script), each with a dark outline, stacked
+/// upwards from the lower third; the first line is the biggest. A tag, if any, sits small above them.
+pub fn thumbnail_picture(image: &[u8], w: u32, h: u32, lines: &[(String, String)], tag: Option<&str>) -> Result<Vec<u8>, String> {
+    let src = image::load_from_memory(image).map_err(|e| format!("image: the picture could not be read ({e})"))?;
+    let mut img = src.resize_to_fill(w, h, image::imageops::FilterType::Lanczos3).to_rgba8();
+    // darker towards the bottom: 0.85 at the top to 0.45 at the bottom
+    for y in 0..h {
+        let k = 0.85 - 0.40 * (y as f32 / h as f32).powf(1.5);
+        for x in 0..w { let p = img.get_pixel_mut(x, y); for i in 0..3 { p[i] = (p[i] as f32 * k) as u8; } }
     }
-    // the whole thing: fit the picture, darken it so the words read, then stack the words on top; one 1280×720 JPEG
-    let _ = run_ffmpeg(&[
-        "-y", "-i", image_.display().to_string().as_str(),
-        "-vf", &format!("scale={w}:{h}:force_original_aspect_ratio=increase,crop={w}:{h},eq=brightness=-0.15,{}", draws.join(",")).as_str(),
-        "-vframes", "1", "-c:v", "mjpeg", "-q:v", "3", out.display().to_string().as_str(),
-    ]).await?;
-
-    let bytes = std::fs::read(&out).map_err(|e| format!("could not read the thumbnail: {e}"))?;
-    std::fs::remove_dir_all(&dir).ok();
-    Ok(("image/jpeg".into(), bytes, json!({"width": w, "height": h, "lines": lines.len()})))
+    let colour = |c: &str| match c { "gold" => [255u8, 214, 90], _ => [255u8, 255, 255] };
+    let max_w = w as f32 * 0.9;
+    let cx = w as f32 / 2.0;
+    // from the bottom up: the last line lowest
+    let mut y = h as f32 * 0.86;
+    let n = lines.len();
+    for (i, (text, c)) in lines.iter().enumerate().rev() {
+        let px = crate::captions::fit_px(text, if i == 0 { 128.0 } else { 84.0 }, max_w)?;
+        crate::captions::draw_line(&mut img, text, px, colour(c), cx, y, (px / 14.0).ceil() as i32)?;
+        y -= px * if i == 0 || n == 1 { 1.25 } else { 1.15 };
+    }
+    if let Some(t) = tag {
+        let px = crate::captions::fit_px(t, 46.0, max_w)?;
+        crate::captions::draw_line(&mut img, t, px, [255, 255, 255], cx, y - 10.0, 3)?;
+    }
+    let mut out = Vec::new();
+    image::DynamicImage::ImageRgba8(img).to_rgb8()
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 90))
+        .map_err(|e| format!("could not write the thumbnail: {e}"))?;
+    Ok(out)
 }
 
 /// The Outfit font the web app ships (web/fonts/outfit-latin-wght.woff2), found beside this binary or in a checked-out
@@ -485,6 +649,250 @@ fn thumbnail_drawtext(text: &str, font: &str, color: &str, y: i32) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A short clip in a long shot is held to the shot's whole length (Peace and Harmony's 5 s clips in 14 s shots
+    /// once made a 15 s picture track under 200 s of audio). Only runs where ffmpeg is installed.
+    #[test]
+    fn clips_play_their_motion_and_the_pictures_take_the_rest() {
+        // 200 s of song, 14 shots, 5 clips of 5.06 s: each clip plays 1.6x slowed (8.1 s), the 9 pictures share the rest
+        let mut plan = vec![(None, None); 14];
+        for i in [0usize, 3, 5, 9, 13] { plan[i] = (None, Some(5.0625)); }
+        let d = layout(200.0, 0.8, &plan);
+        assert!((d[0] - 8.1).abs() < 0.01, "{d:?}");
+        let pic = d[1];
+        assert!(pic > 15.0 && (d.iter().sum::<f64>() - (200.0 + 0.8 * 13.0)).abs() < 1e-6, "fills the audio: {d:?}");
+        assert!(d.iter().enumerate().all(|(i, x)| [0, 3, 5, 9, 13].contains(&i) || (*x - pic).abs() < 1e-9));
+        // a given length is kept; only clips share the audio evenly
+        assert_eq!(layout(20.0, 0.0, &[(Some(3.0), None), (None, None)]), [3.0, 17.0]);
+        assert_eq!(layout(10.0, 0.0, &[(None, Some(2.0)), (None, Some(2.0))]), [5.0, 5.0]);
+    }
+
+    #[test]
+    fn a_composed_video_has_its_captions_as_srt() {
+        let s = srt(&[crate::captions::Caption::new(13.6, 18.0, "Morning light on a quiet sea", crate::captions::Place::Low, 1.0),
+                       crate::captions::Caption::new(3725.25, 3726.5, "two", crate::captions::Place::Low, 1.0)]);
+        assert_eq!(s, "1\n00:00:13,600 --> 00:00:18,000\nMorning light on a quiet sea\n\n2\n01:02:05,250 --> 01:02:06,500\ntwo\n");
+    }
+
+    #[test]
+    fn srt_keeps_only_the_low_captions() {
+        // the verse lines sit low (YouTube subtitles); a centre word is not one, so it is left out of the SRT
+        let caps = vec![
+            crate::captions::Caption::new(1.0, 2.0, "Verse line one", crate::captions::Place::Low, 1.0),
+            crate::captions::Caption::new(1.0, 2.0, "Harmony", crate::captions::Place::Centre, 2.0),
+            crate::captions::Caption::new(3.0, 4.0, "Verse line two", crate::captions::Place::Low, 1.0),
+        ];
+        let s = srt(&caps);
+        assert!(s.contains("Verse line one") && s.contains("Verse line two"), "the verse lines are the subtitles: {s}");
+        assert!(!s.contains("Harmony"), "the centre word is not a subtitle: {s}");
+    }
+
+    /// THUMB_LOOK=<picture> THUMB_OUT=<file.jpg> cargo test thumb_look -- --ignored: a thumbnail to look at.
+    #[test]
+    #[ignore = "writes a picture to look at"]
+    fn thumb_look() {
+        let (Some(i), Some(o)) = (std::env::var_os("THUMB_LOOK"), std::env::var_os("THUMB_OUT")) else { return };
+        let jpg = thumbnail_picture(&std::fs::read(i).unwrap(), 1280, 720,
+            &[("Peace and Harmony".into(), "white".into()), ("acoustic evening".into(), "gold".into())], Some("CALM • ACOUSTIC")).unwrap();
+        std::fs::write(o, jpg).unwrap();
+    }
+
+    #[test]
+    fn a_thumbnail_is_drawn_without_ffmpeg_in_big_bold_type() {
+        let mut pic = image::RgbImage::new(640, 360);
+        for p in pic.pixels_mut() { *p = image::Rgb([90, 140, 190]); }
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgb8(pic).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
+        let jpg = thumbnail_picture(&png, 1280, 720, &[("Fireflies in the Valley".into(), "gold".into()), ("a calm song for sleep".into(), "white".into())],
+                                    Some("SLEEP • CALM")).unwrap();
+        let img = image::load_from_memory(&jpg).unwrap().to_rgb8();
+        assert_eq!((img.width(), img.height()), (1280, 720));
+        // gold type in the lower half, a lot of it (bold and big), and the top stays the darkened picture
+        let gold = img.enumerate_pixels().filter(|(_, y, p)| *y > 360 && p[0] > 220 && p[1] > 180 && p[2] < 140).count();
+        assert!(gold > 15000, "big gold title: {gold} px");
+        let top = img.get_pixel(640, 20);
+        assert!(top[2] > 120 && top[2] < 170, "the top is the picture, a little darker: {top:?}");
+    }
+
+    #[test]
+    fn a_short_plays_a_part_of_the_song() {
+        assert_eq!(audio_part(200.0, Some(35.9), Some(58.0)).unwrap(), (35.9, 58.0));
+        assert_eq!(audio_part(200.0, Some(180.0), Some(58.0)).unwrap(), (180.0, 20.0), "to the end at most");
+        assert_eq!(audio_part(45.0, None, None).unwrap(), (0.0, 45.0));
+        assert!(audio_part(45.0, Some(50.0), None).is_err());
+        assert!(final_filter("s.ass", 58.0, 35.9).contains("atrim=start=35.900"));
+    }
+
+    #[test]
+    fn compose_needs_no_libass_only_stock_filters() {
+        // the listing's second column is the name (Homebrew's ffmpeg 9 lists no subtitles filter)
+        // Homebrew's ffmpeg 9 has no libass (no subtitles filter): with captions drawn by am2Strata it composes all the same
+        let filters = " T.. xfade             VV->V      Cross fade\n ... zoompan  V->V  zoom\n ... afade A->A fade\n ... tpad V->V pad\n ... fade V->V fade\n ... deflicker V->V even\n ... framerate V->V blend";
+        let encoders = " V....D libx264  H.264\n A....D aac   AAC";
+        assert_eq!(crate::media::missing_for_compose(filters, encoders), ["overlay"]);
+        assert!(crate::media::missing_for_compose(&format!("{filters}\n ... overlay VV->V over"), encoders).is_empty());
+    }
+
+    /// The native captions burn in with the stock overlay filter: a held picture, a tone, a caption and a title card
+    /// make a video of the right length whose caption frame has the white type in the low box.
+    #[tokio::test]
+    async fn native_captions_burn_in_without_libass() {
+        if !crate::media::ffmpeg_available() { return; }
+        let dir = std::env::temp_dir().join(format!("strata-natcap-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (pic, wav, out) = (dir.join("p.mp4"), dir.join("t.wav"), dir.join("o.mp4"));
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", "color=c=0x406080:s=640x360:r=30:d=4", "-c:v", "libx264", "-pix_fmt", "yuv420p", &pic.display().to_string()]).await.unwrap();
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=4", &wav.display().to_string()]).await.unwrap();
+        let ovs = crate::captions::overlays(640, 360, &[crate::captions::Caption::new(1.0, 3.5, "Peace in our hands", crate::captions::Place::Low, 1.0)], Some("Title"), None, 4.0).unwrap();
+        let mut args: Vec<String> = vec!["-y".into(), "-i".into(), pic.display().to_string(), "-i".into(), wav.display().to_string()];
+        for (k, o) in ovs.iter().enumerate() {
+            let f = dir.join(format!("c{k}.png"));
+            std::fs::write(&f, &o.png).unwrap();
+            args.extend(["-loop", "1", "-framerate", "30", "-t"].map(String::from));
+            args.push(format!("{:.3}", o.b - o.a));
+            args.extend(["-i".to_string(), f.display().to_string()]);
+        }
+        args.extend(["-filter_complex".into(), crate::captions::overlay_filter(&ovs, 2, 4.0, 0.0), "-map".into(), "[v]".into(), "-map".into(), "[a]".into(),
+                     "-t".into(), "4".into(), "-c:v".into(), "libx264".into(), "-c:a".into(), "aac".into(), out.display().to_string()]);
+        run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>()).await.unwrap();
+        let len = probe_seconds(&out).await.unwrap();
+        assert!((len - 4.0).abs() < 0.1, "{len}");
+        // the frame at 2 s: the caption box low in the picture, with white type in it
+        let shot = dir.join("f.png");
+        run_ffmpeg(&["-y", "-ss", "2", "-i", &out.display().to_string(), "-frames:v", "1", "-update", "1", &shot.display().to_string()]).await.unwrap();
+        let img = image::open(&shot).unwrap().to_rgb8();
+        let white_low = (250..340).flat_map(|y| (0..640).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y)[0] > 220).count();
+        let white_high = (0..100).flat_map(|y| (0..640).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y)[0] > 220).count();
+        assert!(white_low > 100 && white_high == 0, "type low: {white_low}, high: {white_high}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A real compose of two pictures over 8 s of audio with a low verse line and a centre word shown at the same time.
+    /// The shots are zoomed, joined with crossfades (make()'s chain), the captions burned in with the default overlay
+    /// filter (no libass), the audio muxed under; it is verified by reading a frame, not a mock.
+    #[tokio::test]
+    async fn compose_two_pictures_a_center_word_gives_an_mp4() {
+        if !crate::media::ffmpeg_available() { return; }
+        // 8 s of audio, two shots: spread fills it evenly (each ~4.4 s with one crossfade), the joined footage plays 8 s
+        let durations = spread_over(8.0, CROSSFADE, 2);
+        let played = total_length(&durations, CROSSFADE);
+        assert!((played - 8.0).abs() < 1e-6, "the joined footage plays the whole audio: {played}");
+        let dir = std::env::temp_dir().join(format!("strata-centreword-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // two pictures (distinct solids) and an 8 s tone, made with ffmpeg itself so the test needs no image library
+        let wav = dir.join("audio.wav");
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", &format!("sine=frequency=440:duration=8"), &wav.display().to_string()]).await.unwrap();
+        let zoom_n = |frames: usize| frames.saturating_sub(1).max(1);
+        for (j, (name, col)) in [("pic-0.png", "red"), ("pic-1.png", "green")].iter().enumerate() {
+            let pic = dir.join(*name);
+            run_ffmpeg(&["-y", "-f", "lavfi", "-i", &format!("color=c={col}:s=1600x1200:r=1"), "-frames:v", "1", &pic.display().to_string()]).await.unwrap();
+            let shots = dir.join(format!("shot-{j}.mp4"));
+            let frames = frames_for(durations[j]);
+            let n = zoom_n(frames);
+            let zfactor = ZOOM_END - 1.0;
+            // the centred zoom make() uses: from a picture twice the frame size so the steps are sub-pixel
+            let vf = format!("scale=3840:2160:force_original_aspect_ratio=increase,crop=3840:2160,zoompan=z='1+{zfactor:.3}*on/{n}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s=1920x1080:fps=30,format=yuv420p");
+            run_ffmpeg(&["-y", "-loop", "1", "-framerate", "30", "-i", &pic.display().to_string(), "-vf", &vf, "-frames:v", &frames.to_string(), "-an", "-c:v", "libx264", "-crf", "18", &shots.display().to_string()]).await.unwrap();
+        }
+        // join the two shots with a crossfade, then hold for the audio's length (make()'s own chain)
+        let pictures = dir.join("pictures.mp4");
+        let chain = xfade_chain(&durations, CROSSFADE);
+        let mut inps: Vec<String> = vec!["-y".into()];
+        for inp in [dir.join("shot-0.mp4"), dir.join("shot-1.mp4")] {
+            inps.push("-i".into()); inps.push(inp.display().to_string());
+        }
+        inps.push("-filter_complex".into());
+        inps.push(format!("{}fade=t=in:st=0:d=1.0,format=yuv420p[out]", chain));
+        inps.extend(["-map".into(), "[out]".into(), "-t".into(), played.to_string(), "-c:v".into(), "libx264".into(), "-crf".into(), "17".into(), "-pix_fmt".into(), "yuv420p".into(), pictures.display().to_string()]);
+        run_ffmpeg(&inps.iter().map(String::as_str).collect::<Vec<_>>()).await.unwrap();
+
+        // a low verse line and a centre word, overlapping from 1 s to 3 s: captions.rs gives two overlays, drawn together
+        let captions = vec![
+            crate::captions::Caption::new(1.0, 3.0, "Peace in our hands", crate::captions::Place::Low, 1.0),
+            crate::captions::Caption::new(1.0, 3.0, "Harmony", crate::captions::Place::Centre, 2.0),
+        ];
+        let ovs = crate::captions::overlays(1920, 1080, &captions, None, None, played).unwrap();
+        assert_eq!(ovs.len(), 2, "both captions drawn together ({} overlays)", ovs.len());
+        let out = dir.join("out.mp4");
+        let mut args: Vec<String> = vec!["-y".into(), "-i".into(), pictures.display().to_string(), "-i".into(), wav.display().to_string()];
+        for (k, o) in ovs.iter().enumerate() {
+            let f = dir.join(format!("cap-{k}.png"));
+            std::fs::write(&f, &o.png).unwrap();
+            args.extend(["-loop", "1", "-framerate", "30", "-t"].map(String::from));
+            args.push(format!("{:.3}", (o.b - o.a).max(0.3)));
+            args.extend(["-i".to_string(), f.display().to_string()]);
+        }
+        let fc = crate::captions::overlay_filter(&ovs, 2, played, 0.0);
+        args.extend(["-filter_complex".into(), fc, "-map".into(), "[v]".into(), "-map".into(), "[a]".into(), "-t".into(), played.to_string(), "-r".into(), "30".into(), "-c:v".into(), "libx264".into(), "-preset".into(), "medium".into(), "-crf".into(), "18".into(), "-pix_fmt".into(), "yuv420p".into(), "-c:a".into(), "aac".into(), "-b:a".into(), "192k".into(), "-movflags".into(), "+faststart".into(), out.display().to_string()]);
+        run_ffmpeg(&args.iter().map(String::as_str).collect::<Vec<_>>()).await.unwrap();
+
+        // it really is an MP4 of the planned length; keep a copy in the worktree to pull a frame from
+        assert!(out.exists() && std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0) > 0, "the MP4 was written");
+        let len = probe_seconds(&out).await.unwrap();
+        assert!((len - played).abs() < 0.3, "the video plays the whole audio: {len}");
+        let _ = std::fs::copy(&out, std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("compose-frame.mp4"));
+
+        // the frame at 2 s (both captions overlap): white type in a box low in the picture AND another centred vertically
+        let shot = dir.join("f.png");
+        run_ffmpeg(&["-y", "-ss", "2", "-i", &out.display().to_string(), "-frames:v", "1", "-update", "1", &shot.display().to_string()]).await.unwrap();
+        let img = image::open(&shot).unwrap().to_rgb8();
+        let white_low = (800..980).flat_map(|y| (0..1920).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y)[0] > 220).count();
+        let white_center = (430..650).flat_map(|y| (0..1920).map(move |x| (x, y))).filter(|&(x, y)| img.get_pixel(x, y)[0] > 220).count();
+        assert!(white_low > 40 && white_center > 40, "both captions drawn: low {white_low}, centre {white_center}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_short_clip_fills_its_whole_shot() {
+        if !crate::media::ffmpeg_available() { return; }
+        let dir = std::env::temp_dir().join(format!("strata-clip-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (clip, out) = (dir.join("c.mp4"), dir.join("o.mp4"));
+        run_ffmpeg(&["-y", "-f", "lavfi", "-i", "testsrc=s=320x240:r=16:d=1", "-c:v", "libx264", &clip.display().to_string()]).await.unwrap();
+        let frames = frames_for(4.0);
+        run_ffmpeg(&["-y", "-i", &clip.display().to_string(), "-vf", &clip_filter(160, 90, 4.0, Some(1.0)), "-frames:v", &frames.to_string(),
+                     "-an", "-c:v", "libx264", &out.display().to_string()]).await.unwrap();
+        let got = probe_seconds(&out).await.unwrap();
+        assert!((got - 4.0).abs() < 0.05, "a 1 s clip plays its whole 4 s shot: {got}");
+        // a clip that fits when slowed is slowed (2 s of shot from 1.5 s of clip); a longer shot plays it forward and back
+        assert!(clip_filter(160, 90, 2.0, Some(1.5)).contains("setpts=1.3333*PTS") && !clip_filter(160, 90, 2.0, Some(1.5)).contains("reverse"));
+        assert_eq!(clip_plan(4.0, Some(1.0)), (2, 1.0));
+        assert!(clip_filter(160, 90, 4.0, Some(1.0)).contains("reverse"));
+        assert!(clip_filter(160, 90, 4.0, Some(5.0)).contains("setpts=1.0000*PTS"), "a long clip is not slowed");
+        // a 1 s clip in a 6 s shot plays forward and back twice, never frozen (Fireflies' 5 s clip in a 12 s shot froze ~4 s)
+        assert_eq!(clip_plan(6.0, Some(1.0)), (2, 1.5));
+        assert_eq!(clip_plan(12.0, Some(5.0625)).0, 1);
+        let long = dir.join("long.mp4");
+        let frames6 = frames_for(6.0);
+        run_ffmpeg(&["-y", "-i", &clip.display().to_string(), "-vf", &clip_filter(160, 90, 6.0, Some(1.0)), "-frames:v", &frames6.to_string(),
+                     "-an", "-c:v", "libx264", &long.display().to_string()]).await.unwrap();
+        assert!((probe_seconds(&long).await.unwrap() - 6.0).abs() < 0.05);
+        let gray = crate::media_check::video_grey_frames(&std::fs::read(&long).unwrap(), Some(30.0)).unwrap().0;
+        let deltas = crate::media_check::grey_frame_deltas(&gray.iter().map(|f| f.as_slice()).collect::<Vec<_>>());
+        let held = crate::media_check::near_static_run(&deltas, 30.0, 0.05).1;
+        assert!(held < 0.5, "the picture keeps moving to the end: held {held} s");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The crossfade chain is a filtergraph ffmpeg accepts: three shots joined then faded in (the chains were once run
+    /// together without ';', which ffmpeg refused as "trailing garbage"). Only runs where ffmpeg is installed.
+    #[test]
+    fn the_crossfade_chain_parses_in_ffmpeg() {
+        let chain = xfade_chain(&[2.0, 2.0, 2.0], 0.5);
+        assert_eq!(chain.matches(';').count(), 2, "{chain}");
+        // hard cuts join all three shots too (a zero-length xfade stopped after the first)
+        assert_eq!(xfade_chain(&[2.0, 2.0, 2.0], 0.0), "[0:v][1:v][2:v]concat=n=3:v=1:a=0[v];[v]");
+        if !crate::media::ffmpeg_available() { return; }
+        for chain in [chain, xfade_chain(&[2.0, 2.0, 2.0], 0.0)] {
+        let mut args: Vec<String> = Vec::new();
+        for _ in 0..3 { args.extend(["-f", "lavfi", "-i", "color=c=black:s=64x64:r=30:d=2"].map(String::from)); }
+        args.extend(["-filter_complex".into(), format!("{chain}fade=t=in:st=0:d=1.0,format=yuv420p[out]"),
+                     "-map".into(), "[out]".into(), "-f".into(), "null".into(), "-".into()]);
+        let out = std::process::Command::new(crate::server_tls::program("ffmpeg")).args(["-hide_banner", "-loglevel", "error"]).args(&args).output().unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        }
+    }
     use super::*;
 
     #[test]
@@ -516,19 +924,30 @@ mod tests {
 
     #[test]
     fn the_captions_are_written_as_ass_for_libass() {
-        let captions = vec![(0.5, 2.5, "Hello world".to_string()), (3.0, 5.0, "made by am2Strata".to_string())];
-        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"), 60.0);
+        let captions = vec![
+            crate::captions::Caption::new(0.5, 2.5, "Hello world", crate::captions::Place::Low, 1.0),
+            crate::captions::Caption::new(3.0, 5.0, "made by am2Strata", crate::captions::Place::Low, 1.0),
+        ];
+        let ass = ass_script(1920, 1080, &captions, Some("Peace and Harmony"), Some("am2Strata · free and open source"), 200.0);
         // ASS's own line format: "Dialogue: Layer,Start,End,Style,...", so libass shows them (a "0=" was skipped)
         assert!(ass.contains("Dialogue: 0,0:00:00.50,0:00:02.50,Cap,"), "{ass}");
-        assert!(ass.contains("Dialogue: 0,0:00:50.00,0:01:00.00,Ttl,"), "the end card is the last 10 s: {ass}");
+        assert!(ass.contains("Dialogue: 0,0:03:10.00,0:03:20.00,Ttl,"), "a long video's end card is its last 10 s: {ass}");
         assert!(!ass.contains("Dialogue: 0="), "{ass}");
-        let two = ass_script(1280, 720, &[(0.0, 1.0, "line one\nline {two}".to_string())], None, None, 5.0);
+        let two = ass_script(1280, 720, &[crate::captions::Caption::new(0.0, 1.0, "line one\nline {two}", crate::captions::Place::Low, 1.0)], None, None, 5.0);
         assert!(two.contains("line one\\Nline (two)"), "newlines become \\N and braces cannot start an override: {two}");
         assert!(ass.starts_with("[Script Info]"), "a valid ASS starts with the script header");
         assert!(ass.contains("Style: Cap,DejaVu Sans,"), "the caption style is centred low");
         assert!(ass.contains("0:00:00.50") && ass.contains("0:00:02.50"), "each caption carries its start and end");
         assert!(ass.contains("\\fad(250,250)"), "a caption fades in and out so it does not snap");
         assert!(ass.contains("Peace and Harmony") && ass.contains("am2Strata · free and open source"), "the cards are burned in too");
+
+        // a centre word rides the second style (Word), vertically centred, scaled by its size; a top line goes to the top
+        let centre = ass_script(1920, 1080, &[crate::captions::Caption::new(1.0, 3.0, "Harmony", crate::captions::Place::Centre, 2.0)], None, None, 4.0);
+        assert!(centre.contains("Style: Word,"), "a second ASS style for the centre word: {centre}");
+        assert!(centre.contains(",Word,,0,0,0,,") && centre.contains("\\fs116"), "the centre word is middle-centre at 58*2 pt: {centre}");
+
+        let top = ass_script(1920, 1080, &[crate::captions::Caption::new(1.0, 3.0, "Above", crate::captions::Place::Top, 1.0)], None, None, 4.0);
+        assert!(top.contains(",Word,,0,0,0,,") && top.contains("\\an8"), "a top word rides the Word style to the top: {top}");
     }
 
     #[test]
@@ -591,10 +1010,16 @@ mod tests {
             "-frames:v", "81", "-an", "-c:v", "libx264", "-crf", "18", &shot.display().to_string(),
         ]).await.unwrap();
 
-        // pass 2: hold it to 3 s, burn in a caption, and mux the tone under one MP4 (faststart)
+        // pass 2: hold it to 3 s, burn in a caption with make()'s own ASS script and filter, and mux the tone (faststart)
+        let subs = dir.join("subs.ass");
+        std::fs::write(&subs, ass_script(1920, 1080, &[crate::captions::Caption::new(0.2, 2.5, "Hello there", crate::captions::Place::Low, 1.0)], Some("Title"), None, 3.0)).unwrap();
+        // the held picture first (make() joins its shots the same way), then make()'s own final filter
+        let held = dir.join("held.mp4");
+        run_ffmpeg(&["-y", "-i", &shot.display().to_string(), "-vf", "tpad=stop_mode=clone:stop_duration=1", "-c:v", "libx264", &held.display().to_string()]).await.unwrap();
+        let fc = final_filter(&subs.display().to_string().replace('\\', "\\\\").replace(':', "\\:"), 3.0, 0.0);
         run_ffmpeg(&[
-            "-y", "-i", &shot.display().to_string(), "-i", &wav.display().to_string(),
-            "-filter_complex", "[0:v]subtitles='':format=yuv420p[v]", "-map", "[v]", "-map", "1:a",
+            "-y", "-i", &held.display().to_string(), "-i", &wav.display().to_string(),
+            "-filter_complex", &fc, "-map", "[v]", "-map", "[a]",
             "-t", "3.0", "-c:v", "libx264", "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k", "-movflags", "+faststart",
             &out.display().to_string(),
         ]).await.unwrap();

@@ -1,0 +1,18 @@
+[package]
+name = "am2pack"
+description = "The .am2aipac model pack: one file holding a model, its image projector and its expert layout, laid out for a fast load"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.80"
+
+# No dependency on the server or the engines: this crate and docs/PACK-FORMAT.md are released on their own.
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+memmap2 = "0.9"
+
+[dev-dependencies]
+serde_json = "1"
+sha2 = "0.10"

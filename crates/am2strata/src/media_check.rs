@@ -307,11 +307,11 @@ pub fn scan_jumps(deltas: &[f64], fps: f64, floor: f64, iso: f64) -> Vec<Jump> {
 }
 
 /// The longest run of near-static frames, as (frame count, seconds).
-pub fn near_static_run(deltas: &[f64], fps: f64) -> (usize, f64) {
+pub fn near_static_run(deltas: &[f64], fps: f64, floor: f64) -> (usize, f64) {
     let mut run = 0usize;
     let mut longest = 0usize;
     for &d in deltas {
-        if d < NEAR_FLOOR { run += 1; longest = longest.max(run); } else { run = 0; }
+        if d < floor { run += 1; longest = longest.max(run); } else { run = 0; }
     }
     // `run` zero-deltas between them means run+1 identical frames were held, capped at the frame count.
     let frames = (longest + 1).min(deltas.len() + 1);
@@ -363,7 +363,7 @@ pub fn video_grey_frames(data: &[u8], fps_override: Option<f64>) -> Result<(Vec<
     // probe fps from ffprobe (fall back to the override, then 24)
     let mut fps = fps_override.unwrap_or(24.0);
     if let Ok(p) = std::process::Command::new(crate::server_tls::program("ffprobe")).args(["-v", "error", "-select_streams", "v:0",
-        "-show_entries", "stream=r_frame_rate"]).arg(&in_file).output() {
+        "-show_entries", "stream=r_frame_rate", "-of", "default=nw=1:nk=1"]).arg(&in_file).output() {
         // r_frame_rate is a fraction like 30000/1001 (29.97): divide it, not just take the top number. A degenerate
         // 0/0 refuses here so the caller keeps its override/fallback instead of dividing by zero.
         let s = String::from_utf8_lossy(&p.stdout).trim().to_string();
@@ -430,9 +430,9 @@ pub fn check(audio: Option<&[u8]>, gray: Option<&[Vec<u8>]>, expected: &str, hea
         video_obj["jumps"] = json!({"count": jumps.len(), "ok": jumps.is_empty(), "floor": r2(o.jump_floor),
             "isolation": r2(o.jump_iso),
             "list": jumps.iter().map(|j| json!({"seconds": j.t, "grey_levels": j.levels})).collect::<Vec<_>>()});
-        let (nf, ns) = near_static_run(&deltas, fps);
+        let (nf, ns) = near_static_run(&deltas, fps, o.near_floor);
         video_obj["near_static"] = json!({"frames": nf, "seconds": r2(ns), "ok": ns <= o.near_max_s, "max_seconds": r3(o.near_max_s),
-            "floor": r2(NEAR_FLOOR)});
+            "floor": r2(o.near_floor)});
     } else {
         video_obj["note"] = json!("no video frames (send the video to /v1/media/check for ffmpeg to decode)");
     }
@@ -492,9 +492,10 @@ pub async fn check_endpoint(State(s): State<AppState>, headers: HeaderMap, Json(
     }
     let audio = match load_audio(&req).await { Ok(x) => x, Err(e) => return bad(e) };
     let mut gray: Option<Vec<Vec<u8>>> = None;
+    let mut lengths: Option<(Option<f64>, Option<f64>)> = None;
     if let Some(src) = video_source(&req).await {
         match src {
-            Ok(b) => match video_grey_frames_any(&b, req["fps"].as_f64()).await {
+            Ok(b) => match { lengths = stream_lengths(&b).await; video_grey_frames_any(&b, req["fps"].as_f64()).await } {
                 Ok((g, fps)) => { gray = Some(g); req["fps"] = json!(fps); }
                 Err(e) => return Json(json!({"audio": null, "video": {"note": e}})).into_response(),
             },
@@ -502,9 +503,46 @@ pub async fn check_endpoint(State(s): State<AppState>, headers: HeaderMap, Json(
         }
     }
     match run_check(&s, audio, gray.as_deref(), &req).await {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            if let Some((Some(pic), Some(snd))) = lengths {
+                v["video"]["picture_vs_sound"] = picture_vs_sound(pic, snd);
+            }
+            Json(v).into_response()
+        }
         Err(e) => bad(e),
     }
+}
+
+/// The picture track against the sound track: a video whose pictures stop long before its sound (a crossfade chain
+/// cut short) fails, so does one whose sound stops first. Within a second either way is fine.
+pub fn picture_vs_sound(picture_s: f64, sound_s: f64) -> Value {
+    let gap = picture_s - sound_s;
+    json!({"picture_seconds": r2(picture_s), "sound_seconds": r2(sound_s), "ok": gap.abs() <= 1.0,
+           "note": if gap < -1.0 { "the pictures end before the sound" } else if gap > 1.0 { "the sound ends before the pictures" } else { "same length" }})
+}
+
+/// A video file's picture and sound stream lengths in seconds (counted packets, so a wrong header cannot hide a short
+/// stream), by ffprobe when it is installed.
+async fn stream_lengths(video: &[u8]) -> Option<(Option<f64>, Option<f64>)> {
+    if !crate::media::ffmpeg_available() { return None; }
+    let dir = crate::media::tempdir().ok()?;
+    let f = dir.join("v.mp4");
+    std::fs::write(&f, video).ok()?;
+    let probe = |sel: &'static str| {
+        let f = f.clone();
+        async move {
+            let o = tokio::process::Command::new(crate::server_tls::program("ffprobe"))
+                .args(["-v", "error", "-select_streams", sel, "-show_entries", "packet=pts_time,duration_time", "-of", "csv=p=0"])
+                .arg(&f).output().await.ok()?;
+            // the last packet's start plus its length
+            let text = String::from_utf8_lossy(&o.stdout).to_string();
+            text.lines().filter_map(|l| { let mut p = l.split(','); let a: f64 = p.next()?.parse().ok()?; let d: f64 = p.next().and_then(|x| x.parse().ok()).unwrap_or(0.0); Some(a + d) })
+                .fold(None, |m: Option<f64>, x| Some(m.map_or(x, |m| m.max(x))))
+        }
+    };
+    let r = (probe("v:0").await, probe("a:0").await);
+    let _ = std::fs::remove_dir_all(&dir);
+    Some(r)
 }
 
 /// The `check_media` chat tool handle (holds the app state for Whisper transcription when no transcript is given).
@@ -522,6 +560,24 @@ impl Checker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_slow_zoom_is_not_a_frozen_frame_with_a_low_floor() {
+        // a gentle zoom over a painting changes ~0.4 grey levels a frame; a frozen hold ~0.03
+        let zoom = vec![0.4; 200];
+        assert!(near_static_run(&zoom, 30.0, NEAR_FLOOR).1 > 6.0, "the default floor counts a slow zoom as near-static");
+        assert!(near_static_run(&zoom, 30.0, 0.15).1 < 0.1, "a low floor does not");
+        let frozen = vec![0.03; 120];
+        assert!(near_static_run(&frozen, 30.0, 0.15).1 > 3.9, "and still finds a frozen frame");
+    }
+
+    #[test]
+    fn pictures_that_stop_before_the_sound_fail() {
+        // the Peace and Harmony bug: 15 s of pictures under 200 s of sound
+        assert_eq!(picture_vs_sound(15.07, 200.0)["ok"], json!(false));
+        assert_eq!(picture_vs_sound(15.07, 200.0)["note"], json!("the pictures end before the sound"));
+        assert_eq!(picture_vs_sound(199.6, 200.0)["ok"], json!(true));
+    }
 
     const SR: u32 = 16_000;
 
@@ -660,7 +716,7 @@ mod tests {
     fn near_static_reports_a_frozen_hold() {
         let frames: Vec<_> = (0..100u8).map(|_| grey(10)).collect(); // 100 identical frames
         let deltas = grey_frame_deltas(&frames.iter().map(|f| f.as_slice()).collect::<Vec<_>>());
-        let (held, secs) = near_static_run(&deltas, 24.0);
+        let (held, secs) = near_static_run(&deltas, 24.0, NEAR_FLOOR);
         assert_eq!(held, 100, "100 identical frames are a 100-frame frozen hold");
         assert!((secs - 100.0 / 24.0).abs() < 1e-6, "the hold's seconds is frames/fps (got {secs}");
     }

@@ -186,6 +186,15 @@ fn read_frame<R: Read>(r: &mut R) -> std::io::Result<(Value, Vec<f32>)> {
 /// tensor index are in there).
 pub fn fingerprint(path: &std::path::Path) -> Result<String, String> {
     use sha2::Digest;
+    // a model pack answers as the GGUF it was built from, so a node running the pack pairs with one running the GGUF
+    #[cfg(feature = "aipac")]
+    if path.extension().and_then(|e| e.to_str()) == Some("am2aipac") {
+        let pk = am2pack::Pack::open(path)?;
+        let src = pk.source("model").ok_or_else(|| format!("{}: the pack holds no model", path.display()))?;
+        let len = pk.index.sources[src].size;
+        let d = sha2::Sha256::digest(pk.source_head(src, (8u64 << 20).min(len) as usize)?);
+        return Ok(format!("{len}-{}", d.iter().take(16).map(|b| format!("{b:02x}")).collect::<String>()));
+    }
     let mut f = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let len = f.metadata().map_err(|e| e.to_string())?.len();
     let mut buf = vec![0u8; (8u64 << 20).min(len) as usize];

@@ -53,6 +53,8 @@ pub struct Model<'a> {
     pub id: &'a str,
     pub vision: bool,
     pub arch: Option<&'a str>,
+    /// how the model writes tool calls (e.g. "inkling"); overrides the inference from the template/tokenizer
+    pub format: Option<&'a str>,
     pub context: u32,
     /// more run-config keys (merged in)
     pub extra: Value,
@@ -60,7 +62,7 @@ pub struct Model<'a> {
 
 impl Default for Model<'_> {
     fn default() -> Self {
-        Model { id: "mock-a", vision: true, arch: None, context: 8192, extra: Value::Null }
+        Model { id: "mock-a", vision: true, arch: None, format: None, context: 8192, extra: Value::Null }
     }
 }
 
@@ -92,6 +94,9 @@ fn write_config(dir: &Path, m: &Model) {
     }
     if let Some(a) = m.arch {
         cfg["arch"] = json!(a);
+    }
+    if let Some(f) = m.format {
+        cfg["call_format"] = json!(f);
     }
     if let (Some(c), Some(e)) = (cfg.as_object_mut(), m.extra.as_object()) {
         c.extend(e.clone());

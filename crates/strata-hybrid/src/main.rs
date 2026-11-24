@@ -174,7 +174,7 @@ fn main() {
     let pk = arg("--pack").map(|d| pack::Pack::open(std::path::Path::new(&d)).unwrap_or_else(|e| fail(e)));
     #[allow(unused_mut)]
     let (mut m, from_pack) = model::Model::load(std::path::Path::new(&model_path), pk.as_ref()).unwrap_or_else(|e| fail(e));
-    let n_layers = m.layers.len();
+    let n_layers = m.profile_layers();
     // the expert host: this machine lends its memory to a paired master (remote.rs); it serves until stopped
     if let Some(addr) = arg("--serve-experts") {
         let id = remote::Identity::load(std::path::Path::new(&arg("--identity").unwrap_or_else(|| fail("--serve-experts needs --identity node-tls.json".into()))))
@@ -195,7 +195,12 @@ fn main() {
         .map(|p| pack::Profile::read(std::path::Path::new(&p), n_layers, m.profile_experts).unwrap_or_else(|e| fail(e)));
     let save = arg("--expert-profile-save").map(std::path::PathBuf::from);
     let mut placement = "cpu".to_string();
-    let res = if args.iter().any(|a| a == "--resident-experts") {
+    // the RAM tier: a GGUF's MoE blocks take it here, before the devices (the older path); Inkling and any model
+    // from a pack take it after the devices took theirs (pack::ram_tier, below)
+    let want_ram = args.iter().any(|a| a == "--resident-experts");
+    let tiers_after = want_ram && (m.ink.is_some() || !m.file_order.is_empty());
+    #[allow(unused_mut)]
+    let mut res = if want_ram && !tiers_after {
         // the budget: --expert-ram-gib, else what the expert tensors need, capped at 3/4 of the RAM available now
         let all: u64 = m.moes().map(|x| x.up_exps.bytes() + x.down_exps.bytes() + x.gate_exps.as_ref().map(|g| g.bytes()).unwrap_or(0)).sum();
         // the matrices every token uses stay in RAM too: the experts get what is left of 3/4 of the free RAM
@@ -223,7 +228,7 @@ fn main() {
         None
     };
     // the experts each step chose, asked for at once: on with residency (the cold ones are on disk), AM2_PREFETCH=0/1
-    let prefetch = match std::env::var("AM2_PREFETCH").ok().as_deref() { Some("0") => false, Some(_) => true, None => res.is_some() };
+    let prefetch = match std::env::var("AM2_PREFETCH").ok().as_deref() { Some("0") => false, Some(_) => true, None => want_ram };
     m.prefetch.store(prefetch, std::sync::atomic::Ordering::Relaxed);
     if prefetch {
         placement = format!("{placement} prefetch=on");
@@ -247,6 +252,13 @@ fn main() {
     #[cfg(not(feature = "gpu"))]
     if arg("--devices").is_some() {
         fail("--devices: this am2strata-hybrid was built without the gpu feature".into());
+    }
+    if tiers_after {
+        let budget = arg("--expert-ram-gib").and_then(|v| v.parse::<f64>().ok()).map(|g| (g * (1u64 << 30) as f64) as u64)
+            .unwrap_or_else(|| mem_available() / 4 * 3);
+        let (r, summary) = pack::ram_tier(&mut m, profile.as_ref(), budget);
+        placement = format!("{placement} {summary}");
+        res = Some(r);
     }
     // another machine's memory, the third tier: after this machine's GPUs (placed just above) and its RAM, the next-hottest
     // experts that would otherwise come from the disk; an expert on a GPU or in RAM here is never sent away

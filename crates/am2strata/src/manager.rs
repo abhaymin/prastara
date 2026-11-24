@@ -747,10 +747,29 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
         ChatTemplate::from_file(cfg.tokenizer.join("chat_template.jinja")).with_context(|| format!("chat template of {}", entry.id))?,
     );
     let one = |t: &str| tok.encode(t, true).ok().filter(|v| v.len() == 1).map(|v| v[0]);
-    let pad = one("<|image_pad|>");
-    let vision_start = template.source().contains("<|vision_start|>").then(|| one("<|vision_start|>")).flatten();
-    let pad_literal = tok.encode("<|image_pad|>", false).unwrap_or_default();
-    let call_format = strata_frontend::formats::CallFormat::from_pre(tok.pre());
+    let mut call_format = if strata_frontend::formats::is_inkling_template(template.source()) {
+        // Inkling's parts are marked by special tokens, so this is the template to detect by content; the GGUF's
+        // pre-tokenizer can also name it ("inkling2"), but detection holds even when it names nothing.
+        strata_frontend::formats::CallFormat::Inkling
+    } else {
+        strata_frontend::formats::CallFormat::from_pre(tok.pre())
+    };
+    // a config may name its format directly (an architecture no detector matches, or a test forcing one); it wins over
+    // the inference above.
+    if let Some(strata_frontend::formats::CallFormat::Inkling) = cfg.rest.get("call_format").and_then(|v| v.as_str().map(strata_frontend::formats::CallFormat::from_name)) {
+        call_format = strata_frontend::formats::CallFormat::Inkling;
+    }
+    // the token standing for a picture in the template's output, and the marker before it: Qwen-VL style
+    // <|vision_start|><|image_pad|>; Inkling's template writes <|content_image|><|unused_200054|> (llama.cpp's
+    // mtmd puts the picture right after <|content_image|>, so 200054 is the picture's place, step I5)
+    let (pad_text, start_text) = if call_format == strata_frontend::formats::CallFormat::Inkling {
+        ("<|unused_200054|>", "<|content_image|>")
+    } else {
+        ("<|image_pad|>", "<|vision_start|>")
+    };
+    let pad = one(pad_text);
+    let vision_start = template.source().contains(start_text).then(|| one(start_text)).flatten();
+    let pad_literal = tok.encode(pad_text, false).unwrap_or_default();
     let turn_ids: Vec<u32> = call_format.turn_openers().iter().filter_map(|t| one(t)).collect();
     let mut stop_ids: std::collections::HashSet<u32> = match one("<|im_end|>") {
         Some(im_end) => [Some(im_end), one("<|endoftext|>")].into_iter().flatten().collect(),
@@ -776,6 +795,11 @@ async fn start(entry: &ModelEntry, hw: &Hardware, ready_timeout: Duration) -> Re
             stop_ids.extend(one(end));
         }
         think_open_ids = tok.encode("<think>", true).unwrap_or_default();
+    }
+    if call_format == strata_frontend::formats::CallFormat::Inkling {
+        // the reply ends at content_model_end_sampling (a GGUF naming only eos would otherwise run on); the
+        // model also opens each block with <|message_model|>, already the turn opener above.
+        stop_ids.extend(one("<|content_model_end_sampling|>"));
     }
     let family = cfg.family();
     // the image encoder first: the engine sizes its expert cache to the VRAM it finds free, so an encoder started
@@ -864,9 +888,22 @@ fn ensure_tokenizer(cfg: &strata_engine::RunConfig) -> Result<()> {
         .with_context(|| format!("{} does not exist, and the config names no model file to make it from", dir.display()))?;
     let pack = dir.parent().unwrap_or(std::path::Path::new("."));
     tracing::info!("writing the tokenizer from {} into {}", gguf.display(), dir.display());
-    let g = strata_gguf::Gguf::open(&gguf).with_context(|| format!("reading {}", gguf.display()))?;
+    let g = if gguf.extension().is_some_and(|e| e == "am2aipac") { pack_header(&gguf)? } else { strata_gguf::Gguf::open(&gguf).with_context(|| format!("reading {}", gguf.display()))? };
     strata_gguf::extract_tokenizer(&g, pack).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
+}
+
+/// The model's GGUF header as a model pack (`.am2aipac`) keeps it: the vocabulary and chat template come from there.
+#[cfg(feature = "pack")]
+fn pack_header(path: &Path) -> Result<strata_gguf::Gguf> {
+    let pk = am2pack::Pack::open(path).map_err(|e| anyhow!("{e}"))?;
+    let header = pk.source("model").and_then(|s| pk.gguf_header(s)).with_context(|| format!("{} holds no model header", path.display()))?;
+    strata_gguf::Gguf::from_bytes(path, header).with_context(|| format!("reading the model header in {}", path.display()))
+}
+
+#[cfg(not(feature = "pack"))]
+fn pack_header(path: &Path) -> Result<strata_gguf::Gguf> {
+    Err(anyhow!("{}: this build reads no model packs (built without the pack feature)", path.display()))
 }
 
 #[cfg(test)]
@@ -884,5 +921,28 @@ mod split_tests {
         assert!(v(Some(&json!("24,16,12,12")), 4).is_err(), "counts per card are refused");
         assert!(v(Some(&json!("24,36")), 2).is_err(), "too many numbers");
         assert!(v(Some(&json!("1")), 2).is_err(), "from 2 up");
+    }
+}
+
+#[cfg(all(test, feature = "pack"))]
+mod pack_tokenizer_tests {
+    /// AM2_TEST_PACK=<file>.am2aipac AM2_TEST_TOKENIZER=<the tokenizer folder written from that model's GGUF>: the
+    /// folder written from the pack's header holds the same files.
+    #[test]
+    #[ignore]
+    fn the_tokenizer_from_a_pack_is_the_ggufs() {
+        let (pack, want) = (std::env::var("AM2_TEST_PACK").unwrap(), std::env::var("AM2_TEST_TOKENIZER").unwrap());
+        let out = std::env::temp_dir().join(format!("am2-pack-tok-{}", std::process::id()));
+        std::fs::create_dir_all(&out).unwrap();
+        let g = super::pack_header(std::path::Path::new(&pack)).unwrap();
+        strata_gguf::extract_tokenizer(&g, &out).unwrap();
+        let mut n = 0;
+        for f in std::fs::read_dir(&want).unwrap().flatten() {
+            let got = std::fs::read(out.join("tokenizer").join(f.file_name())).unwrap_or_else(|e| panic!("{:?}: {e}", f.file_name()));
+            assert!(got == std::fs::read(f.path()).unwrap(), "{:?} differs", f.file_name());
+            n += 1;
+        }
+        assert!(n >= 4, "only {n} files compared");
+        std::fs::remove_dir_all(&out).ok();
     }
 }

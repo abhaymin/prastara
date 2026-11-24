@@ -140,9 +140,19 @@ impl<R: Read> Rd<R> {
 impl Gguf {
     /// Read the header (metadata and tensor table) of a GGUF file; the weights are not read.
     pub fn open(path: &Path) -> Result<Gguf> {
+        let f = std::fs::File::open(path).map_err(|e| Error::Io { path: path.display().to_string(), source: e })?;
+        Gguf::read(path, BufReader::with_capacity(1 << 20, f))
+    }
+
+    /// The same from a header already in memory (a model pack keeps the GGUF's header verbatim); `path` is the file
+    /// the bytes came from, for messages.
+    pub fn from_bytes(path: &Path, header: &[u8]) -> Result<Gguf> {
+        Gguf::read(path, header)
+    }
+
+    fn read<R: Read>(path: &Path, reader: R) -> Result<Gguf> {
         let p = path.display().to_string();
-        let f = std::fs::File::open(path).map_err(|e| Error::Io { path: p.clone(), source: e })?;
-        let mut r = Rd { r: BufReader::with_capacity(1 << 20, f), path: p.clone(), pos: 0 };
+        let mut r = Rd { r: reader, path: p.clone(), pos: 0 };
         if r.bytes(4)? != b"GGUF" {
             return Err(Error::Format(format!("{p}: not a GGUF file")));
         }

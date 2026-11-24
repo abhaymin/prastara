@@ -14,6 +14,14 @@ pub enum CallFormat {
     Gemma,
     Dsml,
     Lfm2,
+    /// Inkling 2 Mini: the parts are marked by special tokens (200001 … 200057), not text tags; the parser reads them.
+    Inkling,
+}
+
+/// The template that is Inkling's, matched as llama.cpp's `is_inkling_template` does it (the task calls this out:
+/// "chosen when the model's chat template is the Inkling one").
+pub fn is_inkling_template(source: &str) -> bool {
+    source.contains("<|message_user|>") && source.contains("<|content_image|>")
 }
 
 impl CallFormat {
@@ -27,6 +35,7 @@ impl CallFormat {
             "joyai-llm" => CallFormat::Dsml,
             p if p.starts_with("deepseek") => CallFormat::Dsml,
             "lfm2" => CallFormat::Lfm2,
+            "inkling2" => CallFormat::Inkling,
             _ => CallFormat::Function,
         }
     }
@@ -38,6 +47,7 @@ impl CallFormat {
             "gemma" => CallFormat::Gemma,
             "dsml" => CallFormat::Dsml,
             "lfm2" => CallFormat::Lfm2,
+            "inkling" | "inkling2" => CallFormat::Inkling,
             _ => CallFormat::Function,
         }
     }
@@ -49,6 +59,8 @@ impl CallFormat {
             CallFormat::Gemma => &["<|turn>"],
             CallFormat::Glm => &["<|system|>", "<|developer|>", "<|user|>", "<|assistant|>", "<|observation|>"],
             CallFormat::Dsml => &["<｜User｜>", "<｜Assistant｜>"],
+            // Inkling: the assistant's blocks all open with <|message_model|>; llama.cpp names it the assistant delimiter.
+            CallFormat::Inkling => &["<|message_model|>"],
         }
     }
 
@@ -87,7 +99,7 @@ impl CallFormat {
             CallFormat::Gemma => gemma_call_name(text),
             CallFormat::Dsml => text.find('"').map(|i| text[..i].trim().to_string()),
             CallFormat::Lfm2 => lfm2_call_name(text),
-            CallFormat::Function => None,
+            CallFormat::Function | CallFormat::Inkling => None,
         }
     }
 
@@ -98,7 +110,7 @@ impl CallFormat {
             CallFormat::Gemma => gemma_call_end(text),
             CallFormat::Dsml => tagged_end(text, DSML_INVOKE_END, DSML_PARAM_END, DSML_PARAM),
             CallFormat::Lfm2 => text.find(LFM2_CALL_END),
-            CallFormat::Function => None,
+            CallFormat::Function | CallFormat::Inkling => None,
         }
     }
 
@@ -111,7 +123,7 @@ impl CallFormat {
             CallFormat::Gemma => vec![parse_gemma(body, schema)],
             CallFormat::Dsml => vec![parse_dsml(body, schema)],
             CallFormat::Lfm2 => parse_lfm2(body),
-            CallFormat::Function => Vec::new(),
+            CallFormat::Function | CallFormat::Inkling => Vec::new(),
         }
     }
 }

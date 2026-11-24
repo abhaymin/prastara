@@ -24,12 +24,15 @@ fn main() {
         match cmd["op"].as_str().unwrap_or("") {
             "chain" => {
                 let r = &cmd["request"];
-                let clips = r["total_frames"].as_u64().unwrap_or(0).div_ceil(r["clip_frames"].as_u64().unwrap_or(1).max(1));
+                // scenes come as the chain's own stages (one clip each); a single scene as total_frames
+                let stages = r["stages"].as_array().map(|a| (a.len() as u64, a.iter().map(|s| s["frames"].as_u64().unwrap_or(0)).sum::<u64>()));
+                let clips = stages.map(|s| s.0).unwrap_or_else(|| r["total_frames"].as_u64().unwrap_or(0).div_ceil(r["clip_frames"].as_u64().unwrap_or(1).max(1)));
+                let total = stages.map(|s| serde_json::json!(s.1)).unwrap_or(r["total_frames"].clone());
                 for st in 1..=3u64 {
                     emit(serde_json::json!({"event": "step", "step": st, "total": 3, "stage": 1, "stages": clips}));
                 }
                 emit(serde_json::json!({"event": "video", "format": r["output_format"], "width": r["width"], "height": r["height"],
-                                        "frames": r["total_frames"], "fps": r["fps"], "clips": clips, "data": "AAAAIGZ0eXBpc29t"}));
+                                        "frames": total, "fps": r["fps"], "clips": clips, "data": "AAAAIGZ0eXBpc29t"}));
                 emit(serde_json::json!({"event": "done", "ms": 1}));
             }
             "generate" => {
@@ -77,6 +80,20 @@ fn main() {
                 emit(serde_json::json!({"event": "transcript", "text": text, "language": cmd["language"].as_str().unwrap_or("en"),
                     "duration": 1.5, "task": if cmd["translate"] == true { "translate" } else { "transcribe" }, "bytes_b64": n,
                     "device": cmd["device"], "segments": [{"id": 0, "start": 0.0, "end": 1.5, "text": text}]}));
+            }
+            // media analyze (CPU only, no model): a fixed, plausible music analysis for the tests (window echoed so a test
+            // can see from_s / seconds reached it); the real engine does the DSP over MP3, WAV, FLAC, AAC, OGG
+            "analyze" => {
+                let r = serde_json::json!({"event": "analysis", "from_s": cmd["from_s"].clone(), "seconds": cmd["seconds"].clone(),
+                    "tempo": {"bpm": 60.0, "confidence": 0.25, "steady_pulse": false},
+                    "repeat": {"period_s": 20.3, "confidence": 0.53, "repeats_in_section": 6.0},
+                    "pitch": {"tonic": {"hz": 220.0, "note": "A3", "confidence": 0.70},
+                              "range": {"low_hz": 140.0, "high_hz": 380.0},
+                              "swaras": [{"name": "Sa", "share": 0.50}, {"name": "Pa", "share": 0.30}, {"name": "ma", "share": 0.20}]},
+                    "phrases": [
+                        {"start_s": 1.0, "end_s": 6.0, "median_note": "A3", "notes": ["Sa", "Pa"]},
+                        {"start_s": 8.0, "end_s": 12.0, "median_note": "A3", "notes": ["Sa"]}]});
+                emit(r);
             }
             "song" => {
                 for s in 1..=8u64 {

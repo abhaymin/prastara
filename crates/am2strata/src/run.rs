@@ -10,11 +10,10 @@ use std::sync::Arc;
 use strata_engine::vision::normalize_image;
 use strata_engine::GenEvent;
 use strata_frontend::images::{expand_images, images_of};
-use strata_frontend::output::{Event, OutputParser};
+use strata_frontend::output::{Event, InklingParser, OutputParser, Reply, ReplyText};
 use strata_frontend::request::forced_call;
 use strata_frontend::Prepared;
 use strata_protocol::{Images, Sampling};
-use strata_tokenizer::Detokenizer;
 use tokio::sync::mpsc;
 
 /// The engine keeps a few tokens of slack at the end of the context (serve/server.py CTX_SLACK).
@@ -257,6 +256,65 @@ pub struct RunOpts {
     /// the media tools (generate_image, generate_video, speak) for a request that opted in: the capability check
     /// they were offered by
     pub media: Option<Value>,
+    /// a streaming API client (not the web app, whose job cards follow the jobs): after the answer the stream stays open
+    /// while this answer's media jobs run, a line for each clip or part cleared and the file's link at the end
+    /// (`"strata_media_wait": false` turns it off)
+    pub media_wait: bool,
+    /// the request came from this server's own web app (its page), not an API client: the Browser tab follows its
+    /// browser session live; an API client gets each step's result and screenshot in the answer
+    pub from_web: bool,
+}
+
+/// The answer's media jobs, followed to the end in the stream: a line for each stage cleared, then each file's link.
+/// false when the client went away.
+async fn report_media(jobs: &crate::media_jobs::Jobs, ids: &[String], tx: &tokio::sync::mpsc::Sender<RunEvent>) -> bool {
+    let say = |t: String| RunEvent::Event(Event::Content(t));
+    if tx.send(say("\n\n".into())).await.is_err() {
+        return false;
+    }
+    for id in ids {
+        let (mut logged, mut said_wait, t0) = (0usize, false, std::time::Instant::now());
+        loop {
+            let Some(v) = jobs.status(id) else { break };
+            let what = v["kind"].as_str().unwrap_or("media").to_string();
+            let mut lines = Vec::new();
+            match v["state"].as_str().unwrap_or("") {
+                "done" => {
+                    lines.push(format!("✓ {what} {id} is ready: {}\n", v["url"].as_str().unwrap_or("")));
+                }
+                "error" => lines.push(format!("✗ {what} {id} failed: {}\n", v["error"].as_str().unwrap_or("unknown"))),
+                "queued" if !said_wait => {
+                    said_wait = true;
+                    lines.push(format!("… {what} {id} is waiting its turn\n"));
+                }
+                "running" => {
+                    let log = v["log"].as_array().cloned().unwrap_or_default();
+                    for l in log.iter().skip(logged) {
+                        lines.push(format!("· {what} {id}: {}\n", l.as_str().unwrap_or("")));
+                    }
+                    logged = log.len();
+                    if logged == 0 && !said_wait {
+                        said_wait = true;
+                        lines.push(format!("… {what} {id} is being made\n"));
+                    }
+                }
+                _ => {}
+            }
+            for l in lines {
+                if tx.send(say(l)).await.is_err() {
+                    return false;
+                }
+            }
+            if matches!(v["state"].as_str(), Some("done" | "error")) || t0.elapsed() > std::time::Duration::from_secs(3 * 3600) {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(3)) => {}
+                _ = tx.closed() => return false,
+            }
+        }
+    }
+    true
 }
 
 /// What the memory adds to a request before its prompt is built: the <memory> block (matching facts and archived turns),
@@ -417,15 +475,21 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     let by_context = ctx > 0 && max_new >= room;
     let mut budget = if thinking { thinking_budget(asked_budget, max_new, answer_room, by_context) } else { None };
     let mut force = forced_call(opts.tool_choice.as_ref(), prep.tools.as_deref());
-    let mut parser = if loaded.call_format == strata_frontend::formats::CallFormat::Gemma {
+    // how the model writes its parts: Inkling marks them by special tokens, so the parser is fed the token ids and
+    // reads them; every other format writes text tags, so each token's decoded text is fed to the shared OutputParser.
+    let tok = loaded.tok.clone();
+    let dec = move |id: u32| tok.token_bytes(id).unwrap_or_default();
+    let mut parser: Box<dyn Reply> = if loaded.call_format == strata_frontend::formats::CallFormat::Inkling {
+        Box::new(InklingParser::new(dec))
+    } else if loaded.call_format == strata_frontend::formats::CallFormat::Gemma {
         let opened = !loaded.think_open_ids.is_empty() && ids.ends_with(&loaded.think_open_ids);
-        OutputParser::with_format(thinking, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened)
+        Box::new(ReplyText::new(OutputParser::with_format(thinking, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened), Arc::new(dec)))
     } else if loaded.call_format == strata_frontend::formats::CallFormat::Glm {
         // GLM's template opens <think> in the prompt; Flint writes it itself, which the parser takes as the opening
         let opened = prompt.opens_reasoning || (!loaded.think_open_ids.is_empty() && ids.ends_with(&loaded.think_open_ids));
-        OutputParser::with_format(opened, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened)
+        Box::new(ReplyText::new(OutputParser::with_format(opened, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, opened), Arc::new(dec)))
     } else {
-        OutputParser::with_format(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, false)
+        Box::new(ReplyText::new(OutputParser::with_format(prompt.opens_reasoning, prep.tools.as_deref(), opts.stream_tools, loaded.call_format, false), Arc::new(dec)))
     };
     // the config's "tool_call_recovery" (Kolibri 1): a declared tool's call written as JSON inside <tool_call>
     parser.set_recover(loaded.entry.cfg.rest.get("tool_call_recovery") != Some(&Value::Bool(false)));
@@ -433,8 +497,11 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     let mut opening = Vec::new();
     if let (Some(f), false) = (&force, thinking) {
         // without thinking the prompt ends with the forced opening, read as if the model had written it
-        ids.extend(loaded.tok.encode(f, true).map_err(|e| Refusal(500, e.to_string()))?);
-        opening = parser.feed(f).map_err(|e| Refusal(500, e.0))?;
+        let opening_ids = loaded.tok.encode(f, true).map_err(|e| Refusal(500, e.to_string()))?;
+        ids.extend(opening_ids.clone());
+        for id in opening_ids {
+            opening.extend(parser.feed(id));
+        }
         force = None;
     }
     let turn_at = strata_protocol::turn_at(&ids, &loaded.turn_ids);
@@ -448,7 +515,6 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
         let _turn = turn; // held until this request ends
         // a prompt snapshot on the SSD that gives more of this prompt than the engine holds is read back first
         mgr_task.snapshots.before(&lc, &ids, images.is_some()).await;
-        let mut detok = Detokenizer::new();
         let mut cut = StopCutter { stops, held: String::new(), hit: None };
         let mut prompt_ids = ids;
         let (mut n, mut thought) = (0usize, 0usize);
@@ -528,15 +594,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         }
                         seg.push(t);
                         generated.push(t);
-                        let text = lc.tok.token_bytes(t).map(|b| detok.push(&b)).unwrap_or_default();
-                        let evs = match parser.feed(&text) {
-                            Ok(e) => e,
-                            Err(e) => {
-                                record.fail();
-                                let _ = tx.send(RunEvent::Error(e.0)).await;
-                                return;
-                            }
-                        };
+                        let evs = parser.feed(t);
                         let writes_call = evs.iter().any(|e| matches!(e, Event::ToolStart { .. } | Event::ToolCall(_)));
                         if !emit!(evs) {
                             return; // the client left: dropping rx makes the engine STOP
@@ -545,7 +603,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                             break;
                         }
                         if let Some(recover) = loop_recovery {
-                            if !recovered && parser.in_reasoning() && n >= next_loop_check && parser.is_clean() && !detok.has_pending() {
+                            if !recovered && parser.in_reasoning() && n >= next_loop_check && parser.is_clean() && !parser.has_pending() {
                                 next_loop_check = n + LOOP_CHECK_EVERY;
                                 let cov = reasoning_repeat_coverage(&reasoning_text);
                                 if cov >= LOOP_COVERAGE {
@@ -569,7 +627,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         if let Some(b) = budget {
                             if parser.in_reasoning() {
                                 thought += 1;
-                                if thought >= b && parser.is_clean() && !detok.has_pending() {
+                                if thought >= b && parser.is_clean() && !parser.has_pending() {
                                     wrap = true;
                                     break;
                                 }
@@ -578,7 +636,7 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         if force.is_some() {
                             if writes_call {
                                 force = None; // the model is writing a call of its own
-                            } else if parser.at_clean_content() && !detok.has_pending() {
+                            } else if parser.at_clean_content() && !parser.has_pending() {
                                 opens = true;
                                 break;
                             }
@@ -634,18 +692,9 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                     for t in &extra {
                         n += 1;
                         generated.push(*t);
-                        let piece = lc.tok.token_bytes(*t).map(|b| detok.push(&b)).unwrap_or_default();
-                        match parser.feed(&piece) {
-                            Ok(evs) => {
-                                if !emit!(evs) {
-                                    return;
-                                }
-                            }
-                            Err(e) => {
-                                record.fail();
-                                let _ = tx.send(RunEvent::Error(e.0)).await;
-                                return;
-                            }
+                        let evs = parser.feed(*t);
+                        if !emit!(evs) {
+                            return;
                         }
                     }
                     prompt_ids.extend(seg);
@@ -691,31 +740,22 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             for t in &extra {
                 n += 1;
                 generated.push(*t);
-                let piece = lc.tok.token_bytes(*t).map(|b| detok.push(&b)).unwrap_or_default();
-                match parser.feed(&piece) {
-                    Ok(evs) => {
-                        if !emit!(evs) {
-                            return;
-                        }
-                    }
-                    Err(e) => {
-                        record.fail();
-                        let _ = tx.send(RunEvent::Error(e.0)).await;
-                        return;
-                    }
+                let evs = parser.feed(*t);
+                if !emit!(evs) {
+                    return;
                 }
             }
             prompt_ids.extend(seg);
             prompt_ids.extend(extra);
         };
         let (finish, stop) = summary;
-        if !parser.notes.is_empty() || parser.stray_think > 0 {
-            let mut what: Vec<String> = parser.notes.clone();
+        if !parser.notes().is_empty() || parser.stray_think() > 0 {
+            let mut what: Vec<String> = parser.notes().to_vec();
             what.sort();
             what.dedup();
             tracing::info!("output repaired: {} tool argument(s) ({}), {} extra closing think tag(s) dropped",
-                           parser.notes.len(), what.join("; "), parser.stray_think);
-            record.parser_repairs(parser.notes.len(), parser.stray_think);
+                           parser.notes().len(), what.join("; "), parser.stray_think());
+            record.parser_repairs(parser.notes().len(), parser.stray_think());
         }
         if preserve {
             lc.remember_reasoning(&answer_text, &reasoning_text);
@@ -839,6 +879,7 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
         let (mut cur, mut prep, mut total, mut rounds) = (first, prep, 0u64, 0usize);
         let mut prompt_total: Option<u64> = None; // a provider's counts: every round's prompt is billed
         let mut media_jobs = 0usize; // queued by this answer's media tools
+        let mut media_ids: Vec<String> = Vec::new();
         let mut web_queries = 0u32; // this answer's web searches (a client profile may limit them)
         let web_limit = mgr.clients.get().and_then(|c| crate::clients::current(c)).and_then(|p| p.web_queries_per_turn);
         loop {
@@ -894,6 +935,14 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                 }
                 sum.completion_tokens = total;
                 sum.prompt_tokens = prompt_total;
+                // an API client's stream stays open while this answer's media jobs are made, a line per stage cleared
+                if opts.media_wait && !media_ids.is_empty() {
+                    if let Some(j) = mgr.media_jobs.get() {
+                        if !report_media(j, &media_ids, &tx).await {
+                            return;
+                        }
+                    }
+                }
                 let _ = tx.send(RunEvent::Done(sum)).await;
                 return;
             }
@@ -923,6 +972,9 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                         Some(j) => {
                             media_jobs += 1;
                             let mut r = j.submit(&c.name, &args, caps);
+                            if let Some(id) = r["job"]["id"].as_str().filter(|_| r["ok"] == true) {
+                                media_ids.push(id.to_string());
+                            }
                             // speech on the CPU (Chatterbox, beside the text model, no GPU turn): finished inside the
                             // answer, so the model can say it is ready; past the wait it stays queued as before
                             let cpu_speech = c.name == "speak" && caps["kinds"]["tts"]["model"].as_str().is_some_and(|m| m.contains("chatterbox"));
@@ -979,6 +1031,10 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                     let b = &b;
                     let t0 = std::time::Instant::now();
                     let page_of = conv.clone().unwrap_or_else(|| "chat".to_string());
+                    // the Browser tab lists it: from the web app or an API client, and what the chat is about
+                    let about = crate::memory::content_text(&prep.messages.iter().rev().find(|m| m["role"] == "user")
+                        .map(|m| m["content"].clone()).unwrap_or(Value::Null));
+                    b.note_session(&page_of, if opts.from_web { "web app" } else { "API" }, &about);
                     // a risky step (a password, a form sent, a publishing click, an upload) waits for the user's yes
                     let mut allowed = true;
                     let mut approved_note = String::new(); // "approved" or "approved (job)", kept in the step result
@@ -1092,6 +1148,12 @@ pub fn start_loop(mgr: Arc<Manager>, gen: Arc<dyn Round>, first: Started, prep: 
                                 "text": v["text"].as_str().unwrap_or(""), "truncated": false, "ms": 0}),
                             Err(e) => json!({"ok": false, "text": format!("error: {e}"), "chars": 0, "truncated": false, "ms": 0}),
                         },
+                        _ = tx.closed() => return,
+                    }
+                } else if let (true, None, Some(_)) = (c.name == "reverse_image_search", &route, mgr.web.get()) {
+                    // the server's own browser and the media library: not the web tools' plain HTTP
+                    tokio::select! {
+                        r = crate::image_search::tool_reverse(&mgr, &args) => r,
                         _ = tx.closed() => return,
                     }
                 } else if let (true, None, Some(w)) = (crate::web_tools::TOOL_NAMES.contains(&c.name.as_str()), &route, mgr.web.get()) {

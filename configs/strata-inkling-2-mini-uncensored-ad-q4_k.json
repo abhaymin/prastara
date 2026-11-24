@@ -1,0 +1,26 @@
+{
+  "exe": "${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid",
+  "args": [
+    "--model",
+    "${STRATA_DATA}/models/inkling2-mini-uncensored/Inkling-2-Mini-Uncensored-AD-Q4_K.gguf",
+    "--max-context",
+    "32768",
+    "--devices",
+    "cuda:0=11,cuda:1=11",
+    "--no-graph",
+    "--expert-profile",
+    "${STRATA_DATA}/packs/inkling-2-mini-uncensored-ad-q4_k/expert-profile.strp",
+    "--expert-profile-save",
+    "${STRATA_DATA}/packs/inkling-2-mini-uncensored-ad-q4_k/expert-profile.strp",
+    "--threads",
+    "8"
+  ],
+  "cwd": "${AM2STRATA_HOME}",
+  "tokenizer": "${STRATA_DATA}/packs/inkling-2-mini-uncensored-ad-q4_k/tokenizer",
+  "model_name": "inkling-2-mini-uncensored-ad-q4_k",
+  "display_name": "Inkling 2 Mini Uncensored AD-Q4_K",
+  "log": "${STRATA_DATA}/logs/inkling-2-mini-uncensored-ad-q4_k.log",
+  "host": "127.0.0.1",
+  "port": 8000,
+  "fit_max_tokens": true
+}

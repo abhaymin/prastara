@@ -9,6 +9,7 @@ members = [
     "crates/strata-gguf",
     "crates/strata-hub",
     "crates/strata-pack",
+    "crates/am2pack",
     "crates/strata-workshop",
     "crates/am2strata",
 ]
@@ -20,7 +21,7 @@ members = [
 exclude = ["crates/strata-media", "crates/strata-hybrid", "crates/strata-gpu"]
 
 [workspace.package]
-version = "0.1.9"
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 rust-version = "1.80"

@@ -37,7 +37,7 @@ struct Proc {
 
 /// The events that end a command.
 fn ends(event: &str) -> bool {
-    matches!(event, "error" | "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "speech" | "song" | "removal" | "removed" | "accepted"
+    matches!(event, "error" | "done" | "loaded" | "pulled" | "unloaded" | "models" | "transcript" | "analysis" | "speech" | "song" | "removal" | "removed" | "accepted"
              | "frames")
 }
 
@@ -56,8 +56,10 @@ pub struct Media {
     pub pull_job: std::sync::Mutex<Value>,
     /// the video formats the running engine can encode (its ready event); empty before it started
     pub video_formats: std::sync::Mutex<Vec<String>>,
-    /// the engine was built with CUDA (its ready event)
+    /// the engine was built with a GPU, CUDA or the Mac's Metal (its ready event)
     pub cuda: std::sync::atomic::AtomicBool,
+    /// which GPU the engine drives ("cuda", "metal"), once it has started; None for a CPU-only build or before it ran
+    gpu_kind: std::sync::Mutex<Option<String>>,
     /// the timer that frees the speech models after a while unused (audio_api.rs)
     pub audio_idle: std::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
     pub keep_text_model: bool,
@@ -67,12 +69,20 @@ pub struct Media {
     catalog: std::sync::Mutex<Option<Value>>,
 }
 
-/// The media engine: $AM2STRATA_MEDIA_EXE, else crates/strata-media's release build beside this binary's checkout.
+/// The media engine: $AM2STRATA_MEDIA_EXE, else `am2strata-media` beside this binary, else crates/strata-media's release
+/// build beside this binary's checkout.
 pub fn find_exe() -> Option<PathBuf> {
     if let Some(p) = std::env::var_os("AM2STRATA_MEDIA_EXE").map(PathBuf::from) {
         return p.is_file().then_some(p);
     }
     let exe = std::env::current_exe().ok()?;
+    // an installed one beside this binary (bin/am2strata-media), then a checkout's release build
+    // (through a symlink like ~/.local/bin/am2strata, to where the binary really is)
+    let real = std::fs::canonicalize(&exe).unwrap_or_else(|_| exe.clone());
+    let beside = real.with_file_name(format!("am2strata-media{}", std::env::consts::EXE_SUFFIX));
+    if beside.is_file() {
+        return Some(beside);
+    }
     exe.ancestors().skip(1).take(5).map(|d| d.join("crates/strata-media/target/release/am2strata-media")).find(|p| p.is_file())
 }
 
@@ -95,6 +105,7 @@ impl Media {
             pull_job: std::sync::Mutex::new(json!({"state": "idle"})),
             video_formats: std::sync::Mutex::new(Vec::new()),
             cuda: std::sync::atomic::AtomicBool::new(true),
+            gpu_kind: std::sync::Mutex::new(None),
             audio_idle: std::sync::Mutex::new(None),
             keep_text_model: cfg["gpu_policy"].as_str() == Some("keep"),
             mold_home: data_dir.join("media"),
@@ -165,8 +176,14 @@ impl Media {
             .unwrap_or_else(|| vec!["apng".into(), "gif".into()]);
         *self.video_formats.lock().unwrap() = formats;
         self.cuda.store(v["cuda"].as_bool().unwrap_or(false), std::sync::atomic::Ordering::Relaxed);
+        // an older engine names no GPU kind: a GPU build of it was CUDA
+        let kind = v["gpu"].as_str().map(str::to_string).or_else(|| (v["cuda"] == true).then(|| "cuda".to_string()));
+        *self.gpu_kind.lock().unwrap() = kind;
         Ok(Proc { child, stdin, lines, unread: 0, writing: false })
     }
+
+    /// Which GPU the running engine drives: "cuda", "metal", or None (a CPU-only build, or not started yet).
+    pub fn gpu_kind(&self) -> Option<String> { self.gpu_kind.lock().unwrap().clone() }
 
     /// One command; `on_event` sees every event until the one that ends it (done / loaded / pulled / unloaded / error).
     /// The engine's catalog. While a job holds the engine (an image takes minutes), the last catalog is answered at once,
@@ -263,7 +280,14 @@ fn bad(msg: impl Into<String>) -> Response {
     error(StatusCode::BAD_REQUEST, "invalid_request_error", msg)
 }
 
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    crate::run_detached(generations_now(State(s), headers, Json(req))).await
+}
+
+async fn generations_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     images(s, headers, req, Vec::new(), None).await
 }
 
@@ -419,7 +443,7 @@ async fn images(s: AppState, headers: HeaderMap, req: Value, edit_images: Vec<St
     }
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available",
-                     "image generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+                     format!("image generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features {}", GPU_FEATURE));
     }
     let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
         return bad("send {\"prompt\": \"...\"}");
@@ -651,7 +675,7 @@ pub async fn models(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !s.media.available() {
         let mut v = base;
         v["models"] = json!([]);
-        v["note"] = json!("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+        v["note"] = json!(format!("the media engine is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features {}", GPU_FEATURE));
         return Json(v).into_response();
     }
     match s.media.list().await {
@@ -865,17 +889,49 @@ fn starting_image(req: &Value) -> Result<Option<String>, String> {
 /// image. Longer than one clip ("seconds" or "total_frames" past `frames`): a chain of clips (mold's chain, each
 /// continuing from the one before on a model that takes a source image), stitched into one video. The answer is the clip
 /// in base64 (MP4 by default; "webp" or "gif" on request) with its frame count and rate.
+/// The request runs as its own task, holding the GPU's turn until the engine is done with it: a client that gives up
+/// (a 60 s timeout) no longer frees the turn while the media engine still works on the GPU, which let the text model
+/// start over it and fail again and again.
 pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    crate::run_detached(video_generations_now(State(s), headers, Json(req))).await
+}
+
+async fn video_generations_now(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
     if !crate::api_authorized(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
     if !s.media.available() {
         return error(StatusCode::NOT_IMPLEMENTED, "not_available",
-                     "video generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features cuda");
+                     format!("video generation is not built: cargo build --release --manifest-path crates/strata-media/Cargo.toml --features {}", GPU_FEATURE));
     }
-    let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()) else {
-        return bad("send {\"prompt\": \"...\"}");
+    // "scenes": [{"prompt", "seconds"}, ...]: one long video, scene after scene, each continued from the one before
+    // (the media engine's chain, one stage per clip), made as one job into one file
+    let scenes: Vec<(String, f64)> = match req["scenes"].as_array() {
+        None => Vec::new(),
+        Some(a) => {
+            let mut v = Vec::new();
+            for (i, sc) in a.iter().enumerate() {
+                let Some(p) = sc["prompt"].as_str().map(str::trim).filter(|p| !p.is_empty()) else {
+                    return bad(format!("scenes[{i}]: give its prompt"));
+                };
+                let secs = sc["seconds"].as_f64().unwrap_or(5.0);
+                if !(1.0..=600.0).contains(&secs) {
+                    return bad(format!("scenes[{i}].seconds: 1 to 600"));
+                }
+                v.push((p.to_string(), secs));
+            }
+            if v.is_empty() || v.len() > 60 {
+                return bad("scenes: 1 to 60 of them");
+            }
+            v
+        }
     };
+    let first_scene = scenes.first().map(|(p, _)| p.clone());
+    let Some(prompt) = req["prompt"].as_str().filter(|p| !p.trim().is_empty()).or(first_scene.as_deref()) else {
+        return bad("send {\"prompt\": \"...\"}, or {\"scenes\": [{\"prompt\", \"seconds\"}, ...]} for a longer video");
+    };
+    let prompt = prompt.to_string();
+    let prompt = prompt.as_str();
     let model = req["model"].as_str().filter(|m| m.contains(':')).map(str::to_string).unwrap_or_else(|| s.media.video_model());
     // the model's own defaults (size, steps, guidance, frames, fps) fill what the request leaves out
     let list = match s.media.list().await {
@@ -956,8 +1012,20 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     };
     let format = format.as_str();
     let seed = req["seed"].as_u64().unwrap_or_else(|| (crate::now() ^ (std::process::id() as u64) << 20) % 4_294_967_295);
+    // the scenes as the chain's stages: each scene as many clips as its length takes, every clip a whole one (step n+1)
+    let stages: Vec<Value> = scenes.iter().flat_map(|(p, secs)| {
+        let want = ((secs * fps as f64).round() as u64).max(1);
+        let n = want.div_ceil(frames).max(1);
+        let each = ((want.div_ceil(n)).saturating_sub(1)).div_ceil(step) * step + 1;
+        (0..n).map(move |_| json!({"prompt": p, "frames": each.min(frames)}))
+    }).collect();
+    let stage_frames: u64 = stages.iter().map(|s| s["frames"].as_u64().unwrap_or(0)).sum();
+    if stage_frames > MAX_CHAIN_FRAMES {
+        return bad(format!("the scenes add up to {} s; at most {} s in one video", stage_frames / fps, MAX_CHAIN_FRAMES / fps));
+    }
     {
-        let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64)).unwrap_or(0).max(frames);
+        let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64)).unwrap_or(0).max(frames)
+            .max(stage_frames);
         if let Err(e) = crate::clients::video_allowed(&s.clients, total as f64 / fps as f64)
             .and_then(|_| crate::clients::image_allowed(&s.clients, w, h)) {
             return error(StatusCode::FORBIDDEN, "permission_error", e);
@@ -980,11 +1048,19 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     let tail = if m["family"].as_str().unwrap_or("").starts_with("wan") { 1 } else { 17 };
     let total = req["total_frames"].as_u64().or(req["seconds"].as_f64().map(|x| (x * fps as f64).round() as u64))
         .map(|t| t.min(MAX_CHAIN_FRAMES));
+    let total = if stages.len() > 1 || stage_frames > frames { Some(stage_frames) } else { total };
     let (op, r) = match total.filter(|t| *t > frames) {
         Some(t) => {
             let mut c = json!({"model": model, "prompt": prompt, "width": w, "height": h, "steps": steps, "guidance": guidance,
                                "seed": seed, "fps": fps, "output_format": format, "total_frames": t, "clip_frames": frames,
                                "motion_tail_frames": tail});
+            if !stages.is_empty() {
+                // the scenes' own stages (each its prompt); total_frames is left to them
+                c["stages"] = json!(stages);
+                if let Some(o) = c.as_object_mut() {
+                    o.remove("total_frames");
+                }
+            }
             if let Some(b) = &start {
                 c["source_image"] = json!(b);
             }
@@ -1013,6 +1089,8 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
     mon.media_seed(job, seed);
     mon.media_prompt(job, &prompt);
     let _row = crate::monitor::MediaRow::new(&mon, job);
+    // each clip's scene, for the stage log (one scene: its prompt)
+    let stage_prompts: Vec<String> = stages.iter().filter_map(|s| s["prompt"].as_str().map(str::to_string)).collect();
     let mut clip = None;
     let res = s.media.call(json!({"op": op, "request": r}), |ev| {
         if ev["event"] == "video" && clip.is_none() {
@@ -1020,6 +1098,11 @@ pub async fn video_generations(State(s): State<AppState>, headers: HeaderMap, Js
         }
         if ev["event"] == "step" {
             mon.media_step(job, ev["step"].as_u64().unwrap_or(0), ev["total"].as_u64().unwrap_or(steps));
+            // a chain: which clip, and the scene it belongs to
+            if let (Some(st), Some(n)) = (ev["stage"].as_u64(), ev["stages"].as_u64()) {
+                let what = stage_prompts.get(st.saturating_sub(1) as usize).map(String::as_str).unwrap_or(prompt);
+                mon.media_stage(job, st, n, what);
+            }
         }
     }).await;
     if let Err(e) = s.media.call(json!({"op": "unload"}), |_| {}).await {
@@ -1062,3 +1145,6 @@ pub const MAX_CHAIN_FRAMES: u64 = 14_400;
 pub fn video_frame_step(family: &str) -> u64 {
     if family.starts_with("ltx") { 8 } else { 4 }
 }
+
+/// The media engine's GPU feature for this machine: Metal on Apple Silicon, CUDA elsewhere.
+const GPU_FEATURE: &str = if cfg!(target_os = "macos") { "metal" } else { "cuda" };

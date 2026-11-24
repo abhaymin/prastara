@@ -48,6 +48,19 @@ impl PromptBuilder {
         self
     }
 
+    /// Inkling 2 reads its thinking from `reasoning_effort` (the template's "Thinking effort level"), not from the
+    /// `enable_thinking` switch other models use. The switch is the server's only way to turn this model's reasoning on
+    /// or off, so it maps onto the effort: off is the least ("none"); on leaves the effort to the template, whose own
+    /// default (high, 0.9) applies. A request that names its own effort wins either way, and this returns None for the
+    /// prompt to keep that (None = put nothing in chat_template_kwargs).
+    pub fn inkling_reasoning_effort(off: bool, requested: Option<&str>) -> Option<String> {
+        match requested {
+            Some(e) => Some(e.to_string()),
+            None if off => Some("none".into()),
+            None => None,
+        }
+    }
+
     pub fn literals(&self) -> &Literals {
         &self.literals
     }
@@ -61,6 +74,13 @@ impl PromptBuilder {
         let mut kwargs = self.template_tokens.clone();
         kwargs.extend(p.kwargs.clone());
         kwargs.insert("enable_thinking".into(), json!(!off));
+        // Inkling 2's reasoning level comes from its chat_template_kwargs, not this switch, so steer it with the same
+        // signal: off maps to least ("none"), on leaves the template default in place, and an explicit effort wins.
+        if self.format == CallFormat::Inkling {
+            if let Some(effort) = PromptBuilder::inkling_reasoning_effort(off, p.kwargs.get("reasoning_effort").and_then(|v| v.as_str())) {
+                kwargs.insert("reasoning_effort".into(), json!(effort));
+            }
+        }
         let wrap = matches!(self.format, CallFormat::Gemma | CallFormat::Dsml);
         let tools_value = marked_tools.map(|t| {
             Value::Array(if wrap { t.into_iter().map(|f| json!({"type": "function", "function": f})).collect() } else { t })
@@ -86,5 +106,31 @@ impl PromptBuilder {
             _ => false,
         };
         Ok(Prompt { text, ids, opens_reasoning })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PromptBuilder;
+
+    /// Off here means thinking is switched off. It maps onto Inkling 2's effort (the only thing its template reads):
+    /// least ("none") when disabled, the template's own default left in place when enabled, and a named level wins.
+    #[test]
+    fn inkling_effort_maps_thinking_switch() {
+        // reasoning off with no named level -> least ("none")
+        assert_eq!(PromptBuilder::inkling_reasoning_effort(true, None), Some("none".into()));
+        // reasoning on with no named level -> leave it to the template (None = nothing written)
+        assert_eq!(PromptBuilder::inkling_reasoning_effort(false, None), None);
+        // an explicit level wins regardless of the switch
+        assert_eq!(PromptBuilder::inkling_reasoning_effort(true, Some("low")), Some("low".into()));
+        assert_eq!(PromptBuilder::inkling_reasoning_effort(false, Some("high")), Some("high".into()));
+    }
+
+    /// The off-without-a-level case is what build() turns into `"reasoning_effort": "none"` under CallFormat::Inkling.
+    #[test]
+    fn off_without_a_named_effort_writes_none() {
+        let effort = PromptBuilder::inkling_reasoning_effort(true, None);
+        assert_eq!(effort, Some("none".into()));
+        assert_eq!(serde_json::to_value(effort.unwrap()).unwrap(), serde_json::Value::String("none".into()));
     }
 }

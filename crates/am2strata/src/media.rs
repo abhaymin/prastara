@@ -158,6 +158,47 @@ pub fn ffmpeg_available() -> bool {
     Command::new(crate::server_tls::program("ffmpeg")).arg("-version").output().is_ok_and(|o| o.status.success())
 }
 
+/// `ffmpeg_available`, asked at most once a minute (a cluster master reads it with each worker's capabilities).
+pub fn ffmpeg_cached() -> bool {
+    static AT: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    if let Some((t, v)) = *AT.lock().unwrap() {
+        if t.elapsed() < std::time::Duration::from_secs(60) {
+            return v;
+        }
+    }
+    let v = ffmpeg_available();
+    *AT.lock().unwrap() = Some((std::time::Instant::now(), v));
+    v
+}
+
+/// What compose needs of ffmpeg, missing from this one: the filters (xfade, zoompan, overlay, fade, afade, tpad; the captions are
+/// drawn by am2Strata, so libass is not needed) and
+/// the H.264 and AAC encoders. Empty when it can compose. Homebrew's ffmpeg 9, for one, is built without libass, so it
+/// has no `subtitles` filter. Asked at most once a minute.
+pub fn compose_missing() -> Vec<&'static str> {
+    static AT: std::sync::Mutex<Option<(std::time::Instant, Vec<&'static str>)>> = std::sync::Mutex::new(None);
+    if let Some((t, v)) = AT.lock().unwrap().clone() {
+        if t.elapsed() < std::time::Duration::from_secs(60) {
+            return v;
+        }
+    }
+    let v = if !ffmpeg_available() { vec!["ffmpeg"] } else {
+        let run = |a: &str| Command::new(crate::server_tls::program("ffmpeg")).args(["-hide_banner", a]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+        missing_for_compose(&run("-filters"), &run("-encoders"))
+    };
+    *AT.lock().unwrap() = Some((std::time::Instant::now(), v.clone()));
+    v
+}
+
+/// The compose needs not in ffmpeg's `-filters` and `-encoders` listings.
+pub fn missing_for_compose(filters: &str, encoders: &str) -> Vec<&'static str> {
+    let has = |list: &str, name: &str| list.lines().any(|l| l.split_whitespace().nth(1) == Some(name));
+    let mut out: Vec<&'static str> = ["xfade", "zoompan", "overlay", "afade", "tpad", "fade", "deflicker", "framerate"].into_iter().filter(|f| !has(filters, f)).collect();
+    out.extend(["libx264", "aac"].into_iter().filter(|e| !has(encoders, e)));
+    out
+}
+
 fn video_source(part: &Value) -> Option<String> {
     let kind = part.get("type").and_then(Value::as_str)?;
     if !matches!(kind, "video_url" | "video" | "input_video") {

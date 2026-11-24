@@ -101,6 +101,13 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
+    /// model packs (.am2aipac): one file holding a model, its image projector and its experts laid out for a fast
+    /// load: `pack build --model m.gguf --mmproj mmproj.gguf --out m.am2aipac`, `pack inspect|verify|unpack`
+    #[cfg(feature = "pack")]
+    Pack {
+        #[command(subcommand)]
+        cmd: PackCmd,
+    },
     /// a native pack for the strata engine from a model's GGUF (Orca, Qwen3.8 Flash Next)
     IqPack {
         /// the model's shard 1
@@ -429,14 +436,17 @@ enum Cmd {
     },
     /// media generation from a terminal (docs/GAPS-PLAN B; docs/MEDIA.md has every example):
     /// image "prompt" [--size WxH] [--model M] [--n N] --out file.png | video "prompt" [--frames N] [--size WxH] [--format mp4|gif|apng] [--model M] --out file |
-    /// speak "text" [--voice V] [--model M] --out file.wav | transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
+    /// speak "text" [--voice V] [--model M] --out file.wav | transcribe <file> [--language xx] [--response-format json|text|srt|vtt|verbose_json] [--translate] [--out file] |
     /// song "prompt" [--lyrics file.txt] [--seconds N] --out file.wav | check <file> [--expect "text"] [--language xx] (prints each finding; exit 1 when any is not ok) |
     /// dub <request.json> [--out file.wav] | produce <plan.json> [--out file.wav] (posts the plan, polls step N of M every 3 s, then downloads the content) |
-    /// job <id> [--out file] (the job status; with --out also its /content)
+    /// job <id> [--out file] (the job status; with --out also its /content) |
+    /// compose --out video.mp4 -- <request.json> (pictures, clips, audio and captions into one MP4; local files go inside the request) |
+    /// thumbnail --out thumb.jpg -- <request.json> | judge [--brief text|file] [--min-score 7] -- <video> (hard checks, then a model that sees
+    /// the frames scores picture, captions, fit, sequence and thumbnail; exit 1 unless it passes). A file argument goes after --
     Media {
         action: String,
-        /// the prompt (image/speak/song) or the file to send (transcribe/check/dub/produce); an id for job
-        #[arg(last = true)]
+        /// the prompt (image/speak/song) or the file to send (transcribe/check/dub/produce); an id for job. Either right
+        /// after the action (`media image "a lake" --out a.png`) or after `--` (`media judge --brief b.txt -- v.mp4`)
         first: Option<String>,
         #[command(flatten)]
         m: bin_media::MediaOpts,
@@ -1001,6 +1011,8 @@ fn main() -> ExitCode {
             Ok(a) => agent(a),
             Err(e) => { eprintln!("{e}"); ExitCode::from(2) }
         },
+        #[cfg(feature = "pack")]
+        Cmd::Pack { cmd } => done(pack_cmd(cmd)),
         Cmd::IqPack { gguf, out, base, skip_experts, compat_bf16, experts_bin } => done(strata_pack::iq_pack::run(&strata_pack::iq_pack::Options {
             gguf: expand_path(&gguf), out: expand_path(&out), base: base.map(|b| expand_path(&b)), skip_experts, compat_bf16, experts_bin })),
         Cmd::MtpFetch { cmd, out, only } => {
@@ -1091,6 +1103,107 @@ fn main() -> ExitCode {
         Cmd::MtpRt { gguf, out } => done(strata_pack::mtp_rt::run(&strata_pack::mtp_rt::Options { gguf: expand_path(&gguf), out: expand_path(&out) })),
         Cmd::Test => {
             if run(Command::new("cargo").args(["test", "--release"]).current_dir(root())) { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+        }
+    }
+}
+
+#[cfg(feature = "pack")]
+#[derive(Subcommand)]
+enum PackCmd {
+    /// build a pack from a GGUF model: tensor bytes are copied unchanged, the experts regrouped one record each
+    Build {
+        /// the model's GGUF (one file)
+        #[arg(long)]
+        model: PathBuf,
+        /// the image projector beside it
+        #[arg(long)]
+        mmproj: Option<PathBuf>,
+        /// an importance matrix, kept in the pack for re-quantizing
+        #[arg(long)]
+        imatrix: Option<PathBuf>,
+        /// an expert profile (as --expert-profile-save writes): the experts are stored in its order, hottest first
+        #[arg(long)]
+        profile: Option<PathBuf>,
+        /// run defaults, a JSON object (context length, device split, sampling)
+        #[arg(long)]
+        defaults: Option<PathBuf>,
+        /// the pack to write: <name>.am2aipac
+        #[arg(long)]
+        out: PathBuf,
+        /// the pack's name (default: the output file's name)
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// what a pack holds: its sources, sections, tensors and expert records
+    Inspect {
+        pack: PathBuf,
+        /// the whole index as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// check every section's checksum and that each source rebuilds to the file it was packed from
+    Verify { pack: PathBuf },
+    /// write the source files (the GGUF, the projector, ...) back out, byte for byte
+    Unpack {
+        pack: PathBuf,
+        /// the folder to write them into
+        #[arg(long)]
+        out: PathBuf,
+    },
+}
+
+#[cfg(feature = "pack")]
+fn pack_cmd(cmd: PackCmd) -> Result<(), String> {
+    let gib = |b: u64| format!("{:.2} GiB", b as f64 / (1u64 << 30) as f64);
+    match cmd {
+        PackCmd::Build { model, mmproj, imatrix, profile, defaults, out, name } => {
+            let t = std::time::Instant::now();
+            let ex = |p: Option<PathBuf>| p.map(|p| expand_path(&p));
+            let o = am2pack::BuildOptions { model: expand_path(&model), mmproj: ex(mmproj), imatrix: ex(imatrix), profile: ex(profile), defaults: ex(defaults), out: expand_path(&out), name };
+            let s = am2pack::build(&o, &mut |line| eprintln!("{line}"))?;
+            println!("{}: {} in {:.1} s; {} tensors: {} in core, {} stacked expert tensors as {} records ({} order), {} image",
+                o.out.display(), gib(s.bytes), t.elapsed().as_secs_f64(), s.tensors, s.core_tensors, s.split_tensors, s.expert_records, s.expert_order, s.image_tensors);
+            Ok(())
+        }
+        PackCmd::Inspect { pack, json } => {
+            let p = am2pack::Pack::open(&expand_path(&pack))?;
+            let ix = &p.index;
+            if json {
+                println!("{}", serde_json::to_string_pretty(ix).map_err(|e| e.to_string())?);
+                return Ok(());
+            }
+            let m = &ix.manifest;
+            println!("{} (format version {}, {})", m.name, ix.version, m.created_by);
+            println!("architecture {}; {} tensors; {} expert records ({} per layer, {} order)", m.architecture, ix.tensors.len(), ix.experts.len(), m.expert_count, m.expert_order);
+            for (k, v) in &m.extra {
+                println!("  {k}: {v}");
+            }
+            println!("sources:");
+            for s in &ix.sources {
+                println!("  {:<9} {}  {}  sha256 {}", s.role, s.file, gib(s.size), s.sha256);
+            }
+            println!("sections:");
+            for s in &ix.sections {
+                println!("  {:<12} {:<8} at {:>12}  {:>10}", s.kind, s.name, s.off, gib(s.len));
+            }
+            if let (Some(a), Some(b)) = (ix.experts.first(), ix.experts.iter().map(|r| r.len).max()) {
+                println!("expert record: {} parts, up to {:.2} MiB; first is layer {} expert {}", a.parts.len(), b as f64 / (1 << 20) as f64, a.layer, a.expert);
+            }
+            Ok(())
+        }
+        PackCmd::Verify { pack } => {
+            let t = std::time::Instant::now();
+            for line in am2pack::Pack::open(&expand_path(&pack))?.verify()? {
+                println!("{line}");
+            }
+            println!("ok in {:.1} s", t.elapsed().as_secs_f64());
+            Ok(())
+        }
+        PackCmd::Unpack { pack, out } => {
+            for f in am2pack::unpack(&am2pack::Pack::open(&expand_path(&pack))?, &expand_path(&out))? {
+                println!("{}", f.display());
+            }
+            Ok(())
         }
     }
 }

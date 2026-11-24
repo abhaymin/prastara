@@ -51,8 +51,10 @@ pub enum Kv {
     Bool(bool),
     /// `tokenizer.ggml.tokens`, `.merges`
     Strings(Vec<String>),
-    /// `tokenizer.ggml.token_type`
+    /// `tokenizer.ggml.token_type`, the INT32 arrays (`attention.head_count`, ...)
     Ints(Vec<i32>),
+    /// `attention.sliding_window_pattern`: a BOOL array (gguf-py writes it as ARRAY of BOOL, type 7)
+    Bools(Vec<bool>),
     /// `tokenizer.ggml.scores`
     Floats(Vec<f32>),
     /// a value copied as it is from another GGUF: its type tag and its encoded bytes (any type, arrays included), so
@@ -75,6 +77,10 @@ fn put_kv(b: &mut Vec<u8>, key: &str, v: &Kv) {
         Kv::Ints(v) => {
             b.extend(ARRAY.to_le_bytes()); b.extend(INT32.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());
             for n in v { b.extend(n.to_le_bytes()); }
+        }
+        Kv::Bools(v) => {
+            b.extend(ARRAY.to_le_bytes()); b.extend(BOOL.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());
+            for x in v { b.push(*x as u8); }
         }
         Kv::Floats(v) => {
             b.extend(ARRAY.to_le_bytes()); b.extend(FLOAT32.to_le_bytes()); b.extend((v.len() as u64).to_le_bytes());

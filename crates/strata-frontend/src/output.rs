@@ -11,6 +11,8 @@
 use crate::formats::CallFormat;
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
+use strata_tokenizer::Detokenizer;
 
 const THINK_END: &str = "</think>";
 const CALL_START: &str = "<tool_call>";
@@ -1481,8 +1483,296 @@ impl OutputParser {
                 State::Reasoning | State::RCall => out.push(Event::Reasoning(buf)),
                 State::Call => out.push(Event::Content(format!("{}{buf}", self.call_start))),
                 State::Content => out.push(Event::Content(buf)),
+             }
+         }
+         out
+     }
+}
+
+// ------------------------------------------------------------------------------------------------ Inkling 2 (I2)
+//
+/// The model marks its parts by special tokens (the ids from the GGUF vocabulary). A part opens with the model header,
+/// then: `<|content_thinking|>` for the reasoning, `<|content_text|>` for the answer, or a tool name in plain text
+/// followed by `<|content_invoke_tool_json|>` (or its `<|content_invoke_tool_text|>` twin) for a tool call; each block
+/// closes at `<|end_message|>`. `<|content_model_end_sampling|>` ends the turn. `is_special` below is what identifies
+/// them: these ids are always markers in Inkling output, so they are recognised by id, not by their text (a piece of
+/// the answer could otherwise contain one).
+const INK_HEADER_ID: u32 = 200001; // <|message_model|>
+const INK_THINK_ID: u32 = 200008;  // <|content_thinking|>
+const INK_TEXT_ID: u32 = 200004;   // <|content_text|>
+const INK_TOOL_JSON_ID: u32 = 200049; // <|content_invoke_tool_json|>
+const INK_TOOL_TEXT_ID: u32 = 200057; // <|content_invoke_tool_text|> (an alternate tool-call form, not shown by the goldens)
+const INK_END_ID: u32 = 200010;    // <|end_message|>
+const INK_EOM_ID: u32 = 200006;    // <|content_model_end_sampling|> (the stop token, ends the turn)
+
+fn is_inkling_special(id: u32) -> bool {
+    matches!(id, INK_HEADER_ID | INK_THINK_ID | INK_TEXT_ID | INK_TOOL_JSON_ID | INK_TOOL_TEXT_ID | INK_END_ID | INK_EOM_ID)
+}
+
+/// A tool call the model wrote: its name and the arguments as a JSON string, exactly what an OpenAI client expects
+/// (`{"name":…,"args":{…}}` in the tokens becomes the `args` object, compacted like llama.cpp's json.dumps of it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct InklingToolCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// Which block the stream is inside as its markers arrive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum InkMode {
+    WaitHeader,
+    AfterHeader,
+    Thinking,
+    Content,
+    ToolName,
+    ToolArgs,
+}
+
+/// One decoded token: a special marker (kept by id) or a piece of real text.
+#[derive(Clone)]
+enum InkPiece {
+    Mark(u32),
+    Text(String),
+}
+
+/// The compact JSON argument object out of a block's `{"name":…,"args":{…}}` — matching llama.cpp, which parses the
+/// whole object and keeps its `"args"` value (its `json.dumps`, spaces left out).
+fn ink_args(raw: &str) -> String {
+    if let Some(Value::Object(m)) = serde_json::from_str::<Value>(raw).ok() {
+        if let Some(args) = m.get("args") {
+            return serde_json::to_string(args).unwrap_or_else(|_| raw.to_string());
+        }
+    }
+    raw.to_string()
+}
+
+/// A parser fed the model's tokens one at a time. It decodes them (the caller supplies `id -> bytes`, as llama.cpp
+/// tokenizes), tracks the markers, and holds back anything not yet closed, so it streams without splitting a marker or
+/// a segment in two. Reasoning goes to `reasoning_content`, the answer to `content`, tool calls to `tool_calls`.
+pub struct InklingParser {
+    dec: Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync>,
+    detok: Detokenizer,
+    pieces: Vec<InkPiece>,
+    cursor: usize,
+    mode: InkMode,
+    /// text being built for the reasoning or the answer of the current block
+    pending: String,
+    /// a tool call's name (in plain text) and its JSON arguments
+    cur_name: String,
+    cur_args: String,
+    reasoning_parts: Vec<String>,
+    content_parts: Vec<String>,
+    calls: Vec<InklingToolCall>,
+    done: bool,
+}
+
+impl InklingParser {
+    /// `dec`: a token id -> its bytes (e.g. `Tokenizer::token_bytes`). The marker ids are recognised by id; the rest is
+    /// decoded with the shared detokenizer, so multi-byte characters split across tokens still come out right.
+    pub fn new(dec: impl Fn(u32) -> Vec<u8> + Send + Sync + 'static) -> Self {
+        Self { dec: Arc::new(dec), detok: Detokenizer::new(), pieces: Vec::new(), cursor: 0, mode: InkMode::WaitHeader, pending: String::new(), cur_name: String::new(), cur_args: String::new(), reasoning_parts: Vec::new(), content_parts: Vec::new(), calls: Vec::new(), done: false }
+    }
+
+    pub fn feed(&mut self, id: u32) -> Vec<Event> {
+        self.push(id);
+        self.pump()
+    }
+
+    /// Feed every token of a turn at once (a batch), instead of one at a time via `feed`: the parser must reach the same
+    /// reasoning, content and tool calls regardless of how the tokens arrive.
+    pub fn feed_tokens(&mut self, ids: &[u32]) -> Vec<Event> {
+        for &id in ids {
+            self.push(id);
+        }
+        self.pump()
+    }
+
+    /// Decode one token and add it (a marker by id, real text through the detokenizer). Shared by `feed` and
+    /// `feed_tokens`.
+    fn push(&mut self, id: u32) {
+        if is_inkling_special(id) {
+            self.pieces.push(InkPiece::Mark(id));
+        } else {
+            let bytes = (&*self.dec)(id);
+            let text = self.detok.push(&bytes);
+            if !text.is_empty() {
+                self.pieces.push(InkPiece::Text(text));
+            }
+        }
+    }
+
+    /// The reasoning, the answer and the tool calls so far. `reasoning_content` is every reasoning block joined; `content`
+    /// likewise the answer's text blocks; tool calls keep their arguments as the compact JSON string. Special tokens
+    /// never show up in either text (they are markers, decoded and dropped).
+    pub fn reasoning_content(&self) -> String { self.reasoning_parts.concat() }
+    pub fn content(&self) -> String { self.content_parts.concat() }
+    pub fn tool_calls(&self) -> Vec<InklingToolCall> { self.calls.clone() }
+
+    /// Whether the turn has ended (its stop token arrived). `reasoning_content`, `content` and `tool_calls` are whole.
+    pub fn is_done(&self) -> bool { self.done }
+
+    /// Flush any bytes held for an incomplete final character, then close whatever block is open: a model that ends its
+    /// turn without a closing `<|end_message|>` still yields what it wrote.
+    pub fn finish(&mut self) -> Vec<Event> {
+        // flush any bytes still pending (the last character of the final token); a truncated final char is dropped
+        let text = self.detok.push(&[]);
+        if !text.is_empty() {
+            self.pieces.push(InkPiece::Text(text));
+        }
+        // text is passed on as it arrives, so an open reasoning or answer block (a reply cut by max_tokens) has nothing
+        // left to flush but this last piece
+        let out = self.pump();
+        self.done = true;
+        out
+    }
+
+    fn pump(&mut self) -> Vec<Event> {
+        let mut out = Vec::new();
+        while self.cursor < self.pieces.len() {
+            let cur = self.pieces[self.cursor].clone();
+            match self.mode {
+                InkMode::WaitHeader => match &cur {
+                    InkPiece::Mark(INK_HEADER_ID) => { self.cursor += 1; self.mode = InkMode::AfterHeader; }
+                    InkPiece::Mark(INK_EOM_ID) => { self.cursor += 1; self.done = true; break; }
+                    _ => break,
+                },
+                InkMode::AfterHeader => match &cur {
+                    InkPiece::Mark(INK_THINK_ID) => { self.cursor += 1; self.mode = InkMode::Thinking; self.pending.clear(); }
+                    InkPiece::Mark(INK_TEXT_ID) => { self.cursor += 1; self.mode = InkMode::Content; self.pending.clear(); }
+                    InkPiece::Mark(INK_TOOL_JSON_ID) | InkPiece::Mark(INK_TOOL_TEXT_ID) => { self.cursor += 1; self.cur_args.clear(); self.mode = InkMode::ToolArgs; }
+                    InkPiece::Mark(INK_EOM_ID) => { self.cursor += 1; self.done = true; break; }
+                    _ => { self.mode = InkMode::ToolName; /* read this same piece as the tool name */ continue; }
+                },
+                // text is passed on as it arrives (a streamed reply gets its deltas, and a reply cut by max_tokens keeps
+                // what it wrote); the block's end marker only switches the mode
+                InkMode::Thinking => match &cur {
+                    InkPiece::Mark(INK_END_ID) => { self.cursor += 1; self.mode = InkMode::WaitHeader; }
+                    InkPiece::Mark(INK_EOM_ID) => { self.cursor += 1; self.done = true; break; }
+                    InkPiece::Text(s) => {
+                        self.cursor += 1;
+                        if !s.is_empty() { self.reasoning_parts.push(s.clone()); out.push(Event::Reasoning(s.clone())); }
+                    }
+                    _ => break,
+                },
+                // text is passed on as it arrives (a streamed reply gets its deltas, and a reply cut by max_tokens keeps
+                // what it wrote); the block's end marker only switches the mode
+                InkMode::Content => match &cur {
+                    InkPiece::Mark(INK_END_ID) => { self.cursor += 1; self.mode = InkMode::WaitHeader; }
+                    InkPiece::Mark(INK_EOM_ID) => { self.cursor += 1; self.done = true; break; }
+                    InkPiece::Text(s) => {
+                        self.cursor += 1;
+                        if !s.is_empty() { self.content_parts.push(s.clone()); out.push(Event::Content(s.clone())); }
+                    }
+                    _ => break,
+                },
+                InkMode::ToolName => match &cur {
+                    InkPiece::Mark(INK_TOOL_JSON_ID) | InkPiece::Mark(INK_TOOL_TEXT_ID) => {
+                        self.cursor += 1; self.mode = InkMode::ToolArgs; self.cur_args.clear();
+                    }
+                    InkPiece::Text(s) => { self.cur_name.push_str(&s); self.cursor += 1; }
+                    _ => break,
+                },
+                InkMode::ToolArgs => match &cur {
+                    InkPiece::Mark(INK_END_ID) => {
+                        self.cursor += 1; let args = ink_args(&self.cur_args);
+                        let name = self.cur_name.clone();
+                        self.calls.push(InklingToolCall { name: name.clone(), arguments: args.clone() });
+                        out.push(self.finish_call(name, args));
+                        self.cur_name.clear(); self.cur_args.clear();
+                        self.mode = InkMode::WaitHeader;
+                    }
+                    InkPiece::Text(s) => { self.cur_args.push_str(&s); self.cursor += 1; }
+                    _ => break, // the next block opened before this call closed: hold it
+                },
             }
         }
         out
     }
+
+    /// Build a streamed tool call event: name and arguments (parsed from the compact JSON string into a map). The exact
+    /// compact string is kept in `tool_calls()`, as the golden expects.
+    fn finish_call(&self, name: String, args: String) -> Event {
+        let parsed = serde_json::from_str::<Map<String, Value>>(&args).unwrap_or_default();
+        Event::ToolCall(ToolCall::new(name, parsed))
+    }
+
+    /// Which block the stream is in (serve/server.py's reply loop state): where the queries below read it from.
+    fn mode(&self) -> InkMode { self.mode }
 }
+
+/// What the server's reply loop (`run`) needs from whichever parser reads a model's tokens: feed one generated token,
+/// ask where the reply stands so it can end a pass, and close the reply. The text formats read decoded text of each
+/// token; Inkling reads token ids (its parts are marker tokens). `Reply` is the boxed trait object run holds, so its
+/// loop stays the same for every format.
+pub trait Reply: Send {
+    /// One generated token id: decoded to text for a text-format model, read by its markers for Inkling.
+    fn feed(&mut self, id: u32) -> Vec<Event>;
+    /// Opt in to reading a declared tool's call written whole inside `<tool_call>` (Kolibri 1). Not Inkling's.
+    fn set_recover(&mut self, _on: bool) {}
+    /// The reply is still in its reasoning.
+    fn in_reasoning(&self) -> bool;
+    /// Holds an unconfirmed closing tag of its reasoning (a text-format reason to end a forced call). Not Inkling's.
+    fn holds_think_end(&self) -> bool { false }
+    /// Nothing held back in a partial tag, so a pass may end here.
+    fn is_clean(&self) -> bool;
+    /// In the answer with nothing held: a forced call opens here.
+    fn at_clean_content(&self) -> bool;
+    /// The reasoning's closing tag ("" for Inkling, which ends its blocks by its own markers).
+    fn think_end(&self) -> &'static str { "" }
+    /// Close the reply. `reason`: how it ended ("stop" natural, anything else not). Held calls become real only on a
+    /// natural stop; for Inkling every block is already closed by its markers before the turn ends.
+    fn finish(&mut self, reason: Option<&str>) -> Vec<Event>;
+    /// The reply's repairs (extra tool-argument and thinking-tag fixes), logged after it ends.
+    fn notes(&self) -> &[String];
+    fn stray_think(&self) -> usize;
+    /// A character split across tokens is still pending (nothing for Inkling, which reads whole markers).
+    fn has_pending(&self) -> bool { false }
+}
+
+/// A text-format reply: `OutputParser` reading decoded text of each token. It owns the detokenizer `run` held across
+/// one request so a multi-byte character split over tokens still comes out right, exactly as before.
+pub struct ReplyText {
+    inner: OutputParser,
+    dec: Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync>,
+    detok: Detokenizer,
+}
+
+impl ReplyText {
+    pub fn new(inner: OutputParser, dec: Arc<dyn Fn(u32) -> Vec<u8> + Send + Sync>) -> Self {
+        Self { inner, dec, detok: Detokenizer::new() }
+    }
+}
+
+impl Reply for ReplyText {
+    fn feed(&mut self, id: u32) -> Vec<Event> {
+        let text = self.detok.push(&(&*self.dec)(id));
+        self.inner.feed(&text).unwrap_or_default()
+    }
+
+    fn set_recover(&mut self, on: bool) { self.inner.set_recover(on); }
+    fn in_reasoning(&self) -> bool { self.inner.in_reasoning() }
+    fn holds_think_end(&self) -> bool { self.inner.holds_think_end() }
+    fn is_clean(&self) -> bool { self.inner.is_clean() }
+    fn at_clean_content(&self) -> bool { self.inner.at_clean_content() }
+    fn think_end(&self) -> &'static str { self.inner.think_end() }
+
+    fn finish(&mut self, reason: Option<&str>) -> Vec<Event> { self.inner.finish(reason) }
+    fn notes(&self) -> &[String] { &self.inner.notes }
+    fn stray_think(&self) -> usize { self.inner.stray_think }
+    fn has_pending(&self) -> bool { self.detok.has_pending() }
+}
+
+impl Reply for InklingParser {
+    fn feed(&mut self, id: u32) -> Vec<Event> { self.feed(id) }
+
+    fn in_reasoning(&self) -> bool { self.mode() == InkMode::Thinking }
+    fn is_clean(&self) -> bool { self.pending.is_empty() && !matches!(self.mode(), InkMode::ToolName | InkMode::ToolArgs) }
+    fn at_clean_content(&self) -> bool { matches!(self.mode(), InkMode::Content) }
+
+    /// Close the reply: flush a held final character and any block still open. `reason` is taken for parity with the
+    /// text parsers though it changes nothing here (the markers already closed every block).
+    fn finish(&mut self, _reason: Option<&str>) -> Vec<Event> { self.finish() }
+    fn notes(&self) -> &[String] { &[] }
+    fn stray_think(&self) -> usize { 0 }
+}
+

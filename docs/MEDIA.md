@@ -16,6 +16,7 @@ am2strata-run media speak "Welcome to the evening set." --voice laura --out intr
 am2strata-run media transcribe take.wav --model whisper-base            # its text on stdout (or --format srt|vtt|text)
 am2strata-run media song "warm acoustic ballad, female vocal" --lyrics words.txt --seconds 180 --out song.wav
 am2strata-run media check take.wav --expect "Welcome to the evening set."   # prints each finding; exit 1 when any is not ok
+am2strata-run media analyze take.wav --from 300 --seconds 120   # music facts of that window: tempo, repeat, tonic+range, swaras, phrases
 am2strata-run media dub dub-request.json --out soundtrack.wav
 am2strata-run media produce plan.json --out set.wav                     # posts the plan, polls step N of M, then downloads it
 am2strata-run media job mj-1234 --out set.wav                           # its status; with --out also /content
@@ -71,6 +72,24 @@ each edit is shown over its original with a slider between them.
 - **`"image"`** starts a clip from a picture, on a model that takes a source image.
 - **The answer** is the clip in base64: MP4 by default, `"webp"` or `"gif"` on request.
 
+### Long videos: one request, one file
+
+A video of minutes is never made in pieces by the caller: one request makes the whole of it inside the server, as one
+background job, each clip continued from the one before (the media engine's chain), stitched into one file.
+
+- `"seconds": 120`: one scene that long.
+- `"scenes": [{"prompt", "seconds"}, ...]`: a story in scenes (up to 60), each its own prompt, as many clips as its
+  length takes; up to 15 minutes in all.
+- The chat tool `generate_video` and the job API (`POST /api/jobs {"tool": "generate_video", "arguments": {...}}`) take
+  the same; the model is told to make a long video in one call, never several.
+- **Following it:** `GET /api/jobs/{id}` (and the chat's job card) gives the clip now (`stage` of `stages`), the time so
+  far, and `log`, a line for each clip finished with its scene; the web app's card appends them as they clear.
+- **An API chat stays engaged:** a streaming chat (Chat Completions, Messages, Responses) from an API client that
+  queued media keeps its stream open after the answer, adding a line as each clip clears and, at the end,
+  `✓ video mj-N is ready: /v1/media/jobs/mj-N/content`. `"strata_media_wait": false` ends the stream with the answer.
+- Short asks stay one shot: one image, one clip, one sound. Long audio is one job too: `speak` reads up to ~20 minutes,
+  `produce` joins speech, songs and music into one file with chapters.
+
 ## Speech
 
 | Endpoint | Body | Answer |
@@ -123,6 +142,26 @@ curl -s $URL/v1/images/edits -H "Authorization: Bearer $KEY" -H "Content-Type: a
 - **In the app:** Media › Library, with Edit this, Pin, Copy id, Download and Delete. **CLI:** `am2strata-run media files`,
   `media add <file>`, `media get <id> --out f`, `media rm <id>`, `media pin <id>`, `media unpin <id>`.
 
+## Image search and reverse image search
+
+Private to this machine: the searches run from here, in a throwaway browser session, and the results come back to you
+only. **Nothing is filtered for what an image shows** (Google is asked for `safe=off`). It is not for identifying a
+person from their face: no face-search engine is used.
+
+- `POST /v1/search/images` `{"query", "n"}`: images for some words, each with its image, its page, where it is from
+  and its licence when known. SearXNG's image search when the run config has one, else Wikimedia Commons.
+- `POST /v1/search/reverse` `{"image": a library id, a data: URL, base64 or a URL, "engines"?: ["yandex", "google_lens"], "n"}`:
+  where the image, or one like it, appears. **The image is sent to the engines named**; that is all that leaves this
+  machine. Yandex answers with what the image seems to show and the sites it is on, read in the server's own headless
+  browser. Google Lens asks a browser like that to prove it is a person; that is never solved here, so its answer is
+  `needs_you` with its results link, to open in your own browser. The image is kept in the media library.
+  The answer is `{"object": "reverse_search", "file_id", "engines": [{"engine", "status": "ok" | "needs_you" | "failed",
+  "contains": [what the image seems to show], "sites": [{"title", "url", …}], "results_url", "similar_url"}]}`: the
+  results are per engine, under `engines[].sites`, not in one list.
+- **Chat tools** (with the web on, `"strata_web": true`): `image_search` and `reverse_image_search` (an `mf_` id or a URL).
+- **In the app:** Media › Tools › Image search, and **Find on the web** on each library image.
+  **CLI:** `am2strata-run media search -- "words"`, `am2strata-run media reverse -- <file | mf_id | url>`.
+
 ## Productions: one long piece from parts
 
 `POST /v1/media/productions` queues one job for a whole piece:
@@ -148,13 +187,34 @@ curl -s $URL/v1/images/edits -H "Authorization: Bearer $KEY" -H "Content-Type: a
 These need ffmpeg on the server.
 
 - **`POST /v1/media/videos/compose`:**
-  `{"audio", "shots": [{"image"} | {"clip"}, …], "captions"?: [[start_s, end_s, text]], "title_card"?, "end_card"?, "size"?: "1920x1080", "crossfade_s"?: 0.8}`.
-  Images are slowly zoomed, clips are fitted, joins crossfade, captions are burnt in. The result is one MP4 (H.264 and
-  AAC).
+  `{"audio", "shots": [{"image"} | {"clip"}, …], "captions"?: [[start_s, end_s, text] | [start_s, end_s, text, {"place", "size"}]], "title_card"?, "end_card"?, "engine"?: "native"|"libass", "size"?: "1920x1080", "crossfade_s"?: 0.8}`.
+  Images are slowly zoomed, clips are fitted, joins crossfade, captions are burnt in (by am2Strata with ffmpeg's
+  `overlay`, or by libass on `"captions_engine": "libass"`). The result is one MP4 (H.264 and AAC).
 - **`POST /v1/media/thumbnails`:** `{"image", "lines": [[text, "white" | "gold"]], "tag"}`. The result is one
   1280×720 JPEG with big type over a dark gradient.
 
 Both are queued jobs, and their files are at `/v1/media/jobs/{id}/content`.
+
+### The caption's place and size
+
+A caption is normally `[start_s, end_s, text]` — the verse line, drawn centred low and 120 px above the bottom (and it
+is the only kind kept in `captions.srt`, so YouTube shows the verse). It can instead carry a fourth element giving where
+the word sits and how large the type is, so the mantra's half-verse can show low while the word being sung shows large
+in the centre at the same time:
+
+```json
+{"audio": "…", "shots": [{"image": "…"}], "captions": [
+  ["0.0", "8.0", "नमस्ते अस्तु भगवन्"],                    // low, today's look (size 1.0)
+  ["0.0", "8.0", "नमस्ते", {"place": "centre", "size": 2.5}] // the sung word, large, centred, shown with the line above
+]}
+```
+
+- `"place"` is `"low"` (the default) or `"centre"` (centred vertically) or `"top"`. A low caption and a centre word in
+  the same interval overlap in time and both are drawn.
+- `"size"` scales the type (`1.0` = today's 58 px at a 1080 short side; `0.5`–`3.0` are allowed). A size `2.0` box is
+  about twice as tall as a size `1.0` one.
+- The default engine draws them with am2Strata and ffmpeg's `overlay`; on `"captions_engine": "libass"` the centre word
+  rides a second ASS style (centred, sized by its `size`). Only the low captions go to `captions.srt`.
 
 ## Dubbing
 
@@ -202,6 +262,23 @@ so the picture does not move:
 - **Without `heard_text`,** the take is transcribed in its own language with the most accurate Whisper on the server.
 - **Video checks need ffmpeg** (GAPS-PLAN A14).
 - **In the web app:** the Tools tab has a Check card — drop a take or a video, give the expected words if you have them, and it shows each check's result as pass or fail.
+
+## Analyzing the music of a take
+
+`POST /v1/media/analyze`: the facts a producer needs to learn before making a matching take — tempo, the drone's key and
+home note (the tonic), the notes the voice sits on (the swaras) with how long it spends on each, and every phrase with its
+timing and notes. It is pure math over the audio (a CPU job in the media engine, no model, no FFT), so it answers instantly
+for any size file it reads — MP3, WAV, FLAC, AAC, OGG — at most 200 MiB:
+
+```json
+{"audio": "data:audio/mp3;base64,…", "from_s": 0, "seconds": 0}
+```
+
+`from_s`/`seconds` select a window (both 0 mean the whole take); the CLI is `am2strata-run media analyze <file> [--from S] [--seconds N]`.
+The endpoint forwards the raw bytes to the engine's `analyze` op and returns its analysis (like `/v1/audio/transcriptions`
+forwards `transcribe`). The answer carries `tempo` (bpm, confidence, whether it is a steady pulse), `repeat` (one verse's
+period and how many times it repeats), `pitch.tonic` (note + hertz) with the `range`, each `swara` as `{name, share}`, and a
+`phrases` list. Send the file as a multipart `file` or as base64 / a data URL in JSON.
 
 ## Media from a chat
 

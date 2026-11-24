@@ -11,8 +11,9 @@ pub const POLY_ARCHS: [(&str, &str); 9] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("c
                                            ("flint", "Flint 40B-A2.5B"), ("kolibri1", "Kolibri 1")];
 
 /// GGUF architectures am2strata-hybrid runs (crates/strata-hybrid, checked against llama.cpp), with their family.
-pub const HYBRID_ARCHS: [(&str, &str); 7] = [("nemotron_h_moe", "Nemotron-H MoE"), ("nemotron_h", "Nemotron-H"), ("deepseek2", "GLM-4.7-Flash / DeepSeek"),
-                                             ("llama", "Llama / Mistral / Mixtral"), ("mistral3", "Mistral 3"), ("qwen3", "Qwen3"), ("qwen3moe", "Qwen3 MoE")];
+pub const HYBRID_ARCHS: [(&str, &str); 9] = [("nemotron_h_moe", "Nemotron-H MoE"), ("nemotron_h", "Nemotron-H"), ("deepseek2", "GLM-4.7-Flash / DeepSeek"),
+                                             ("llama", "Llama / Mistral / Mixtral"), ("mistral3", "Mistral 3"), ("qwen3", "Qwen3"), ("qwen3moe", "Qwen3 MoE"),
+                                             ("inkling2", "Inkling 2"), ("inkling2_loop", "Inkling 2 (looped)")];
 
 /// Architectures the Rust engine also runs, which it runs only when strata-poly and strata are not here: a release without them.
 pub const RUST_FALLBACK_ARCHS: [(&str, &str); 2] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("qwen4exp", "Qwen3.8 Flash Next")];

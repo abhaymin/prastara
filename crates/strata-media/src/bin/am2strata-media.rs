@@ -15,6 +15,8 @@
 //!   -> {"op":"transcribe","model":"whisper-large-v3-turbo","audio":"<base64 file>","language"?,"translate"?,"device"?}
 //!                                                         <- {"event":"segment","start":..,"end":..,"text":..} ...
 //!                                                         <- {"event":"transcript","text":..,"language":..,"segments":[..],"duration":..}
+//!   -> {"op":"analyze","audio":"<base64 file>","from_s"?,"seconds"?}  (CPU only: no model - tempo, repeat period, tonic...)
+//!                                                         <- {"event":"analysis", "loudness","tempo","repeat","pitch","phrases", ...}
 //!   -> {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>}  (MP4/H.264 in Rust, no ffmpeg)
 //!                                                         <- {"event":"frames","fps","duration_s","width","height","frames":[{"t":..,"png":"<base64>"}]}
 //!   -> {"op":"speak","model":"parler-tts-mini-v1","text":..,"voice"?,"seed"?,"device"?}
@@ -40,6 +42,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "../audio.rs"]
 mod audio;
+#[path = "../analyze.rs"]
+mod analyze;
 #[path = "../parler_hf.rs"]
 mod parler_hf;
 #[path = "../acestep/mod.rs"]
@@ -133,6 +137,27 @@ fn transcribe(st: &mut State, cmd: &Value) -> Result<Value> {
     r["warnings"] = json!(warnings);
     r["ms"] = json!(t0.elapsed().as_millis() as u64);
     r["model"] = json!(name);
+    Ok(r)
+}
+
+/// {"op":"analyze","audio":"<base64|data URL>","from_s"?,"seconds"?}: the music facts of from_s/seconds into the file
+/// (loudness, tempo, repeat period, tonic, range, swaras and phrases). CPU only - no model.
+fn analyze_op(_st: &mut State, cmd: &Value) -> Result<Value> {
+    let raw = match cmd["audio"].as_str() {
+        Some(s) if !s.is_empty() => s.split_once(";base64,").map(|(_, b)| b).unwrap_or(s),
+        _ => bail!("analyze: no \"audio\""),
+    };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(raw.trim()).context("audio: base64")?;
+    let (pcm, rate, warnings) = audio::decode(bytes)?;
+    let from_s = cmd["from_s"].as_f64().unwrap_or(0.0).max(0.0);
+    let seconds = cmd["seconds"].as_f64().filter(|s| *s > 0.0).unwrap_or(0.0);
+    let t0 = std::time::Instant::now();
+    let mut r = analyze::run(&pcm, rate, from_s, seconds);
+    r["event"] = json!("analysis");
+    r["ms"] = json!(t0.elapsed().as_millis() as u64);
+    if !warnings.is_empty() {
+        r["warnings"] = json!(warnings);
+    }
     Ok(r)
 }
 
@@ -437,7 +462,7 @@ fn song(st: &mut State, cmd: &Value) -> Result<Value> {
         st.model = None;
         let device = match cmd["device"].as_str() {
             Some("cpu") => candle_core::Device::Cpu,
-            _ if cfg!(feature = "cuda") => candle_core::Device::new_cuda(cmd["gpu"].as_u64().unwrap_or(0) as usize)?,
+            _ if audio::gpu_kind().is_some() => audio::gpu(cmd["gpu"].as_u64().unwrap_or(0) as usize)?,
             _ => candle_core::Device::Cpu,
         };
         st.song = Some(acestep::pipeline::AceStep::load(&dir, &device)?);
@@ -1029,7 +1054,8 @@ fn main() {
                          #[cfg(feature = "onnx")]
                          chatterbox: None, song: None };
     // the video formats this build can encode (mold: mp4 with its mp4 feature, webp with its webp feature)
-    emit(json!({"event": "ready", "cuda": cfg!(feature = "cuda"), "version": env!("CARGO_PKG_VERSION"),
+    // "cuda" is the server's flag for "this engine has a GPU" (the Mac's Metal counts); "gpu" names which
+    emit(json!({"event": "ready", "cuda": audio::gpu_kind().is_some(), "gpu": audio::gpu_kind(), "version": env!("CARGO_PKG_VERSION"),
                 "video_formats": ["mp4", "apng", "gif"]}));
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };
@@ -1074,6 +1100,10 @@ fn main() {
                 }
                 "transcribe" => {
                     let r = transcribe(&mut st, &cmd)?;
+                    emit(r)
+                }
+                "analyze" => {
+                    let r = analyze_op(&mut st, &cmd)?;
                     emit(r)
                 }
                 "video_frames" => emit(video_frames(&cmd)?),

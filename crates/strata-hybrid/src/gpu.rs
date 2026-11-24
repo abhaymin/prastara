@@ -22,13 +22,19 @@ pub struct OnDevice {
 
 impl OnDevice {
     pub fn matvec(&self, x: &[f32]) -> Vec<f32> {
-        DEVICES.get().expect("devices opened")[self.dev].matvec(&self.w, x)
+        let t0 = std::time::Instant::now();
+        let y = DEVICES.get().expect("devices opened")[self.dev].matvec(&self.w, x);
+        crate::model::times::device(t0);
+        y
     }
 
     /// Several matrices on the same device with the same input, in one submission.
     pub fn matvec_many(group: &[&OnDevice], x: &[f32]) -> Vec<Vec<f32>> {
         let ws: Vec<&strata_gpu::Weights> = group.iter().map(|g| g.w.as_ref()).collect();
-        DEVICES.get().expect("devices opened")[group[0].dev].matvec_many(&ws, x)
+        let t0 = std::time::Instant::now();
+        let ys = DEVICES.get().expect("devices opened")[group[0].dev].matvec_many(&ws, x);
+        crate::model::times::device(t0);
+        ys
     }
 
     pub fn device(&self) -> usize {
@@ -62,17 +68,50 @@ pub fn parse(spec: &str) -> Result<Vec<(String, u64)>, String> {
     }).collect()
 }
 
-/// Upload `q` to device `d` unless it does not fit `left` (or no kernel takes its type); true when placed.
-fn put(gpus: &[strata_gpu::Gpu], d: usize, q: &mut QMat, left: &mut u64) -> Result<bool, String> {
-    let size = q.data.len() as u64;
-    if size > *left || strata_gpu::kernels::geometry(q.ty()).is_none() {
-        return Ok(false);
-    }
-    let w = gpus[d].upload(q.ty(), q.data, q.rows, q.cols)?;
-    q.gpu = Some(OnDevice { dev: d, w: Arc::new(w) });
-    *left -= size;
-    Ok(true)
+/// What placement needs to know of a matrix: its bytes, and whether a kernel takes it on a device (its type has one
+/// and its width is whole blocks).
+#[derive(Clone, Copy)]
+pub struct Item {
+    pub bytes: u64,
+    /// the type has a kernel
+    pub kernel: bool,
+    /// and the width is a multiple of its block
+    pub whole: bool,
 }
+
+impl Item {
+    fn of(q: &QMat) -> Item {
+        let g = strata_gpu::kernels::geometry(q.ty());
+        Item { bytes: q.data.len() as u64, kernel: g.is_some(), whole: g.is_some_and(|(per_block, _, _)| q.cols % per_block as usize == 0) }
+    }
+}
+
+/// Where each matrix goes, in the order given: `Some(device)` or `None` (the CPU), and what each budget has left.
+/// Devices fill in order and are never returned to: a matrix that does not fit the current one moves on to the next,
+/// and so does everything after it, so each device holds one run of the order (in a model pack, one run of the file).
+/// A type with no kernel stays on the CPU without moving on.
+pub fn plan(items: &[Item], budgets: &[u64]) -> (Vec<Option<usize>>, Vec<u64>) {
+    let mut left = budgets.to_vec();
+    let mut d = 0usize;
+    let to = items.iter().map(|it| {
+        while d < left.len() {
+            if it.kernel && it.whole && it.bytes <= left[d] {
+                left[d] -= it.bytes;
+                return Some(d);
+            }
+            if !it.kernel {
+                break;
+            }
+            d += 1;
+        }
+        None
+    }).collect();
+    (to, left)
+}
+
+/// How much a device may have queued before the loader has it flushed: the runtime keeps a host copy of every upload
+/// until then, so without a bound the whole model sits in RAM a second time (measured: 17 GiB for Inkling 2 Mini).
+const QUEUE_BYTES: u64 = 512 << 20;
 
 /// Given what placement did, whether no matrix (dense/attention or expert) landed on any of the requested devices.
 pub fn nothing_placed(dense_on_device: usize, experts_on_device: usize) -> bool {
@@ -82,68 +121,117 @@ pub fn nothing_placed(dense_on_device: usize, experts_on_device: usize) -> bool 
 /// Place the model's matrices on the devices; -> (a summary for the engine's INFO line, how many dense/attention
 /// matrices were placed on a device, how many experts). Findings item 2: the caller uses the counts to know whether
 /// `--devices` actually put anything where it was asked.
+///
+/// The plan is made first (sizes are known), then the uploads are fed to all devices at once: each device's thread
+/// copies to its card while the loader reads the next matrix for another, and the loader waits for a device only
+/// when it has QUEUE_BYTES queued. From a model pack the experts go in the file's order unless a profile is given,
+/// so each device's share is one run of the file, asked from the disk ahead of the uploads.
 pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>) -> Result<(String, usize, usize), String> {
+    let t0 = std::time::Instant::now();
     let gpus: Vec<strata_gpu::Gpu> = devices.iter().map(|(n, _)| strata_gpu::Gpu::open(n)).collect::<Result<_, _>>()?;
-    let ne = m.profile_experts;
-    let n_layers = m.layers.len();
-    // the experts' order: the profile's ranking, then the rest layer by layer
-    let mut order: Vec<(usize, usize)> = profile.map(|p| p.ranked.iter().map(|&(l, e)| (l as usize, e as usize)).collect()).unwrap_or_default();
-    let mut seen = vec![false; n_layers * ne.max(1)];
-    order.iter().for_each(|&(l, e)| if l * ne + e < seen.len() { seen[l * ne + e] = true });
-    let n_exp: Vec<(usize, usize)> = m.moes().map(|x| (x.layer, x.n_expert)).collect();
-    for (l, n) in n_exp {
-        for e in 0..n {
-            if !seen[l * ne + e] {
-                order.push((l, e));
+    let open_ms = t0.elapsed().as_millis();
+    let (order, from) = crate::pack::expert_order(m, profile);
+    let from_file = from == "file";
+    let file_map = m.file_map;
+    let (every, mut experts) = m.matrices_mut();
+    // every matrix in placement order, and which expert (by its place in the order) each belongs to
+    let n_every = every.len();
+    let mut qs: Vec<&mut QMat> = every;
+    let mut owner: Vec<usize> = vec![usize::MAX; n_every];
+    let mut n_groups = 0usize;
+    for key in order {
+        if let Some(group) = experts.remove(&key) {
+            owner.extend(std::iter::repeat_n(n_groups, group.len()));
+            qs.extend(group);
+            n_groups += 1;
+        }
+    }
+    let items: Vec<Item> = qs.iter().map(|q| Item::of(q)).collect();
+    let budgets: Vec<u64> = devices.iter().map(|(_, b)| *b).collect();
+    let (to, left) = plan(&items, &budgets);
+
+    // read-ahead: from a pack each device's matrices are one run of the file (the core, then a run of the experts),
+    // read from the disk by several threads ahead of the uploads
+    let mut ahead: Vec<Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>> = vec![None; gpus.len()];
+    if let Some(map) = file_map.filter(|_| from_file) {
+        let base = map.as_ptr() as usize;
+        for (d, slot) in ahead.iter_mut().enumerate() {
+            let mut span: Option<(usize, usize)> = None;
+            for (q, _) in qs.iter().zip(&to).filter(|(_, t)| **t == Some(d)) {
+                let a = q.data.as_ptr() as usize;
+                if a >= base && a + q.data.len() <= base + map.len() {
+                    span = Some(span.map_or((a, a + q.data.len()), |(lo, hi)| (lo.min(a), hi.max(a + q.data.len()))));
+                }
+            }
+            if let Some((lo, hi)) = span {
+                *slot = Some(crate::pack::read_ahead_run(&map[lo - base..hi - base]));
             }
         }
     }
-    let (every, mut experts) = m.matrices_mut();
-    let mut left: Vec<u64> = devices.iter().map(|(_, b)| *b).collect();
+
+    // the uploads, each device fed in turn: always the device with the least sent so far that still has work
+    let mut queues: Vec<std::collections::VecDeque<usize>> = vec![Default::default(); gpus.len()];
+    to.iter().enumerate().for_each(|(i, t)| if let Some(d) = t { queues[*d].push_back(i) });
+    let mut slots: Vec<Option<&mut QMat>> = qs.into_iter().map(Some).collect();
+    let mut sent = vec![0u64; gpus.len()];
+    let mut queued = vec![0u64; gpus.len()];
+    let mut waited = vec![0u128; gpus.len()];
+    let t_up = std::time::Instant::now();
+    while let Some(d) = (0..gpus.len()).filter(|&d| !queues[d].is_empty()).min_by_key(|&d| sent[d]) {
+        let i = queues[d].pop_front().expect("a queue with work");
+        let q = slots[i].take().expect("each matrix is uploaded once");
+        let w = gpus[d].upload(q.ty(), q.data, q.rows, q.cols)?;
+        q.gpu = Some(OnDevice { dev: d, w: Arc::new(w) });
+        // the device has its copy now (the client copied it already): the file's pages need not stay mapped
+        crate::pack::released(q.data);
+        if let Some(p) = &ahead[d] {
+            p.fetch_max(q.data.as_ptr() as usize + q.data.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+        sent[d] += items[i].bytes;
+        queued[d] += items[i].bytes;
+        if queued[d] >= QUEUE_BYTES {
+            let t = std::time::Instant::now();
+            // a flush waits for the uploads before the previous one and frees their host copies: at most two
+            // queues' worth of copies are alive per device
+            gpus[d].flush()?;
+            waited[d] += t.elapsed().as_millis();
+            queued[d] = 0;
+        }
+    }
+    let feed_ms = t_up.elapsed().as_millis();
+    for (d, g) in gpus.iter().enumerate() {
+        let t = std::time::Instant::now();
+        g.flush()?;
+        g.flush()?;
+        g.sync()?;
+        waited[d] += t.elapsed().as_millis();
+    }
+    let upload_ms = t_up.elapsed().as_millis();
+
     let mut placed = vec![(0usize, 0u64); gpus.len()];
     let (mut cpu_n, mut cpu_bytes) = (0usize, 0u64);
-    let mut d = 0usize;
-    let mut take = |q: &mut QMat, d: &mut usize| -> Result<(), String> {
-        while *d < gpus.len() {
-            let before = left[*d];
-            if put(&gpus, *d, q, &mut left[*d])? {
-                placed[*d].0 += 1;
-                placed[*d].1 += before - left[*d];
-                return Ok(());
-            }
-            // a type with no kernel stays on the CPU without moving on to the next device
-            if strata_gpu::kernels::geometry(q.ty()).is_none() {
-                break;
-            }
-            *d += 1;
-        }
-        cpu_n += 1;
-        cpu_bytes += q.data.len() as u64;
-        Ok(())
-    };
-    for q in every {
-        take(q, &mut d)?;
-    }
-    let mut n_experts_on = 0usize;
-    for key in order {
-        if let Some(qs) = experts.remove(&key) {
-            let mut all = true;
-            for q in qs {
-                let was = d;
-                take(q, &mut d)?;
-                all &= d < gpus.len() || was < gpus.len();
-            }
-            if all && d < gpus.len() {
-                n_experts_on += 1;
+    let mut group_on = vec![true; n_groups];
+    for (i, t) in to.iter().enumerate() {
+        match t {
+            Some(d) => { placed[*d].0 += 1; placed[*d].1 += items[i].bytes; }
+            None => {
+                cpu_n += 1;
+                cpu_bytes += items[i].bytes;
+                if owner[i] != usize::MAX {
+                    group_on[owner[i]] = false;
+                }
             }
         }
     }
+    let n_experts_on = group_on.iter().filter(|&&on| on).count();
+    let dense_on_device = to[..n_every].iter().filter(|t| t.is_some()).count();
     let _ = DEVICES.set(gpus);
-    let _ = ROOM.set(left.clone());
+    let _ = ROOM.set(left);
     let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
     let per: Vec<String> = devices.iter().zip(&placed).map(|((n, _), (k, b))| format!("{n}:{k}:{:.2}GiB", gib(*b))).collect();
-    let dense_on_device = placed.iter().map(|(k, _)| *k).sum();
-    Ok((format!("devices={} experts_on_devices={n_experts_on} cpu_matrices={cpu_n} cpu_gib={:.2}", per.join(","), gib(cpu_bytes)),
+    let waits: Vec<String> = waited.iter().map(|w| w.to_string()).collect();
+    Ok((format!("devices={} experts_on_devices={n_experts_on} cpu_matrices={cpu_n} cpu_gib={:.2} order={} open_ms={open_ms} upload_ms={upload_ms} feed_ms={feed_ms} device_wait_ms={}",
+                per.join(","), gib(cpu_bytes), from, waits.join("/")),
         dense_on_device, n_experts_on))
 }
 
@@ -156,4 +244,20 @@ fn nothing_placed_on_any_device_is_a_cpu_run() {
     assert!(nothing_placed(0, 0), "--devices requested a GPU but placed no dense matrix and no expert on it");
     assert!(!nothing_placed(1, 0), "dense or attention weights on a device are a real GPU placement");
     assert!(!nothing_placed(0, 2), "experts on a device count as placed too");
+}
+
+/// The plan fills the devices in order, each with one run of the order, and never returns to an earlier device.
+#[cfg(feature = "gpu")]
+#[test]
+fn the_plan_gives_each_device_one_run() {
+    let it = |bytes| Item { bytes, kernel: true, whole: true };
+    let items = [it(4), it(4), it(4), Item { bytes: 1, kernel: false, whole: false }, it(4), it(2), it(4), it(9)];
+    let (to, left) = plan(&items, &[10, 9]);
+    // 4+4 on the first; the third does not fit and opens the second; no kernel: the CPU, without moving on;
+    // 4 fits the second (4+4); 2 does not (1 left) and nothing returns to the first, so the rest is the CPU's
+    assert_eq!(to, vec![Some(0), Some(0), Some(1), None, Some(1), None, None, None]);
+    assert_eq!(left, vec![2, 1]);
+    // a width that is not whole blocks moves on like one that does not fit (as the upload always did)
+    let (to, _) = plan(&[Item { bytes: 1, kernel: true, whole: false }, it(1)], &[10, 10]);
+    assert_eq!(to, vec![None, None]);
 }

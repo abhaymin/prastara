@@ -8,6 +8,7 @@
 mod agents;
 mod media_files;
 mod edit_controls;
+mod image_search;
 mod cluster;
 mod cluster_tls;
 mod workshop;
@@ -44,7 +45,9 @@ mod mcp;
 mod memory;
 mod media;
 mod compose;
+mod captions;
 mod media_check;
+mod media_analyze;
 mod media_dub;
 mod media_jobs;
 mod model_remove;
@@ -272,6 +275,34 @@ pub fn api_access(state: &AppState, headers: &HeaderMap) -> Option<Option<client
 /// The main key, or (on a worker) a key it gave its master: what the master polls, the model list and the queue.
 pub fn authorized_or_master(state: &AppState, headers: &HeaderMap) -> bool {
     authorized(state, headers) || clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k, cluster_tls::peer_of(headers)))
+}
+
+/// On a worker: the request came from a cluster master, with the key this worker gave it (on its pinned link).
+pub fn is_master_request(state: &AppState, headers: &HeaderMap) -> bool {
+    !authorized(state, headers)
+        && clients::given_key(headers).is_some_and(|k| state.cluster.is_master_key(k, cluster_tls::peer_of(headers)))
+}
+
+/// On a worker: the tool sets a master sent with a request it routed here (x-strata-routed-tools: the caller's
+/// profile on the master, without memory and MCP, which stay there), as a profile of its own. None without the header.
+pub fn routed_profile(state: &AppState, headers: &HeaderMap) -> Option<clients::Profile> {
+    if !is_master_request(state, headers) {
+        return None;
+    }
+    let sets = headers.get("x-strata-routed-tools")?.to_str().ok()?;
+    let tools = sets.split(',').map(str::trim).filter(|t| *t != "memory" && clients::SETS.contains(t)).map(str::to_string).collect();
+    let who = headers.get("x-strata-routed-for").and_then(|v| v.to_str().ok()).unwrap_or("master");
+    Some(clients::Profile::generated(format!("routed:{who}"), tools, "routed".into()))
+}
+
+/// Run a request's work as its own task (with the queue's priority and client carried over) and wait for it. If the
+/// client goes away, only the waiting stops: the work finishes and its GPU turn is held until then.
+pub async fn run_detached<F>(fut: F) -> Response
+where F: std::future::Future<Output = Response> + Send + 'static {
+    match tokio::spawn(crate::queue::carry(fut)).await {
+        Ok(r) => r,
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("the job stopped: {e}")),
+    }
 }
 
 pub fn api_authorized(state: &AppState, headers: &HeaderMap) -> bool {
@@ -569,6 +600,7 @@ async fn main() -> Result<()> {
         Some(d) => d,
         None => own_web_dir().context("the am2Strata web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
     };
+    captions::set_font_dir(&web_dir); // the caption fonts ship in web/fonts/captions
     let app = Router::new()
         .route("/health", get(web::health))
         .route("/api/health", get(unsloth::health))
@@ -621,8 +653,11 @@ async fn main() -> Result<()> {
         .route("/v1/media/videos/compose", post(compose::compose_videos))
         .route("/v1/media/thumbnails", post(compose::thumbnails))
         .route("/v1/media/check", post(media_check::check_endpoint))
+        .route("/v1/media/analyze", post(media_analyze::analyze_endpoint))
         .route("/v1/media/dub", post(media_dub::dub_endpoint))
         .route("/api/jobs/{id}", get(media_jobs::status))
+        .route("/v1/search/images", post(image_search::images))
+        .route("/v1/search/reverse", post(image_search::reverse))
         .route("/v1/media/files", get(media_files::list).post(media_files::upload))
         .route("/v1/media/files/{id}", get(media_files::get).delete(media_files::delete).patch(media_files::patch))
         .route("/v1/media/files/{id}/content", get(media_files::content))

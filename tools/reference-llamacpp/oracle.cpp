@@ -4,12 +4,39 @@
 //   oracle <model.gguf> <n_new> <id,id,...>
 //   oracle <model.gguf> <n_new> text:<prompt>     (tokenized by llama.cpp, special tokens parsed; ids on stderr)
 //   oracle <model.gguf> -1 text:<prompt>          (only the vocabulary is loaded: prints the ids and exits)
+// ORACLE_DUMP=<dir>: every named F32 tensor of the prompt pass (llama.cpp's cb names, e.g. Qcur-3, attn_out-3, ffn_inp-3)
+// is written as <dir>/<name>.f32 (raw little-endian floats), with <dir>/index.tsv: name, ne0, ne1, ne2, ne3. A name
+// computed twice (a looped layer reuses no names, but split graphs may) keeps its first value.
 #include "llama.h"
+#include "ggml.h"
+#include "ggml-backend.h"
+#include <set>
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+struct dump_state { std::string dir; bool on = true; std::set<std::string> seen; FILE * index = nullptr; };
+
+static bool dump_cb(struct ggml_tensor * t, bool ask, void * user) {
+    auto * d = (dump_state *) user;
+    if (!d->on || t->type != GGML_TYPE_F32 || t->name[0] == 0) return ask ? false : true;
+    if (ask) return true;
+    const std::string name = t->name;
+    if (d->seen.count(name) || name.find(' ') != std::string::npos || name.find('/') != std::string::npos) return true;
+    d->seen.insert(name);
+    std::vector<float> buf(ggml_nelements(t));
+    if (ggml_is_contiguous(t)) {
+        ggml_backend_tensor_get(t, buf.data(), 0, ggml_nbytes(t));
+    } else {
+        return true;
+    }
+    FILE * f = fopen((d->dir + "/" + name + ".f32").c_str(), "wb");
+    if (f) { fwrite(buf.data(), sizeof(float), buf.size(), f); fclose(f); }
+    fprintf(d->index, "%s\t%lld\t%lld\t%lld\t%lld\n", name.c_str(), (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+    return true;
+}
 
 int main(int argc, char ** argv) {
     if (argc < 4) { fprintf(stderr, "usage: oracle model.gguf n_new ids\n"); return 2; }
@@ -39,11 +66,20 @@ int main(int argc, char ** argv) {
     if (vocab_only) { llama_model_free(model); return 0; }
     llama_context_params cp = llama_context_default_params();
     cp.n_ctx = 8192; cp.n_batch = 8192; cp.n_ubatch = 512;
+    dump_state dump;
+    if (const char * dd = std::getenv("ORACLE_DUMP")) {
+        dump.dir = dd;
+        dump.index = fopen((dump.dir + "/index.tsv").c_str(), "w");
+        if (!dump.index) { fprintf(stderr, "ORACLE_DUMP: cannot write %s/index.tsv\n", dd); return 1; }
+        cp.cb_eval = dump_cb; cp.cb_eval_user_data = &dump;
+    }
     llama_context * ctx = llama_init_from_model(model, cp);
     const int n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
     int n_new = std::atoi(argv[2]);
     llama_batch b = llama_batch_get_one(ids.data(), (int) ids.size());
     if (llama_decode(ctx, b)) { fprintf(stderr, "decode failed\n"); return 1; }
+    dump.on = false;
+    if (dump.index) fclose(dump.index);
     for (int step = 0; step < n_new; ++step) {
         const float * lg = llama_get_logits_ith(ctx, -1);
         std::vector<int> idx(n_vocab);

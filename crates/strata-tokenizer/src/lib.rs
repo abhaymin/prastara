@@ -74,6 +74,10 @@ const TEKKEN_PATTERN: &str = concat!(
     r"|\s+",
 );
 
+/// `inkling2` (Inkling 2 Mini, `tokenizer.ggml.pre = inkling2`): llama.cpp's GPT-4o pre-tokenizer (`LLAMA_VOCAB_PRE_TYPE_GPT4O`,
+/// also llama.cpp's "gpt-4o"; minimax-m2 has its own pattern there), no BOS, clean_spaces false so leading spaces are kept as their own pieces.
+const GPT4O_PATTERN: &str = r"[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+
 /// `gemma4` (Gemma 4): a BPE over UTF-8 characters, not GPT-2's byte alphabet. A space is SentencePiece's visible
 /// space, the text is cut only at runs of newlines, and a piece the vocabulary lacks goes byte by byte as <0x00>..<0xFF>.
 const GEMMA4_PATTERN: &str = r"[^\n]+|\n+";
@@ -268,6 +272,7 @@ impl Tokenizer {
             // llama.cpp gives these the LLAMA3 pre-tokenizer (GLM4's pattern) with ignore_merges: Nemotron 3.5 is "pixtral"
             "glm4" | "glm5" | "lfm2" | "pixtral" | "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" => GLM4_PATTERN,
             "gemma4" => GEMMA4_PATTERN,
+            "inkling2" | "gpt-4o" => GPT4O_PATTERN,
             "tekken" => TEKKEN_PATTERN,
             "kolibri1" => QWEN2_PATTERN,
             "joyai-llm" | "deepseek-v3" => DEEPSEEK3_SEQUENCE[2],
@@ -709,5 +714,27 @@ mod flint_tests {
         assert_eq!(p("你好ab"), ["你好", "ab"]);
         assert_eq!(p("HTTPServer and McDonald's"), ["HTTPServer", " and", " Mc", "Donald's"]);
         assert_eq!(p("they've  said.\n\n  x"), ["they've", " ", " said", ".\n\n", " ", " x"]);
+    }
+}
+
+#[cfg(test)]
+mod inkling2_tests {
+    use super::*;
+
+    fn inkling() -> Tokenizer {
+        Tokenizer::new(vec!["a".into()], vec![], vec![1], "inkling2".into(), HashMap::new()).unwrap()
+    }
+
+    /// The `inkling2` pre-tokenizer (llama.cpp's GPT-4o pattern): letters are cut where capitals end with English
+    /// contractions kept on the word, digits split in runs of three, punctuation its own piece, spaces preserved as-is
+    /// (clean_spaces false), a leading space folded into the following token.
+    #[test]
+    fn inkling2_pieces_match_gpt4o() {
+        let t = inkling();
+        let p = |s: &str| t.pieces(s).unwrap().into_iter().map(str::to_string).collect::<Vec<_>>();
+        assert_eq!(p("Hello, world!"), ["Hello", ",", " world", "!"]);
+        assert_eq!(p("I'm don't we'll THEY'VE it's"), ["I'm", " don't", " we'll", " THEY'VE", " it's"]);
+        assert_eq!(p("3.14159e-10"), ["3", ".", "141", "59", "e", "-", "10"]);
+        assert_eq!(p("   "), ["   "]);
     }
 }

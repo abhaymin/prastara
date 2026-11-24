@@ -87,7 +87,7 @@ impl Profile {
     /// prior profile's rank, then (layer, expert). Only experts that exist in their layer are listed.
     pub fn learned(model: &Model, prior: Option<&Profile>) -> Profile {
         let ne = model.profile_experts;
-        let nl = model.layers.len();
+        let nl = model.profile_layers();
         let mut prior_rank = vec![usize::MAX; nl * ne];
         if let Some(p) = prior {
             for (r, &(l, e)) in p.ranked.iter().enumerate() {
@@ -97,7 +97,7 @@ impl Profile {
                 }
             }
         }
-        let mut all: Vec<usize> = model.moes().flat_map(|m| (0..m.n_expert).map(move |e| m.layer * ne + e)).collect();
+        let mut all: Vec<usize> = model.expert_layers().0.into_iter().flat_map(|(l, n)| (0..n).map(move |e| l * ne + e)).collect();
         let heat = |i: usize| model.heat[i].load(Ordering::Relaxed);
         all.sort_by(|&a, &b| heat(b).cmp(&heat(a)).then(prior_rank[a].cmp(&prior_rank[b])).then(a.cmp(&b)));
         Profile { n_layers: nl, n_expert: ne, ranked: all.into_iter().map(|i| ((i / ne) as u16, (i % ne) as u16)).collect() }
@@ -252,9 +252,101 @@ pub(crate) fn pin(_: &[u8]) -> bool {
     false
 }
 
+/// A run of the mapped file asked from the disk ahead of its use (the reads start and this returns).
+pub fn read_ahead(b: &[u8]) {
+    wanted(b);
+}
+
+/// A run of the mapped file read from the disk ahead of its use by several threads at once: an NVMe SSD answers many
+/// reads in parallel, and one thread faulting pages in as it copies them reads far below the disk's speed (measured
+/// cold on Inkling 2 Mini: 0.9 GiB/s of the WD SN580's 2.8). The caller stores in the returned counter the address it
+/// has consumed up to (the uploads go through the run in order, to its end): the readers stay within a window ahead of
+/// it and skip what is behind it. Returns at once.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub fn read_ahead_run(b: &'static [u8]) -> std::sync::Arc<std::sync::atomic::AtomicUsize> {
+    use std::sync::atomic::AtomicUsize;
+    const CHUNK: usize = 16 << 20;
+    const THREADS: usize = 4;
+    // how far ahead of the consumer the readers go: enough to keep the disk busy, without mapping the whole run at
+    // once when it is already in the page cache (that showed as 16 GiB of resident memory)
+    const WINDOW: usize = 2 << 30;
+    let progress = std::sync::Arc::new(AtomicUsize::new(b.as_ptr() as usize));
+    wanted(b);
+    let page = 4096usize;
+    let lo = (b.as_ptr() as usize) & !(page - 1);
+    let hi = b.as_ptr() as usize + b.len();
+    let next = std::sync::Arc::new(AtomicUsize::new(0));
+    let n = (hi - lo).div_ceil(CHUNK);
+    for _ in 0..THREADS.min(n) {
+        let (next, progress) = (next.clone(), progress.clone());
+        std::thread::spawn(move || loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let (a, z) = (lo + i * CHUNK, (lo + (i + 1) * CHUNK).min(hi));
+            while a > progress.load(Ordering::Relaxed) + WINDOW {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            if z <= progress.load(Ordering::Relaxed) {
+                continue;
+            }
+            // read into the page cache and map: one call per chunk where the kernel has it (Linux 5.14), else a
+            // byte of every page
+            #[cfg(target_os = "linux")]
+            let done = unsafe { libc::madvise(a as *mut libc::c_void, z - a, libc::MADV_POPULATE_READ) == 0 };
+            #[cfg(not(target_os = "linux"))]
+            let done = false;
+            if !done {
+                let mut sum = 0u8;
+                for p in (a..z).step_by(page) {
+                    sum = sum.wrapping_add(unsafe { std::ptr::read_volatile(p as *const u8) });
+                }
+                std::hint::black_box(sum);
+            }
+        });
+    }
+    progress
+}
+
+/// The model files this process has mapped: (start, end) addresses. `released` acts only inside them.
+static FILE_MAPS: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
+
+/// Note a mapped model file (the loaders call this), so `released` knows its pages are the file's.
+pub fn mapped_file(b: &[u8]) {
+    FILE_MAPS.lock().unwrap().push((b.as_ptr() as usize, b.as_ptr() as usize + b.len()));
+}
+
+/// A run of a mapped model file this process no longer reads (a device holds the matrix): its pages leave this
+/// process's memory. They stay in the page cache while there is room, so the next start is still warm (asking them
+/// paged out instead made the next load read the disk again: 9.6 s became 15 s); read again, they come back.
+/// Memory that is not a mapped file - a matrix the RAM tier copied - is left alone: this advice would zero it.
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+pub fn released(_b: &[u8]) {
+    #[cfg(unix)]
+    {
+        // whole pages inside the run only: a page shared with a neighbour stays
+        let page = 4096usize;
+        let start = (_b.as_ptr() as usize).div_ceil(page) * page;
+        let end = (_b.as_ptr() as usize + _b.len()) / page * page;
+        if end > start && FILE_MAPS.lock().unwrap().iter().any(|&(lo, hi)| start >= lo && end <= hi) {
+            unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+        }
+    }
+}
+
 /// One expert's matrices asked for in the background (MADV_WILLNEED starts the reads and returns).
 pub fn prefetch_expert(m: &Moe, e: usize) {
     expert_ranges(m, e).iter().for_each(|r| wanted(r));
+}
+
+/// The same for one matrix, unless a device holds it (its file pages are not needed then).
+pub fn wanted_off_device(q: &crate::model::QMat) {
+    #[cfg(feature = "gpu")]
+    if q.gpu.is_some() {
+        return;
+    }
+    wanted(q.data);
 }
 
 fn wanted(_b: &[u8]) {
@@ -319,6 +411,137 @@ pub fn place(model: &Model, profile: Option<&Profile>, budget: u64) -> Residency
         }
     }
     Residency { resident, n_resident, bytes, locked: locked && n_resident > 0 }
+}
+
+/// The experts' placement order and what it came from: the profile's ranking, else a model pack's own record order
+/// ("file": each tier is then one run of the file), then every expert not listed, layer by layer.
+pub fn expert_order(model: &Model, profile: Option<&Profile>) -> (Vec<(usize, usize)>, &'static str) {
+    let (mut order, from): (Vec<(usize, usize)>, _) = match profile {
+        Some(p) => (p.ranked.iter().map(|&(l, e)| (l as usize, e as usize)).collect(), "profile"),
+        None if !model.file_order.is_empty() => (model.file_order.clone(), "file"),
+        None => (vec![], "layer"),
+    };
+    let ne = model.profile_experts.max(1);
+    let (n_exp, n_layers) = model.expert_layers();
+    let mut seen = vec![false; n_layers * ne];
+    order.retain(|&(l, e)| l * ne + e < seen.len() && !std::mem::replace(&mut seen[l * ne + e], true));
+    for (l, n) in n_exp {
+        for e in 0..n {
+            if !seen[l * ne + e] {
+                order.push((l, e));
+            }
+        }
+    }
+    (order, from)
+}
+
+/// Which experts the RAM tier takes: walking `sizes` (each expert's bytes that are not on a device, in placement
+/// order), every expert that still fits `budget`, stopping at the first that does not, so the tier is one run of the
+/// order. An expert wholly on a device (0 bytes) is passed over.
+pub fn ram_plan(sizes: &[u64], budget: u64) -> Vec<bool> {
+    let mut left = budget;
+    let mut open = true;
+    sizes.iter().map(|&b| {
+        if b == 0 || !open {
+            return false;
+        }
+        if b > left {
+            open = false;
+            return false;
+        }
+        left -= b;
+        true
+    }).collect()
+}
+
+/// The RAM tier, after the devices took theirs (any model; `place` above is the older path for a GGUF's MoE blocks):
+/// the matrices every token uses that are on no device, then the experts on no device in placement order within
+/// `budget`, are kept in RAM - locked where the memlock limit allows, else copied into memory of our own, because the
+/// kernel drops file pages under pressure whatever the advice. What follows stays on the SSD, marked cold; the file
+/// pages of what a device holds are marked cold too. From a pack the tier is one run of the file, asked from the
+/// disk in one go before the copies. -> (what was placed, a summary for INFO).
+pub fn ram_tier(model: &mut Model, profile: Option<&Profile>, budget: u64) -> (Residency, String) {
+    let t0 = std::time::Instant::now();
+    let ne = model.profile_experts.max(1);
+    let n_slots = model.heat.len();
+    let (order, from) = expert_order(model, profile);
+    let file_map = model.file_map.filter(|_| from == "file");
+    let (every, mut experts) = model.matrices_mut();
+    let off_device = |q: &QMat| !on_device(q);
+    let mut keep: Vec<&mut QMat> = Vec::new();
+    let mut always = 0u64;
+    for q in every {
+        if off_device(q) {
+            always += q.data.len() as u64;
+            keep.push(q);
+        } else {
+            cold(q.data);
+        }
+    }
+    let n_always = keep.len();
+    let groups: Vec<((usize, usize), Vec<&mut QMat>)> = order.iter().filter_map(|k| experts.remove(k).map(|g| (*k, g))).collect();
+    let sizes: Vec<u64> = groups.iter().map(|(_, g)| g.iter().filter(|q| off_device(q)).map(|q| q.data.len() as u64).sum()).collect();
+    let take = ram_plan(&sizes, budget.saturating_sub(always));
+    let mut resident = vec![false; n_slots];
+    let (mut bytes, mut n_resident, mut n_cold, mut cold_bytes) = (0u64, 0usize, 0usize, 0u64);
+    for (((l, e), group), (&size, &t)) in groups.into_iter().zip(sizes.iter().zip(&take)) {
+        if t {
+            if let Some(r) = resident.get_mut(l * ne + e) {
+                *r = true;
+            }
+            n_resident += 1;
+            bytes += size;
+        } else if size > 0 {
+            n_cold += 1;
+            cold_bytes += size;
+        }
+        for q in group {
+            if t && off_device(q) {
+                keep.push(q);
+            } else {
+                cold(q.data);
+            }
+        }
+    }
+    // one read-ahead over the tier's run of the file, then lock or copy matrix by matrix
+    if let Some(map) = file_map {
+        let base = map.as_ptr() as usize;
+        let spans: Vec<(usize, usize)> = keep[n_always..].iter().map(|q| (q.data.as_ptr() as usize, q.data.as_ptr() as usize + q.data.len()))
+            .filter(|&(a, z)| a >= base && z <= base + map.len()).collect();
+        let (lo, hi) = (spans.iter().map(|s| s.0).min(), spans.iter().map(|s| s.1).max());
+        if let (Some(lo), Some(hi)) = (lo, hi) {
+            read_ahead(&map[lo - base..hi - base]);
+        }
+    }
+    // locked where the limit allows; from the first refusal on, copied - on every core, since a copy is mostly page
+    // faults (first the file's, then our own memory's)
+    let mut locked = true;
+    let mut to_copy: Vec<&mut QMat> = Vec::new();
+    for q in keep {
+        if !(locked && pin(q.data)) {
+            locked = false;
+            to_copy.push(q);
+        }
+    }
+    {
+        use rayon::prelude::*;
+        to_copy.par_iter_mut().for_each(|q| {
+            let old = q.data;
+            q.data = owned(old);
+            cold(old);
+        });
+    }
+    let gib = |b: u64| b as f64 / (1u64 << 30) as f64;
+    let summary = format!("ram_experts={n_resident} ram_gib={:.2} ram_always_gib={:.2} ssd_experts={n_cold} ssd_gib={:.2} ram={} ram_ms={}",
+                          gib(bytes), gib(always), gib(cold_bytes), if locked { "mlock" } else { "copy" }, t0.elapsed().as_millis());
+    (Residency { resident, n_resident, bytes, locked }, summary)
+}
+
+fn on_device(_q: &QMat) -> bool {
+    #[cfg(feature = "gpu")]
+    return _q.gpu.is_some();
+    #[cfg(not(feature = "gpu"))]
+    false
 }
 
 /// Moves the matrices every token uses, then the resident experts, into the engine's own memory, for when mlock was refused (the usual 8 MiB memlock limit).
@@ -415,6 +638,15 @@ pub fn hit_rate(model: &Model, res: &Residency, last: &mut Vec<u32>) -> (u64, u6
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ram_tier_is_one_run_after_the_devices() {
+        // experts 0 and 1 are on a device (0 bytes left for RAM); 2 and 3 fit; 4 does not, and 5 - though it would -
+        // is not taken, so the tier stays one run of the order
+        assert_eq!(ram_plan(&[0, 0, 4, 4, 9, 1], 10), vec![false, false, true, true, false, false]);
+        assert_eq!(ram_plan(&[4, 4], 0), vec![false, false]);
+        assert_eq!(ram_plan(&[], 10), Vec::<bool>::new());
+    }
 
     #[test]
     fn profile_round_trip() {

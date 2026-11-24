@@ -28,7 +28,7 @@ fn limited_key_model(extra: Value) -> Model<'static> {
     if let (Some(o), Some(e)) = (c.as_object_mut(), extra.as_object()) {
         o.extend(e.clone());
     }
-    Model { id: "mock-a", vision: true, arch: None, context: 8192, extra: c }
+    Model { id: "mock-a", vision: true, arch: None, format: None, context: 8192, extra: c }
 }
 
 #[test]

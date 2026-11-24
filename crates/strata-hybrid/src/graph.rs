@@ -51,6 +51,9 @@ fn on_device<'a>(q: &'a QMat, dev: &mut Option<usize>) -> Result<&'a Weights, St
 
 impl<'a> Graph<'a> {
     pub fn new(m: &'a Model, max_ctx: usize) -> Result<Graph<'a>, String> {
+        if m.arch.starts_with("inkling2") {
+            return Err("--graph does not run Inkling yet".into());
+        }
         let mut dev = None;
         let rope = m.rope.as_ref().ok_or("--graph needs a model with RoPE")?;
         let output = on_device(&m.output, &mut dev)?;

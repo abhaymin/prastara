@@ -19,7 +19,10 @@ use rayon::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use strata_gguf::{Gguf, TensorInfo};
+use strata_gguf::Gguf;
+
+mod inkling;
+pub(crate) use inkling::InkSlot;
 
 /// One weight matrix in the GGUF: `rows` output features of `cols` inputs, in its stored encoding.
 #[derive(Clone)]
@@ -58,6 +61,11 @@ impl QMat {
         }
     }
 
+    /// The kernel that multiplies rows as they are read (cpu_dot.rs).
+    fn fast(&self) -> Option<crate::cpu_dot::Fast> {
+        crate::cpu_dot::Fast::of(&self.ty)
+    }
+
     /// y = W x, rows in parallel.
     pub fn matvec(&self, x: &[f32], y: &mut [f32]) {
         debug_assert_eq!(x.len(), self.cols);
@@ -85,7 +93,7 @@ impl QMat {
             }
         }
         // the common encodings: multiplied as they are read (cpu_dot.rs)
-        if let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) {
+        if let Some(fast) = self.fast() {
             y.par_chunks_mut(chunk).enumerate().for_each(|(ci, ys)| {
                 for (k, out) in ys.iter_mut().enumerate() {
                     let r = ci * chunk + k;
@@ -116,7 +124,7 @@ impl QMat {
         if self.gpu.is_some() {
             return xs.iter().map(|x| self.mul(x)).collect();
         }
-        let Some(fast) = crate::cpu_dot::Fast::of(&self.ty) else {
+        let Some(fast) = self.fast() else {
             return self.matmul_dequant(xs);
         };
         let int8 = self.int8(fast);
@@ -668,9 +676,18 @@ impl Moe {
 pub struct Experts(pub Vec<QMat>);
 
 impl Experts {
-    fn stacked(q: QMat, n_expert: usize) -> Experts {
+    pub(crate) fn stacked(q: QMat, n_expert: usize) -> Experts {
         let rows = q.rows / n_expert;
         Experts((0..n_expert).map(|e| q.slice(e, rows)).collect())
+    }
+
+    /// A layer's stacked tensor `name` as a matrix per expert: sliced from the one tensor of a GGUF, or put together
+    /// from a model pack's per-expert slices (`name#0`, `name#1`, ...). None when the model has neither.
+    pub(crate) fn named(tensors: &HashMap<String, QMat>, name: &str, n_expert: usize) -> Option<Experts> {
+        if let Some(q) = tensors.get(name) {
+            return Some(Experts::stacked(q.clone(), n_expert));
+        }
+        (0..n_expert).map(|e| tensors.get(&format!("{name}#{e}")).cloned()).collect::<Option<Vec<_>>>().filter(|v| !v.is_empty()).map(Experts)
     }
 
     pub fn bytes(&self) -> u64 {
@@ -829,6 +846,13 @@ pub struct Model {
     pub prefetch: AtomicBool,
     /// Another machine's memory as an expert tier (remote.rs): set by --remote-experts.
     pub remote: Option<crate::remote::Remote>,
+    /// Inkling 2 (model/inkling.rs): its layers are not `layers`' blocks
+    pub(crate) ink: Option<Box<inkling::Inkling>>,
+    /// From a model pack: its expert records' (layer, expert) in file order, so the device and RAM tiers are each one
+    /// run of the file. Empty from a GGUF.
+    pub file_order: Vec<(usize, usize)>,
+    /// From a model pack: the whole mapped file, for read-ahead over a tier's run.
+    pub file_map: Option<&'static [u8]>,
 }
 
 /// Per-conversation state: per layer the attention cache (K, V - or MLA's latent and rotary key), and the Mamba
@@ -842,6 +866,8 @@ pub struct State {
     idx: HashMap<usize, (Vec<f32>, Vec<f32>)>,
     ple_win: Vec<f32>,
     prev: Vec<u32>,
+    /// Inkling's cache slots
+    ink: Vec<InkSlot>,
 }
 
 /// What `State::rollback` returns to: the recurrent parts copied (conv windows, SSM / delta-net states, the QSA index,
@@ -853,12 +879,14 @@ pub struct Checkpoint {
     idx: HashMap<usize, (Vec<f32>, Vec<f32>)>,
     ple_win: Vec<f32>,
     prev: Vec<u32>,
+    ink_hist: Vec<Vec<f32>>,
 }
 
 impl State {
     pub fn checkpoint(&self) -> Checkpoint {
         Checkpoint { pos: self.pos, conv: self.conv.clone(), ssm: self.ssm.clone(), idx: self.idx.clone(),
-                     ple_win: self.ple_win.clone(), prev: self.prev.clone() }
+                     ple_win: self.ple_win.clone(), prev: self.prev.clone(),
+                     ink_hist: self.ink.iter().map(|s| s.hist.clone()).collect() }
     }
 
     /// Back to the checkpoint: the tokens after it are forgotten. Each attention cache holds the same number of values
@@ -869,6 +897,9 @@ impl State {
                 k.truncate(k.len() / self.pos * ck.pos);
                 v.truncate(v.len() / self.pos * ck.pos);
             }
+            for s in self.ink.iter_mut() {
+                s.cut(self.pos, ck.pos);
+            }
         }
         self.pos = ck.pos;
         self.conv = ck.conv;
@@ -876,6 +907,9 @@ impl State {
         self.idx = ck.idx;
         self.ple_win = ck.ple_win;
         self.prev = ck.prev;
+        for (s, h) in self.ink.iter_mut().zip(ck.ink_hist) {
+            s.hist = h;
+        }
     }
 }
 
@@ -887,29 +921,17 @@ fn arr_u64(g: &Gguf, key: &str, i: usize) -> u64 {
     }
 }
 
-pub const ARCHS: &[&str] = &["nemotron_h_moe", "nemotron_h", "llama", "mistral3", "qwen3", "qwen3moe", "deepseek2", "qwen35moe", "qwen4exp"];
+pub const ARCHS: &[&str] = &["nemotron_h_moe", "nemotron_h", "llama", "mistral3", "qwen3", "qwen3moe", "deepseek2", "qwen35moe", "qwen4exp", "inkling2", "inkling2_loop"];
 
 impl Model {
     /// Loads the GGUF (memory-mapped); with a pack, its float tensors replace the GGUF's. Also returns how many
     /// tensors came from the pack.
     pub fn load(first: &Path, pack: Option<&crate::pack::Pack>) -> Result<(Model, usize), String> {
-        let shards = strata_gguf::shards(first);
-        let mut tensors: HashMap<String, QMat> = HashMap::new();
-        let mut offsets: HashMap<String, u64> = HashMap::new();
-        let mut meta: Option<Gguf> = None;
-        for p in &shards {
-            let g = Gguf::open(p).map_err(|e| e.to_string())?;
-            let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
-            let mm: &'static memmap2::Mmap = Box::leak(Box::new(unsafe { memmap2::Mmap::map(&f) }.map_err(|e| e.to_string())?));
-            for t in &g.tensors {
-                tensors.insert(t.name.clone(), qmat(mm, &g, t)?);
-                offsets.insert(t.name.clone(), g.data_start + t.offset);
-            }
-            if meta.is_none() {
-                meta = Some(g);
-            }
+        let aipac = first.extension().and_then(|e| e.to_str()) == Some("am2aipac");
+        if aipac && pack.is_some() {
+            return Err("--pack (a strata pack folder) goes with a GGUF, not with a .am2aipac model pack".into());
         }
-        let g = meta.ok_or("no shards")?;
+        let (g, mut tensors, offsets, file_order, file_map) = if aipac { open_aipac(first)? } else { open_gguf(first)? };
         if g.metadata.contains_key("prism.hadamard.version") {
             return Err("this GGUF holds Hadamard-folded experts (PRISM, Strata 0.2): they compute only on Strata 0.2's engine".into());
         }
@@ -920,6 +942,29 @@ impl Model {
         let arch = g.architecture().unwrap_or("").to_string();
         if !ARCHS.contains(&arch.as_str()) {
             return Err(format!("this engine runs {} models, not {arch}", ARCHS.join(", ")));
+        }
+        if arch.starts_with("inkling2") {
+            let ink = inkling::Inkling::load(&g, &arch, &tensors)?;
+            let take = |name: &str| tensors.get(name).cloned().ok_or_else(|| format!("tensor {name} is missing"));
+            let n_embd = g.u64(&format!("{arch}.embedding_length")).ok_or("embedding_length is missing")? as usize;
+            let eps = g.metadata.get(&format!("{arch}.attention.layer_norm_rms_epsilon")).and_then(|v| v.as_f64()).ok_or("layer_norm_rms_epsilon is missing")? as f32;
+            let mut stops = vec![];
+            for key in ["tokenizer.ggml.eos_token_id", "tokenizer.ggml.eot_token_id", "tokenizer.ggml.eom_token_id"] {
+                if let Some(v) = g.u64(key) {
+                    if !stops.contains(&(v as u32)) {
+                        stops.push(v as u32);
+                    }
+                }
+            }
+            let profile_experts = ink.n_expert();
+            let n_layer = g.u64(&format!("{arch}.block_count")).unwrap_or(0) as usize;
+            return Ok((Model {
+                n_embd, d_inner: 0, d_state: 0, n_ssm_head: 0, n_group: 1, d_conv: 0, eps, rope: None, attn_temp: None, stops,
+                embd: take("token_embd.weight")?, out_norm: take("output_norm.weight")?.all_f32(), output: take("output.weight")?,
+                hc: 0, hc_head: None, layers: vec![],
+                heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
+                prefetch: AtomicBool::new(false), remote: None, profile_experts, ink: Some(Box::new(ink)), arch, file_order, file_map,
+            }, from_pack));
         }
         let k = |n: &str| format!("{arch}.{n}");
         let u = |n: &str| g.u64(&k(n)).ok_or_else(|| format!("{} is missing", k(n)));
@@ -980,8 +1025,8 @@ impl Model {
                 *max_expert = (*max_expert).max(n_expert);
                 // the experts' projections, stacked or one tensor per expert
                 let role = |r: &str| -> Result<Option<Experts>, String> {
-                    if let Some(q) = opt(&p(&format!("ffn_{r}_exps.weight"))) {
-                        return Ok(Some(Experts::stacked(q, n_expert)));
+                    if let Some(x) = Experts::named(&tensors, &p(&format!("ffn_{r}_exps.weight")), n_expert) {
+                        return Ok(Some(x));
                     }
                     if opt(&p(&format!("ffn_{r}.0.weight"))).is_none() {
                         return Ok(None);
@@ -1138,17 +1183,23 @@ impl Model {
             embd, out_norm: optf("output_norm.weight").unwrap_or_default(), output, hc, hc_head,
             heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
             prefetch: AtomicBool::new(false),
-            remote: None,
+            remote: None, ink: None, file_order, file_map,
             profile_experts, layers, arch,
         }, from_pack))
     }
 
     pub fn new_state(&self) -> State {
-        State { pos: 0, kv: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new(), idx: HashMap::new(), ple_win: vec![], prev: vec![] }
+        State { pos: 0, kv: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new(), idx: HashMap::new(), ple_win: vec![], prev: vec![],
+                ink: self.ink.as_ref().map_or(vec![], |i| vec![InkSlot::default(); i.n_slots()]) }
     }
 
     /// One token through the model: the logits of the next one.
     pub fn forward(&self, st: &mut State, token: u32) -> Vec<f32> {
+        if let Some(ink) = &self.ink {
+            let logits = ink.forward(self, &mut st.ink, st.pos, ink.embed(self, token));
+            st.pos += 1;
+            return logits;
+        }
         if self.hc > 0 {
             return self.forward_hc(st, token);
         }
@@ -1214,6 +1265,17 @@ impl Model {
 
     fn forward_chunk(&self, st: &mut State, tokens: &[u32], all: bool) -> Vec<Vec<f32>> {
         debug_assert!(self.batchable());
+        if self.ink.is_some() {
+            // token by token for now: each value is `forward`'s
+            let mut outs: Vec<Vec<f32>> = Vec::new();
+            for (i, &t) in tokens.iter().enumerate() {
+                let l = self.forward(st, t);
+                if all || i + 1 == tokens.len() {
+                    outs.push(l);
+                }
+            }
+            return outs;
+        }
         if self.hc > 0 {
             return self.forward_hc_batch(st, tokens, all);
         }
@@ -2169,8 +2231,13 @@ impl Model {
             out.push(up);
             out.push(down);
         }
-        let Model { output, hc_head, layers, .. } = self;
+        let Model { output, hc_head, layers, ink, .. } = self;
         let mut every: Vec<&mut QMat> = vec![output];
+        if let Some(ink) = ink.as_mut() {
+            let (dense, exps) = ink.matrices_mut();
+            every.extend(dense);
+            experts.extend(exps);
+        }
         if let Some(HcMix { down, up, .. }) = hc_head.as_mut() {
             every.extend([down, up]);
         }
@@ -2234,6 +2301,19 @@ impl Model {
         (every, experts)
     }
 
+    /// How many rows (layers) the expert profile has.
+    pub fn profile_layers(&self) -> usize {
+        self.heat.len().checked_div(self.profile_experts).unwrap_or(0)
+    }
+
+    /// (layer, experts) of every MoE layer, and how many layers the expert profile has rows for.
+    pub fn expert_layers(&self) -> (Vec<(usize, usize)>, usize) {
+        match &self.ink {
+            Some(ink) => { let c = ink.expert_counts(); let n = c.len(); (c, n) }
+            None => (self.moes().map(|x| (x.layer, x.n_expert)).collect(), self.layers.len()),
+        }
+    }
+
     pub fn moes(&self) -> impl Iterator<Item = &Moe> {
         self.layers.iter().flat_map(|l| l.parts.iter()).filter_map(|(_, b)| if let Block::Moe(m) = b { Some(m) } else { None })
     }
@@ -2281,14 +2361,78 @@ fn softmax(v: &mut [f32]) {
     v.iter_mut().for_each(|s| *s /= sum);
 }
 
-fn qmat(mm: &'static memmap2::Mmap, g: &Gguf, t: &TensorInfo) -> Result<QMat, String> {
-    let n = t.expected_bytes().ok_or_else(|| format!("{}: unsupported type {}", t.name, t.type_name()))? as usize;
-    let start = (g.data_start + t.offset) as usize;
-    let data: &'static [u8] = &mm[start..start + n];
-    let cols = t.dims[0] as usize;
-    let rows = (t.elements() as usize) / cols;
-    let ty = t.type_name();
-    Ok(QMat { data, row_bytes: QMat::row_bytes(&ty, cols), vdt: Vdt::of(&ty), ty, rows, cols, #[cfg(feature = "gpu")] gpu: None })
+type Opened = (Gguf, HashMap<String, QMat>, HashMap<String, u64>, Vec<(usize, usize)>, Option<&'static [u8]>);
+
+/// A GGUF's header, its tensors mapped in place, and each tensor's file offset (for a strata pack's check).
+fn open_gguf(first: &Path) -> Result<Opened, String> {
+    let shards = strata_gguf::shards(first);
+    let mut tensors: HashMap<String, QMat> = HashMap::new();
+    let mut offsets: HashMap<String, u64> = HashMap::new();
+    let mut meta: Option<Gguf> = None;
+    for p in &shards {
+        let g = Gguf::open(p).map_err(|e| e.to_string())?;
+        let f = std::fs::File::open(p).map_err(|e| format!("{}: {e}", p.display()))?;
+        let mm: &'static memmap2::Mmap = Box::leak(Box::new(unsafe { memmap2::Mmap::map(&f) }.map_err(|e| e.to_string())?));
+        crate::pack::mapped_file(mm);
+        for t in &g.tensors {
+            let n = t.expected_bytes().ok_or_else(|| format!("{}: unsupported type {}", t.name, t.type_name()))? as usize;
+            let start = (g.data_start + t.offset) as usize;
+            let cols = t.dims[0] as usize;
+            tensors.insert(t.name.clone(), qmat(&mm[start..start + n], t.type_name(), t.elements() as usize / cols, cols));
+            offsets.insert(t.name.clone(), g.data_start + t.offset);
+        }
+        if meta.is_none() {
+            meta = Some(g);
+        }
+    }
+    Ok((meta.ok_or("no shards")?, tensors, offsets, vec![], None))
+}
+
+/// A model pack (.am2aipac, docs/PACK-FORMAT.md): the header is the GGUF's, kept verbatim; the tensors are mapped in
+/// place from the pack. A stacked expert tensor is not one run of bytes there: each expert's slice sits in that
+/// expert's record, and is named `<tensor>#<expert>` here (Experts::named puts them together).
+#[cfg(feature = "aipac")]
+fn open_aipac(path: &Path) -> Result<Opened, String> {
+    let pk: &'static am2pack::Pack = Box::leak(Box::new(am2pack::Pack::open(path)?));
+    let bad = |what: &str| format!("{}: {what}", path.display());
+    let src = pk.source("model").ok_or_else(|| bad("the pack holds no model"))?;
+    let g = Gguf::from_bytes(path, pk.gguf_header(src).ok_or_else(|| bad("the pack's model has no header"))?).map_err(|e| e.to_string())?;
+    let mut tensors: HashMap<String, QMat> = HashMap::new();
+    for t in &g.tensors {
+        let n = t.expected_bytes().ok_or_else(|| format!("{}: unsupported type {}", t.name, t.type_name()))?;
+        let (pt, bytes) = pk.tensor(src, &t.name).ok_or_else(|| bad(&format!("tensor {} is not in the pack", t.name)))?;
+        let cols = t.dims[0] as usize;
+        match (bytes, pt.split) {
+            (Some(b), _) if b.len() as u64 >= n => { tensors.insert(t.name.clone(), qmat(&b[..n as usize], t.type_name(), t.elements() as usize / cols, cols)); }
+            (None, Some(count)) if pt.len == n => {
+                let rows = t.elements() as usize / cols / count as usize;
+                for e in 0..count {
+                    let (_, parts) = pk.expert(layer_of(&t.name).ok_or_else(|| bad(&format!("{}: not a layer's tensor", t.name)))?, e)
+                        .ok_or_else(|| bad(&format!("{}: expert {e} has no record", t.name)))?;
+                    let b = parts.iter().find(|(x, _)| x.name == t.name).ok_or_else(|| bad(&format!("{}: expert {e}'s record lacks it", t.name)))?.1;
+                    tensors.insert(format!("{}#{e}", t.name), qmat(b, t.type_name(), rows, cols));
+                }
+            }
+            _ => return Err(bad(&format!("tensor {} is not the size its header gives", t.name))),
+        }
+    }
+    crate::pack::mapped_file(pk.bytes(0, pk.len()));
+    let order = pk.index.experts.iter().map(|r| (r.layer as usize, r.expert as usize)).collect();
+    Ok((g, tensors, HashMap::new(), order, Some(pk.bytes(0, pk.len()))))
+}
+
+#[cfg(not(feature = "aipac"))]
+fn open_aipac(path: &Path) -> Result<Opened, String> {
+    Err(format!("{}: this build reads no model packs (built without the aipac feature)", path.display()))
+}
+
+#[cfg(feature = "aipac")]
+fn layer_of(name: &str) -> Option<u32> {
+    name.strip_prefix("blk.")?.split('.').next()?.parse().ok()
+}
+
+fn qmat(data: &'static [u8], ty: String, rows: usize, cols: usize) -> QMat {
+    QMat { data, row_bytes: QMat::row_bytes(&ty, cols), vdt: Vdt::of(&ty), ty, rows, cols, #[cfg(feature = "gpu")] gpu: None }
 }
 
 #[cfg(test)]
@@ -2470,8 +2614,11 @@ pub mod times {
     use super::Block;
     use std::sync::atomic::{AtomicU64, Ordering};
     pub const OUTPUT: usize = 6;
-    const NAMES: [&str; 7] = ["mamba", "gdn", "attn", "mla", "dense", "moe", "output"];
-    static NS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+    /// time inside products on a device (part of the kinds above, not beside them) and how many there were
+    pub const DEVICE: usize = 7;
+    pub const DEVICE_CALLS: usize = 8;
+    const NAMES: [&str; 9] = ["mamba", "gdn", "attn", "mla", "dense", "moe", "output", "device", "device_calls"];
+    static NS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     pub fn on() -> bool {
         *ON.get_or_init(|| std::env::var_os("AM2_TIMES").is_some())
@@ -2481,6 +2628,12 @@ pub mod times {
     }
     pub fn add(k: usize, t0: std::time::Instant) {
         NS[k].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    pub fn device(t0: std::time::Instant) {
+        if on() {
+            add(DEVICE, t0);
+            NS[DEVICE_CALLS].fetch_add(1_000_000, Ordering::Relaxed);
+        }
     }
     /// "moe=1234,mla=567,..." in ms since the last call, the non-zero ones; resets them.
     pub fn take() -> String {

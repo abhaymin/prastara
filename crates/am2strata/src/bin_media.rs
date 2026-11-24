@@ -56,6 +56,26 @@ pub fn song_request(prompt: &str, lyrics: Option<&str>, seconds: Option<u32>) ->
     r
 }
 
+/// A request with `seed` set when one is given (every generation endpoint takes it).
+pub fn with_seed(body: &mut Value, seed: Option<u64>) {
+    if let Some(s) = seed { body["seed"] = json!(s); }
+}
+
+/// A long flag's value from the command line (`--name value` or `--name=value`), for options a single action takes that a
+/// shared clap field would clash with: `media analyze --seconds N`, since MediaOpts.seconds is a song's length, not this.
+pub fn flag_value(args: &[String], name: &str) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        if let Some(eq) = args[i].split_once('=') {
+            if eq.0 == name { return Some(eq.1.to_string()); }
+        } else if args[i] == name && i + 1 < args.len() {
+            return Some(args[i + 1].clone());
+        }
+        i += 1;
+    }
+    None
+}
+
 /// The non-file fields of a transcription (OpenAI's multipart: `file`, `model`, `response_format`, `language`).
 /// `translate` does not change a field: it changes the endpoint (/v1/audio/transcriptions vs /v1/audio/translations).
 pub fn transcribe_fields(model: Option<&str>, response_format: Option<&str>, language: Option<&str>) -> Vec<(&'static str, String)> {
@@ -137,14 +157,20 @@ fn parse_request(first: &Option<String>, what: &str) -> Result<Value, String> {
 ///   transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file]
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
+///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts, polls every 3 s for step N of M, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
+///   compose <request.json> --out video.mp4                (pictures, clips, audio, captions and cards into one MP4; files in the request may be paths)
+///   thumbnail <request.json> --out thumb.jpg              (a big-worded poster image from a picture)
+///   judge <video.mp4> [--brief text|file] [--min-score 7] [--judge-model M]   (the hard checks, then a model that sees the frames reviews it; exit 1 unless it passes)
 ///   files [image|video|audio]                             (the media library: every file made or sent, newest first)
 ///   add <file>                                            (puts a file in the library; prints its id)
 ///   get <id> --out file                                   (a library file)
 ///   rm <id>                                               (removes a library file)
 ///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
+///   search "<words>"                                      (images on the web for some words)
+///   reverse <file | id | url>                             (where an image, or one like it, appears on the web)
 #[derive(Args)]
 pub struct MediaOpts {
     /// the answer's file (image, video, speech, song, dub and job --out all need it; refuse a missing one)
@@ -183,12 +209,33 @@ pub struct MediaOpts {
     /// song length in seconds (10 to 600)
     #[arg(long, default_value_t = 60)]
     seconds: u32,
+    /// for analyze only: how far into the file to start (seconds); --seconds alone is parsed from the command line
+    #[arg(long)]
+    from: Option<f64>,
     /// expected words for the check, so words_heard can be measured
     #[arg(long)]
     expect: Option<String>,
     /// print the raw server answer as JSON instead of a friendly rendering
     #[arg(long)]
     json: bool,
+    /// the seed (image, video, speak, song): the same seed and request give the same result; takes differ by seed
+    #[arg(long)]
+    seed: Option<u64>,
+    /// judge: what the video is meant to be (text, or a file holding it): its title, audience, scenes and words
+    #[arg(long)]
+    brief: Option<String>,
+    /// judge: the lowest score (1-10) each part of the review may get to pass
+    #[arg(long, default_value_t = 7)]
+    min_score: u8,
+    /// judge: the model that looks at the frames (one that sees images)
+    #[arg(long)]
+    judge_model: Option<String>,
+    /// judge: how many frames, spread over the video, the model looks at
+    #[arg(long, default_value_t = 16)]
+    judge_frames: u32,
+    /// judge: how many reviews (each with frames at other places); the median score of each part counts
+    #[arg(long, default_value_t = 3)]
+    judge_runs: u32,
 }
 
 /// `am2strata-run media <action> ...`: /v1/images/generations, /v1/videos/generations, /v1/audio/speech and
@@ -200,14 +247,20 @@ pub struct MediaOpts {
 ///   transcribe <file> [--language xx] [--format json|text|srt|vtt|verbose_json] [--translate] [--out file]
 ///   song "<prompt>" [--lyrics file.txt] [--seconds N] --out file.wav
 ///   check <file> [--expect "text"] [--language xx]       (prints each finding; exit 1 when any is not ok)
+///   analyze <file> [--from S] [--seconds N]               (music facts: tempo, the drone's tonic + range, swaras, phrases over a take)
 ///   dub <request.json> [--out file.wav]
 ///   produce <plan.json> [--out file.wav]                  (posts the plan, polls step N of M every 3 s, then downloads the content)
 ///   job <id> [--out file]                                 (the job status; with --out also its /content)
+///   compose <request.json> --out video.mp4                (pictures, clips, audio, captions and cards into one MP4; files in the request may be paths)
+///   thumbnail <request.json> --out thumb.jpg              (a big-worded poster image from a picture)
+///   judge <video.mp4> [--brief text|file] [--min-score 7] [--judge-model M]   (the hard checks, then a model that sees the frames reviews it; exit 1 unless it passes)
 ///   files [image|video|audio]                             (the media library: every file made or sent, newest first)
 ///   add <file>                                            (puts a file in the library; prints its id)
 ///   get <id> --out file                                   (a library file)
 ///   rm <id>                                               (removes a library file)
 ///   pin <id> | unpin <id>                                 (a pinned library file is kept past the age limit)
+///   search "<words>"                                      (images on the web for some words)
+///   reverse <file | id | url>                             (where an image, or one like it, appears on the web)
 #[allow(clippy::too_many_arguments)]
 pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option<String>, api_key: Option<String>, models_dir: &str) -> ExitCode {
     let (local_url, local_key) = local_server(models_dir);
@@ -234,11 +287,16 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
             "song"  => cmd_song(&client, &send, first.as_deref(), o, &url)?,
             "transcribe" => cmd_transcribe(&client, &send, first.as_ref(), o, &url)?,
             "check" => cmd_check(&client, &send, first.as_ref(), o, &url)?,
+            "analyze" => cmd_analyze(&client, &send, first.as_ref(), o, &url)?,
             "dub" => cmd_dub(&client, &send, &first, o, &url)?,
             "produce" => cmd_produce(&client, &send, &first, o, &url)?,
             "job" => cmd_job(&client, &send, first.as_deref(), o, &url)?,
+            "compose" => cmd_compose(&client, &send, &first, o, &url, "/v1/media/videos/compose")?,
+            "thumbnail" => cmd_compose(&client, &send, &first, o, &url, "/v1/media/thumbnails")?,
+            "judge" => cmd_judge(&client, &send, first.as_ref(), o, &url)?,
             "files" | "add" | "get" | "rm" | "pin" | "unpin" => cmd_files(&client, &send, action, first.as_deref(), o, &url)?,
-            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, dub, produce, job, files, add, get, rm, pin, unpin")),
+            "search" | "reverse" => cmd_search(&client, &send, action, first.as_deref(), o, &url)?,
+            other => return Err(format!("unknown action {other:?}: image, video, speak, transcribe, song, check, analyze, dub, produce, job, compose, thumbnail, judge, files, add, get, rm, pin, unpin, search, reverse")),
         }
         Ok(())
     })();
@@ -254,7 +312,8 @@ pub fn media_cmd(action: &str, first: Option<String>, o: &MediaOpts, url: Option
 fn cmd_image(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let body = image_request(prompt.ok_or("image needs a prompt")?, o.size.as_deref(), o.model.as_deref(), o.n);
+    let mut body = image_request(prompt.ok_or("image needs a prompt")?, o.size.as_deref(), o.model.as_deref(), o.n);
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/images/generations")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let data = j["data"].as_array().ok_or_else(|| "no images in the answer".to_string())?;
@@ -275,7 +334,8 @@ fn cmd_image(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
 fn cmd_video(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let body = video_request(prompt.ok_or("video needs a prompt")?, Some(o.frames), o.size.as_deref(), o.format.as_deref(), o.model.as_deref());
+    let mut body = video_request(prompt.ok_or("video needs a prompt")?, Some(o.frames), o.size.as_deref(), o.format.as_deref(), o.model.as_deref());
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/videos/generations")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let raw = j["data"][0]["b64"].as_str().unwrap_or("");
@@ -291,7 +351,8 @@ fn cmd_video(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
 fn cmd_speak(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              prompt: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let body = speak_request(prompt.ok_or("speak needs text")?, o.voice.as_deref(), o.model.as_deref());
+    let mut body = speak_request(prompt.ok_or("speak needs text")?, o.voice.as_deref(), o.model.as_deref());
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/audio/speech")).json(&body))?;
     let bytes = r.bytes().map_err(|e| e.to_string())?;
     write_file(&out, &bytes)?;
@@ -306,7 +367,8 @@ fn cmd_song(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqw
         Some(path) => Some(std::fs::read_to_string(expand_path(Path::new(path))).map_err(|e| format!("{path}: {e}"))?),
         None => None,
     };
-    let body = song_request(prompt.ok_or("song needs a prompt")?, lyrics.as_deref(), Some(o.seconds));
+    let mut body = song_request(prompt.ok_or("song needs a prompt")?, lyrics.as_deref(), Some(o.seconds));
+    with_seed(&mut body, o.seed);
     let r = send(client.post(format!("{url}/v1/audio/music")).json(&body))?;
     let bytes = r.bytes().map_err(|e| e.to_string())?;
     write_file(&out, &bytes)?;
@@ -344,9 +406,13 @@ fn print_transcript_text(r: reqwest::blocking::Response, out: Option<&str>) -> R
 fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
              first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let file = expand_path(Path::new(first.ok_or("check needs a file")?));
-    let body = check_body(&data_url(&file)?, o.expect.as_deref(), o.language.as_deref());
+    let url_ = data_url(&file)?;
+    // a video goes in "video" (its frames are checked, and its picture against its sound); a take in "audio"
+    let body = if url_.starts_with("data:video/") { json!({"video": url_, "near_floor": 0.15}) } else { check_body(&url_, o.expect.as_deref(), o.language.as_deref()) };
     let r = send(client.post(format!("{url}/v1/media/check")).json(&body))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
+    // --json: every number (words heard and its rate, pause seconds, clip ratio, frames), not just pass/fail
+    if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); }
     let mut problems = 0usize;
     for (family, obj) in [("audio", &j["audio"]), ("video", &j["video"])] {
         if let Some(checks) = obj.as_object() {
@@ -354,13 +420,84 @@ fn cmd_check(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
                 if name == "note" || name == "error" { println!("{family}.{name}: {}", check.as_str().unwrap_or("")); continue; }
                 let ok = check["ok"].as_bool();
                 if matches!(ok, Some(false)) { problems += 1; }
-                println!("{family}.{name}: {}", match ok { Some(true) => "pass", Some(false) => "FAIL", None => "n/a" });
+                let num = ["rate", "seconds", "ratio", "peak_ratio", "count"].iter().find_map(|k| check.get(*k).filter(|v| v.is_number()).map(|v| format!(" ({k} {v})"))).unwrap_or_default();
+                println!("{family}.{name}: {}{num}", match ok { Some(true) => "pass", Some(false) => "FAIL", None => "n/a" });
             }
         }
     }
     if j["audio"].get("error").is_some() || j["video"].get("error").is_some() { problems = problems.max(1); }
     if problems > 0 { return Err(format!("{problems} check(s) not ok")); }
     Ok(())
+}
+
+// -------------------------------------------------------------------------------------------------- analyze
+
+fn cmd_analyze(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+               first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    use reqwest::blocking::multipart::{Form, Part};
+
+    // the audio goes in as multipart `file` (a base64 data URL works too); /v1/media/analyze reads any format and reports
+    // the music facts. --seconds is parsed from the command line itself, since MediaOpts.seconds is a song's length: it is
+    // 0 (the whole take) unless this analyze asks for a window; --from is clap's own field.
+    let (bytes, name) = read_bytes(&expand_path(Path::new(first.ok_or("analyze needs a file")?)))?;
+    let args: Vec<String> = std::env::args().collect();
+    let mut from_s = o.from.unwrap_or(0.0);
+    if let Some(v) = flag_value(&args, "--from") { if let Ok(x) = v.parse::<f64>() { from_s = x; } }
+    let seconds: f64 = flag_value(&args, "--seconds").and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let mut form = Form::new().part("file", Part::bytes(bytes).file_name(name));
+    if from_s > 0.0 { form = form.text("from_s", format!("{from_s}")); }
+    if seconds > 0.0 { form = form.text("seconds", format!("{seconds}")); }
+    let r = send(client.post(format!("{url}/v1/media/analyze")).multipart(form))?;
+    let j: Value = r.json().map_err(|e| e.to_string())?;
+    if o.json { println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default()); }
+    print_analyze(&j);
+    Ok(())
+}
+
+/// The music facts of an analyze answer: tempo (bpm, steady/unsteady), the verse's repeat period, the drone's tonic (note + hertz)
+/// and range, every swara its voice spends on it, and each phrase's timing and notes.
+fn print_analyze(j: &Value) {
+    if let Some(e) = j["error"].as_str() { println!("analyze failed: {e}"); return; }
+    let sec = j["seconds"].as_f64().unwrap_or(0.0);
+    println!("analyzed {:.1} s", sec);
+    // tempo — the beat of the voice band above the drone
+    match j["tempo"]["bpm"].as_f64() {
+        Some(bpm) if bpm > 0.0 => {
+            let conf = j["tempo"]["confidence"].as_f64().unwrap_or(0.0);
+            let steady = j["tempo"]["steady_pulse"].as_bool().unwrap_or(true);
+            println!("tempo: {:.0} bpm, confidence {:.2}, {}", bpm, conf, if steady { "steady pulse" } else { "unsteady" });
+        }
+        _ => println!("tempo: none found"),
+    }
+    // repeat — one verse of the mantra
+    match j["repeat"]["period_s"].as_f64() {
+        Some(p) if p > 0.0 => println!("repeat: {:.1} s per verse ({} times in the clip)", p, j["repeat"]["repeats_in_section"].as_f64().unwrap_or(0.0)),
+        _ => println!("repeat: none found"),
+    }
+    // pitch — the drone's home note and where the voice travels
+    if let Some(tonic) = j["pitch"]["tonic"]["note"].as_str() {
+        let hz = j["pitch"]["tonic"]["hz"].as_f64().unwrap_or(0.0);
+        let conf = j["pitch"]["tonic"]["confidence"].as_f64().unwrap_or(0.0);
+        let low = j["pitch"]["range"]["low_hz"].as_f64().unwrap_or(0.0);
+        let high = j["pitch"]["range"]["high_hz"].as_f64().unwrap_or(0.0);
+        println!("tonic: {tonic} ({hz:.1} Hz, confidence {:.2})", conf);
+        if low > 0.0 && high > 0.0 { println!("range: {:.1}-{} Hz", low, high); }
+    }
+    // each swara and the share of voiced time the voice spends on it (sorted by share)
+    if let Some(arr) = j["pitch"]["swaras"].as_array() {
+        for s in arr {
+            println!("  {} {:.2}", s["name"].as_str().unwrap_or(""), s["share"].as_f64().unwrap_or(0.0));
+        }
+    }
+    // phrases — the voiced stretches and the notes each one moves through
+    if let Some(arr) = j["phrases"].as_array() {
+        println!("phrases: {}", arr.len());
+        for p in arr {
+            let start = p["start_s"].as_f64().unwrap_or(0.0);
+            let note = p["median_note"].as_str().unwrap_or("");
+            println!("  {:.1}-{} s, median {}", start, p["end_s"].as_f64().unwrap_or(0.0), note);
+        }
+    }
 }
 
 // ----------------------------------------------------------------------------------------------------- dub / produce / job
@@ -453,10 +590,48 @@ fn cmd_files(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<req
     Ok(())
 }
 
+/// Image search by words (POST /v1/search/images) and reverse image search (POST /v1/search/reverse).
+fn cmd_search(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+              action: &str, first: Option<&str>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    let what = first.ok_or(if action == "search" { "search needs some words" } else { "reverse needs an image: a file, a library id or a URL" })?;
+    let j: Value = if action == "search" {
+        send(client.post(format!("{url}/v1/search/images")).json(&json!({"query": what, "n": o.n.max(1) * 10})))?.json().map_err(|e| e.to_string())?
+    } else {
+        let p = expand_path(Path::new(what));
+        let image = if p.is_file() { data_url(&p)? } else { what.to_string() };
+        send(client.post(format!("{url}/v1/search/reverse")).json(&json!({"image": image})))?.json().map_err(|e| e.to_string())?
+    };
+    if o.json {
+        println!("{}", serde_json::to_string_pretty(&j).map_err(|e| e.to_string())?);
+        return Ok(());
+    }
+    if action == "search" {
+        for f in j["data"].as_array().into_iter().flatten() {
+            println!("{}\n  {}\n  {}", f["title"].as_str().unwrap_or(""), f["image_url"].as_str().unwrap_or(""), f["page_url"].as_str().unwrap_or(""));
+        }
+        return Ok(());
+    }
+    for e in j["engines"].as_array().into_iter().flatten() {
+        println!("{} ({})", e["engine"].as_str().unwrap_or(""), e["status"].as_str().unwrap_or(""));
+        if let Some(c) = e["contains"].as_array().filter(|c| !c.is_empty()) {
+            println!("  seems to show: {}", c.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(", "));
+        }
+        for s in e["sites"].as_array().into_iter().flatten() {
+            println!("  {}  {}", s["domain"].as_str().unwrap_or(""), s["url"].as_str().unwrap_or(""));
+        }
+        if let Some(n) = e["note"].as_str() { println!("  {n}"); }
+        if let Some(u) = e["results_url"].as_str() { println!("  results: {u}"); }
+    }
+    Ok(())
+}
+
 fn cmd_produce(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
                first: &Option<String>, o: &MediaOpts, url: &str) -> Result<(), String> {
     let out = require_out(&o.out)?;
-    let req = parse_request(first, "produce")?;
+    let mut req = parse_request(first, "produce")?;
+    let base = first.as_ref().map(|f| Path::new(f)).filter(|p| p.is_file()).and_then(|p| p.parent()).map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    inline_files(&mut req, &base)?;
     let r = send(client.post(format!("{url}/v1/media/productions")).json(&req))?;
     let j: Value = r.json().map_err(|e| e.to_string())?;
     let id = j["id"].as_str().ok_or("no job id in the answer")?.to_string();
@@ -488,6 +663,180 @@ fn cmd_produce(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<r
     Ok(())
 }
 
+/// Every "audio", "image" and "clip" in a request that names a file on this computer becomes that file as a data: URL
+/// (so the request travels as it is: to a cluster worker, or to a server that does not read local paths). A relative
+/// path is read from `base`, the request file's folder.
+pub fn inline_files(v: &mut Value, base: &Path) -> Result<usize, String> {
+    let mut n = 0;
+    match v {
+        Value::Object(o) => {
+            for (k, x) in o.iter_mut() {
+                if let (true, Some(t)) = (matches!(k.as_str(), "audio" | "image" | "clip" | "file"), x.as_str()) {
+                    let t = t.trim();
+                    if !(t.starts_with("data:") || t.starts_with("http://") || t.starts_with("https://") || t.starts_with("mj-") || t.starts_with("mf_")) {
+                        let p = expand_path(Path::new(t));
+                        let p = if p.is_absolute() { p } else { base.join(p) };
+                        *x = Value::String(data_url(&p)?);
+                        n += 1;
+                        continue;
+                    }
+                }
+                n += inline_files(x, base)?;
+            }
+        }
+        Value::Array(a) => for x in a.iter_mut() { n += inline_files(x, base)?; },
+        _ => {}
+    }
+    Ok(n)
+}
+
+/// Follow a media job until it is done, printing its progress, then save its file to `out`.
+fn follow_job(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+              url: &str, id: &str, out: &Path) -> Result<Value, String> {
+    let mut last = String::new();
+    let st = loop {
+        std::thread::sleep(Duration::from_secs(3));
+        let j: Value = send(client.get(format!("{url}/v1/media/jobs/{id}")))?.json().map_err(|e| e.to_string())?;
+        match j["state"].as_str() {
+            Some("done") => break j,
+            Some("error") => return Err(format!("{id} failed: {}", j["error"].as_str().unwrap_or("no reason given"))),
+            _ => {}
+        }
+        let now = format!("{} {}", j["meta"]["now"].as_str().unwrap_or(""), j["meta"]["worker"].as_str().map(|w| format!("(on {w})")).unwrap_or_default());
+        if now != last { println!("{id}: {now}"); last = now; }
+    };
+    let bytes = send(client.get(format!("{url}/v1/media/jobs/{id}/content")))?.bytes().map_err(|e| e.to_string())?;
+    write_file(out, &bytes)?;
+    println!("saved {} ({} KB){}", out.display(), bytes.len() / 1024,
+             st["meta"]["worker"].as_str().map(|w| format!(", made by worker {w}")).unwrap_or_default());
+    Ok(st)
+}
+
+fn cmd_compose(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+               first: &Option<String>, o: &MediaOpts, url: &str, path: &str) -> Result<(), String> {
+    let out = require_out(&o.out)?;
+    let mut req = parse_request(first, if path.ends_with("compose") { "compose" } else { "thumbnail" })?;
+    let base = first.as_ref().map(|f| Path::new(f)).filter(|p| p.is_file()).and_then(|p| p.parent()).map(Path::to_path_buf)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+    let n = inline_files(&mut req, &base)?;
+    if n > 0 { eprintln!("[am2strata] {n} file(s) sent in the request"); }
+    let j: Value = send(client.post(format!("{url}{path}")).json(&req))?.json().map_err(|e| e.to_string())?;
+    let id = j["id"].as_str().ok_or("no job id in the answer")?.to_string();
+    println!("queued {id}{}", j["worker"].as_str().map(|w| format!(" on worker {w}")).unwrap_or_default());
+    follow_job(client, send, url, &id, &out)?;
+    Ok(())
+}
+
+/// What the judge model is told: score the video against its brief, as a strict reviewer for a YouTube channel.
+pub const JUDGE_RUBRIC: &str = "You are the strict final reviewer of a video before it goes to YouTube. You see frames spread \
+evenly over the video, in order, and its brief. Score each part from 1 (bad) to 10 (perfect), looking only at what the \
+frames show: \
+picture (sharp, no artefacts, no warped hands, faces, animals or objects, no garbled text in the pictures), \
+captions (readable, not cut off, not covering the subject, and the words you can see are correct words of the \
+brief's lyrics; you see only some frames, so a lyric line that is not in your frames was shown between them: never \
+count it as missing or skipped, and a line seen twice is a repeated chorus, not an error), \
+fit (every scene matches the brief's subject and mood; nothing off-topic or unsafe for a general audience), \
+sequence (the scenes flow in a sensible order with variety, no near-duplicate shots in a row, a strong opening that \
+makes a viewer stay in the first seconds, a clear ending), \
+thumbnail (at least one frame would make a clear, striking thumbnail). \
+Answer with JSON only, no other text: {\"scores\": {\"picture\": n, \"captions\": n, \"fit\": n, \"sequence\": n, \
+\"thumbnail\": n}, \"issues\": [{\"frame\": k, \"problem\": \"...\", \"fix\": \"...\"}], \"best_thumbnail_frame\": k, \
+\"order\": \"a better scene order if the sequence is weak, else empty\", \"verdict\": \"pass\" or \"fail\"}. \
+Frames are numbered from 1. List at most 6 issues, the most important first, each in one short sentence. Be honest: a \
+fail with clear fixes is more useful than a kind pass.";
+
+/// The JSON object in a model's answer (it may be wrapped in a code fence or have words around it).
+pub fn json_in(text: &str) -> Option<Value> {
+    let a = text.find('{')?;
+    let b = text.rfind('}')?;
+    serde_json::from_str(&text[a..=b]).ok()
+}
+
+/// Several reviews as one: each score the median of the reviews', the verdict "pass" when most of them say pass,
+/// and the issues, thumbnail frame and better order of the first review.
+pub fn median_review(reviews: &[Value]) -> Value {
+    let mut out = reviews.first().cloned().unwrap_or(json!({}));
+    for p in ["picture", "captions", "fit", "sequence", "thumbnail"] {
+        let mut v: Vec<f64> = reviews.iter().filter_map(|r| r["scores"][p].as_f64()).collect();
+        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        if !v.is_empty() { out["scores"][p] = json!(v[v.len() / 2]); }
+    }
+    let passes = reviews.iter().filter(|r| r["verdict"].as_str() == Some("pass")).count();
+    out["verdict"] = json!(if passes * 2 > reviews.len() { "pass" } else { "fail" });
+    out
+}
+
+/// The judge's review passes: a pass verdict and every score at least `min`.
+pub fn review_passes(review: &Value, min: u8) -> (bool, Vec<String>) {
+    let mut low = Vec::new();
+    for k in ["picture", "captions", "fit", "sequence", "thumbnail"] {
+        let s = review["scores"][k].as_f64().unwrap_or(0.0);
+        if s < min as f64 { low.push(format!("{k} {s}")); }
+    }
+    (low.is_empty() && review["verdict"].as_str() == Some("pass"), low)
+}
+
+fn cmd_judge(client: &reqwest::blocking::Client, send: &dyn Fn(RB) -> Result<reqwest::blocking::Response, String>,
+             first: Option<&String>, o: &MediaOpts, url: &str) -> Result<(), String> {
+    let file = expand_path(Path::new(first.ok_or("judge needs a video file")?));
+    let video = data_url(&file)?;
+    // 1. the hard checks: broken crossfades, frozen stretches, pictures shorter than the sound
+    let mut problems = Vec::new();
+    // a slow zoom over a painting changes ~0.4 grey levels a frame and is fine; a frozen picture changes ~0.03
+    let j: Value = send(client.post(format!("{url}/v1/media/check")).json(&json!({"video": video, "near_floor": 0.15})))?.json().map_err(|e| e.to_string())?;
+    for (name, c) in j["video"].as_object().into_iter().flatten() {
+        if c["ok"] == false { problems.push(format!("video.{name}: {}", c.get("note").and_then(Value::as_str).unwrap_or("not ok"))); }
+        if c["ok"].is_boolean() { println!("check video.{name}: {}", if c["ok"] == true { "pass" } else { "FAIL" }); }
+    }
+    // 2. a model that sees the frames reviews it against the brief
+    let brief = match &o.brief {
+        Some(b) if Path::new(b).is_file() => std::fs::read_to_string(b).map_err(|e| e.to_string())?,
+        Some(b) => b.clone(),
+        None => "No brief was given: judge it as a calm music video for a general audience.".into(),
+    };
+    let model = o.judge_model.clone().unwrap_or_else(|| "minicpm-v-4.7-35b-a3b-uncensored-ad-q5_k-q4_k".into());
+    // one model pass over 16 frames is noisy (the same video scored 7 and 5 on captions in two runs): review it a few
+    // times, each with its frames at other places, and take the median of each part
+    let runs = o.judge_runs.clamp(1, 7);
+    let mut reviews = Vec::new();
+    for k in 0..runs {
+        let frames = o.judge_frames + 3 * k;
+        let body = json!({"model": model, "temperature": 0, "max_tokens": 4000, "video_frames": frames,
+            "messages": [{"role": "system", "content": JUDGE_RUBRIC},
+                         {"role": "user", "content": [{"type": "text", "text": format!("The brief:\n{brief}")},
+                                                      {"type": "video_url", "video_url": {"url": video}}]}]});
+        let r: Value = send(client.post(format!("{url}/v1/chat/completions")).json(&body))?.json().map_err(|e| e.to_string())?;
+        let text = r["choices"][0]["message"]["content"].as_str().unwrap_or("");
+        match json_in(text) {
+            Some(v) => {
+                let line: Vec<String> = ["picture", "captions", "fit", "sequence", "thumbnail"].iter()
+                    .map(|p| format!("{p} {}", v["scores"][*p])).collect();
+                println!("review {} of {runs} ({frames} frames): {} -> {}", k + 1, line.join(", "), v["verdict"].as_str().unwrap_or("?"));
+                reviews.push((frames, v));
+            }
+            None => println!("review {} of {runs}: no JSON in the answer", k + 1),
+        }
+    }
+    if reviews.is_empty() { return Err("the judge gave no review".into()); }
+    let review = median_review(&reviews.iter().map(|(_, v)| v.clone()).collect::<Vec<_>>());
+    let frames_used = reviews[0].0;
+    if o.json { println!("{}", serde_json::to_string_pretty(&review).unwrap_or_default()); }
+    for (k, v) in review["scores"].as_object().into_iter().flatten() { println!("score {k}: {v}"); }
+    for i in review["issues"].as_array().into_iter().flatten() {
+        println!("issue at frame {}: {} -> fix: {}", i["frame"], i["problem"].as_str().unwrap_or(""), i["fix"].as_str().unwrap_or(""));
+    }
+    if let Some(f) = review["best_thumbnail_frame"].as_u64() {
+        let len = j["video"]["length_seconds"].as_f64().unwrap_or(0.0);
+        let at = if frames_used > 0 { len * (f as f64 - 0.5) / frames_used as f64 } else { 0.0 };
+        println!("best thumbnail: frame {f} (about {at:.1} s)");
+    }
+    if let Some(ord) = review["order"].as_str().filter(|s| !s.is_empty()) { println!("better order: {ord}"); }
+    let (ok, low) = review_passes(&review, o.min_score);
+    if !low.is_empty() { problems.push(format!("scores under {}: {}", o.min_score, low.join(", "))); }
+    if !ok && low.is_empty() { problems.push("the judge's verdict is fail".into()); }
+    if problems.is_empty() { println!("verdict: PASS"); Ok(()) } else { Err(format!("verdict: FAIL\n  {}", problems.join("\n  "))) }
+}
+
 fn require_out(out: &Option<String>) -> Result<PathBuf, String> {
     match out { Some(o) => Ok(expand_path(Path::new(o))), None => Err("this answer is a file: give --out <path>".into()) }
 }
@@ -495,6 +844,40 @@ fn require_out(out: &Option<String>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_compose_requests_local_files_travel_inside_it() {
+        let dir = std::env::temp_dir().join(format!("am2-inline-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.png"), [0x89, b'P', b'N', b'G']).unwrap();
+        let mut v = json!({"audio": "https://x.org/s.wav", "shots": [{"image": "a.png"}, {"clip": "mj-4"}], "captions": [[0, 1, "a.png"]]});
+        assert_eq!(inline_files(&mut v, &dir).unwrap(), 1);
+        assert!(v["shots"][0]["image"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert_eq!(v["shots"][1]["clip"], "mj-4", "a job id stays an id");
+        assert_eq!(v["audio"], "https://x.org/s.wav");
+        assert_eq!(v["captions"][0][2], "a.png", "caption words are words");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn three_reviews_count_by_their_median_and_majority() {
+        let r = |c: f64, v: &str| json!({"scores": {"picture": 8, "captions": c, "fit": 7, "sequence": 7, "thumbnail": 8}, "verdict": v});
+        let m = median_review(&[r(5.0, "fail"), r(8.0, "pass"), r(7.0, "pass")]);
+        assert_eq!(m["scores"]["captions"], 7.0, "the median, not the worst");
+        assert_eq!(m["verdict"], "pass");
+        assert!(review_passes(&m, 7).0);
+        assert_eq!(median_review(&[r(7.0, "fail"), r(7.0, "fail"), r(8.0, "pass")])["verdict"], "fail");
+    }
+
+    #[test]
+    fn the_judge_passes_only_a_pass_with_every_score_high_enough() {
+        let r = json_in("```json\n{\"scores\": {\"picture\": 8, \"captions\": 9, \"fit\": 8, \"sequence\": 7, \"thumbnail\": 9}, \"verdict\": \"pass\"}\n```").unwrap();
+        assert_eq!(review_passes(&r, 7), (true, vec![]));
+        let (ok, low) = review_passes(&r, 8);
+        assert!(!ok && low == ["sequence 7"]);
+        let mut f = r.clone(); f["verdict"] = json!("fail");
+        assert!(!review_passes(&f, 7).0, "a fail verdict fails even with good scores");
+    }
 
     #[test]
     fn later_images_go_in_the_same_folder_as_the_first() {
@@ -520,6 +903,10 @@ mod tests {
     fn speech_and_song_send_only_the_fields() {
         assert_eq!(speak_request("hello world", None, None), json!({"input": "hello world"}));
         assert_eq!(speak_request("hi", Some("laura"), Some("m")), json!({"input": "hi", "voice": "laura", "model": "m"}));
+        // a song take by its seed (the producer makes takes 7, 21 and 42)
+        let mut b = song_request("chant", Some("ॐ त्र्यम्बकं"), Some(90));
+        with_seed(&mut b, Some(21));
+        assert_eq!(b, json!({"style": "chant", "lyrics": "ॐ त्र्यम्बकं", "duration": 90, "seed": 21}));
         assert_eq!(song_request("a ballad", None, None), json!({"style": "a ballad"}));
         assert_eq!(song_request("sad", Some("[verse]\n…"), Some(90)),
             json!({"style": "sad", "lyrics": "[verse]\n…", "duration": 90}));

@@ -254,23 +254,48 @@ impl Gpu {
         if data.len() != rows * row_bytes {
             return Err(format!("{} bytes for a {rows}x{cols} {ty} matrix (want {})", data.len(), rows * row_bytes));
         }
-        native!(self, n, Ok(Weights { handle: Mem::Mtl(n.upload(data)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
-                                      geometry, bytes: data.len(), wide_fits: false }));
-        // whole u32 words: the tail padded with zeros
-        let mut words = vec![0u32; data.len().div_ceil(4)];
-        for (i, c) in data.chunks(4).enumerate() {
-            let mut b = [0u8; 4];
-            b[..c.len()].copy_from_slice(c);
-            words[i] = u32::from_le_bytes(b);
-        }
-        let handle = Mem::Cube(with_client!(self, c, R, c.create_from_slice(u32::as_bytes(&words))));
+        native!(self, n, {
+            let t = kernels::table_for(ty);
+            let all: Vec<u8> = t.iter().chain(data).copied().collect();
+            Ok(Weights { handle: Mem::Mtl(n.upload(&all)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
+                         geometry, bytes: all.len(), wide_fits: false })
+        });
+        // whole u32 words: the kind's lookup table first (IQ3_XXS's grid), then the rows, the tail padded with zeros.
+        // A matrix with no table and whole words (every K-quant and float one) goes as it is: the client makes the
+        // one copy the device thread uploads from, so the mapped file is read once and nothing is rebuilt here.
+        let table = kernels::table_for(ty);
+        let handle = if table.is_empty() && data.len() % 4 == 0 {
+            Mem::Cube(with_client!(self, c, R, c.create_from_slice(data)))
+        } else {
+            let padded = (table.len() + data.len()).div_ceil(4) * 4;
+            let mut all = Vec::with_capacity(padded);
+            all.extend_from_slice(&table);
+            all.extend_from_slice(data);
+            all.resize(padded, 0);
+            Mem::Cube(with_client!(self, c, R, c.create_from_slice(&all)))
+        };
+        let data_len = table.len() + data.len();
         let shared = with_client!(self, c, R, c.properties().hardware.max_shared_memory_size);
         let need = match geometry.2 {
             kernels::kind::Q6_K => kernels::wide_q6k_shared_bytes(cols as u32),
             _ => kernels::wide_shared_bytes(cols as u32),
         };
         let wide_fits = need <= shared;
-        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data.len(), wide_fits })
+        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data_len, wide_fits })
+    }
+
+    /// Let go of the host copies of uploads the device has finished reading. The runtime keeps each upload's bytes
+    /// until its queue is flushed, and frees them one flush later (it waits for the device first), so without this
+    /// a model's whole upload stays in RAM beside its mapped file until the first kernels run.
+    pub fn flush(&self) -> Result<(), String> {
+        native!(self, _n, Ok(()));
+        with_client!(self, c, R, c.flush().map_err(|e| format!("{}: {e:?}", self.name)))
+    }
+
+    /// Wait until the device has done everything queued so far (uploads included).
+    pub fn sync(&self) -> Result<(), String> {
+        native!(self, _n, Ok(()));
+        with_client!(self, c, R, cubecl::future::block_on(c.sync()).map_err(|e| format!("{}: {e:?}", self.name)))
     }
 
     /// The products of several matrices with the same input (q, k, v; gate and up): one upload of x, the kernels

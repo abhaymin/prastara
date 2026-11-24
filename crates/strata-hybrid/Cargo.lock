@@ -45,6 +45,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "am2pack"
+version = "0.1.0"
+dependencies = [
+ "memmap2",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2855,7 +2865,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strata-gguf"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -2877,6 +2887,7 @@ dependencies = [
 name = "strata-hybrid"
 version = "0.1.0"
 dependencies = [
+ "am2pack",
  "base64 0.22.1",
  "libc",
  "memmap2",
@@ -2893,7 +2904,7 @@ dependencies = [
 
 [[package]]
 name = "strata-pack"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "libc",
  "reqwest",
@@ -2905,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "strata-tokenizer"
-version = "0.1.9"
+version = "0.2.0"
 dependencies = [
  "aho-corasick",
  "fancy-regex",

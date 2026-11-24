@@ -6,7 +6,9 @@ edition = "2021"
 license = "MIT"
 
 [features]
-default = ["gpu", "vendor-gpus"]
+default = ["gpu", "vendor-gpus", "aipac"]
+# --model takes a .am2aipac model pack (the am2pack crate, AGPL-3.0)
+aipac = ["dep:am2pack"]
 # weights on GPUs: NVIDIA (CUDA), AMD (ROCm), any Vulkan GPU - strata-gpu's CubeCL kernels (tools/build-hybrid.sh)
 gpu = ["dep:strata-gpu", "strata-gpu/wgpu"]
 # and NVIDIA's and AMD's own runtimes, which need their toolkits to build: the releases leave them out and use wgpu
@@ -16,6 +18,7 @@ vendor-gpus = ["gpu", "strata-gpu/cuda", "strata-gpu/hip"]
 strata-gpu = { path = "../strata-gpu", optional = true, default-features = false }
 strata-gguf = { path = "../strata-gguf" }
 strata-pack = { path = "../strata-pack" }
+am2pack = { path = "../am2pack", optional = true }
 serde_json = { version = "1", features = ["preserve_order"] }
 rayon = "1"
 memmap2 = "0.9"

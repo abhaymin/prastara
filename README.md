@@ -370,3 +370,7 @@ quantizers, ACE-Step, Chatterbox, Parler-TTS and more) is listed with its licenc
 ## License
 
 MIT, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+One part has its own licence: the model pack format (`crates/am2pack`, the `.am2aipac` files) is AGPL-3.0-only, see
+[crates/am2pack/LICENSE](crates/am2pack/LICENSE). It is a cargo feature that is on by default, and a binary built with
+it is distributed under the AGPL's terms. Build with `--no-default-features` for an MIT-only binary without packs.

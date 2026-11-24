@@ -60,6 +60,10 @@ pub fn row_dot(t: Fast, row: &[u8], x: &[f32]) -> f32 {
                 }
                 s += dot8(&q, xs);
             }
+            // a width that is not a multiple of 32 (Inkling's 16-wide bias table): the columns past the last block
+            for (c, xv) in row.chunks_exact(128).remainder().chunks_exact(4).zip(x.chunks_exact(32).remainder()) {
+                s += f32::from_le_bytes([c[0], c[1], c[2], c[3]]) * xv;
+            }
         }
         Fast::F16 => {
             for (c, xs) in row.chunks_exact(64).zip(x.chunks_exact(32)) {
@@ -68,6 +72,9 @@ pub fn row_dot(t: Fast, row: &[u8], x: &[f32]) -> f32 {
                 }
                 s += dot8(&q, xs);
             }
+            for (c, xv) in row.chunks_exact(64).remainder().chunks_exact(2).zip(x.chunks_exact(32).remainder()) {
+                s += h(c, 0) * xv;
+            }
         }
         Fast::Bf16 => {
             for (c, xs) in row.chunks_exact(64).zip(x.chunks_exact(32)) {
@@ -75,6 +82,9 @@ pub fn row_dot(t: Fast, row: &[u8], x: &[f32]) -> f32 {
                     q[j] = f32::from_bits((u16::from_le_bytes([c[2 * j], c[2 * j + 1]]) as u32) << 16);
                 }
                 s += dot8(&q, xs);
+            }
+            for (c, xv) in row.chunks_exact(64).remainder().chunks_exact(2).zip(x.chunks_exact(32).remainder()) {
+                s += f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16) * xv;
             }
         }
         Fast::Q8_0 => {
@@ -164,6 +174,26 @@ mod tests {
             let scale: f64 = deq.iter().zip(&x).map(|(a, b)| (*a as f64 * *b as f64).abs()).sum();
             let got = row_dot(Fast::of(ty).unwrap(), &row, &x) as f64;
             assert!((got - want).abs() <= 1e-5 * scale.max(1e-9), "{ty}: {got} vs {want}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod narrow {
+    use super::*;
+
+    /// A row narrower than a block of 32, or with columns past its last block, is multiplied whole.
+    #[test]
+    fn a_width_that_is_not_a_multiple_of_32_keeps_every_column() {
+        for cols in [16usize, 32, 40, 100] {
+            let w: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.37).sin()).collect();
+            let x: Vec<f32> = (0..cols).map(|i| (i as f32 * 0.11).cos()).collect();
+            let want: f32 = w.iter().zip(&x).map(|(a, b)| a * b).sum();
+            let f32s: Vec<u8> = w.iter().flat_map(|v| v.to_le_bytes()).collect();
+            assert!((row_dot(Fast::F32, &f32s, &x) - want).abs() < 1e-4, "F32, {cols} columns");
+            let bf: Vec<u8> = w.iter().flat_map(|v| ((v.to_bits() >> 16) as u16).to_le_bytes()).collect();
+            let want_bf: f32 = w.iter().zip(&x).map(|(a, b)| f32::from_bits(a.to_bits() & 0xffff_0000) * b).sum();
+            assert!((row_dot(Fast::Bf16, &bf, &x) - want_bf).abs() < 1e-4, "BF16, {cols} columns");
         }
     }
 }

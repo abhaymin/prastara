@@ -1,0 +1,881 @@
+{
+ "hi_none": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Hi"
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "none"
+   }
+  },
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   150239,
+   150330,
+   196980,
+   4896,
+   1,
+   13,
+   161721,
+   195646,
+   279,
+   13,
+   176147,
+   154258,
+   386,
+   149880,
+   183263,
+   11,
+   159072,
+   151974,
+   150202,
+   149904,
+   149951,
+   150572,
+   13,
+   150166,
+   150261,
+   149887,
+   153972,
+   169014,
+   13,
+   200010,
+   200001,
+   200004,
+   4896,
+   150102,
+   0,
+   220,
+   37365,
+   149882,
+   152750,
+   149941,
+   13,
+   151337,
+   149951,
+   149904,
+   150572,
+   149941,
+   151841,
+   30,
+   200010,
+   200006
+  ],
+  "raw_text": "The user just said \"Hi\". Simple greeting. Respond warmly and briefly, maybe ask how I can help. No need for deep reasoning.Hi there! Nice to meet you. How can I help you today?",
+  "parsed": {
+   "reasoning_content": "The user just said \"Hi\". Simple greeting. Respond warmly and briefly, maybe ask how I can help. No need for deep reasoning.",
+   "content": "Hi there! Nice to meet you. How can I help you today?",
+   "tool_calls": null
+  },
+  "finish_reason": "stop"
+ },
+ "math_high": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is 17*23? Answer with the number only."
+    }
+   ]
+  },
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is 17*23? Answer with the number only.<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   159306,
+   220,
+   68107,
+   9,
+   68169,
+   13,
+   173071,
+   25,
+   220,
+   68107,
+   9,
+   68020,
+   28,
+   79281,
+   11,
+   220,
+   68107,
+   9,
+   18,
+   28,
+   69387,
+   11,
+   150269,
+   220,
+   89431,
+   13,
+   170289,
+   150893,
+   149899,
+   150107,
+   150130,
+   13,
+   174520,
+   150400,
+   150130,
+   150107,
+   13,
+   200010,
+   200001,
+   200004,
+   89431,
+   200010,
+   200006
+  ],
+  "raw_text": "The user wants 17*23. Compute: 17*20=340, 17*3=51, total 391. Need answer with number only. Ensure final only number.391",
+  "parsed": {
+   "reasoning_content": "The user wants 17*23. Compute: 17*20=340, 17*3=51, total 391. Need answer with number only. Ensure final only number.",
+   "content": "391",
+   "tool_calls": null
+  },
+  "finish_reason": "stop"
+ },
+ "code_low": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Write a one-line Python expression that reverses a string s."
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "low"
+   }
+  },
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Write a one-line Python expression that reverses a string s.<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   159306,
+   149878,
+   150011,
+   12,
+   909,
+   152743,
+   151461,
+   149890,
+   156815,
+   82,
+   149878,
+   150379,
+   149943,
+   13,
+   161721,
+   25,
+   149943,
+   58,
+   145037,
+   12,
+   16,
+   60,
+   13,
+   170289,
+   150893,
+   152482,
+   150239,
+   151461,
+   13,
+   174520,
+   150011,
+   150264,
+   13,
+   179027,
+   153522,
+   149921,
+   153939,
+   170436,
+   150379,
+   13,
+   154879,
+   149911,
+   4123,
+   13,
+   200010,
+   200001,
+   200004,
+   63,
+   82,
+   58,
+   145037,
+   12,
+   16,
+   60,
+   63,
+   200010,
+   200006
+  ],
+  "raw_text": "The user wants a one-line Python expression that reverses a string s. Simple: s[::-1]. Need answer likely just expression. Ensure one line. Could mention it returns reversed string. Final concise.`s[::-1]`",
+  "parsed": {
+   "reasoning_content": "The user wants a one-line Python expression that reverses a string s. Simple: s[::-1]. Need answer likely just expression. Ensure one line. Could mention it returns reversed string. Final concise.",
+   "content": "`s[::-1]`",
+   "tool_calls": null
+  },
+  "finish_reason": "stop"
+ },
+ "tool_one": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Kochi?"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "low"
+   }
+  },
+  "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is the weather in Kochi?<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   171960,
+   154046,
+   149881,
+   151138,
+   33784,
+   13,
+   170289,
+   150054,
+   150055,
+   62,
+   30847,
+   13,
+   151138,
+   33784,
+   152482,
+   152652,
+   149881,
+   152933,
+   13,
+   157995,
+   151955,
+   13,
+   200010,
+   200001,
+   832,
+   62,
+   30847,
+   200049,
+   90,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   30847,
+   1,
+   11,
+   1,
+   70747,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   1,
+   32268,
+   33784,
+   1,
+   92,
+   92,
+   200010,
+   200006
+  ],
+  "raw_text": "The user asks weather in Kochi. Need use get_weather. Kochi likely city in India. Call tool.get_weather{\"name\":\"get_weather\",\"args\":{\"city\":\"Kochi\"}}",
+  "parsed": {
+   "reasoning_content": "The user asks weather in Kochi. Need use get_weather. Kochi likely city in India. Call tool.",
+   "content": "",
+   "tool_calls": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Kochi\"}"
+     },
+     "id": "0b8Fj1t5djaINIhcuRnLwkC0uSTN7onI"
+    }
+   ]
+  },
+  "finish_reason": "tool_calls"
+ },
+ "tool_two": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "Weather and local time in Kochi and in Oslo? Call the tools."
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "description": "Local time in a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "low"
+   }
+  },
+  "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"Local time in a city\",\"name\":\"get_time\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>Weather and local time in Kochi and in Oslo? Call the tools.<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   159306,
+   154046,
+   149880,
+   150368,
+   150038,
+   149881,
+   151138,
+   33784,
+   149880,
+   188439,
+   13,
+   170289,
+   151272,
+   152804,
+   13,
+   150197,
+   149951,
+   151272,
+   150055,
+   62,
+   30847,
+   149880,
+   150055,
+   62,
+   848,
+   149887,
+   150334,
+   160723,
+   13,
+   150962,
+   149914,
+   153394,
+   11,
+   149982,
+   153793,
+   13,
+   170289,
+   149895,
+   162944,
+   25,
+   150055,
+   62,
+   30847,
+   152652,
+   152482,
+   196980,
+   32268,
+   33784,
+   1,
+   149880,
+   196980,
+   37949,
+   1,
+   13,
+   150055,
+   62,
+   848,
+   152652,
+   181830,
+   13,
+   151217,
+   6,
+   82,
+   149906,
+   220,
+   19,
+   157754,
+   149881,
+   153793,
+   13,
+   200010,
+   200001,
+   832,
+   62,
+   30847,
+   200049,
+   90,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   30847,
+   1,
+   11,
+   1,
+   70747,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   1,
+   32268,
+   33784,
+   1,
+   92,
+   92,
+   200010,
+   200001,
+   832,
+   62,
+   30847,
+   200049,
+   90,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   30847,
+   1,
+   11,
+   1,
+   70747,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   1,
+   37949,
+   1,
+   92,
+   92,
+   200010,
+   200001,
+   832,
+   62,
+   848,
+   200049,
+   90,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   848,
+   1,
+   11,
+   1,
+   70747,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   1,
+   32268,
+   33784,
+   1,
+   92,
+   92,
+   200010,
+   200001,
+   832,
+   62,
+   848,
+   200049,
+   90,
+   1,
+   930,
+   1,
+   25,
+   1,
+   832,
+   62,
+   848,
+   1,
+   11,
+   1,
+   70747,
+   1,
+   25,
+   90,
+   1,
+   2958,
+   1,
+   25,
+   1,
+   37949,
+   1,
+   92,
+   92,
+   200010,
+   200006
+  ],
+  "raw_text": "The user wants weather and local time in Kochi and Oslo. Need call tools. We can call get_weather and get_time for both cities. These are independent, so parallel. Need be careful: get_weather city likely \"Kochi\" and \"Oslo\". get_time city similarly. Let's do 4 calls in parallel.get_weather{\"name\":\"get_weather\",\"args\":{\"city\":\"Kochi\"}}get_weather{\"name\":\"get_weather\",\"args\":{\"city\":\"Oslo\"}}get_time{\"name\":\"get_time\",\"args\":{\"city\":\"Kochi\"}}get_time{\"name\":\"get_time\",\"args\":{\"city\":\"Oslo\"}}",
+  "parsed": {
+   "reasoning_content": "The user wants weather and local time in Kochi and Oslo. Need call tools. We can call get_weather and get_time for both cities. These are independent, so parallel. Need be careful: get_weather city likely \"Kochi\" and \"Oslo\". get_time city similarly. Let's do 4 calls in parallel.",
+   "content": "",
+   "tool_calls": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Kochi\"}"
+     },
+     "id": "KAxKX2YzOyJQMDaWUxozgwxygjM89oAX"
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "arguments": "{\"city\":\"Oslo\"}"
+     },
+     "id": "i2VAMu35SCNiz6aqL5Rc1geiS9EoRXGv"
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "arguments": "{\"city\":\"Kochi\"}"
+     },
+     "id": "SJWBtEYfXpK6nfn5UnGXqUjDvFUHrKtY"
+    },
+    {
+     "type": "function",
+     "function": {
+      "name": "get_time",
+      "arguments": "{\"city\":\"Oslo\"}"
+     },
+     "id": "FQXN78mEevUHoiEEvRLmAMTtngjImzym"
+    }
+   ]
+  },
+  "finish_reason": "tool_calls"
+ },
+ "tool_answer": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "What is the weather in Kochi?"
+    },
+    {
+     "role": "assistant",
+     "content": "",
+     "tool_calls": [
+      {
+       "id": "c1",
+       "type": "function",
+       "function": {
+        "name": "get_weather",
+        "arguments": "{\"city\":\"Kochi\"}"
+       }
+      }
+     ]
+    },
+    {
+     "role": "tool",
+     "tool_call_id": "c1",
+     "content": "{\"temp_c\":29,\"sky\":\"rain\"}"
+    }
+   ],
+   "tools": [
+    {
+     "type": "function",
+     "function": {
+      "name": "get_weather",
+      "description": "Weather for a city",
+      "parameters": {
+       "type": "object",
+       "properties": {
+        "city": {
+         "type": "string"
+        }
+       },
+       "required": [
+        "city"
+       ]
+      }
+     }
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "low"
+   }
+  },
+  "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Weather for a city\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>What is the weather in Kochi?<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Kochi\"}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp_c\":29,\"sky\":\"rain\"}<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   171960,
+   154046,
+   149881,
+   151138,
+   33784,
+   13,
+   159747,
+   157089,
+   155665,
+   62,
+   66,
+   220,
+   68237,
+   11,
+   158808,
+   154005,
+   13,
+   170289,
+   150893,
+   149911,
+   4123,
+   13,
+   220,
+   45169,
+   150517,
+   150870,
+   25,
+   220,
+   68237,
+   5140,
+   34,
+   149880,
+   154005,
+   13,
+   150166,
+   151469,
+   13,
+   200010,
+   200001,
+   200004,
+   32268,
+   33784,
+   149884,
+   154552,
+   220,
+   68237,
+   5140,
+   34,
+   149899,
+   154005,
+   13,
+   200010,
+   200006
+  ],
+  "raw_text": "The user asks weather in Kochi. Tool returned temp_c 29, sky rain. Need answer concise. Mention current conditions: 29°C and rain. No extra.Kochi is currently 29°C with rain.",
+  "parsed": {
+   "reasoning_content": "The user asks weather in Kochi. Tool returned temp_c 29, sky rain. Need answer concise. Mention current conditions: 29°C and rain. No extra.",
+   "content": "Kochi is currently 29°C with rain.",
+   "tool_calls": null
+  },
+  "finish_reason": "stop"
+ },
+ "hindi": {
+  "request": {
+   "messages": [
+    {
+     "role": "user",
+     "content": "नमस्ते! एक वाक्य में बताइए कि आप कौन हैं।"
+    }
+   ],
+   "chat_template_kwargs": {
+    "reasoning_effort": "none"
+   }
+  },
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>नमस्ते! एक वाक्य में बताइए कि आप कौन हैं।<|end_message|>",
+  "tokens": [
+   200001,
+   200008,
+   371,
+   150409,
+   171960,
+   149881,
+   187941,
+   25,
+   196980,
+   32269,
+   0,
+   149954,
+   150011,
+   156021,
+   11,
+   151968,
+   149991,
+   150180,
+   149941,
+   149914,
+   13,
+   1,
+   170289,
+   150893,
+   149881,
+   187941,
+   152482,
+   150011,
+   156021,
+   13,
+   170289,
+   151967,
+   149891,
+   149954,
+   38297,
+   149910,
+   194375,
+   155125,
+   82,
+   156453,
+   13,
+   174520,
+   150011,
+   156021,
+   150130,
+   13,
+   179027,
+   150657,
+   25,
+   196980,
+   75974,
+   149954,
+   38297,
+   153326,
+   78214,
+   11,
+   187660,
+   194375,
+   155125,
+   82,
+   156453,
+   151147,
+   154827,
+   68184,
+   150199,
+   68274,
+   1,
+   151787,
+   6,
+   82,
+   150011,
+   156021,
+   13,
+   170289,
+   149923,
+   151469,
+   13,
+   154879,
+   150130,
+   13,
+   200010,
+   200001,
+   200004,
+   75974,
+   149954,
+   38297,
+   153326,
+   78214,
+   11,
+   187660,
+   194375,
+   155125,
+   82,
+   156453,
+   151147,
+   154827,
+   68184,
+   150199,
+   68274,
+   200010,
+   200006
+  ],
+  "raw_text": "The user asks in Hindi: \"Hello! In one sentence, tell me who you are.\" Need answer in Hindi likely one sentence. Need identify as Inkling by Thinking Machines Lab. Ensure one sentence only. Could say: \"मैं Inkling हूँ, जिसे Thinking Machines Lab ने बनाया है।\" That's one sentence. Need no extra. Final only.मैं Inkling हूँ, जिसे Thinking Machines Lab ने बनाया है।",
+  "parsed": {
+   "reasoning_content": "The user asks in Hindi: \"Hello! In one sentence, tell me who you are.\" Need answer in Hindi likely one sentence. Need identify as Inkling by Thinking Machines Lab. Ensure one sentence only. Could say: \"मैं Inkling हूँ, जिसे Thinking Machines Lab ने बनाया है।\" That's one sentence. Need no extra. Final only.",
+   "content": "मैं Inkling हूँ, जिसे Thinking Machines Lab ने बनाया है।",
+   "tool_calls": null
+  },
+  "finish_reason": "stop"
+ }
+}
