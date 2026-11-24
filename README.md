@@ -58,6 +58,40 @@ channel) and [docs/REGRESSION.md](docs/REGRESSION.md).
 
 Plans and where each stands: [docs/LEDGER.md](docs/LEDGER.md).
 
+## Prastara: the name ahead
+
+am2Strata is growing into **Prastara**: one platform that runs any model on any chip a machine has, made for the
+whole world. Until that app is ready, it keeps the name am2Strata.
+
+### Why "Prastara"
+
+**Prastara** (प्रस्तर, *prastara*) is Sanskrit for a stone or rock, and for something spread out flat: a layer, a
+bed, a level surface. It comes from *pra-* ("forth") and the root *stṛ* (स्तृ), "to spread, to lay out in layers".
+
+The same ancient root runs through Latin *sternere* ("to spread"), which gave English *stratum* and **strata**. So
+Prastara is Strata's own word in its oldest form. The project began as Strata, a way of laying a model out in layers
+across a machine: the hot parts on the GPU, the rest in memory and on disk. Prastara takes that idea to a new level.
+
+A closely related word, *prastāra* (प्रस्तार), is the name Piṅgala's *Chandaḥśāstra* (around the 2nd century BCE)
+gives to the method of laying out every possible pattern in order, one of the earliest systematic enumerations in
+mathematics. Arranging the parts of a model across any hardware, in order, is what Prastara does.
+
+### The technology names
+
+| Name | Sanskrit | Meaning | What it is |
+|---|---|---|---|
+| **Prastara** | प्रस्तर (*prastara*) | stone; a layer spread out | the platform |
+| **Triveni** | त्रिवेणी (*triveṇī*) | the confluence of three rivers | the layer that makes GPU, CPU and NPU work as one: which chip runs which part of each layer |
+| **Kosha** | कोश (*kośa*) | treasury, container | the model file, `.kosha`: one file holding a model laid out for a fast load and fast experts (today's `.am2aipac` packs are its first version) |
+| **Anu** | अणु (*aṇu*) | atom, the smallest particle | the kernels: one Rust source for NVIDIA, AMD, any Vulkan or Metal GPU and the CPU |
+| **Stara** | स्तर (*stara*) | layer, level | the model and expert manager: places each part across VRAM, RAM, disk and other machines |
+| **Gati** | गति (*gati*) | motion, speed | the runtime engine |
+| **Avarta** | आवर्त (*āvarta*) | turning, recurrence | loop transformers: blocks that run again and again with the same weights |
+| **Rupa** | रूप (*rūpa*) | form | model variants (finetunes, merges) stored inside one Kosha |
+| **Kula** | कुल (*kula*) | family, lineage | model families: a base model and its variants |
+| **Mandala** | मण्डल (*maṇḍala*) | circle, group | a cluster of machines working as one |
+| **Gana** | गण (*gaṇa*) | group, assembly | the expert groups inside a mixture-of-experts model |
+
 ## Install
 
 **Linux (x86_64, arm64) and macOS (Apple silicon, Intel):**
