@@ -385,9 +385,29 @@ impl CustomOp1 for FrozenLinear {
     }
 
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
-        let w = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
-        Ok(Some(grad_res.matmul(&w)?))
+        // grad · W, a slice of W's rows at a time when W is large (see `WIDEN_ROWS_MAX`)
+        let rows = self.w.dim(0)?;
+        let step = widen_rows(&self.w);
+        let mut acc: Option<Tensor> = None;
+        for r0 in (0..rows).step_by(step) {
+            let n = step.min(rows - r0);
+            let w = self.w.narrow(0, r0, n)?;
+            let w = if w.dtype() == DType::F32 { w } else { w.to_dtype(DType::F32)? };
+            let part = grad_res.narrow(D::Minus1, r0, n)?.contiguous()?.matmul(&w)?;
+            acc = Some(match acc { Some(a) => (a + part)?, None => part });
+        }
+        Ok(acc)
     }
+}
+
+/// The most values of a 16-bit matrix widened to f32 at once (256 MB): a larger one (the output head: 152k x 4096
+/// for Qwen3-8B, 2.5 GB as f32) is multiplied a slice of rows at a time, each row's dot product as before.
+static WIDEN_VALUES_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64 << 20);
+
+fn widen_rows(w: &Tensor) -> usize {
+    let max = WIDEN_VALUES_MAX.load(std::sync::atomic::Ordering::Relaxed);
+    let (rows, cols) = (w.dim(0).unwrap_or(1), w.elem_count() / w.dim(0).unwrap_or(1).max(1));
+    if w.dtype() == DType::F32 || rows * cols <= max { rows.max(1) } else { (max / cols.max(1)).max(1) }
 }
 
 /// `softmax(x · scale + mask)` over the last dimension as ONE node of the graph. Built from candle's differentiable
@@ -523,11 +543,19 @@ impl Linear {
         // computes the gradient of BOTH operands whether or not they need one: a full `[out, in]` f32 gradient for
         // every frozen weight on the path, every step (measured: 542 MB peak against 180 MB on a 12-block model).
         // FrozenLinear sends the gradient to the input only.
-        let wide = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
-        let value = x.detach().matmul(&wide.t()?)?;
-        // not redundant: `wide` would otherwise live to the end of this function; for a 16-bit base it is a fresh f32
-        // copy of the whole weight, freed here before the graph node and the bias add allocate (a lower peak)
-        drop(wide);
+        let value = {
+            let rows = self.w.dim(0)?;
+            let step = widen_rows(&self.w);
+            let xd = x.detach();
+            let mut parts = Vec::new();
+            for r0 in (0..rows).step_by(step) {
+                let w = self.w.narrow(0, r0, step.min(rows - r0))?;
+                // each slice's f32 copy is freed before the next is made (a lower peak than the whole matrix)
+                let wide = if w.dtype() == DType::F32 { w } else { w.to_dtype(DType::F32)? };
+                parts.push(xd.matmul(&wide.t()?)?);
+            }
+            if parts.len() == 1 { parts.pop().unwrap() } else { Tensor::cat(&parts, D::Minus1)? }
+        };
         let y = if x.track_op() { x.apply_op1(FrozenLinear { y: Mutex::new(Some(value)), w: self.w.clone() })? } else { value };
         Ok(match &self.bias {
             Some(b) => y.broadcast_add(b)?,
@@ -721,7 +749,14 @@ impl LlamaModel {
         let dev = &devs[0];
         let last = &devs[devs.len() - 1];
         let cfg = ModelConfig::load(dir)?;
-        let block_dev: Vec<usize> = (0..cfg.num_hidden_layers).map(|i| i * devs.len() / cfg.num_hidden_layers.max(1)).collect();
+        // the last device also holds the output head (and the final logits): it takes that many blocks' worth fewer
+        let block_dev: Vec<usize> = {
+            let (n, d) = (cfg.num_hidden_layers.max(1), devs.len());
+            let block = (cfg.block_params() - cfg.block_small_params()).max(1) as f64;
+            let head = if d > 1 { ((cfg.vocab_size * cfg.hidden_size) as f64 / block).round() as usize } else { 0 };
+            let units = n + head;
+            (0..n).map(|i| (i * d / units).min(d - 1)).collect()
+        };
         let files = weight_files(dir)?;
         // mapped, not read: each tensor is copied out (and narrowed to the base dtype) one at a time
         let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files) }.with_context(|| format!("{}", dir.display()))?;
@@ -1208,6 +1243,27 @@ mod tests {
     /// candle's `matmul` backward computes a gradient for both operands: through it, every frozen weight on the path
     /// got a full-size f32 gradient each step (542 MB peak instead of 228 MB on a 12-block model). No gradient may be
     /// bigger than the largest adapter matrix or activation; a weight-sized one means a frozen weight got one.
+    /// A large 16-bit matrix is widened a slice of rows at a time: the same values and input gradient as all at once.
+    #[test]
+    fn a_sliced_widening_gives_the_same_product_and_gradient() {
+        let (o, i, rows) = (37, 24, 5);
+        let w = Tensor::from_vec((0..o * i).map(|k| ((k * 7) % 31) as f32 / 31.0 - 0.5).collect::<Vec<f32>>(), (o, i), &Device::Cpu).unwrap()
+            .to_dtype(DType::BF16).unwrap();
+        let run = || {
+            let x = Var::from_tensor(&Tensor::from_vec((0..rows * i).map(|k| (k % 5) as f32 * 0.3 - 0.6).collect::<Vec<f32>>(), (rows, i), &Device::Cpu).unwrap()).unwrap();
+            let y = Linear { w: w.clone(), bias: None, lora: None }.forward(x.as_tensor(), &Ctx::eval()).unwrap();
+            let g = y.sqr().unwrap().sum_all().unwrap().backward().unwrap();
+            (y.to_vec2::<f32>().unwrap(), g.get(&x).unwrap().to_vec2::<f32>().unwrap())
+        };
+        let whole = run();
+        WIDEN_VALUES_MAX.store(10 * i, std::sync::atomic::Ordering::Relaxed); // slices of 10 rows: 4 slices, the last of 7
+        let sliced = run();
+        WIDEN_VALUES_MAX.store(64 << 20, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(whole.0, sliced.0, "each row's product is computed as before");
+        let d = whole.1.iter().flatten().zip(sliced.1.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+        assert!(d < 1e-5, "the input gradient sums the slices: {d}");
+    }
+
     #[test]
     fn regress_frozen_weights_get_no_gradient() {
         let (o, i, rows) = (64, 48, 3);

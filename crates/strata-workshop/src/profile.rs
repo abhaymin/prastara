@@ -57,6 +57,10 @@ pub struct ProfileInput {
     pub epochs: f64,
     /// mean tokens per conversation, for the time estimate (the memory estimate uses `max_len`)
     pub avg_tokens: usize,
+    /// gradient checkpointing: each trained block keeps its input only, and one block's activations at a time
+    pub checkpointing: bool,
+    /// how many devices the blocks are split over (1: one)
+    pub devices: usize,
 }
 
 /// The estimate, part by part.
@@ -71,6 +75,8 @@ pub struct Estimate {
     pub gradient_bytes: u64,
     pub activation_bytes: u64,
     pub widening_bytes: u64,
+    /// the most one device holds when the blocks are split over several (0: one device)
+    pub per_device_bytes: u64,
     /// the peak while the activation cache is filled, one frozen block at a time (0 without the cache)
     pub fill_bytes: u64,
     /// the peak: the sum of the parts above, or the cache fill when that is larger
@@ -122,14 +128,25 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let weights = if cached { base_bytes(cfg, p.base_dtype, trained, false) } else { base_bytes(cfg, p.base_dtype, layers, true) };
     let adapter = trainable * 4;
 
+    // a loop in the trained blocks runs its core again: those are block passes with activations too
+    let loop_extra = match cfg.loop_ {
+        Some(l) if l.start >= first => (l.passes - 1) * (l.end - l.start),
+        _ => 0,
+    };
+    let block_passes = (trained + loop_extra) as f64;
     let per_token = graph_floats_per_token(cfg, &p.lora, seq);
-    let graph = 2.0 * 4.0 * seq as f64 * per_token * trained as f64;
+    let graph = if p.checkpointing {
+        4.0 * (seq * cfg.hidden_size) as f64 * block_passes + 2.0 * 4.0 * seq as f64 * per_token
+    } else {
+        2.0 * 4.0 * seq as f64 * per_token * block_passes
+    };
     let head = 6.0 * 4.0 * (seq * cfg.vocab_size) as f64;
     let frozen = if cached || first == 0 { 0.0 } else { 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq) };
     let activations = (graph + head + frozen) as u64;
 
     let largest = Target::ALL.iter().map(|t| { let (o, i) = cfg.target_shape(*t); o * i }).max().unwrap_or(0).max(cfg.vocab_size * cfg.hidden_size) as u64;
-    let widening = if p.base_dtype == BaseDtype::F32 { 0 } else { largest * 4 };
+    // a matrix larger than 64 M values is widened a slice at a time (model.rs, WIDEN_VALUES_MAX)
+    let widening = if p.base_dtype == BaseDtype::F32 { 0 } else { largest.min(64 << 20) * 4 };
 
     // the cache is filled with the embeddings, then one frozen block, in memory — and one conversation's activations
     let frozen_tokens = 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq);
@@ -148,12 +165,21 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let head_fwd = 2.0 * (cfg.vocab_size * cfg.hidden_size) as f64;
     let passes = p.examples as f64 * p.epochs;
     let lower_passes = if cached { p.examples as f64 } else { passes };
-    let flops = tokens * (lower_passes * first as f64 * block_fwd + passes * 3.0 * (trained as f64 * block_fwd + head_fwd));
+    let train_factor = if p.checkpointing { 4.0 } else { 3.0 };
+    let flops = tokens * (lower_passes * first as f64 * block_fwd + passes * train_factor * (block_passes * block_fwd + head_fwd));
+    let total = (weights + 5 * adapter + activations + widening).max(fill);
+    // split over devices: the blocks and their activations divide; the head (last device) and one widened matrix do not
+    let head_bytes = (cfg.vocab_size * cfg.hidden_size) as u64 * p.base_dtype.bytes() + head as u64;
+    let per_device = if p.devices > 1 {
+        (weights + 5 * adapter + activations).saturating_sub(head_bytes) / p.devices as u64 + head_bytes + widening
+    } else {
+        0
+    };
 
     Estimate {
         total_params: cfg.total_params(), trainable_params: trainable, trained_blocks: trained, weights_bytes: weights, adapter_bytes: adapter,
         optimizer_bytes: 2 * adapter, gradient_bytes: 2 * adapter, activation_bytes: activations, widening_bytes: widening, fill_bytes: fill,
-        total_bytes: (weights + 5 * adapter + activations + widening).max(fill),
+        total_bytes: total, per_device_bytes: per_device,
         cache_disk_bytes: if cached { (p.examples * p.avg_tokens.clamp(2, seq) * cfg.hidden_size * 4) as u64 } else { 0 },
         steps, flops, base_dtype: p.base_dtype,
     }
@@ -278,11 +304,14 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
                 human_bytes(e.activation_bytes), if e.widening_bytes > 0 { format!(" + widening one 16-bit matrix {}", human_bytes(e.widening_bytes)) } else { String::new() },
                 human_bytes(e.total_bytes)),
     ];
+    if e.per_device_bytes > 0 {
+        out.push(format!("split over the devices: about {} on the busiest (the last, which also holds the head)", human_bytes(e.per_device_bytes)));
+    }
     if e.cache_disk_bytes > 0 {
         out.push(format!("activation cache: about {} on disk; the {} frozen blocks run once per conversation, one block in memory at a time (peak {} while filling)",
                          human_bytes(e.cache_disk_bytes), p.cfg.num_hidden_layers - e.trained_blocks, human_bytes(e.fill_bytes)));
     }
-    out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on a 16 GB-class GPU (assumed {:.0} GFLOP/s, not measured — GPU runs are not part of this trainer yet)",
+    out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on a 16 GB-class GPU (assumed {:.0} GFLOP/s, not measured; train with --devices cuda:0[,cuda:1] in a cuda build)",
                      e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * cpu_training_efficiency(e.base_dtype), human_seconds(v.gpu_seconds), ASSUMED_GPU_GFLOPS));
     out.push(match v.fits_ram {
         Some(true) => format!("fits: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
@@ -387,7 +416,7 @@ pub fn autopilot(a: &AutopilotInput) -> Result<Plan> {
                               train_layers: (train_layers < layers).then_some(train_layers), seed: 42 };
         // whenever blocks are frozen: besides the time over several epochs, it is what keeps them out of memory
         let cache = train_layers < layers;
-        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, epochs,
+        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, checkpointing: false, devices: 1, epochs,
                                          avg_tokens: a.avg_tokens.min(max_len) });
         (lora, cache, e)
     };

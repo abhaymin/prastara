@@ -153,7 +153,7 @@ fn a_run_that_will_not_fit_is_refused_before_it_starts() {
     // other refusals, each plain: a 4-bit base, a GPU
     let msg = |args: &[&str]| run(args).0.last().unwrap()["message"].as_str().unwrap().to_string();
     assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--base-dtype", "4bit"]).contains("QLoRA"));
-    assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--device", "cuda"]).contains("CPU only"));
+    assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--device", "cuda"]).contains("cpu or cuda:N"));
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn profile_and_autopilot_answer_before_any_training() {
                              "--targets", "q_proj,v_proj", "--train-layers", "2", "--base-dtype", "f16", "--cache-activations", p(&root.join("c"))]);
     assert!(ok, "{events:?}");
     let pr = of(&events, "profile")[0];
-    assert_eq!((pr["model"]["parameters"].as_u64(), pr["trainable_parameters"].as_u64(), pr["memory"]["total"].as_u64()), (Some(6_738_415_616), Some(524_288), Some(6_604_537_856)));
+    assert_eq!((pr["model"]["parameters"].as_u64(), pr["trainable_parameters"].as_u64(), pr["memory"]["total"].as_u64()), (Some(6_738_415_616), Some(524_288), Some(6_348_685_312)));
 
     // autopilot: the plan, its reasons, and a command that the trainer accepts as it is
     let (events, ok) = run(&["autopilot", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("auto")), "--time-budget", "1h", "--ram-budget", "4GB", "--cpu-gflops", "50"]);

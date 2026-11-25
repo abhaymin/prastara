@@ -15,7 +15,7 @@ fn lora(r: usize, train_layers: Option<usize>) -> LoraSpec {
 }
 
 fn input(cfg: ModelConfig, r: usize, train_layers: Option<usize>, dtype: BaseDtype, max_len: usize, cache: bool) -> ProfileInput {
-    ProfileInput { cfg, lora: lora(r, train_layers), base_dtype: dtype, max_len, accumulation: 4, cache, examples: 20, epochs: 3.0, avg_tokens: 12 }
+    ProfileInput { cfg, lora: lora(r, train_layers), base_dtype: dtype, max_len, accumulation: 4, cache, examples: 20, epochs: 3.0, avg_tokens: 12, checkpointing: false, devices: 1 }
 }
 
 #[test]
@@ -96,12 +96,12 @@ fn llama_2_7b_by_hand() {
     // two blocks' matrices and the head at 2 bytes; two blocks' norms and the final one at 4
     assert_eq!(small.weights_bytes, (2 * 202_375_168 + 131_072_000) * 2 + (2 * 8192 + 4096) * 4);
     assert_eq!(small.activation_bytes, 2 * 2_105_802_752 + 786_432_000);
-    // the embeddings (32000 × 4096) are the largest matrix
-    assert_eq!(small.widening_bytes, 524_288_000);
-    assert_eq!(small.total_bytes, 1_071_726_592 + 10_485_760 + 4_998_037_504 + 524_288_000);
+    // the embeddings (32000 × 4096, 131 M values) are the largest matrix, widened 64 M values at a time
+    assert_eq!(small.widening_bytes, 268_435_456);
+    assert_eq!(small.total_bytes, 1_071_726_592 + 10_485_760 + 4_998_037_504 + 268_435_456);
     // filling the cache: one block in 16 bits (404 783 104, more than the embeddings' 262 144 000), a conversation
     // passing it (4 · 1024 · 232 448) and the widened matrix
-    assert_eq!(small.fill_bytes, 404_783_104 + 952_107_008 + 524_288_000);
+    assert_eq!(small.fill_bytes, 404_783_104 + 952_107_008 + 268_435_456);
     assert!(small.fill_bytes < small.total_bytes);
 
     // 16 bits alone, every block: the matrices at 2 bytes, 266 240 norm values at 4
@@ -118,8 +118,8 @@ fn the_verdict_compares_with_free_memory() {
     let cfg = profile::preset("llama-2-7b").unwrap();
     let p = input(cfg, 16, Some(2), BaseDtype::F16, 1024, true);
     let e = profile::estimate(&p);
-    // 6 604 537 856 + 10 % + 512 MiB
-    assert_eq!(profile::need_bytes(&e), 6_604_537_856 + 660_453_785 + (512 << 20));
+    // 6 348 685 312 + 10 % + 512 MiB
+    assert_eq!(profile::need_bytes(&e), 6_348_685_312 + 634_868_531 + (512 << 20));
     assert_eq!(profile::verdict(&e, &machine(16)).fits_ram, Some(true));
     assert_eq!(profile::verdict(&e, &machine(6)).fits_ram, Some(false));
     // a system that does not say how much is free is not refused
@@ -174,7 +174,7 @@ fn the_autopilot_fits_the_machine_and_says_why() {
     assert_eq!((tight.lora.r, tight.lora.alpha, tight.lr, tight.epochs), (16, 32.0, 2e-4, 3.0));
     // the largest number of blocks that fits: twice as many would not
     let twice = profile::estimate(&ProfileInput { cfg: big.clone(), lora: LoraSpec { train_layers: Some(n * 2), ..tight.lora.clone() }, base_dtype: tight.base_dtype,
-                                                  max_len: tight.max_len, accumulation: tight.accumulation, cache: true, examples: 2000, epochs: tight.epochs, avg_tokens: 250 });
+                                                  max_len: tight.max_len, accumulation: tight.accumulation, cache: true, examples: 2000, epochs: tight.epochs, avg_tokens: 250, checkpointing: false, devices: 1 });
     assert!(profile::need_bytes(&twice) > 16 << 30 || profile::cpu_seconds(&twice, 100.0) > 200.0 * 3600.0);
 
     // every choice has its one-line reason

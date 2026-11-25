@@ -93,6 +93,12 @@ contexts, and Mula refining itself on Prastara's own tasks.
 - **M2, gradient checkpointing:** `--gradient-checkpointing` keeps only each trained block's input and recomputes
   its activations in the backward pass, with the same dropout masks. Its gradients equal the plain ones to 6e-8 on
   a looped model with dropout, and a checkpointed 6-step run on two GPUs gives the CPU's losses and adapter.
+- **M2, memory:** a 16-bit matrix larger than 64 M values (the output head: 152k x 4096) is widened to f32 a slice
+  of rows at a time, each row's product as before (2.5 GB to 256 MB). With several devices the last one, which holds
+  the head, takes three blocks fewer. `profile` now counts the loop's extra block passes, checkpointing and
+  the split. Its estimate for the looped 8B over two cards (rank 16 on all seven projections, top 24 blocks) is
+  12.2 GB on the busier card at 512 tokens, 15.2 GB at 1,024 and 21.8 GB at 2,048. These are estimates; the run
+  below measures.
 - **Next:** the first run on the cards (owner's yes needed). Load the looped 8B over both GPUs with
   checkpointing, train a few steps at 512 and 1,024 tokens, and report the peak memory per card and the time per
   step. Then M3, the data.

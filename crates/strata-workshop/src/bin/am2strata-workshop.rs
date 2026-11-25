@@ -279,7 +279,7 @@ struct RunArgs {
     /// CPU threads (all cores when not given)
     #[arg(long)]
     threads: Option<usize>,
-    /// cpu (GPU runs are not part of this trainer yet)
+    /// one device: cpu (default) or cuda:N; for several, --devices
     #[arg(long, default_value = "cpu")]
     device: String,
 }
@@ -287,9 +287,6 @@ struct RunArgs {
 impl RunArgs {
     /// The settings these flags (and the Soup file) describe, and what to say about them.
     fn settings(&self, need_data: bool) -> Result<(TrainSettings, Vec<String>), String> {
-        if self.device != "cpu" {
-            return Err(format!("--device {}: this trainer runs on the CPU only for now (GPU runs through the server's queue are the next milestone)", self.device));
-        }
         let (mut s, mut notes) = match &self.soup {
             Some(path) => {
                 let imp = soup::import_file(path, self.soup_relax).map_err(|e| e.to_string())?;
@@ -321,7 +318,7 @@ impl RunArgs {
         if let Some(n) = self.train_layers { s.lora.train_layers = Some(n); }
         if let Some(c) = &self.cache_activations { s.cache_dir = Some(c.clone()); }
         if let Some(d) = &self.base_dtype { s.base_dtype = BaseDtype::from_s(d).map_err(|e| e.to_string())?; }
-        s.devices = self.devices.clone();
+        s.devices = if self.devices.is_empty() && self.device != "cpu" { vec![self.device.clone()] } else { self.devices.clone() };
         s.gradient_checkpointing = self.gradient_checkpointing;
         if let Some(v) = self.lr { s.lr = v; }
         if let Some(v) = self.epochs { s.epochs = v; }
@@ -392,7 +389,7 @@ fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, a
         (examples.unwrap_or(n - held), avg_tokens.unwrap_or(avg))
     };
     let max_len = s.max_len.min(cfg.max_position_embeddings.max(8));
-    Ok(ProfileInput { lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
+    Ok(ProfileInput { checkpointing: s.gradient_checkpointing, devices: s.devices.len().max(1), lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
                       cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg })
 }
 
@@ -616,7 +613,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             }
             let mut lines = profile::report_lines(&p, &est, &machine);
             lines.extend(notes);
-            lines.push("a 4-bit base (QLoRA), expert adapters of mixture-of-experts models, several GPUs and vision towers are not done".into());
+            lines.push("a 4-bit base (QLoRA), expert adapters of mixture-of-experts models, and vision towers are not done; several GPUs need a cuda build (--devices)".into());
             let mut v = profile::estimate_json(&p, &est, &machine);
             v["event"] = json!("profile");
             v["lines"] = json!(lines);
