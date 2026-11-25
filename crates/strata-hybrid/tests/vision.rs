@@ -41,7 +41,13 @@ fn encode(exe: &str, extra: &[&str], images: &[PathBuf], dir: &Path, tag: &str) 
 }
 
 fn images() -> Vec<PathBuf> {
-    env("VISION_IMAGES").split(':').filter(|s| !s.is_empty()).map(|s| std::path::absolute(s).unwrap()).collect()
+    // the synthetic pictures in tests/fixtures/vision (synthetic, made for this test) unless VISION_IMAGES names others
+    let given = std::env::var("VISION_IMAGES").unwrap_or_default();
+    if given.is_empty() {
+        let d = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/vision");
+        return ["pagoda_320x192.png", "grad_333x217.png", "pagoda_640x640.png"].iter().map(|n| d.join(n)).collect();
+    }
+    given.split(':').filter(|s| !s.is_empty()).map(|s| std::path::absolute(s).unwrap()).collect()
 }
 
 #[test]
