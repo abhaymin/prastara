@@ -264,14 +264,22 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn from_env() -> Result<Model> {
+    /// The loaded model, or `want` (else `AM2STRATA_MODEL`) when given: any model the server lists, a remote one included.
+    pub fn from_env() -> Result<Model> { Model::from_env_with(None) }
+
+    pub fn from_env_with(want: Option<&str>) -> Result<Model> {
         let url = std::env::var("AM2STRATA_URL").unwrap_or_else(|_| "http://127.0.0.1:8000".into()).trim_end_matches('/').to_string();
         let key = std::env::var("AM2STRATA_API_KEY").ok().filter(|k| !k.is_empty());
         let client = reqwest::blocking::Client::builder().timeout(std::time::Duration::from_secs(600)).build()?;
         let mut m = Model { url, key, client, name: String::new() };
         let models = m.get("/v1/models")?;
-        m.name = models["data"].as_array().and_then(|a| a.iter().find(|x| x["loaded"] == true).or(a.first()))
-            .and_then(|x| x["id"].as_str()).ok_or_else(|| anyhow!("the server lists no model"))?.to_string();
+        let list = models["data"].as_array().cloned().unwrap_or_default();
+        m.name = match want.map(str::to_string).or_else(|| std::env::var("AM2STRATA_MODEL").ok()).filter(|n| !n.is_empty()) {
+            Some(want) => list.iter().find(|x| x["id"] == want.as_str()).and_then(|x| x["id"].as_str()).map(str::to_string)
+                .ok_or_else(|| anyhow!("the server has no model {want:?}: {}", list.iter().filter_map(|x| x["id"].as_str()).collect::<Vec<_>>().join(", ")))?,
+            None => list.iter().find(|x| x["loaded"] == true).or(list.first())
+                .and_then(|x| x["id"].as_str()).ok_or_else(|| anyhow!("the server lists no model"))?.to_string(),
+        };
         Ok(m)
     }
 
@@ -374,7 +382,20 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
     let plans: Vec<Option<Plan>> = (0..units.len()).map(|i| match s.recipe {
         Recipe::Code => Some(recipes::draw_code(&mut draw, s.language.as_deref())),
         Recipe::Indic => Some(recipes::draw_indic(&mut draw, &indic_langs)),
-        Recipe::Translate => Some(recipes::draw_translate(&mut draw, &indic_langs, i)),
+        Recipe::Translate => {
+            let mut p = recipes::draw_translate(&mut draw, &indic_langs, i);
+            // a document is translated out of its own language: Indic text into English, English into the language
+            if let (Some(chunk), Plan::Translate { lang, to_indic, .. }) = (&units[i].0, &mut p) {
+                if let Some(l) = indic_langs.iter().max_by(|a, b| recipes::script_share(chunk, a.block)
+                        .total_cmp(&recipes::script_share(chunk, b.block))).filter(|l| recipes::script_share(chunk, l.block) > 0.5) {
+                    *lang = *l;
+                    *to_indic = false;
+                } else {
+                    *to_indic = true;
+                }
+            }
+            Some(p)
+        }
         _ => None,
     }).collect();
     let rustc = if s.check_code && s.recipe == Recipe::Code {

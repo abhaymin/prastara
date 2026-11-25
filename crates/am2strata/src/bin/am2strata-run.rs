@@ -1391,6 +1391,9 @@ struct DatagenOpts {
     /// datagen code: compile each self-contained Rust answer and drop those that fail
     #[arg(long)]
     check_code: bool,
+    /// datagen: the model to write with (any the server lists; default the loaded one)
+    #[arg(long = "writer")]
+    writer: Option<String>,
     /// dataset: the first record to show, and how many
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -1444,7 +1447,7 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "seeds": dg.seeds.clone().map(abs), "output": out.clone().map(abs), "count": dg.count,
                                    "per_chunk": dg.per_chunk, "chunk_chars": dg.chunk_chars, "temperature": dg.temperature,
                                    "min_score": dg.min_score, "topic": dg.topic.clone(), "language": dg.language.clone(),
-                                   "seed": dg.seed, "check_code": dg.check_code})
+                                   "seed": dg.seed, "check_code": dg.check_code, "model": dg.writer.clone()})
             }
             "upload" => {
                 let file = first.clone().ok_or("upload <file>")?;

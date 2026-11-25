@@ -12,7 +12,7 @@
 //!   - datagen: `"recipe"` (qa | chat | instruct | code | indic | translate), `"sources"` (documents: files or
 //!     folders; needed for qa and chat, optional for code and translate), `"seeds"`? (a JSONL of example chats;
 //!     instruct), `"seed"`? and `"check_code"`? (the built-in recipes' draw, and compiling Rust answers),
-//!     `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?, `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`? — training data written by the
+//!     `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?, `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`?, `"model"`? (the one to write with; default the loaded one) — training data written by the
 //!     loaded model, through this server's own chat API (its address and key reach the command in its environment,
 //!     never on its command line)
 //! - `POST /v1/workshop/uploads?name=notes.pdf` (the file as the body) saves a document into `<data>/workshop/uploads`.
@@ -332,7 +332,7 @@ impl Workshop {
                         args.extend([flag.into(), v]);
                     }
                 }
-                for k in ["topic", "language"] {
+                for k in ["topic", "language", "model"] {
                     if let Some(v) = s(k) {
                         args.extend([format!("--{k}"), v.chars().take(200).collect()]);
                     }

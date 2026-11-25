@@ -142,6 +142,9 @@ enum Cmd {
         /// let a thinking model think before it writes (slower)
         #[arg(long)]
         think: bool,
+        /// the model to write with (any the server lists, remote ones included); default: the loaded one
+        #[arg(long)]
+        model: Option<String>,
     },
     /// the model library: ready-made recipes (Soup's catalogue, ported, and Prastara's own) for text, code, tools,
     /// vision, OCR, image, speech, music and video models:
@@ -811,14 +814,14 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             quantize_gguf::quantize(input, dst, t).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "gguf".into()))
         }
-        Cmd::Datagen { recipe, sources, seeds, out: dst, count, per_chunk, chunk_chars, overlap, temperature, min_score, topic, language, seed, check_code, think } => {
+        Cmd::Datagen { recipe, sources, seeds, out: dst, count, per_chunk, chunk_chars, overlap, temperature, min_score, topic, language, seed, check_code, think, model: writer } => {
             let settings = datagen::Settings {
                 recipe: datagen::Recipe::from_s(recipe).map_err(|e| e.to_string())?, sources: sources.clone(), seeds: seeds.clone(),
                 count: *count, per_chunk: (*per_chunk).clamp(1, 20), chunk_chars: (*chunk_chars).clamp(500, 20_000),
                 overlap: *overlap, temperature: *temperature, min_score: (*min_score).min(5), topic: topic.clone(),
                 language: language.clone(), out: dst.clone(), seed: *seed, check_code: *check_code, think: *think,
             };
-            let model = datagen::Model::from_env().map_err(|e| e.to_string())?;
+            let model = datagen::Model::from_env_with(writer.as_deref()).map_err(|e| e.to_string())?;
             out.event(json!({"event": "start", "what": format!("{} data with {} into {}", recipe, model.name, dst.display())}));
             // a cancel (SIGTERM from the server) stops after the current request and still writes what was made
             #[cfg(unix)]
