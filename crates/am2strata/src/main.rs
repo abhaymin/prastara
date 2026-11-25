@@ -699,6 +699,9 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/files", get(workshop::files_get))
         .route("/v1/workshop/library", get(workshop::library_get).post(workshop::library_post))
         .route("/v1/workshop/uploads", axum::routing::post(workshop::upload_post))
+        .route("/v1/workshop/upload", axum::routing::put(workshop::upload_put).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/v1/workshop/upload-folder", axum::routing::post(workshop::upload_folder_post))
+        .route("/v1/workshop/browse", get(workshop::browse_get))
         .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
         // remote models: the owner's page and its API (remote/api.rs), linked from nowhere

@@ -909,6 +909,38 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .ws-pick i { grid-row: 1 / span 2; grid-column: 2; align-self: center; font-style: normal; font-size: 12px; color: var(--st-ink-muted); }
 .ws-pick p { margin: 6px var(--st-s-2); font-size: 12px; color: var(--st-ink-muted); }
 
+/* path fields: Browse (the server's folders) and Upload (from this device) beside each */
+.ws-field:has(.ws-pathrow) { grid-column: 1 / -1; }
+.ws-pathrow { display: flex; gap: var(--st-s-2); align-items: stretch; min-width: 0; }
+.ws-pathrow > .st-input { flex: 1; min-width: 0; }
+.ws-pathrow > .st-btn { flex: none; height: auto; padding: 0 var(--st-s-3); font-size: 13px; }
+.ws-dialog { padding: 0; border: 1px solid var(--st-line-strong); border-radius: var(--st-r-lg); background: var(--st-surface); color: var(--st-ink);
+  box-shadow: var(--st-sh-pop); width: min(44rem, 94vw); max-height: min(40rem, 88vh); }
+.ws-dialog::backdrop { background: rgba(0,0,0,.45); }
+.ws-dialog__box { display: flex; flex-direction: column; max-height: min(40rem, 88vh); }
+.ws-dialog__head { display: flex; align-items: center; justify-content: space-between; padding: var(--st-s-4) var(--st-s-5) var(--st-s-2); }
+.ws-dialog__head h3 { margin: 0; font-size: var(--st-fs-base); }
+.ws-dialog__bar { display: flex; align-items: center; gap: var(--st-s-3); padding: 0 var(--st-s-5) var(--st-s-3); border-bottom: 1px solid var(--st-line-soft); }
+.ws-dialog__path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; flex: 1; min-width: 0; }
+.ws-dialog__list { flex: 1; min-height: 12rem; overflow-y: auto; padding: var(--st-s-2); }
+.ws-dialog__list button { display: grid; grid-template-columns: 1.4rem minmax(0, 1fr) auto auto; align-items: center; gap: var(--st-s-3); width: 100%;
+  min-height: 36px; padding: 0 var(--st-s-3); border: 0; border-radius: var(--st-r-sm); background: none; color: inherit; font: inherit;
+  font-size: var(--st-fs-sm); text-align: left; cursor: pointer; }
+.ws-dialog__list button:hover, .ws-dialog__list button:focus-visible { background: var(--st-surface-2); outline: none; }
+.ws-dialog__list button[disabled] { opacity: .45; cursor: default; }
+.ws-dialog__list b { font-weight: var(--st-fw-bold); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-dialog__list i, .ws-dialog__list small { font-style: normal; font-size: 12px; color: var(--st-ink-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 18rem; }
+.ws-dialog__foot { display: flex; align-items: center; gap: var(--st-s-2); justify-content: flex-end; padding: var(--st-s-3) var(--st-s-5) var(--st-s-4);
+  border-top: 1px solid var(--st-line-soft); }
+.ws-dialog__foot .muted { margin-right: auto; }
+.ws-upload { position: fixed; z-index: 70; right: var(--st-s-5); bottom: var(--st-s-5); width: min(24rem, 92vw); padding: var(--st-s-4);
+  background: var(--st-surface); border: 1px solid var(--st-line-strong); border-radius: var(--st-r-lg); box-shadow: var(--st-sh-pop);
+  display: flex; flex-direction: column; gap: var(--st-s-2); }
+.ws-upload[hidden] { display: none; }
+.ws-upload__top { display: flex; align-items: center; gap: var(--st-s-2); }
+.ws-upload__top .muted { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ws-upload .st-btn { height: 28px; padding: 0 var(--st-s-3); font-size: 12px; }
+
 /* narrower windows: the jobs become a drawer, then the rail a step scroller on top */
 @media (max-width: 1280px) {
   .ws { grid-template-columns: 14rem minmax(0, 1fr); }

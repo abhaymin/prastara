@@ -357,3 +357,46 @@ fn training_data_jobs_get_the_server_by_environment_and_their_datasets_can_be_re
 fn urlencode(s: &str) -> String {
     s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~/".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
 }
+
+/// From another device: a model file streamed to disk whatever its size, a whole folder file by file, and the
+/// server's folders browsed, all inside the Workshop's folders.
+#[test]
+fn uploads_stream_files_and_folders_and_the_workshop_folders_can_be_browsed() {
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    let c = reqwest::blocking::Client::new();
+    let put = |q: &[(&str, &str)], body: Vec<u8>| {
+        let r = c.put(format!("{}/v1/workshop/upload", s.base)).query(q).bearer_auth(common::KEY).body(body).send().unwrap();
+        (r.status().as_u16(), r.json::<Value>().unwrap_or(Value::Null))
+    };
+    // a file larger than the server's 256 MB body limit for other requests: streamed, never held whole
+    let big = vec![7u8; (257 << 20) as usize];
+    let (code, j) = put(&[("name", "model.gguf")], big);
+    assert_eq!(code, 200, "{j}");
+    let p = std::path::PathBuf::from(j["path"].as_str().unwrap());
+    assert_eq!(std::fs::metadata(&p).unwrap().len(), 257 << 20);
+    assert!(p.ends_with("workshop/uploads/model.gguf"), "{}", p.display());
+    assert!(!p.with_file_name("model.gguf.part").exists(), "the .part file is renamed when whole");
+    std::fs::remove_file(&p).unwrap();
+    // a folder: made empty, then its files by their paths inside it
+    let (code, f) = s.post("/v1/workshop/upload-folder?name=my-model", &json!({}));
+    assert_eq!(code, 200, "{f}");
+    let folder = f["folder"].as_str().unwrap().to_string();
+    assert_eq!(put(&[("folder", &folder), ("rel", "config.json")], b"{}".to_vec()).0, 200);
+    assert_eq!(put(&[("folder", &folder), ("rel", "sub/model.safetensors")], b"x".to_vec()).0, 200);
+    assert!(std::path::Path::new(&folder).join("sub/model.safetensors").exists());
+    for bad in ["../escape.txt", "a/../../b", "/etc/passwd", ""] {
+        assert_eq!(put(&[("folder", &folder), ("rel", bad)], b"x".to_vec()).0, 400, "{bad:?}");
+    }
+    assert_eq!(put(&[("folder", &folder), ("rel", "config.json")], b"{}".to_vec()).0, 400, "never over a file already there");
+    assert_eq!(put(&[("folder", "/tmp"), ("rel", "x.txt")], b"x".to_vec()).0, 400, "only into an upload folder");
+    assert_eq!(c.put(format!("{}/v1/workshop/upload?name=x.txt", s.base)).body("x").send().unwrap().status().as_u16(), 401, "needs the key");
+    // browsing: the roots, then a folder, its entries marked
+    let (code, roots) = s.get("/v1/workshop/browse", true);
+    assert_eq!(code, 200, "{roots}");
+    assert!(roots["entries"].as_array().unwrap().iter().any(|e| e["name"] == "uploads" && e["where"].as_str().unwrap().ends_with("workshop")), "{roots}");
+    let (code, up) = s.get(&format!("/v1/workshop/browse?path={}", urlencode(std::path::Path::new(&folder).parent().unwrap().to_str().unwrap())), true);
+    assert_eq!(code, 200, "{up}");
+    let e = up["entries"].as_array().unwrap().iter().find(|e| e["name"] == "my-model").expect("the uploaded folder");
+    assert_eq!((e["dir"].as_bool(), e["kind"].as_str()), (Some(true), Some("hf-model")));
+    assert_eq!(s.get("/v1/workshop/browse?path=/etc", true).0, 400, "nothing outside the Workshop's folders");
+}

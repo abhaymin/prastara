@@ -747,6 +747,24 @@
       </aside>
       <button type="button" class="st-btn st-btn--secondary ws-jobs-toggle" id="ws-jobs-toggle" aria-controls="ws-side" aria-expanded="false">Jobs</button>
       <div class="ws-pick" id="ws-pick" role="listbox" hidden></div>
+      <dialog class="ws-dialog" id="ws-browse" aria-labelledby="ws-b-title">
+        <form method="dialog" class="ws-dialog__box">
+          <header class="ws-dialog__head"><h3 id="ws-b-title">Server folders</h3>
+            <button type="submit" class="st-btn st-btn--icon" value="cancel" aria-label="Close">×</button></header>
+          <div class="ws-dialog__bar"><button type="button" class="st-btn st-btn--secondary" id="ws-b-up">Up</button>
+            <span class="mono small ws-dialog__path" id="ws-b-path"></span></div>
+          <div class="ws-dialog__list" id="ws-b-list" role="listbox" aria-label="Folder contents"></div>
+          <footer class="ws-dialog__foot"><span class="muted small" id="ws-b-hint"></span>
+            <button type="submit" class="st-btn st-btn--secondary" value="cancel">Cancel</button>
+            <button type="button" class="st-btn st-btn--primary" id="ws-b-use" hidden>Use this folder</button></footer>
+        </form>
+      </dialog>
+      <input type="file" id="ws-up-file" hidden><input type="file" id="ws-up-dir" hidden webkitdirectory multiple>
+      <div class="ws-upload" id="ws-upload" role="status" aria-live="polite" hidden>
+        <div class="ws-upload__top"><strong id="ws-up-title">Uploading</strong><span class="muted small" id="ws-up-note"></span>
+          <button type="button" class="st-btn st-btn--secondary" id="ws-up-cancel">Cancel</button></div>
+        <div class="st-progress"><div class="st-progress__bar" id="ws-up-bar" style="width:0%"></div></div>
+      </div>
     </div>
   </section>
 

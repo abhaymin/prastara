@@ -24,6 +24,8 @@
 //! - `GET /v1/workshop/jobs` lists jobs, `GET /v1/workshop/jobs/{id}` one (with its log), `DELETE` cancels.
 //! - `GET /v1/workshop/files` lists the models and adapters the Workshop may use, for its pickers.
 //! - `GET /v1/workshop/library` lists the model library's recipes (abilities, and whether the Workshop trains each);
+//! - `PUT /v1/workshop/upload?name=…` streams a file of any size into the uploads folder; `POST upload-folder?name=…`
+//!   then `PUT upload?folder=…&rel=…` per file uploads a whole folder. `GET /v1/workshop/browse?path=…` lists a folder.
 //!   `POST /v1/workshop/library` `{"name"}` writes one's soup.yaml and DATA.md into `<data>/workshop/recipes/`.
 //!
 //! **Paths** must be inside the models folder, `<data>/workshop`, or a folder listed in the run config's
@@ -734,6 +736,166 @@ pub async fn upload_post(State(s): State<AppState>, headers: HeaderMap, axum::ex
         Ok(()) => Json(json!({"path": path.display().to_string(), "bytes": body.len()})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{}: {e}", path.display())),
     }
+}
+
+/// `POST /v1/workshop/upload-folder?name=…`: a new, empty folder in the uploads folder for a folder upload (a model
+/// or an adapter folder from another device); its files then come one by one to `PUT /v1/workshop/upload`.
+pub async fn upload_folder_post(State(s): State<AppState>, headers: HeaderMap,
+                                axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("folders can be uploaded to the Workshop");
+    }
+    let Some(name) = q.get("name").and_then(|n| safe_name(n)) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "give the folder's name: ?name=my-model");
+    };
+    let dir = Workshop::fresh(&w.uploads_dir(), &name, "");
+    match std::fs::create_dir_all(&dir) {
+        Ok(()) => Json(json!({"folder": dir.display().to_string()})).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{}: {e}", dir.display())),
+    }
+}
+
+/// Where a streamed upload goes: a new file in the uploads folder (`?name=`), or `?folder=` (one made by
+/// `upload-folder`) plus `?rel=` (the file's path inside the folder being uploaded: plain names, no "..").
+fn upload_target(w: &Workshop, q: &std::collections::HashMap<String, String>) -> Result<PathBuf, String> {
+    let uploads = w.uploads_dir();
+    std::fs::create_dir_all(&uploads).map_err(|e| e.to_string())?;
+    let uploads = uploads.canonicalize().map_err(|e| e.to_string())?;
+    match (q.get("folder"), q.get("rel")) {
+        (Some(folder), Some(rel)) => {
+            let folder = std::path::Path::new(folder).canonicalize().map_err(|_| format!("{folder}: no such upload folder"))?;
+            if !folder.starts_with(&uploads) || folder == uploads {
+                return Err("an upload folder is one made by upload-folder, inside the uploads folder".into());
+            }
+            if rel.starts_with(['/', '\\']) || rel.contains(':') {
+                return Err(format!("{rel}: a path inside the folder, not a full path"));
+            }
+            let mut p = folder;
+            let parts: Vec<&str> = rel.split(['/', '\\']).filter(|x| !x.is_empty()).collect();
+            if parts.is_empty() || parts.len() > 16 {
+                return Err("give the file's path inside the folder: ?rel=sub/file.safetensors".into());
+            }
+            for part in parts {
+                let safe = safe_name(part).ok_or_else(|| format!("{rel}: not a usable file name"))?;
+                if safe != part {
+                    return Err(format!("{rel}: use plain names (letters, digits, \".\", \"_\", \"-\")"));
+                }
+                p.push(part);
+            }
+            if p.exists() {
+                return Err(format!("{} is already there", p.display()));
+            }
+            Ok(p)
+        }
+        (None, None) => {
+            let name = q.get("name").and_then(|n| safe_name(n)).ok_or("give the file's name: ?name=model.gguf")?;
+            let (stem, ext) = match name.rfind('.') {
+                Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
+                _ => (name.clone(), String::new()),
+            };
+            Ok(Workshop::fresh(&uploads, &stem, &ext))
+        }
+        _ => Err("a folder upload gives both ?folder= and ?rel=".into()),
+    }
+}
+
+/// `PUT /v1/workshop/upload?name=…` (or `?folder=…&rel=…`): the body is the file, streamed to disk as it arrives, so
+/// a model file of any size never sits in memory. It is written beside its name as `.part` and renamed when whole.
+pub async fn upload_put(State(s): State<AppState>, headers: HeaderMap,
+                        axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+                        body: axum::body::Body) -> Response {
+    use futures::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("files can be uploaded to the Workshop");
+    }
+    let path = match upload_target(&w, &q) {
+        Ok(p) => p,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    if let Some(d) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{}: {e}", d.display()));
+        }
+    }
+    let part = path.with_file_name(format!("{}.part", path.file_name().and_then(|n| n.to_str()).unwrap_or("upload")));
+    let mut f = match tokio::fs::File::create(&part).await {
+        Ok(f) => f,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("{}: {e}", part.display())),
+    };
+    let mut stream = body.into_data_stream();
+    let mut bytes = 0u64;
+    let fail = |m: String| { let _ = std::fs::remove_file(&part); error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", m) };
+    while let Some(chunk) = stream.next().await {
+        let chunk = match chunk {
+            Ok(c) => c,
+            Err(e) => return fail(format!("the upload stopped: {e}")),
+        };
+        bytes += chunk.len() as u64;
+        if let Err(e) = f.write_all(&chunk).await {
+            return fail(format!("{}: {e}", part.display()));
+        }
+    }
+    if let Err(e) = f.flush().await {
+        return fail(format!("{}: {e}", part.display()));
+    }
+    drop(f);
+    if bytes == 0 {
+        let _ = std::fs::remove_file(&part);
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "the file is empty");
+    }
+    match std::fs::rename(&part, &path) {
+        Ok(()) => Json(json!({"path": path.display().to_string(), "bytes": bytes})).into_response(),
+        Err(e) => fail(format!("{}: {e}", path.display())),
+    }
+}
+
+/// `GET /v1/workshop/browse[?path=…]`: the Workshop's folders, or one folder's entries (folders first), each marked
+/// with what it is to the Workshop: a Hugging Face model folder, an adapter, a GGUF or a dataset.
+pub async fn browse_get(State(s): State<AppState>, headers: HeaderMap,
+                        axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    let Some(p) = q.get("path").filter(|p| !p.is_empty()) else {
+        // each root by its own name, with where it is
+        let root = |r: &Path| json!({"name": r.file_name().map_or(r.display().to_string(), |n| n.to_string_lossy().to_string()),
+                                     "path": r.display().to_string(), "dir": true, "where": r.parent().map(|p| p.display().to_string())});
+        let roots: Vec<Value> = w.roots.iter().map(|r| root(r)).chain(std::iter::once(root(&w.uploads_dir()))).collect();
+        return Json(json!({"path": null, "parent": null, "entries": roots})).into_response();
+    };
+    let dir = match w.allowed(p, true) {
+        Ok(d) if d.is_dir() => d,
+        Ok(d) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("{} is not a folder", d.display())),
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    let kind = |p: &Path, is_dir: bool| -> &'static str {
+        if is_dir {
+            if p.join("adapter_config.json").exists() { return "adapter"; }
+            if p.join("config.json").exists() { return "hf-model"; }
+            return "";
+        }
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("gguf") => "gguf",
+            Some("jsonl") => "dataset",
+            Some("safetensors") => "weights",
+            _ => "",
+        }
+    };
+    let mut entries: Vec<(bool, String, Value)> = std::fs::read_dir(&dir).into_iter().flatten().flatten().take(5000).filter_map(|e| {
+        let name = e.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') || name.ends_with(".part") { return None; }
+        let p = e.path();
+        let m = e.metadata().ok();
+        let is_dir = p.is_dir();
+        let modified = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+        Some((is_dir, name.to_lowercase(), json!({"name": name, "path": p.display().to_string(), "dir": is_dir, "kind": kind(&p, is_dir),
+            "bytes": if is_dir { 0 } else { m.map_or(0, |m| m.len()) }, "modified": modified})))
+    }).collect();
+    entries.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // the parent, while it is still one of the Workshop's folders
+    let parent = dir.parent().filter(|pp| w.allowed(&pp.display().to_string(), true).is_ok()).map(|pp| pp.display().to_string());
+    Json(json!({"path": dir.display().to_string(), "parent": parent, "entries": entries.into_iter().map(|e| e.2).collect::<Vec<_>>()})).into_response()
 }
 
 impl Workshop {

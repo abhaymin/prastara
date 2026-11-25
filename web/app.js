@@ -5072,6 +5072,131 @@ $("ws-r-del").onclick = async () => {
     wsReviewLoad();
   } catch (e) { wsError(e.message); }
 };
+// ------------------------------------------------------------------ Workshop: Browse the server's folders, Upload from this device
+// Paths are the server's: jobs run there. From another device, Upload sends a file or a whole folder into the
+// server's uploads folder (streamed, any size) and fills the field with its server path.
+const WS_PICK_FOLDER = {hf: true, adapters: true};
+const WS_PICK_EXT = {gguf: ".gguf", datasets: ".jsonl"};
+const WS_PICK_KIND = {hf: "hf-model", adapters: "adapter", gguf: "gguf", datasets: "dataset"};
+for (const input of document.querySelectorAll("[data-ws-pick]")) {
+  const row = document.createElement("div");
+  row.className = "ws-pathrow";
+  input.replaceWith(row);
+  row.append(input);
+  const folder = WS_PICK_FOLDER[input.dataset.wsPick];
+  const mk = (label, title, fn) => {
+    const b = document.createElement("button");
+    Object.assign(b, {type: "button", className: "st-btn st-btn--secondary", textContent: label, title, onclick: fn});
+    row.append(b);
+  };
+  mk("Browse", "Pick from the server's folders", () => wsBrowseOpen(input));
+  mk("Upload", folder ? "Send a folder from this device to the server" : "Send a file from this device to the server", () => wsUploadPick(input));
+}
+const wsB = {input: null, path: null, parent: null};
+async function wsBrowseOpen(input) {
+  wsB.input = input;
+  wsPickHide();
+  const start = input.value.trim();
+  $("ws-browse").showModal();
+  try { await wsBrowseGo(start ? (WS_PICK_FOLDER[input.dataset.wsPick] ? start : wsDir(start)) : null); }
+  catch { await wsBrowseGo(null).catch((e) => { $("ws-b-hint").textContent = e.message; }); }
+}
+async function wsBrowseGo(path) {
+  const j = await wsFetch("v1/workshop/browse" + (path ? `?path=${encodeURIComponent(path)}` : ""));
+  Object.assign(wsB, {path: j.path, parent: j.parent});
+  const kind = wsB.input.dataset.wsPick, wantFolder = !!WS_PICK_FOLDER[kind], want = WS_PICK_KIND[kind], ext = WS_PICK_EXT[kind];
+  $("ws-b-path").textContent = j.path || "The Workshop's folders";
+  $("ws-b-path").title = j.path || "";
+  $("ws-b-up").disabled = !j.path;
+  $("ws-b-use").hidden = !(wantFolder && j.path);
+  $("ws-b-hint").textContent = wantFolder ? `A ${want === "adapter" ? "adapter" : "model"} folder: pick it, or open folders and use the one you are in.` : `Pick a ${ext} file.`;
+  const entries = j.entries || [];
+  $("ws-b-list").innerHTML = entries.length ? entries.map((e, i) => {
+    const pick = wantFolder ? e.dir && e.kind === want : !e.dir && e.name.endsWith(ext);
+    const usable = e.dir || pick;
+    return `<button type="button" role="option" data-i="${i}"${usable ? "" : " disabled"} title="${esc(e.path)}">` +
+      `<span aria-hidden="true">${e.dir ? (pick ? "◆" : "▸") : "·"}</span><b>${esc(e.name)}</b>` +
+      `<i>${e.kind ? esc(e.kind.replace("-", " ")) : ""}</i><small>${e.where ? esc(e.where) : e.dir ? "" : fmtBytes(e.bytes || 0)}${e.modified ? ` · ${wsAgo(e.modified)}` : ""}</small></button>`;
+  }).join("") : '<p class="muted small">This folder is empty.</p>';
+  $("ws-b-list").onclick = (ev) => {
+    const b = ev.target.closest("[data-i]");
+    if (!b || b.disabled) return;
+    const e = entries[Number(b.dataset.i)];
+    const pick = wantFolder ? e.dir && e.kind === want : !e.dir && e.name.endsWith(ext);
+    if (pick) wsBrowseChoose(e.path);
+    else if (e.dir) wsBrowseGo(e.path).catch((err) => { $("ws-b-hint").textContent = err.message; });
+  };
+}
+function wsBrowseChoose(path) {
+  wsB.input.value = path;
+  wsB.input.dispatchEvent(new Event("change", {bubbles: true}));
+  $("ws-browse").close();
+}
+$("ws-b-up").onclick = () => wsBrowseGo(wsB.parent).catch((e) => { $("ws-b-hint").textContent = e.message; });
+$("ws-b-use").onclick = () => { if (wsB.path) wsBrowseChoose(wsB.path); };
+
+const wsUp = {input: null, xhr: null, cancelled: false};
+function wsUploadPick(input) {
+  wsUp.input = input;
+  wsPickHide();
+  const kind = input.dataset.wsPick, el = WS_PICK_FOLDER[kind] ? $("ws-up-dir") : $("ws-up-file");
+  if (!WS_PICK_FOLDER[kind]) el.accept = WS_PICK_EXT[kind] || "";
+  el.value = "";
+  el.click();
+}
+$("ws-up-file").onchange = (e) => { const f = e.target.files[0]; if (f) wsUploadRun([{file: f, rel: null}], null); };
+$("ws-up-dir").onchange = (e) => {
+  // a folder keeps its layout; hidden files (.git, .cache) stay behind
+  const files = [...e.target.files].map((f) => ({file: f, rel: f.webkitRelativePath.split("/").slice(1).join("/")}))
+    .filter((x) => x.rel && !x.rel.split("/").some((p) => p.startsWith(".")));
+  if (files.length) wsUploadRun(files, e.target.files[0].webkitRelativePath.split("/")[0]);
+};
+function wsPut(url, file, progress) {
+  return new Promise((resolve, reject) => {
+    const x = wsUp.xhr = new XMLHttpRequest();
+    x.open("PUT", url);
+    for (const [k, v] of Object.entries(headers())) x.setRequestHeader(k, v);
+    x.upload.onprogress = (e) => progress(e.loaded);
+    x.onload = () => {
+      let j = {};
+      try { j = JSON.parse(x.responseText); } catch { /* not JSON */ }
+      x.status < 300 ? resolve(j) : reject(new Error(j.error?.message || `HTTP ${x.status}`));
+    };
+    x.onerror = () => reject(new Error("the connection dropped"));
+    x.onabort = () => reject(new Error("cancelled"));
+    x.send(file);
+  });
+}
+async function wsUploadRun(items, folderName) {
+  const total = items.reduce((a, x) => a + x.file.size, 0);
+  let done = 0;
+  wsUp.cancelled = false;
+  $("ws-upload").hidden = false;
+  $("ws-up-title").textContent = `Uploading ${folderName || items[0].file.name}`;
+  const show = (now, i) => {
+    $("ws-up-bar").style.width = `${total ? ((100 * (done + now)) / total).toFixed(1) : 100}%`;
+    $("ws-up-note").textContent = `${fmtBytes(done + now)} of ${fmtBytes(total)}${items.length > 1 ? ` · file ${i + 1} of ${items.length}` : ""}`;
+  };
+  try {
+    const folder = folderName ? (await wsFetch(`v1/workshop/upload-folder?name=${encodeURIComponent(folderName)}`, {method: "POST"})).folder : null;
+    let last = null;
+    for (const [i, x] of items.entries()) {
+      if (wsUp.cancelled) throw new Error("cancelled");
+      const q = folder ? `folder=${encodeURIComponent(folder)}&rel=${encodeURIComponent(x.rel)}` : `name=${encodeURIComponent(x.file.name)}`;
+      show(0, i);
+      last = await wsPut(`v1/workshop/upload?${q}`, x.file, (n) => show(n, i));
+      done += x.file.size;
+    }
+    const path = folder || last.path;
+    wsUp.input.value = path;
+    wsUp.input.dispatchEvent(new Event("change", {bubbles: true}));
+    toast("success", "Uploaded to the server", `${wsBase(path)} · ${fmtBytes(total)}`);
+    wsFiles();
+  } catch (e) { wsError(`Upload: ${e.message}${wsUp.cancelled ? "" : " (what was sent stays in the uploads folder)"}`); }
+  finally { $("ws-upload").hidden = true; wsUp.xhr = null; }
+}
+$("ws-up-cancel").onclick = () => { wsUp.cancelled = true; wsUp.xhr?.abort(); };
+
 // the step chosen last time (after the library and review code above, which it may call)
 wsStep(store.get("ws-step", "overview"));
 
