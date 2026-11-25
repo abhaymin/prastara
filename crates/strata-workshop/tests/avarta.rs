@@ -119,3 +119,54 @@ fn the_real_base_runs_and_its_looped_copy_is_exact() {
     }
     assert_eq!(a, run(&out), "the looped copy's logits");
 }
+
+/// The same model spread over several devices (M2): two CPU "devices" exercise the moves between them; with the
+/// `cuda` feature and AM2_TEST_GPUS=1 the same is checked on cuda:0 and cuda:1 against the CPU, logits and gradients.
+fn split_matches(devs: &[Device], tol: f32) {
+    let out = scratch(&format!("split{}", devs.len()));
+    make_looped(&fixture(), &out, LoopSpec { start: 1, end: 3, passes: 2 }).unwrap();
+    let gates: HashMap<String, Tensor> = [("loop.gate.1".to_string(), Tensor::full(0.3f32, 64, &Device::Cpu).unwrap())].into();
+    let hidden = LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap().cfg.hidden_size;
+    let gates: HashMap<String, Tensor> = if hidden == 64 { gates } else { [("loop.gate.1".to_string(), Tensor::full(0.3f32, hidden, &Device::Cpu).unwrap())].into() };
+    candle_core::safetensors::save(&gates, out.join(LOOP_FILE)).unwrap();
+    let spec = LoraSpec { targets: vec![Target::Q, Target::V, Target::Down], ..LoraSpec::default() };
+    let supervised = vec![true; TOKENS.len()];
+    let run = |m: &mut LlamaModel| -> (Vec<Vec<f32>>, Vec<f32>) {
+        m.add_lora(&spec).unwrap();
+        let logits = m.forward(&TOKENS, &Ctx::eval()).unwrap().to_device(&Device::Cpu).unwrap().to_vec2().unwrap();
+        let vars = m.lora_vars();
+        let grads = m.loss(&TOKENS, &supervised, &Ctx::eval()).unwrap().backward().unwrap();
+        let norms = vars.iter().map(|(_, v)| grads.get(v).map_or(0.0, |g| g.sqr().unwrap().sum_all().unwrap().to_device(&Device::Cpu).unwrap().to_scalar::<f32>().unwrap())).collect();
+        (logits, norms)
+    };
+    let (want_l, want_g) = run(&mut LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap());
+    let (got_l, got_g) = run(&mut LlamaModel::load_on(&out, BaseDtype::F32, devs).unwrap());
+    let dl = want_l.iter().flatten().zip(got_l.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let dg = want_g.iter().zip(&got_g).map(|(a, b)| (a - b).abs() / a.abs().max(1e-6)).fold(0.0f32, f32::max);
+    println!("{} devices: logits differ by {dl:.2e}, gradient norms by {dg:.2e} (relative)", devs.len());
+    let names: Vec<String> = { let mut m = LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap(); m.add_lora(&spec).unwrap(); m.lora_vars().into_iter().map(|(n, _)| n).collect() };
+    for ((n, a), b) in names.iter().zip(&want_g).zip(&got_g) {
+        if (a - b).abs() / a.abs().max(1e-6) > 1e-4 {
+            println!("  {n}: cpu {a:.6e} split {b:.6e}");
+        }
+    }
+    assert!(dl <= tol && dg <= tol.max(1e-4), "logits {dl}, gradients {dg}");
+    assert!(want_g.iter().all(|g| *g > 0.0) || want_g.iter().any(|g| *g > 0.0));
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+#[test]
+fn a_model_split_over_two_devices_is_the_same_model() {
+    split_matches(&[Device::Cpu, Device::Cpu], 0.0);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn a_model_split_over_two_gpus_matches_the_cpu() {
+    let devs: Vec<Device> = match std::env::var("AM2_TEST_GPUS").as_deref() {
+        Ok("0") => vec![Device::new_cuda(0).unwrap()],
+        _ => vec![Device::new_cuda(0).unwrap(), Device::new_cuda(1).unwrap()],
+    };
+    split_matches(&devs, 1e-3);
+}

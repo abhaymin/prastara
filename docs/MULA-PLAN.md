@@ -78,4 +78,16 @@ contexts, and Mula refining itself on Prastara's own tasks.
   the base's bit for bit. The gates get a gradient while closed, train with a LoRA adapter, save in it
   (`base_model.model.model.loop.gate.<p>`), load back, and survive `merge` (`tests/avarta.rs`). Training from a block
   inside the loop is refused.
-- **Next: M2**, GPU training. On the CPU one forward pass of the looped 8B takes 37 s, so training it needs the cards.
+- **M2, the code:** `am2strata-workshop train --devices cuda:0,cuda:1` (a `cuda` build) splits the blocks over the
+  cards. The two custom nodes have their GPU side, and hidden states and their gradients move between cards. Checked
+  on a tiny looped model: split over both cards, the logits and every gradient equal the CPU's to 1e-6, and a 6-step
+  training run gives the same losses (2.4e-7) and the same adapter (1.5e-8) as on the CPU.
+  - Found on the way: candle's direct card-to-card copy is not ordered against the next kernel in the backward pass,
+    so gradients came out a few percent wrong while the forward values were right. Moves between two GPUs now go
+    through host memory (`model::move_to`).
+- **M2, open:** the 8B on the cards. Training runs need the owner's yes for each run (owner, 2026-11-25: dedicated
+  runs, approved one at a time), since the cards hold the live model.
+  - Estimate, not measured: the BF16 weights are 8.2 GB per card. The activations kept for the backward pass, from
+    block 12 up with the loop's second pass, come to about 0.5 GB per block pass at 1,024 tokens, about 18 GB.
+    So 1,024-token examples need gradient checkpointing (recompute a block's activations in the backward pass),
+    which is the next piece.

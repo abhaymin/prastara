@@ -31,3 +31,7 @@ clap.workspace = true
 libc = "0.2"
 # datagen: the server's own chat API (the loaded model writes the data)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+
+[features]
+# training on NVIDIA GPUs (candle's CUDA backend; needs the CUDA toolkit at build time)
+cuda = ["candle-core/cuda", "candle-nn/cuda"]

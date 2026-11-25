@@ -379,6 +379,11 @@ impl CustomOp1 for FrozenLinear {
         take_value(&self.y, "frozen-half-linear")
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(&self, _storage: &candle_core::CudaStorage, _layout: &Layout) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        take_cuda(&self.y, "frozen-half-linear")
+    }
+
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let w = if self.w.dtype() == DType::F32 { self.w.clone() } else { self.w.to_dtype(DType::F32)? };
         Ok(Some(grad_res.matmul(&w)?))
@@ -404,6 +409,11 @@ impl CustomOp1 for MaskedSoftmax {
         take_value(&self.y, "masked-softmax")
     }
 
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(&self, _storage: &candle_core::CudaStorage, _layout: &Layout) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        take_cuda(&self.y, "masked-softmax")
+    }
+
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let gy = grad_res.mul(res)?;
         let inner = gy.broadcast_sub(&res.broadcast_mul(&gy.sum_keepdim(D::Minus1)?)?)?;
@@ -418,6 +428,31 @@ fn take_value(slot: &Mutex<Option<Tensor>>, name: &str) -> candle_core::Result<(
     // one copy of the values into a buffer of their own (the tensor may be a view of a larger one)
     let shape = y.shape().clone();
     Ok((CpuStorage::F32(y.flatten_all()?.to_vec1::<f32>()?), shape))
+}
+
+/// The same on a GPU: the value already sits on the card, and is handed over as a copy of its own (contiguous).
+#[cfg(feature = "cuda")]
+fn take_cuda(slot: &Mutex<Option<Tensor>>, name: &str) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+    use candle_core::backend::BackendStorage;
+    let y = slot.lock().map_err(|_| candle_core::Error::Msg(format!("{name}: lock")))?.take()
+        .ok_or_else(|| candle_core::Error::Msg(format!("{name}: forward ran twice")))?
+        .contiguous()?;
+    let (storage, layout) = y.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Cuda(c) => Ok((c.try_clone(layout)?, y.shape().clone())),
+        _ => Err(candle_core::Error::Msg(format!("{name}: the value is not on a GPU"))),
+    }
+}
+
+/// `x` on `dev`, its gradient sent back the same way. Between two GPUs the move goes through host memory: candle's
+/// direct copy from one card to another is not ordered against the next kernel, and in the backward pass that gave
+/// gradients a few percent wrong (the forward values were right), measured on two RTX 5060 Ti. The host copy waits
+/// for the card, so the hop is ordered; the hidden state is small next to the work of a block.
+pub fn move_to(x: &Tensor, dev: &Device) -> Result<Tensor> {
+    if x.device().same_device(dev) {
+        return Ok(x.clone());
+    }
+    Ok(if x.device().is_cuda() && dev.is_cuda() { x.to_device(&Device::Cpu)?.to_device(dev)? } else { x.to_device(dev)? })
 }
 
 /// The plain version, from differentiable operations (what [`masked_softmax`] is checked against).
@@ -546,6 +581,10 @@ pub struct LlamaModel {
     dev: Device,
     /// the loop's gates, one `[hidden]` vector per pass after the first (empty without a loop)
     loop_gates: Vec<Var>,
+    /// every device the model is spread over (one, unless loaded with [`LlamaModel::load_on`]); `dev` is the first
+    devs: Vec<Device>,
+    /// the index into `devs` of each block's device; the embeddings sit on the first, the final norm and head on the last
+    block_dev: Vec<usize>,
 }
 
 /// The weight files of a model folder, in order: `model.safetensors`, or the `model-0000i-of-0000n` shards.
@@ -590,21 +629,40 @@ impl LlamaModel {
     /// Load only some of the model: the blocks in `blocks`, the embeddings and the output head each on request (a
     /// tied head needs the embeddings and loads them). The activation cache is filled this way, one block at a time.
     pub fn load_parts(dir: &Path, base_dtype: BaseDtype, dev: &Device, blocks_wanted: std::ops::Range<usize>, with_embeddings: bool, with_head: bool) -> Result<Self> {
+        Self::load_parts_on(dir, base_dtype, std::slice::from_ref(dev), blocks_wanted, with_embeddings, with_head)
+    }
+
+    /// The whole model spread over `devs` (e.g. two GPUs): the blocks are split into equal runs in order, the first
+    /// run with the embeddings on the first device, the last with the final norm and the head on the last. Hidden
+    /// states move between devices, and so do their gradients.
+    pub fn load_on(dir: &Path, base_dtype: BaseDtype, devs: &[Device]) -> Result<Self> {
+        let layers = ModelConfig::load(dir)?.num_hidden_layers;
+        Self::load_parts_on(dir, base_dtype, devs, 0..layers, true, true)
+    }
+
+    pub fn load_parts_on(dir: &Path, base_dtype: BaseDtype, devs: &[Device], blocks_wanted: std::ops::Range<usize>, with_embeddings: bool, with_head: bool) -> Result<Self> {
+        if devs.is_empty() {
+            bail!("no device to load the model on");
+        }
+        let dev = &devs[0];
+        let last = &devs[devs.len() - 1];
         let cfg = ModelConfig::load(dir)?;
+        let block_dev: Vec<usize> = (0..cfg.num_hidden_layers).map(|i| i * devs.len() / cfg.num_hidden_layers.max(1)).collect();
         let files = weight_files(dir)?;
         // mapped, not read: each tensor is copied out (and narrowed to the base dtype) one at a time
         let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files) }.with_context(|| format!("{}", dir.display()))?;
         let names: HashMap<String, ()> = st.tensors().into_iter().map(|(n, _)| (n, ())).collect();
         let prefix = if names.contains_key("model.embed_tokens.weight") { "model." } else if names.contains_key("embed_tokens.weight") { "" }
             else { bail!("{}: no model.embed_tokens.weight (not a Llama-family checkpoint)", dir.display()) };
-        let matrix = |name: &str| -> Result<Tensor> {
+        let matrix_on = |name: &str, dev: &Device| -> Result<Tensor> {
             let t = st.load(name, dev).with_context(|| format!("{}: tensor {name}", dir.display()))?;
             if !matches!(t.dtype(), DType::F32 | DType::F16 | DType::BF16) {
                 bail!("{name} is {:?}: the base must be F32, F16 or BF16 safetensors", t.dtype());
             }
             Ok(t.to_dtype(base_dtype.dtype())?)
         };
-        let vector = |name: &str| -> Result<Tensor> { Ok(st.load(name, dev).with_context(|| format!("{}: tensor {name}", dir.display()))?.to_dtype(DType::F32)?) };
+        let matrix = |name: &str| matrix_on(name, dev);
+        let vector_on = |name: &str, dev: &Device| -> Result<Tensor> { Ok(st.load(name, dev).with_context(|| format!("{}: tensor {name}", dir.display()))?.to_dtype(DType::F32)?) };
         let expect = |t: &Tensor, dims: &[usize], name: &str| -> Result<()> {
             if t.dims() != dims { bail!("{name} has shape {:?}, the config says {dims:?}", t.dims()) } else { Ok(()) }
         };
@@ -616,6 +674,9 @@ impl LlamaModel {
                 continue;
             }
             let p = |k: &str| format!("{prefix}layers.{i}.{k}");
+            let bdev = &devs[block_dev[i]];
+            let matrix = |name: &str| matrix_on(name, bdev);
+            let vector = |name: &str| vector_on(name, bdev);
             let mut lin = Vec::with_capacity(7);
             for t in Target::ALL {
                 let name = p(&format!("{}.{}.weight", t.module(), t.as_str()));
@@ -644,20 +705,23 @@ impl LlamaModel {
         } else {
             None
         };
-        let lm_head = if has_head && with_head { Some(matrix("lm_head.weight")?) } else { None };
-        let norm = vector(&format!("{prefix}norm.weight"))?;
+        let lm_head = if has_head && with_head { Some(matrix_on("lm_head.weight", last)?) } else { None };
+        let norm = vector_on(&format!("{prefix}norm.weight"), last)?;
+        let gate_dev = cfg.loop_.map_or(dev, |l| &devs[block_dev[l.end - 1]]);
         let mut loop_gates = Vec::new();
         if let Some(l) = cfg.loop_ {
             let saved = if dir.join(LOOP_FILE).exists() { candle_core::safetensors::load(dir.join(LOOP_FILE), dev)? } else { HashMap::new() };
             for p in 1..l.passes {
                 let g = match saved.get(&format!("loop.gate.{p}")) {
                     Some(t) => { expect(t, &[cfg.hidden_size], "loop gate")?; t.to_dtype(DType::F32)? }
-                    None => Tensor::zeros(cfg.hidden_size, DType::F32, dev)?,
+                    None => Tensor::zeros(cfg.hidden_size, DType::F32, gate_dev)?,
                 };
+                let g = g.to_device(gate_dev)?;
                 loop_gates.push(Var::from_tensor(&g)?);
             }
         }
-        Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone(), loop_gates })
+        Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone(), loop_gates,
+                  devs: devs.to_vec(), block_dev })
     }
 
     pub fn device(&self) -> &Device {
@@ -706,8 +770,8 @@ impl LlamaModel {
                 let bound = 1.0 / (in_ as f32).sqrt();
                 let a: Vec<f32> = (0..spec.r * in_).map(|_| bound * (2.0 * unit(&mut state) - 1.0)).collect();
                 block.lin[ti].lora = Some(Lora {
-                    a: Var::from_tensor(&Tensor::from_vec(a, (spec.r, in_), &self.dev)?)?,
-                    b: Var::from_tensor(&Tensor::zeros((out, spec.r), DType::F32, &self.dev)?)?,
+                    a: Var::from_tensor(&Tensor::from_vec(a, (spec.r, in_), &self.devs[self.block_dev[i]])?)?,
+                    b: Var::from_tensor(&Tensor::zeros((out, spec.r), DType::F32, &self.devs[self.block_dev[i]])?)?,
                     scaling: spec.scaling(),
                     dropout: spec.dropout,
                 });
@@ -782,7 +846,9 @@ impl LlamaModel {
                         if !spec.targets.contains(&t) {
                             spec.targets.push(t);
                         }
-                        Some(Lora { a: Var::from_tensor(&a.to_dtype(DType::F32)?)?, b: Var::from_tensor(&b.to_dtype(DType::F32)?)?, scaling: spec.scaling(), dropout: spec.dropout })
+                        let bdev = &self.devs[self.block_dev[i]];
+                        Some(Lora { a: Var::from_tensor(&a.to_dtype(DType::F32)?.to_device(bdev)?)?, b: Var::from_tensor(&b.to_dtype(DType::F32)?.to_device(bdev)?)?,
+                                    scaling: spec.scaling(), dropout: spec.dropout })
                     }
                     (None, None) => None,
                     _ => bail!("{stem}: the adapter has only one of lora_A and lora_B"),
@@ -794,7 +860,8 @@ impl LlamaModel {
                 if g.dims() != [self.cfg.hidden_size] {
                     bail!("loop gate {p} has shape {:?}, the model's hidden size is {}", g.dims(), self.cfg.hidden_size);
                 }
-                self.loop_gates[p - 1] = Var::from_tensor(&g.to_dtype(DType::F32)?)?;
+                let gdev = self.loop_gates[p - 1].as_tensor().device().clone();
+                self.loop_gates[p - 1] = Var::from_tensor(&g.to_dtype(DType::F32)?.to_device(&gdev)?)?;
                 used += 1;
             }
         }
@@ -838,7 +905,7 @@ impl LlamaModel {
         self.embed.is_some() && self.blocks.iter().take(self.first_trained).all(Option::is_some)
     }
 
-    fn rope(&self, seq: usize) -> Result<(Tensor, Tensor)> {
+    fn rope(&self, seq: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
         let hd = self.cfg.head_dim;
         // as transformers: inv_freq in f32, angles = position × inv_freq, each repeated over both halves
         let inv: Vec<f32> = (0..hd / 2).map(|i| 1.0 / (self.cfg.rope_theta as f32).powf(2.0 * i as f32 / hd as f32)).collect();
@@ -854,7 +921,7 @@ impl LlamaModel {
                 }
             }
         }
-        Ok((Tensor::from_vec(cos, (seq, hd), &self.dev)?, Tensor::from_vec(sin, (seq, hd), &self.dev)?))
+        Ok((Tensor::from_vec(cos, (seq, hd), dev)?, Tensor::from_vec(sin, (seq, hd), dev)?))
     }
 
     fn block_forward(&self, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx) -> Result<Tensor> {
@@ -893,9 +960,9 @@ impl LlamaModel {
         Ok((x + block.lin[6].forward(&gated, ctx)?)?)
     }
 
-    fn causal_mask(&self, seq: usize) -> Result<Tensor> {
+    fn causal_mask(&self, seq: usize, dev: &Device) -> Result<Tensor> {
         let m: Vec<f32> = (0..seq).flat_map(|i| (0..seq).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })).collect();
-        Ok(Tensor::from_vec(m, (seq, seq), &self.dev)?)
+        Ok(Tensor::from_vec(m, (seq, seq), dev)?)
     }
 
     fn run_blocks(&self, mut x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx) -> Result<Tensor> {
@@ -903,23 +970,36 @@ impl LlamaModel {
         if seq == 0 {
             bail!("an empty token sequence");
         }
-        let (rope, mask) = (self.rope(seq)?, self.causal_mask(seq)?);
-        let block = |i: usize| self.blocks[i].as_ref().ok_or_else(|| anyhow!("block {i} is not in memory (the activation cache stands in for it)"));
+        // the rotary tables and the mask, once per device the blocks sit on
+        let mut per_dev: Vec<Option<((Tensor, Tensor), Tensor)>> = vec![None; self.devs.len()];
+        for i in range.clone() {
+            let d = self.block_dev[i];
+            if per_dev[d].is_none() {
+                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, self.causal_mask(seq, &self.devs[d])?));
+            }
+        }
+        // one block on its own device: the hidden state (and, backwards, its gradient) moves when the device changes
+        let step = |j: usize, x: &Tensor| -> Result<Tensor> {
+            let b = self.blocks[j].as_ref().ok_or_else(|| anyhow!("block {j} is not in memory (the activation cache stands in for it)"))?;
+            let (rope, mask) = per_dev[self.block_dev[j]].as_ref().ok_or_else(|| anyhow!("block {j}: no tables for its device"))?;
+            self.block_forward(b, &move_to(x, &self.devs[self.block_dev[j]])?, rope, mask, ctx)
+        };
         if let Some(l) = self.cfg.loop_ {
             if range.start > l.start && range.start < l.end {
                 bail!("blocks {}.. start inside the loop {}..{}: the loop's blocks must be run together", range.start, l.start, l.end);
             }
         }
         for i in range.clone() {
-            x = self.block_forward(block(i)?, &x, &rope, &mask, ctx)?;
+            x = step(i, &x)?;
             match self.cfg.loop_ {
                 Some(l) if i + 1 == l.end && range.start <= l.start => {
                     for (p, g) in self.loop_gates.iter().enumerate() {
                         let _ = p;
                         let mut y = x.clone();
                         for j in l.start..l.end {
-                            y = self.block_forward(block(j)?, &y, &rope, &mask, ctx)?;
+                            y = step(j, &y)?;
                         }
+                        let y = move_to(&y, x.device())?;
                         x = (&x + (y - &x)?.broadcast_mul(g.as_tensor())?)?;
                     }
                 }
@@ -941,7 +1021,7 @@ impl LlamaModel {
         if let Some(bad) = tokens.iter().find(|t| **t as usize >= self.cfg.vocab_size) {
             bail!("token id {bad} is outside the vocabulary of {}", self.cfg.vocab_size);
         }
-        let ids = Tensor::from_vec(tokens.to_vec(), (tokens.len(),), &self.dev)?;
+        let ids = Tensor::from_vec(tokens.to_vec(), (tokens.len(),), embed.device())?;
         Ok(embed.index_select(&ids, 0)?.to_dtype(DType::F32)?)
     }
 
@@ -953,13 +1033,14 @@ impl LlamaModel {
     /// From that hidden state through the trained blocks to the final norm: `[seq, hidden]`.
     pub fn upper_hidden(&self, h: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let x = self.run_blocks(h.clone(), self.first_trained..self.cfg.num_hidden_layers, ctx)?;
-        rms_norm(&x, &self.norm, self.cfg.rms_norm_eps)
+        rms_norm(&move_to(&x, self.norm.device())?, &self.norm, self.cfg.rms_norm_eps)
     }
 
     /// The output head on `[rows, hidden]` → `[rows, vocab]`.
     pub fn head(&self, h: &Tensor) -> Result<Tensor> {
         let w = self.lm_head.as_ref().or(self.embed.as_ref()).ok_or_else(|| anyhow!("no output head in memory"))?.clone();
-        Linear { w, bias: None, lora: None }.forward(h, &Ctx::eval())
+        let h = move_to(h, w.device())?;
+        Linear { w, bias: None, lora: None }.forward(&h, &Ctx::eval())
     }
 
     /// From the cached hidden state to logits `[seq, vocab]`.
@@ -981,9 +1062,10 @@ impl LlamaModel {
         }
         let targets: Vec<u32> = rows.iter().map(|r| tokens[*r as usize + 1]).collect();
         let n = rows.len();
-        let hidden = self.upper_hidden(h, ctx)?.index_select(&Tensor::from_vec(rows, (n,), &self.dev)?, 0)?;
+        let hidden = self.upper_hidden(h, ctx)?;
+        let hidden = hidden.index_select(&Tensor::from_vec(rows, (n,), hidden.device())?, 0)?;
         let logits = self.head(&hidden)?;
-        Ok(candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (n,), &self.dev)?)?)
+        Ok(candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (n,), logits.device())?)?)
     }
 
     pub fn loss(&self, tokens: &[u32], supervised: &[bool], ctx: &Ctx) -> Result<Tensor> {

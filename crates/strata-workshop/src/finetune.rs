@@ -84,6 +84,26 @@ pub struct TrainSettings {
     pub chat_template: Option<PathBuf>,
     /// score every token, not only the assistant's (Soup's `train_on_responses_only: false`)
     pub score_everything: bool,
+    /// where the model trains: `cpu` (the default), or GPUs such as `cuda:0,cuda:1`, the blocks split between them
+    pub devices: Vec<String>,
+}
+
+/// The devices named by `--devices` (`cpu`, `cuda:N`), opened.
+pub fn open_devices(names: &[String]) -> Result<Vec<Device>> {
+    if names.is_empty() {
+        return Ok(vec![Device::Cpu]);
+    }
+    names.iter().map(|n| match n.trim() {
+        "cpu" => Ok(Device::Cpu),
+        g => {
+            let i: usize = g.strip_prefix("cuda:").and_then(|i| i.parse().ok())
+                .ok_or_else(|| anyhow!("device {g:?}: name cpu or cuda:N"))?;
+            #[cfg(feature = "cuda")]
+            { Device::new_cuda(i).map_err(|e| anyhow!("cuda:{i}: {e}")) }
+            #[cfg(not(feature = "cuda"))]
+            { let _ = i; bail!("device {g}: this Workshop was built without the cuda feature") }
+        }
+    }).collect()
 }
 
 impl TrainSettings {
@@ -94,7 +114,7 @@ impl TrainSettings {
             model: model.into(), data: data.into(), data_format: DataFormat::Auto, eval_data: None, val_split: 0.1, out: out.into(),
             lora: LoraSpec::default(), base_dtype: BaseDtype::F32, lr: 2e-4, epochs: 3.0, max_steps: None, accumulation: 4, max_len: 2048,
             warmup_ratio: 0.03, weight_decay: 0.01, max_grad_norm: 1.0, seed: 42, cache_dir: None, save_steps: 100, eval_steps: 0,
-            logging_steps: 10, resume: None, chat_template: None, score_everything: false,
+            logging_steps: 10, resume: None, chat_template: None, score_everything: false, devices: Vec::new(),
         }
     }
 
@@ -446,7 +466,9 @@ impl Runner {
             }
             lower_in_memory = false;
         }
-        let mut model = LlamaModel::load_from(&s.model, s.base_dtype, &dev, if cache.is_some() { first } else { 0 })?;
+        let devs = open_devices(&s.devices)?;
+        let skip = if cache.is_some() { first } else { 0 };
+        let mut model = LlamaModel::load_parts_on(&s.model, s.base_dtype, &devs, skip..cfg.num_hidden_layers, skip == 0, true)?;
         model.add_lora(&s.lora)?;
         let (names, vars): (Vec<String>, Vec<Var>) = model.lora_vars().into_iter().unzip();
         let mut params = ParamsAdamW::default();
@@ -575,9 +597,9 @@ impl Runner {
         let step = state["global_step"].as_u64().ok_or_else(|| anyhow!("{STATE_FILE}: no global_step"))? as usize;
         let adam = state["adam_step"].as_u64().ok_or_else(|| anyhow!("{STATE_FILE}: no adam_step"))? as usize;
         for (name, (theta, m, v)) in self.names.iter().zip(&self.opt.slots) {
-            theta.set(&adapter[name])?;
-            m.set(&moments[&format!("{name}.exp_avg")])?;
-            v.set(&moments[&format!("{name}.exp_avg_sq")])?;
+            theta.set(&adapter[name].to_device(theta.device())?)?;
+            m.set(&moments[&format!("{name}.exp_avg")].to_device(m.device())?)?;
+            v.set(&moments[&format!("{name}.exp_avg_sq")].to_device(v.device())?)?;
         }
         self.opt.step_t = adam;
         let losses = state["losses"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();

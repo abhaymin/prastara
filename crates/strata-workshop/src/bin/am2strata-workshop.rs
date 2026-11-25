@@ -234,6 +234,9 @@ struct RunArgs {
     /// hold the frozen base as f32, f16 or bf16 (half the memory; LoRA and the loss stay f32)
     #[arg(long)]
     base_dtype: Option<String>,
+    /// where to train: cpu (default) or GPUs, e.g. cuda:0,cuda:1 (the blocks split between them; needs a cuda build)
+    #[arg(long, value_delimiter = ',')]
+    devices: Vec<String>,
     #[arg(long)]
     lr: Option<f64>,
     #[arg(long)]
@@ -315,6 +318,7 @@ impl RunArgs {
         if let Some(n) = self.train_layers { s.lora.train_layers = Some(n); }
         if let Some(c) = &self.cache_activations { s.cache_dir = Some(c.clone()); }
         if let Some(d) = &self.base_dtype { s.base_dtype = BaseDtype::from_s(d).map_err(|e| e.to_string())?; }
+        s.devices = self.devices.clone();
         if let Some(v) = self.lr { s.lr = v; }
         if let Some(v) = self.epochs { s.epochs = v; }
         if let Some(v) = self.max_steps { s.max_steps = Some(v); }
@@ -528,7 +532,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             let (s, notes) = run.settings(true)?;
             let cfg = ModelConfig::load(&s.model).map_err(|e| format!("{e:#}"))?;
             out.event(json!({"event": "start", "what": format!("train a LoRA adapter on {} with {} into {}", s.model.display(), s.data.display(), s.out.display()),
-                             "threads": run.threads, "device": "cpu", "base_dtype": s.base_dtype.as_str()}));
+                             "threads": run.threads, "device": if s.devices.is_empty() { "cpu".to_string() } else { s.devices.join(",") }, "base_dtype": s.base_dtype.as_str()}));
             for n in notes {
                 out.event(json!({"event": "log", "message": n}));
             }
