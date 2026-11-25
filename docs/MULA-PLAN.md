@@ -47,6 +47,29 @@ The models are versioned **v0.1** onward. Prastara becomes **v1.0** when Mula v0
 
 The skill names are proposals for the owner; "Mula" is decided.
 
+## 1M-token context (owner, 2026-11-25: "increase context limit of the model to 1M and actually make the model accept 1M context")
+
+Accepting 1M tokens means the model still finds and uses what is in them, measured. Saying so in a config is not
+enough. Qwen3-8B is trained to 32K (its config allows 40,960 positions).
+
+**Why it cannot be done by a setting alone (Qwen3-8B, 36 layers, 8 key/value heads of 128):**
+- **Keys and values:** every layer keeps them for every token, 144 KB per token. At 1M that is 137 GiB, and 183 GiB
+  with the loop's second pass. This PC has 32 GB of VRAM and 59 GB of RAM.
+- **Training attention:** it keeps a seq x seq table per head. At 64K tokens that is 512 GB for one block.
+- **Positions:** beyond 32K the model has never seen them; stretching them (YaRN) needs training at long lengths
+  to hold up.
+
+**The design:**
+
+| Piece | What | Effect at 1M tokens |
+|---|---|---|
+| L1 YaRN positions | `rope_scaling: yarn`, factor 32 over the original 32,768 (the method Qwen documents for 128K), in the Workshop and the engine | positions up to 1,048,576 |
+| L2 Hybrid attention | one layer in four keeps full attention (9 of 36); the other 27 attend to a 4,096-token window (`layer_types`, `sliding_window`), then trained to recover | keys and values for 12 full layers (with the loop): 46 GiB in BF16, 23 GiB at 8 bits, about 12 GiB at 4 bits |
+| L3 Chunked attention in training | attention computed a block of queries at a time, storing only the output and one number per row; the backward pass recomputes each block (the flash-attention method), with exact gradients | memory grows with the length, not its square: 64K-token examples train |
+| L4 Long training | continued training at 16K, then 32K, then 64K, on long documents, code repositories and books, with the hybrid layers and YaRN | the model learns to use the far context |
+| L5 The engine at 1M | YaRN, sliding windows, the loop, 8-bit keys and values tiered across VRAM and RAM (Stara), prompts read in chunks | the cache fits (about 23 GiB); a 1M prompt reads in about an hour on these cards (estimate), decoding at a few tokens/s |
+| L6 The gates | passkey and needle-in-a-haystack retrieval at 32K, 128K, 256K, 512K and 1M, at several depths, and a multi-needle test; short-context quality kept | a model is called 1M only when the 1M needles are found |
+
 ## What has to be built first
 
 | Step | What | Gate |

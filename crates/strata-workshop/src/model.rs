@@ -71,6 +71,67 @@ pub struct ModelConfig {
     pub tie_word_embeddings: bool,
     /// Avarta: blocks `start..end` run `passes` times with the same weights (`"prastara_loop"` in config.json)
     pub loop_: Option<LoopSpec>,
+    /// YaRN position scaling (`rope_scaling` / `rope_parameters` with `rope_type: yarn`)
+    pub yarn: Option<Yarn>,
+    /// the window of the sliding-attention layers (`sliding_window`), with `layer_types` naming which layers slide
+    pub sliding_window: Option<usize>,
+    /// per layer: true for `sliding_attention` (empty: every layer attends to everything)
+    pub layer_sliding: Vec<bool>,
+}
+
+/// YaRN (transformers' `_compute_yarn_parameters`): rotary frequencies past the original length are interpolated
+/// by `factor`, the fast ones kept, a linear ramp between `beta_fast` and `beta_slow` rotations; cos and sin are
+/// scaled by `attention_factor` (0.1 ln(factor) + 1 unless given).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Yarn {
+    pub factor: f64,
+    pub original_max_position_embeddings: usize,
+    pub beta_fast: f64,
+    pub beta_slow: f64,
+    pub attention_factor: f64,
+    pub truncate: bool,
+}
+
+impl Yarn {
+    pub fn new(factor: f64, original: usize) -> Yarn {
+        Yarn { factor, original_max_position_embeddings: original, beta_fast: 32.0, beta_slow: 1.0,
+               attention_factor: if factor <= 1.0 { 1.0 } else { 0.1 * factor.ln() + 1.0 }, truncate: true }
+    }
+
+    fn from_json(r: &Value, max_pos: usize) -> Result<Yarn> {
+        let factor = r["factor"].as_f64().ok_or_else(|| anyhow!("rope_scaling yarn: no factor"))?;
+        if factor < 1.0 {
+            bail!("rope_scaling yarn: factor {factor} is below 1");
+        }
+        let mut y = Yarn::new(factor, r["original_max_position_embeddings"].as_u64().map_or(max_pos, |x| x as usize));
+        if let Some(b) = r["beta_fast"].as_f64() { y.beta_fast = b; }
+        if let Some(b) = r["beta_slow"].as_f64() { y.beta_slow = b; }
+        if let Some(a) = r["attention_factor"].as_f64() { y.attention_factor = a; }
+        if r.get("mscale").is_some_and(|v| !v.is_null()) || r.get("mscale_all_dim").is_some_and(|v| !v.is_null()) {
+            bail!("rope_scaling yarn with mscale / mscale_all_dim (DeepSeek's form) is not implemented");
+        }
+        if let Some(t) = r["truncate"].as_bool() { y.truncate = t; }
+        Ok(y)
+    }
+
+    /// The rotary inverse frequencies for a head of `dim` with base `theta`.
+    pub fn inv_freq(&self, dim: usize, theta: f64) -> Vec<f64> {
+        let correction = |rot: f64| dim as f64 * (self.original_max_position_embeddings as f64 / (rot * 2.0 * std::f64::consts::PI)).ln() / (2.0 * theta.ln());
+        let (mut low, mut high) = (correction(self.beta_fast), correction(self.beta_slow));
+        if self.truncate {
+            low = low.floor();
+            high = high.ceil();
+        }
+        let (low, high) = (low.max(0.0), high.min(dim as f64 - 1.0));
+        let high = if low == high { high + 0.001 } else { high };
+        (0..dim / 2).map(|i| {
+            let pos = theta.powf(2.0 * i as f64 / dim as f64);
+            let (extra, inter) = (1.0 / pos, 1.0 / (self.factor * pos));
+            let ramp = ((i as f64 - low) / (high - low)).clamp(0.0, 1.0);
+            let keep = 1.0 - ramp;
+            inter * (1.0 - keep) + extra * keep
+        }).collect()
+    }
 }
 
 /// A loop over the core blocks (Avarta, docs/MULA-PLAN.md M1). Pass 1 is the base's own pass; every later pass p
@@ -149,12 +210,40 @@ impl ModelConfig {
         let n = |k: &str| c[k].as_u64().map(|x| x as usize).ok_or_else(|| anyhow!("config.{k} is missing or not a number"));
         // transformers 5 writes rope_parameters {rope_theta, rope_type}; before that rope_theta and rope_scaling
         let rope = &c["rope_parameters"];
-        if let Some(t) = rope["rope_type"].as_str().or(c["rope_scaling"]["rope_type"].as_str()).or(c["rope_scaling"]["type"].as_str()) {
-            if t != "default" {
-                bail!("rope scaling of type {t:?} is not implemented in this forward pass");
+        let mut yarn = None;
+        let max_pos_cfg = c["max_position_embeddings"].as_u64().map(|x| x as usize).unwrap_or(2048);
+        // rope_scaling (transformers 4) wins over rope_parameters (transformers 5) when both are written
+        let scaling = &c["rope_scaling"];
+        let (src, kind) = match scaling["rope_type"].as_str().or(scaling["type"].as_str()) {
+            Some(t) => (scaling, Some(t)),
+            None => (rope, rope["rope_type"].as_str()),
+        };
+        if let Some(t) = kind {
+            match t {
+                "default" => {}
+                "yarn" => yarn = Some(Yarn::from_json(src, max_pos_cfg)?),
+                _ => bail!("rope scaling of type {t:?} is not implemented in this forward pass (default and yarn are)"),
             }
         } else if c.get("rope_scaling").is_some_and(|v| !v.is_null()) {
             bail!("config.rope_scaling is set, which this forward pass does not implement");
+        }
+        let layers_n = n("num_hidden_layers")?;
+        let layer_sliding: Vec<bool> = match c["layer_types"].as_array() {
+            Some(a) => {
+                if a.len() != layers_n {
+                    bail!("config.layer_types names {} layers, the model has {layers_n}", a.len());
+                }
+                a.iter().map(|t| match t.as_str() {
+                    Some("full_attention") => Ok(false),
+                    Some("sliding_attention") => Ok(true),
+                    other => bail!("layer type {other:?}: full_attention or sliding_attention"),
+                }).collect::<Result<_>>()?
+            }
+            None => Vec::new(),
+        };
+        let sliding_window = c["sliding_window"].as_u64().map(|x| x as usize).filter(|_| layer_sliding.iter().any(|s| *s));
+        if layer_sliding.iter().any(|s| *s) && sliding_window.unwrap_or(0) == 0 {
+            bail!("config.layer_types has sliding layers but no sliding_window");
         }
         if let Some(act) = c["hidden_act"].as_str() {
             if act != "silu" {
@@ -188,6 +277,7 @@ impl ModelConfig {
             max_position_embeddings: c["max_position_embeddings"].as_u64().map(|x| x as usize).unwrap_or(2048),
             tie_word_embeddings: c["tie_word_embeddings"].as_bool().unwrap_or(false),
             loop_: LoopSpec::from_json(&c["prastara_loop"], n("num_hidden_layers")?)?,
+            yarn, sliding_window, layer_sliding,
         })
     }
 
@@ -1030,7 +1120,10 @@ impl LlamaModel {
     fn rope(&self, seq: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
         let hd = self.cfg.head_dim;
         // as transformers: inv_freq in f32, angles = position × inv_freq, each repeated over both halves
-        let inv: Vec<f32> = (0..hd / 2).map(|i| 1.0 / (self.cfg.rope_theta as f32).powf(2.0 * i as f32 / hd as f32)).collect();
+        let (inv, scale): (Vec<f32>, f32) = match self.cfg.yarn {
+            Some(y) => (y.inv_freq(hd, self.cfg.rope_theta).into_iter().map(|f| f as f32).collect(), y.attention_factor as f32),
+            None => ((0..hd / 2).map(|i| 1.0 / (self.cfg.rope_theta as f32).powf(2.0 * i as f32 / hd as f32)).collect(), 1.0),
+        };
         let mut cos = Vec::with_capacity(seq * hd);
         let mut sin = Vec::with_capacity(seq * hd);
         for p in 0..seq {
@@ -1038,8 +1131,8 @@ impl LlamaModel {
                 let _ = half;
                 for f in &inv {
                     let a = p as f32 * f;
-                    cos.push(a.cos());
-                    sin.push(a.sin());
+                    cos.push(a.cos() * scale);
+                    sin.push(a.sin() * scale);
                 }
             }
         }
@@ -1096,7 +1189,13 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
 impl LlamaModel {
 
     fn causal_mask(&self, seq: usize, dev: &Device) -> Result<Tensor> {
-        let m: Vec<f32> = (0..seq).flat_map(|i| (0..seq).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })).collect();
+        self.window_mask(seq, usize::MAX, dev)
+    }
+
+    /// Causal, and a key more than `window - 1` positions back is hidden (transformers' sliding window: query i sees
+    /// keys j with i - window < j <= i).
+    fn window_mask(&self, seq: usize, window: usize, dev: &Device) -> Result<Tensor> {
+        let m: Vec<f32> = (0..seq).flat_map(|i| (0..seq).map(move |j| if j > i || i - j >= window { f32::NEG_INFINITY } else { 0.0 })).collect();
         Ok(Tensor::from_vec(m, (seq, seq), dev)?)
     }
 
@@ -1106,17 +1205,26 @@ impl LlamaModel {
             bail!("an empty token sequence");
         }
         // the rotary tables and the mask, once per device the blocks sit on
-        let mut per_dev: Vec<Option<((Tensor, Tensor), Tensor)>> = vec![None; self.devs.len()];
+        // (rope, the causal mask, the sliding layers' mask when there are any) per device
+        let mut per_dev: Vec<Option<((Tensor, Tensor), Tensor, Option<Tensor>)>> = vec![None; self.devs.len()];
         for i in range.clone() {
             let d = self.block_dev[i];
             if per_dev[d].is_none() {
-                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, self.causal_mask(seq, &self.devs[d])?));
+                let sw = match self.cfg.sliding_window {
+                    Some(w) if w < seq => Some(self.window_mask(seq, w, &self.devs[d])?),
+                    _ => None,
+                };
+                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, self.causal_mask(seq, &self.devs[d])?, sw));
             }
         }
         // one block on its own device: the hidden state (and, backwards, its gradient) moves when the device changes
         let step = |j: usize, x: &Tensor| -> Result<Tensor> {
             let b = self.blocks[j].as_ref().ok_or_else(|| anyhow!("block {j} is not in memory (the activation cache stands in for it)"))?;
-            let (rope, mask) = per_dev[self.block_dev[j]].as_ref().ok_or_else(|| anyhow!("block {j}: no tables for its device"))?;
+            let (rope, full, sliding) = per_dev[self.block_dev[j]].as_ref().ok_or_else(|| anyhow!("block {j}: no tables for its device"))?;
+            let mask = match sliding {
+                Some(m) if self.cfg.layer_sliding.get(j) == Some(&true) => m,
+                _ => full,
+            };
             self.block_forward(b, &move_to(x, &self.devs[self.block_dev[j]])?, rope, mask, ctx)
         };
         if let Some(l) = self.cfg.loop_ {
