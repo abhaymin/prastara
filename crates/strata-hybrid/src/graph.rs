@@ -54,6 +54,9 @@ impl<'a> Graph<'a> {
         if m.arch.starts_with("inkling2") {
             return Err("--graph does not run Inkling yet".into());
         }
+        if m.passes() > 1 {
+            return Err("--graph does not run a looped model yet (docs/MULA-PLAN.md M8): matrix by matrix, or --loop-passes 1".into());
+        }
         let mut dev = None;
         let rope = m.rope.as_ref().ok_or("--graph needs a model with RoPE")?;
         let output = on_device(&m.output, &mut dev)?;

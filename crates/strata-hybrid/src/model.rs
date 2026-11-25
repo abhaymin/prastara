@@ -22,6 +22,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use strata_gguf::Gguf;
 
 mod inkling;
+#[cfg(test)]
+mod loop_tests;
 pub(crate) use inkling::InkSlot;
 
 /// One weight matrix in the GGUF: `rows` output features of `cols` inputs, in its stored encoding.
@@ -853,6 +855,30 @@ pub struct Model {
     pub file_order: Vec<(usize, usize)>,
     /// From a model pack: the whole mapped file, for read-ahead over a tier's run.
     pub file_map: Option<&'static [u8]>,
+    /// The loop (Avarta, the Workshop's `LoopSpec`): blocks start..end run again with the same weights
+    pub(crate) loop_: Option<Loop>,
+    /// How many passes the loop runs (`--loop-passes`): 0 is the model's own count, 1 the base alone
+    pub loop_passes: std::sync::atomic::AtomicUsize,
+}
+
+/// A loop over the core blocks, as the Workshop trains it (crates/strata-workshop/src/model.rs `LoopSpec`): pass 1 is
+/// the base's own; every later pass p takes the core's output x, runs blocks start..end again to y (with its own
+/// attention cache), and keeps `x + g_p * (y - x)`, g_p one value per hidden channel (`loop.gate.<p>`).
+pub(crate) struct Loop {
+    pub start: usize,
+    pub end: usize,
+    pub passes: usize,
+    pub gates: Vec<Vec<f32>>,
+}
+
+/// One step of a forward pass: a layer in a pass of the loop (0 is the base's pass), or the mixing after an extra pass.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Step {
+    Layer(usize, usize),
+    /// before an extra pass: keep the hidden state it starts from
+    Save,
+    /// after extra pass p: x = saved + g_p * (x - saved)
+    Mix(usize),
 }
 
 /// Per-conversation state: per layer the attention cache (K, V - or MLA's latent and rotary key), and the Mamba
@@ -964,6 +990,7 @@ impl Model {
                 hc: 0, hc_head: None, layers: vec![],
                 heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
                 prefetch: AtomicBool::new(false), remote: None, profile_experts, ink: Some(Box::new(ink)), arch, file_order, file_map,
+                loop_: None, loop_passes: Default::default(),
             }, from_pack));
         }
         let k = |n: &str| format!("{arch}.{n}");
@@ -1173,6 +1200,23 @@ impl Model {
         }
         let embd = take("token_embd.weight")?;
         let output = opt("output.weight").unwrap_or_else(|| embd.clone());
+        let loop_ = match u("loop.count") {
+            Ok(passes) => {
+                let (start, end, passes) = (u("loop.start")? as usize, u("loop.end")? as usize, passes as usize);
+                if !matches!(arch.as_str(), "qwen3" | "llama") {
+                    return Err(format!("{arch}: a loop runs on qwen3 and llama models here"));
+                }
+                if start >= end || end > n_layer || !(2..=16).contains(&passes) {
+                    return Err(format!("{arch}: invalid loop: blocks {start}..{end} of {n_layer}, {passes} passes"));
+                }
+                let gates = (1..passes).map(|p| vecf(&format!("loop.gate.{p}"))).collect::<Result<Vec<_>, _>>()?;
+                if let Some(g) = gates.iter().find(|g| g.len() != n_embd) {
+                    return Err(format!("{arch}: a loop gate has {} values, the hidden size is {n_embd}", g.len()));
+                }
+                Some(Loop { start, end, passes, gates })
+            }
+            Err(_) => None,
+        };
         let profile_experts = (u("expert_count").unwrap_or(0) as usize).max(max_expert);
         let hc_head = if qwen4 { Some(mixer("output_hc_norm.weight", "output_hc_down.weight", "output_hc_up.weight", None)?) } else { None };
         Ok((Model {
@@ -1184,13 +1228,46 @@ impl Model {
             heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
             prefetch: AtomicBool::new(false),
             remote: None, ink: None, file_order, file_map,
-            profile_experts, layers, arch,
+            profile_experts, layers, arch, loop_, loop_passes: Default::default(),
         }, from_pack))
     }
 
     pub fn new_state(&self) -> State {
         State { pos: 0, kv: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new(), idx: HashMap::new(), ple_win: vec![], prev: vec![],
                 ink: self.ink.as_ref().map_or(vec![], |i| vec![InkSlot::default(); i.n_slots()]) }
+    }
+
+    /// The loop's passes this request runs (1: the base alone), within the model's own count.
+    pub fn passes(&self) -> usize {
+        self.loop_.as_ref().map_or(1, |l| match self.loop_passes.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => l.passes,
+            n => n.min(l.passes),
+        })
+    }
+
+    /// The order a token goes through the layers: every layer once, and after the loop's last block the core again
+    /// for each extra pass, between a save and a mix.
+    fn schedule(&self) -> Vec<Step> {
+        let mut s = Vec::with_capacity(self.layers.len());
+        for l in 0..self.layers.len() {
+            s.push(Step::Layer(l, 0));
+            if let Some(lp) = self.loop_.as_ref().filter(|lp| lp.end == l + 1) {
+                for p in 1..self.passes() {
+                    s.push(Step::Save);
+                    s.extend((lp.start..lp.end).map(|j| Step::Layer(j, p)));
+                    s.push(Step::Mix(p));
+                }
+            }
+        }
+        s
+    }
+
+    /// `x = saved + g_p * (x - saved)`
+    fn mix(&self, p: usize, saved: &[f32], x: &mut [f32]) {
+        let g = &self.loop_.as_ref().expect("a loop").gates[p - 1];
+        for ((x, s), g) in x.iter_mut().zip(saved).zip(g) {
+            *x = s + g * (*x - s);
+        }
     }
 
     /// One token through the model: the logits of the next one.
@@ -1206,7 +1283,17 @@ impl Model {
         let mut x = self.embd.row(token as usize);
         // AM2_DEBUG_LAYERS=1: a checksum of the hidden state after each block, to compare devices (CPU vs a GPU)
         let dbg = std::env::var_os("AM2_DEBUG_LAYERS").is_some();
-        for (l, layer) in self.layers.iter().enumerate() {
+        let n_layers = self.layers.len();
+        let mut saved: Vec<f32> = vec![];
+        for step in self.schedule() {
+            let (l, pass) = match step {
+                Step::Layer(l, p) => (l, p),
+                Step::Save => { saved = x.clone(); continue; }
+                Step::Mix(p) => { self.mix(p, &saved, &mut x); continue; }
+            };
+            let layer = &self.layers[l];
+            // each pass of the loop has its own attention cache
+            let sl = pass * n_layers + l;
             for (pi, (norm, block)) in layer.parts.iter().enumerate() {
                 let h = rms_norm(&x, norm, self.eps);
                 let kind = if dbg { match block { Block::Attn(_) => "attn", Block::Dense(_) => "ffn", Block::Moe(_) => "moe", _ => "other" } } else { "" };
@@ -1214,8 +1301,8 @@ impl Model {
                 let out = match block {
                     Block::Mamba(b) => self.mamba(l, b, &h, st),
                     Block::Gdn(b) => self.gdn(l, b, &h, st),
-                    Block::Attn(b) => self.attention(l * 2 + pi, b, &h, st),
-                    Block::Mla(b) => self.mla(l * 2 + pi, b, &h, st),
+                    Block::Attn(b) => self.attention(sl * 2 + pi, b, &h, st),
+                    Block::Mla(b) => self.mla(sl * 2 + pi, b, &h, st),
                     Block::Dense(b) => b.forward(&h),
                     Block::Moe(b) => self.moe(b, &h),
                 };
@@ -1281,7 +1368,19 @@ impl Model {
         }
         let base = st.pos;
         let mut xs: Vec<Vec<f32>> = tokens.iter().map(|&t| self.embd.row(t as usize)).collect();
-        for (l, layer) in self.layers.iter().enumerate() {
+        let n_layers = self.layers.len();
+        let mut saved: Vec<Vec<f32>> = vec![];
+        for step in self.schedule() {
+            let (l, pass) = match step {
+                Step::Layer(l, p) => (l, p),
+                Step::Save => { saved = xs.clone(); continue; }
+                Step::Mix(p) => {
+                    for (x, s0) in xs.iter_mut().zip(&saved) { self.mix(p, s0, x); }
+                    continue;
+                }
+            };
+            let layer = &self.layers[l];
+            let sl = pass * n_layers + l;
             for (pi, (norm, block)) in layer.parts.iter().enumerate() {
                 let hs: Vec<Vec<f32>> = xs.iter().map(|x| rms_norm(x, norm, self.eps)).collect();
                 let t0 = times::on().then(std::time::Instant::now);
@@ -1291,7 +1390,7 @@ impl Model {
                         let mut atts = Vec::with_capacity(tokens.len());
                         for (i, ((qv, kv), vv)) in q.into_iter().zip(k).zip(v).enumerate() {
                             st.pos = base + i;
-                            atts.push(self.attend(l * 2 + pi, a, qv, kv, vv, None, st));
+                            atts.push(self.attend(sl * 2 + pi, a, qv, kv, vv, None, st));
                         }
                         let mut o = a.o.matmul(&atts);
                         o.iter_mut().for_each(|y| add_bias(y, &a.o_b));
@@ -1299,7 +1398,7 @@ impl Model {
                     }
                     Block::Dense(b) => b.forward_batch(&hs),
                     Block::Moe(b) => self.moe_batch(b, &hs),
-                    Block::Mla(b) => self.mla_batch(l * 2 + pi, b, &hs, st, base),
+                    Block::Mla(b) => self.mla_batch(sl * 2 + pi, b, &hs, st, base),
                     Block::Gdn(b) => {
                         st.pos = base;
                         self.gdn_batch(l, b, &hs, st)
@@ -1310,8 +1409,8 @@ impl Model {
                         match block {
                             Block::Mamba(b) => self.mamba(l, b, h, st),
                             Block::Gdn(b) => self.gdn(l, b, h, st),
-                            Block::Attn(b) => self.attention(l * 2 + pi, b, h, st),
-                            Block::Mla(b) => self.mla(l * 2 + pi, b, h, st),
+                            Block::Attn(b) => self.attention(sl * 2 + pi, b, h, st),
+                            Block::Mla(b) => self.mla(sl * 2 + pi, b, h, st),
                             _ => unreachable!("batched above"),
                         }
                     }).collect(),
@@ -2335,7 +2434,11 @@ impl Model {
                 None => c.push((name, 1)),
             }
         }
-        c.iter().map(|(n, k)| format!("{n}_layers={k}")).collect::<Vec<_>>().join(" ")
+        let mut s = c.iter().map(|(n, k)| format!("{n}_layers={k}")).collect::<Vec<_>>().join(" ");
+        if let Some(l) = &self.loop_ {
+            s.push_str(&format!(" loop={}..{}x{}/{}", l.start, l.end, self.passes(), l.passes));
+        }
+        s
     }
 }
 

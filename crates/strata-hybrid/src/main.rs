@@ -171,9 +171,12 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     };
+    // --loop-passes N: a looped model (Avarta) runs its core N times (1: the base alone, faster); 0 or none, its own count
+    let loop_passes: usize = arg("--loop-passes").map(|v| v.parse().unwrap_or_else(|_| fail(format!("--loop-passes {v}: a number")))).unwrap_or(0);
     let pk = arg("--pack").map(|d| pack::Pack::open(std::path::Path::new(&d)).unwrap_or_else(|e| fail(e)));
     #[allow(unused_mut)]
     let (mut m, from_pack) = model::Model::load(std::path::Path::new(&model_path), pk.as_ref()).unwrap_or_else(|e| fail(e));
+    m.loop_passes.store(loop_passes, std::sync::atomic::Ordering::Relaxed);
     let n_layers = m.profile_layers();
     // the expert host: this machine lends its memory to a paired master (remote.rs); it serves until stopped
     if let Some(addr) = arg("--serve-experts") {

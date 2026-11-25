@@ -6,6 +6,9 @@
 //!   - convert: `"input"` (a Hugging Face model folder), `"output"`? (a .gguf), `"outtype"`? (f16 | f32), `"pre_tokenizer"`?
 //!   - quantize: `"input"` (a .gguf), `"output"`?, `"type"` (q8_0 | q6_k | q5_k | q4_k | q4_0 | f16)
 //!   - merge: `"base"` (an HF model folder), `"adapter"` (a PEFT/Unsloth adapter folder), `"output"`? (a folder)
+//!   - loop: `"input"` (an HF model folder), `"start"`, `"end"` (its blocks start..end), `"passes"`? (2-16, default 2),
+//!     `"output"`? (a folder) — a looped copy (Avarta): the core runs again behind gates that start closed, so the copy
+//!     is exactly its base until trained; convert carries the loop into the GGUF and the Rust engine runs it
 //!   - strata: `"input"` (a .gguf), `"name"`?, `"display_name"`?, `"overwrite"`? — make it a model the server runs: the
 //!     same run config and tokenizer folder a downloaded model gets (strata-hub's config writer, which picks the engine
 //!     for the architecture and refuses one no engine runs), so it appears in the model list
@@ -38,7 +41,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 5] = ["convert", "quantize", "merge", "strata", "datagen"];
+const KINDS: [&str; 6] = ["convert", "quantize", "merge", "loop", "strata", "datagen"];
 
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -262,6 +265,33 @@ impl Workshop {
                 };
                 Ok((kind.into(), vec!["merge".into(), base.display().to_string(), adapter.display().to_string(),
                                       "--out".into(), output.display().to_string()], output))
+            }
+            "loop" => {
+                let input = self.allowed(s("input").ok_or("loop needs \"input\": a Hugging Face model folder")?, true)?;
+                let cfg: Value = std::fs::read_to_string(input.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+                    .ok_or_else(|| format!("{} has no config.json: loop takes a Hugging Face model folder", input.display()))?;
+                let layers = cfg["num_hidden_layers"].as_u64().ok_or("the model's config.json has no num_hidden_layers")?;
+                if !cfg["prastara_loop"].is_null() {
+                    return Err(format!("{} is already looped", input.display()));
+                }
+                let n = |k: &str| req[k].as_u64();
+                let (start, end) = (n("start").ok_or("loop needs \"start\": the loop's first block")?, n("end").ok_or("loop needs \"end\": the block after its last")?);
+                let passes = n("passes").unwrap_or(2);
+                if start >= end || end > layers {
+                    return Err(format!("the loop's blocks {start}..{end} must be a non-empty range inside the model's {layers}"));
+                }
+                if !(2..=16).contains(&passes) {
+                    return Err(format!("\"passes\" is 2 to 16 (got {passes})"));
+                }
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => self.default_output(&input, &format!("-loop{start}-{end}x{passes}")),
+                };
+                if output.exists() {
+                    return Err(format!("{} already exists", output.display()));
+                }
+                Ok((kind.into(), vec!["loop".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
+                                      "--start".into(), start.to_string(), "--end".into(), end.to_string(), "--passes".into(), passes.to_string()], output))
             }
             "strata" => {
                 let input = self.allowed(s("input").ok_or("strata needs \"input\": a .gguf")?, true)?;

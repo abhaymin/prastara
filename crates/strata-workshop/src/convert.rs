@@ -535,9 +535,12 @@ fn model_size_label(params: u64) -> String {
 
 /// Write the GGUF file. `dir` holds the HF checkpoint (config/tokenizer/shards); `out` is the destination path.
 pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>) -> Result<()> {
+    if is_qwen3(dir) {
+        return convert_qwen3(dir, out, outtype, pre_tokenizer);
+    }
     let hparams = HfConfig::load(dir)?;
     if !hparams.is_llama() {
-        bail!("converter only handles LlamaForCausalLM (config.architectures={:?})", hparams.arch);
+        bail!("converter handles LlamaForCausalLM and Qwen3ForCausalLM (config.architectures={:?})", hparams.arch);
     }
     // identify the BPE pre-tokenizer the way llama.cpp does (`get_vocab_base_pre`); a synthetic tokenizer matches no
     // known probe hash and is named via `pre_tokenizer` instead, exactly as make-tiny-llama-reference.py forces "gpt-2"
@@ -550,7 +553,8 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
         .with_context(|| format!("reading tokenizer_config.json in {}", dir.display()))?)?;
     let chat = chat_template(&tc);
 
-    let mapped = mapped_tensors(&tensors, &hparams)?;
+    let mut mapped = mapped_tensors(&tensors, &hparams)?;
+    let lp = loop_parts(dir, "llama", hparams.hidden_size, hparams.num_hidden_layers)?;
     // total number of parameters across every tensor — llama.cpp derives general.size_label from it.
     let total_params: u64 = mapped.iter().map(|m| m.shape.iter().product::<u64>()).sum();
 
@@ -616,6 +620,15 @@ pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&
     kv.push(("tokenizer.ggml.add_eos_token", Kv::Bool(get_bool(&tc, "add_eos_token"))));
     if !chat.is_empty() {
         kv.push(("tokenizer.chat_template", Kv::Str(chat)));
+    }
+    // the loop (a looped copy's settings and gates), after everything llama.cpp writes
+    if let Some((lkv, gates)) = lp {
+        for (k, v) in lkv {
+            kv.push((Box::leak(k.into_boxed_str()), v));
+        }
+        for (name, vals) in gates {
+            mapped.push(Mapped { name, shape: vec![vals.len() as u64], vals });
+        }
     }
 
     let specs: Vec<TensorSpec> = mapped.iter().map(|m| {
@@ -756,4 +769,201 @@ mod tests {
         let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-llama-hf");
         assert_eq!(model_pre_tokenizer(&fx, Some("gpt-2")).unwrap(), "gpt-2");
     }
+}
+
+// ------------------------------------------------------------------------------------------------- Qwen3 and the loop
+
+/// The loop (Avarta, model.rs `LoopSpec`) a converted model carries: `<arch>.loop.start`, `.end`, `.count` and the
+/// gates `loop.gate.<p>` (F32, one value per hidden channel, p = 1..count-1). Gates missing from `loop.safetensors`
+/// are zeros, as the Workshop reads them (a model just converted to a loop is exactly its base).
+fn loop_parts(dir: &Path, arch: &str, hidden: usize, layers: usize) -> Result<Option<(Vec<(String, Kv)>, Vec<(String, Vec<f32>)>)>> {
+    let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
+    let Some(l) = crate::model::LoopSpec::from_json(&c["prastara_loop"], layers)? else { return Ok(None) };
+    let kv = vec![(format!("{arch}.loop.start"), Kv::U32(l.start as u32)), (format!("{arch}.loop.end"), Kv::U32(l.end as u32)),
+                  (format!("{arch}.loop.count"), Kv::U32(l.passes as u32))];
+    let file = dir.join(crate::model::LOOP_FILE);
+    let saved = if file.exists() { Some(safetensors_io::Shard::open(&file)?) } else { None };
+    let mut gates = vec![];
+    for p in 1..l.passes {
+        let name = format!("loop.gate.{p}");
+        let vals = match saved.as_ref().and_then(|s| s.get(&name).cloned().map(|t| (s, t))) {
+            Some((s, t)) => {
+                anyhow::ensure!(t.numel() as usize == hidden, "{}: {name} has {} values, the model's hidden size is {hidden}", file.display(), t.numel());
+                tensor_f32(s, &t, &file)?
+            }
+            None => vec![0.0; hidden],
+        };
+        gates.push((name, vals));
+    }
+    Ok(Some((kv, gates)))
+}
+
+fn tensor_f32(s: &safetensors_io::Shard, t: &safetensors_io::TensorDesc, f: &Path) -> Result<Vec<f32>> {
+    let raw = s.bytes(t);
+    Ok(match t.dtype() {
+        safetensors_io::Dtype::F32 => raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
+        safetensors_io::Dtype::BF16 => raw.chunks_exact(2).map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16)).collect(),
+        safetensors_io::Dtype::F16 => raw.chunks_exact(2).map(|c| half::f16::from_bits(u16::from_le_bytes([c[0], c[1]])).to_f32()).collect(),
+        other => bail!("{}: tensor {} is {}; the converter reads F32, BF16 and F16", f.display(), t.name(), other.as_str()),
+    })
+}
+
+/// The whole vocabulary as llama.cpp's `get_vocab_base` writes it: `model.vocab` and the added tokens by id, the
+/// gaps up to `vocab_size` as `[PAD<i>]` (UNUSED); added special tokens CONTROL, other added tokens USER_DEFINED;
+/// and the BPE merges.
+fn full_vocab(dir: &Path, vocab_size: usize) -> Result<(Vec<String>, Vec<i32>, Vec<String>, HashMapStr)> {
+    let tj: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("tokenizer.json"))
+        .with_context(|| format!("reading tokenizer.json in {}", dir.display()))?)?;
+    let mut by_id: std::collections::HashMap<usize, (String, i32)> = std::collections::HashMap::new();
+    for (t, id) in tj["model"]["vocab"].as_object().ok_or_else(|| anyhow!("tokenizer.json model.vocab is not an object"))? {
+        by_id.insert(id.as_u64().unwrap_or(0) as usize, (t.clone(), 1));
+    }
+    for a in tj["added_tokens"].as_array().into_iter().flatten() {
+        if let (Some(id), Some(t)) = (a["id"].as_u64(), a["content"].as_str()) {
+            by_id.insert(id as usize, (t.to_string(), if a["special"] == true { 3 } else { 4 }));
+        }
+    }
+    let n = vocab_size.max(by_id.keys().max().map_or(0, |m| m + 1));
+    let (mut tokens, mut types) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for i in 0..n {
+        let (t, ty) = by_id.get(&i).cloned().unwrap_or_else(|| (format!("[PAD{i}]"), 5));
+        tokens.push(t);
+        types.push(ty);
+    }
+    let merges = tj["model"]["merges"].as_array().into_iter().flatten().filter_map(|m| match m {
+        Json::String(s) => Some(s.clone()),
+        Json::Array(p) if p.len() == 2 => Some(format!("{} {}", p[0].as_str()?, p[1].as_str()?)),
+        _ => None,
+    }).collect();
+    let ids = tokens.iter().enumerate().map(|(i, t)| (t.clone(), i as u32)).collect();
+    Ok((tokens, types, merges, ids))
+}
+
+type HashMapStr = std::collections::HashMap<String, u32>;
+
+/// A Qwen3ForCausalLM folder to a `qwen3` GGUF as llama.cpp's `Qwen3Model` writes it (no q/k permute: Qwen's rotary
+/// is NEOX; per-head q/k norms `attn_q_norm` / `attn_k_norm`; head size in `attention.key_length`), with the loop when
+/// the folder has one. The tensors are read one at a time from the mapped shards, so the memory needed is one tensor,
+/// not the model.
+pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>) -> Result<()> {
+    let d = dir.display();
+    let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("reading config for {d}"))?)?;
+    let n = |k: &str| c[k].as_f64().ok_or_else(|| anyhow!("{d}: config.{k} missing or not a number"));
+    let (hidden, layers, heads) = (n("hidden_size")? as usize, n("num_hidden_layers")? as usize, n("num_attention_heads")? as usize);
+    let kv_heads = c["num_key_value_heads"].as_f64().map_or(heads, |v| v as usize);
+    let head_dim = c["head_dim"].as_f64().map_or(hidden / heads, |v| v as usize);
+    let theta = c["rope_theta"].as_f64().or_else(|| c["rope_parameters"]["rope_theta"].as_f64()).unwrap_or(1_000_000.0);
+    let rope_type = c["rope_scaling"]["rope_type"].as_str().or_else(|| c["rope_parameters"]["rope_type"].as_str()).unwrap_or("default");
+    if rope_type != "default" {
+        bail!("{d}: rope type {rope_type:?}: the engine's long-context path (docs/MULA-PLAN.md L5) is not written yet; convert the model before the long-context step");
+    }
+    if c["layer_types"].as_array().is_some_and(|a| a.iter().any(|t| t != "full_attention")) {
+        bail!("{d}: sliding-window layers: the engine's long-context path (docs/MULA-PLAN.md L5) is not written yet");
+    }
+    let vocab_size = n("vocab_size")? as usize;
+    let arch = "qwen3";
+
+    // the weights: every shard but the loop's gates
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors")
+                    && p.file_name().and_then(|s| s.to_str()) != Some(crate::model::LOOP_FILE)).collect();
+    files.sort();
+    anyhow::ensure!(!files.is_empty(), "{d}: no *.safetensors shards found");
+    let shards: Vec<safetensors_io::Shard> = files.iter().map(|f| safetensors_io::Shard::open(f)).collect::<Result<_>>()?;
+    let find = |name: &str| shards.iter().enumerate().find_map(|(i, s)| s.get(name).cloned().map(|t| (i, t)));
+    let mut plan: Vec<(String, String)> = vec![("token_embd.weight".into(), "model.embed_tokens.weight".into()),
+                                               ("output_norm.weight".into(), "model.norm.weight".into())];
+    if find("lm_head.weight").is_some() && c["tie_word_embeddings"] != true {
+        plan.push(("output.weight".into(), "lm_head.weight".into()));
+    }
+    for b in 0..layers {
+        for (g, h) in [("attn_norm", "input_layernorm"), ("attn_q", "self_attn.q_proj"), ("attn_k", "self_attn.k_proj"),
+                       ("attn_v", "self_attn.v_proj"), ("attn_output", "self_attn.o_proj"), ("attn_q_norm", "self_attn.q_norm"),
+                       ("attn_k_norm", "self_attn.k_norm"), ("ffn_norm", "post_attention_layernorm"), ("ffn_gate", "mlp.gate_proj"),
+                       ("ffn_up", "mlp.up_proj"), ("ffn_down", "mlp.down_proj")] {
+            plan.push((format!("blk.{b}.{g}.weight"), format!("model.layers.{b}.{h}.weight")));
+        }
+    }
+    let mut located = vec![];
+    for (g, h) in &plan {
+        let (i, t) = find(h).ok_or_else(|| anyhow!("{d}: tensor {h} is missing"))?;
+        located.push((g.clone(), i, t));
+    }
+    let lp = loop_parts(dir, arch, hidden, layers)?;
+    let total_params: u64 = located.iter().map(|(_, _, t)| t.numel()).sum();
+
+    let pre = model_pre_tokenizer(dir, pre_tokenizer)?;
+    let (tokens, types, merges, ids) = full_vocab(dir, vocab_size)?;
+    let tc: Json = std::fs::read_to_string(dir.join("tokenizer_config.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Json::Null);
+    let id_of = |key: &str| special_text(&tc, key).and_then(|t| ids.get(&t).copied());
+    let eos = id_of("eos_token").or_else(|| c["eos_token_id"].as_u64().map(|v| v as u32)).unwrap_or(0);
+    let bos = id_of("bos_token").or_else(|| c["bos_token_id"].as_u64().map(|v| v as u32)).unwrap_or(eos);
+    let mut chat = chat_template(&tc);
+    if chat.is_empty() {
+        chat = std::fs::read_to_string(dir.join("chat_template.jinja")).unwrap_or_default();
+    }
+
+    let folder = dir.file_name().and_then(|n| n.to_str());
+    let mut kv: Vec<(String, Kv)> = vec![
+        ("general.architecture".into(), Kv::Str(arch.into())),
+        ("general.type".into(), Kv::Str("model".into())),
+        ("general.name".into(), Kv::Str(folder.map_or("qwen3".into(), id_to_title))),
+        ("general.size_label".into(), Kv::Str(model_size_label(total_params))),
+        (format!("{arch}.block_count"), Kv::U32(layers as u32)),
+        (format!("{arch}.context_length"), Kv::U32(n("max_position_embeddings")? as u32)),
+        (format!("{arch}.embedding_length"), Kv::U32(hidden as u32)),
+        (format!("{arch}.feed_forward_length"), Kv::U32(n("intermediate_size")? as u32)),
+        (format!("{arch}.attention.head_count"), Kv::U32(heads as u32)),
+        (format!("{arch}.attention.head_count_kv"), Kv::U32(kv_heads as u32)),
+        (format!("{arch}.rope.freq_base"), Kv::F32(theta as f32)),
+        (format!("{arch}.attention.layer_norm_rms_epsilon"), Kv::F32(n("rms_norm_eps")? as f32)),
+        (format!("{arch}.attention.key_length"), Kv::U32(head_dim as u32)),
+        (format!("{arch}.attention.value_length"), Kv::U32(head_dim as u32)),
+        ("general.file_type".into(), Kv::U32(outtype.file_type())),
+        ("general.quantization_version".into(), Kv::U32(2)),
+        ("tokenizer.ggml.model".into(), Kv::Str("gpt2".into())),
+        ("tokenizer.ggml.pre".into(), Kv::Str(pre)),
+        ("tokenizer.ggml.tokens".into(), Kv::Strings(tokens)),
+        ("tokenizer.ggml.token_type".into(), Kv::Ints(types)),
+        ("tokenizer.ggml.merges".into(), Kv::Strings(merges)),
+        ("tokenizer.ggml.eos_token_id".into(), Kv::U32(eos)),
+        ("tokenizer.ggml.bos_token_id".into(), Kv::U32(bos)),
+        ("tokenizer.ggml.add_bos_token".into(), Kv::Bool(get_bool(&tc, "add_bos_token"))),
+    ];
+    if let Some(p) = id_of("pad_token") {
+        kv.push(("tokenizer.ggml.padding_token_id".into(), Kv::U32(p)));
+    }
+    if !chat.is_empty() {
+        kv.push(("tokenizer.chat_template".into(), Kv::Str(chat)));
+    }
+    let (loop_kv, gates) = lp.unwrap_or_default();
+    kv.extend(loop_kv);
+
+    let mut specs: Vec<TensorSpec> = located.iter().map(|(g, _, t)| {
+        let (ggml_type, ot) = tensor_type(t.shape(), outtype);
+        TensorSpec { name: g.clone(), shape: t.shape().iter().map(|&x| x as u64).collect(), ggml_type,
+                     nbytes: t.numel() * if ot == OutType::F16 { 2 } else { 4 } }
+    }).collect();
+    for (g, v) in &gates {
+        specs.push(TensorSpec { name: g.clone(), shape: vec![v.len() as u64], ggml_type: 0, nbytes: v.len() as u64 * 4 });
+    }
+    let kv_ref: Vec<(&str, Kv)> = kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let mut w = Writer::create_typed(out, &kv_ref, specs)?;
+    for (_, i, t) in &located {
+        let vals = tensor_f32(&shards[*i], t, &files[*i])?;
+        w.tensor_data(&serialize(&vals, tensor_type(t.shape(), outtype).1))?;
+        w.end_tensor()?;
+    }
+    for (_, v) in &gates {
+        w.tensor_data(&serialize(v, OutType::F32))?;
+        w.end_tensor()?;
+    }
+    w.finish()?;
+    Ok(())
+}
+
+/// Whether a folder is a Qwen3ForCausalLM (`convert_qwen3`) rather than a Llama (`convert`).
+pub fn is_qwen3(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join("config.json")).ok().and_then(|s| serde_json::from_str::<Json>(&s).ok())
+        .is_some_and(|c| c["architectures"][0].as_str() == Some("Qwen3ForCausalLM"))
 }

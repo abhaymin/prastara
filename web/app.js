@@ -4731,6 +4731,8 @@ async function wsSubmit(body, btn) {
   } catch (e) { wsError(e.message); }
   finally { btn.disabled = false; btn.textContent = label; }
 }
+$("ws-loop").onclick = (e) => wsSubmit({kind: "loop", input: $("ws-lp-in").value.trim(), start: Number($("ws-lp-start").value),
+  end: Number($("ws-lp-end").value), passes: Number($("ws-lp-passes").value), output: $("ws-lp-out").value.trim()}, e.currentTarget);
 $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").value.trim(), adapter: $("ws-m-adapter").value.trim(), output: $("ws-m-out").value.trim()}, e.currentTarget);
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);

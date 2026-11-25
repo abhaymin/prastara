@@ -599,6 +599,26 @@
                 (training from this tab comes next). <code>profile</code> and <code>autopilot</code> say what fits this PC.</p></div>
             <pre class="ws-cmd">am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt;</pre>
             <p class="muted small">Use a dataset from step 1, then merge the adapter in step 3.</p>
+            <div class="ws-sub">
+              <span class="card-title">Loop a model (Avarta)</span>
+              <p class="muted small">A copy of a Llama or Qwen3 model whose middle blocks run more than once with the same
+                weights: it thinks deeper at the same size on disk. Each extra pass enters through a gate that starts
+                closed, so the copy answers exactly as its base until you train it here (the gates train with the
+                adapter). Convert carries the loop into the GGUF, and the Rust engine runs it.</p>
+              <div class="ws-form">
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-lp-in">Model (HF folder)</label>
+                  <input class="st-input mono" id="ws-lp-in" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
+                <div class="ws-field"><label class="st-label" for="ws-lp-start">First block</label>
+                  <input class="st-input mono" id="ws-lp-start" type="number" min="0" value="12"></div>
+                <div class="ws-field"><label class="st-label" for="ws-lp-end">After the last block</label>
+                  <input class="st-input mono" id="ws-lp-end" type="number" min="1" value="24"></div>
+                <div class="ws-field"><label class="st-label" for="ws-lp-passes">Passes</label>
+                  <input class="st-input mono" id="ws-lp-passes" type="number" min="2" max="16" value="2"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-lp-out">Output folder <output>optional</output></label>
+                  <input class="st-input mono" id="ws-lp-out" placeholder="in the Workshop folder"></div>
+              </div>
+              <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-loop">Make the looped copy</button></div>
+            </div>
             <div class="ws-lib">
               <span class="card-title">Model library</span>
               <p class="muted small">Ready-made recipes for text, code, tools, vision, OCR, image, speech, music and video
@@ -638,7 +658,7 @@
           <div class="st-card ws-panel" data-ws-panel="convert" hidden>
             <div class="ws-panel__head"><span class="card-title">Convert to GGUF</span>
               <p class="muted small">A Hugging Face model folder (safetensors, config.json, tokenizer) to one GGUF file, byte for
-                byte as llama.cpp's converter writes it. Llama-family models for now.</p></div>
+                byte as llama.cpp's converter writes it. Llama and Qwen3 models; a looped copy keeps its loop.</p></div>
             <div class="ws-form">
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-in">Model (HF folder)</label>
                 <input class="st-input mono" id="ws-c-in" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
@@ -687,7 +707,7 @@
         <aside class="ws-side">
           <div class="st-card ws-jobs"><span class="card-title">Jobs</span>
             <div id="ws-jobs"><p class="muted small">No jobs yet.</p></div></div>
-          <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|strata|datagen|upload|dataset|jobs|cancel</code>
+          <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|loop|strata|datagen|upload|dataset|jobs|cancel</code>
             (through this server), or <code>am2strata-workshop</code> on its own.</p>
         </aside>
       </div>

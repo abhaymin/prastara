@@ -840,6 +840,7 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
   .ws-steps button { min-width: 7rem; }
 }
 
+.ws-sub { display: flex; flex-direction: column; gap: .6rem; margin: .4rem 0 1rem; padding-top: .9rem; border-top: 1px solid var(--st-border, rgba(127,127,127,.25)); }
 .ws-lib { display: flex; flex-direction: column; gap: .6rem; }
 .ws-lib__list { max-height: 20rem; overflow: auto; border: 1px solid var(--st-border, rgba(127,127,127,.25)); border-radius: 8px; }
 .ws-lib__item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .2rem .8rem; width: 100%; padding: .45rem .7rem;

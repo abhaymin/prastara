@@ -128,6 +128,22 @@ fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
     assert_eq!(s.post("/v1/workshop/jobs", &json!({"kind": "quantize", "input": out, "type": "q3_x"})).0, 400);
     assert_eq!(s.post("/v1/workshop/jobs", &json!({"kind": "merge", "base": model, "adapter": model})).0, 400, "not an adapter");
     assert_eq!(s.post("/v1/workshop/jobs", &json!({"kind": "train"})).0, 400);
+    // a loop: blocks inside the model, 2-16 passes, not a model that is looped already
+    let deep = s.dir.join("hf-deep");
+    std::fs::create_dir_all(&deep).unwrap();
+    std::fs::write(deep.join("config.json"), r#"{"num_hidden_layers": 4}"#).unwrap();
+    for (bad, why) in [(json!({"start": 1, "end": 5}), "past the last block"), (json!({"start": 2, "end": 2}), "empty"),
+                       (json!({"start": 0, "end": 2, "passes": 17}), "too many passes"), (json!({"end": 2}), "no start")] {
+        let mut req = json!({"kind": "loop", "input": deep});
+        req.as_object_mut().unwrap().extend(bad.as_object().unwrap().clone());
+        assert_eq!(s.post("/v1/workshop/jobs", &req).0, 400, "{why}");
+    }
+    let looped = s.dir.join("hf-looped");
+    std::fs::create_dir_all(&looped).unwrap();
+    std::fs::write(looped.join("config.json"), r#"{"num_hidden_layers": 4, "prastara_loop": {"start": 1, "end": 3, "passes": 2}}"#).unwrap();
+    let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "loop", "input": looped, "start": 0, "end": 2}));
+    assert_eq!(code, 400);
+    assert!(e["error"]["message"].as_str().unwrap().contains("already looped"), "{e}");
     let (_, list) = s.get("/v1/workshop/jobs", true);
     assert_eq!(list["jobs"].as_array().unwrap().len(), 4);
 }

@@ -155,14 +155,15 @@ enum Cmd {
     },
     /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
     /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
+    /// | loop <hf-folder> 12..24x2 (a looped copy: blocks 12-23 run twice, behind gates that start closed)
     /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
     /// | jobs | job <id> | cancel <id> | files
     Workshop {
         action: String,
-        /// convert/quantize: the input; merge: the base model; job/cancel: the job id
+        /// convert/quantize/loop: the input; merge: the base model; job/cancel: the job id
         first: Option<String>,
-        /// merge: the adapter folder
+        /// merge: the adapter folder; loop: the blocks and passes, <start>..<end>[x<passes>]
         second: Option<String>,
         #[arg(long)]
         out: Option<String>,
@@ -1438,6 +1439,15 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
             "merge" => serde_json::json!({"kind": "merge", "base": abs(first.clone().ok_or("merge <base-folder> <adapter-folder>")?),
                                           "adapter": abs(second.clone().ok_or("merge <base-folder> <adapter-folder>")?),
                                           "output": out.clone().map(abs)}),
+            "loop" => {
+                const USE: &str = "loop <hf-folder> <start>..<end>[x<passes>] (e.g. 12..24x2: blocks 12 to 23 run twice)";
+                let spec = second.clone().ok_or(USE)?;
+                let (range, passes) = spec.split_once('x').map_or((spec.as_str(), "2"), |(r, p)| (r, p));
+                let (a, b) = range.split_once("..").ok_or(USE)?;
+                let num = |v: &str| v.trim().parse::<u64>().map_err(|_| USE.to_string());
+                serde_json::json!({"kind": "loop", "input": abs(first.clone().ok_or(USE)?), "start": num(a)?, "end": num(b)?,
+                                   "passes": num(passes)?, "output": out.clone().map(abs)})
+            }
             "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
                                            "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),
             "datagen" => {

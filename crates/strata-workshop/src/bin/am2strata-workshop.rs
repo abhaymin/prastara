@@ -802,7 +802,10 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
         }
         Cmd::Convert { dir, out: dst, outtype, pre_tokenizer } => {
             let ot = convert::OutType::from_s(outtype).map_err(|e| e.to_string())?;
-            fits(f32_bytes_of(dir), "converting this model")?;
+            // the Llama converter holds the model in f32; the Qwen3 one streams a tensor at a time
+            if !convert::is_qwen3(dir) {
+                fits(f32_bytes_of(dir), "converting this model")?;
+            }
             out.event(json!({"event": "start", "what": format!("convert {} to {} ({outtype})", dir.display(), dst.display())}));
             convert::convert(dir, dst, ot, pre_tokenizer.as_deref()).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "gguf".into()))

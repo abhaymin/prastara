@@ -211,3 +211,52 @@ fn checkpointing_gives_the_same_gradients() {
     assert!(big > 0.0 && d <= big * 1e-5, "{d}");
     let _ = std::fs::remove_dir_all(&out);
 }
+
+/// A looped tiny Qwen3 with open gates (different per pass and channel) and a tokenizer, ready to convert.
+fn looped_with_gates(tag: &str) -> PathBuf {
+    let out = scratch(tag);
+    make_looped(&fixture(), &out, LoopSpec { start: 1, end: 3, passes: 3 }).unwrap();
+    let hidden = LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap().cfg.hidden_size;
+    let gate = |p: usize| Tensor::new((0..hidden).map(|c| 0.1 + 0.3 * p as f32 + 0.01 * c as f32).collect::<Vec<f32>>(), &Device::Cpu).unwrap();
+    let gates: HashMap<String, Tensor> = [("loop.gate.1".to_string(), gate(1)), ("loop.gate.2".to_string(), gate(2))].into();
+    candle_core::safetensors::save(&gates, out.join(LOOP_FILE)).unwrap();
+    // the tiny Llama fixture's tokenizer (32 tokens; the rest of the 64 are padding)
+    let tok = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-llama-hf");
+    for f in ["tokenizer.json", "tokenizer_config.json"] {
+        std::fs::copy(tok.join(f), out.join(f)).unwrap();
+    }
+    out
+}
+
+#[test]
+fn a_looped_qwen3_converts_to_a_gguf_with_its_loop() {
+    let dir = looped_with_gates("gguf");
+    let gguf = dir.join("model.f32.gguf");
+    strata_workshop::convert::convert(&dir, &gguf, strata_workshop::convert::OutType::F32, Some("gpt-2")).unwrap();
+    let g = strata_gguf::Gguf::open(&gguf).unwrap();
+    assert_eq!(g.architecture(), Some("qwen3"));
+    for (k, v) in [("qwen3.loop.start", 1), ("qwen3.loop.end", 3), ("qwen3.loop.count", 3), ("qwen3.block_count", 3), ("qwen3.attention.key_length", 16)] {
+        assert_eq!(g.u64(k), Some(v), "{k}");
+    }
+    let names: Vec<&str> = g.tensors.iter().map(|t| t.name.as_str()).collect();
+    for n in ["loop.gate.1", "loop.gate.2", "blk.2.attn_q_norm.weight", "blk.0.attn_k_norm.weight", "output.weight"] {
+        assert!(names.contains(&n), "{n} in {names:?}");
+    }
+    assert_eq!(g.tensors.len(), 3 + 3 * 11 + 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The engine's parity fixture (crates/strata-hybrid/tests/loop_parity.rs): the looped tiny Qwen3 as an F32 GGUF, and
+/// the Workshop's logits for it and for its base. Run with --ignored to write it again after a change to the loop.
+#[test]
+#[ignore]
+fn write_the_engines_loop_fixture() {
+    let dir = looped_with_gates("fixture");
+    let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3-loop");
+    std::fs::create_dir_all(&fx).unwrap();
+    strata_workshop::convert::convert(&dir, &fx.join("model.f32.gguf"), strata_workshop::convert::OutType::F32, Some("gpt-2")).unwrap();
+    let json = serde_json::json!({"tokens": TOKENS, "looped": logits(&dir), "base": logits(&fixture()), "passes": 3,
+                                  "note": "written by crates/strata-workshop/tests/avarta.rs write_the_engines_loop_fixture"});
+    std::fs::write(fx.join("logits.json"), serde_json::to_string(&json).unwrap()).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
