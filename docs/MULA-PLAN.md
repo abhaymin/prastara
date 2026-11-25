@@ -160,3 +160,14 @@ contexts, and Mula refining itself on Prastara's own tasks.
     - the loss computed a chunk of rows at a time, with the head's recomputation in the backward pass;
     - token-chunked recomputation inside a block (everything but attention works token by token);
     - the checkpointed block inputs kept in RAM, not on the cards.
+- **The loop in the engine (2026-11-25), M8's first half:**
+  - **Convert:** Qwen3 folders now convert to a `qwen3` GGUF as llama.cpp's converter writes it, a tensor at a time
+    (the looped 8B: 56 s, 16.4 GB in F16, 8 GB of memory, mostly the mapped shards). The loop goes with it.
+  - **Engine:** `am2strata-hybrid` runs the loop on the CPU path, token by token and a chunk at a time, each pass
+    with its own attention cache. On the tiny looped Qwen3 with open gates, its logits equal the Workshop's within
+    2e-3 (the base alone is 6e-4 off, from the F16 cache; the loop moves the logits by 1.7).
+  - **The looped 8B** (`Strata-data/mula/gguf/mula-base-loop-v0.1-f16.gguf`, gates still closed) answers "The capital
+    of France is" with " Paris", the same 8 tokens with one pass or two. On the CPU in F16: 18.0 s with one pass,
+    23.5 s with two.
+  - **Open:** the GPU graph path for qwen3 and the loop (M8's second half); a per-request pass count.
+

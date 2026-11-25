@@ -523,6 +523,19 @@ split or balanced by language afterwards.
 A small or base model may not write the JSON the recipe asks for. The job then fails, saying so, and leaves no empty
 file. An instruction-tuned model of 7B or more works best. The judge roughly doubles the time.
 
+**Looped models (Avarta):** a copy of a Llama or Qwen3 model whose middle blocks run more than once with the same
+weights, so it thinks deeper at the same size on disk. Each extra pass enters through a gate (one value per hidden
+channel) that starts closed: the copy answers exactly as its base until it is trained, and the gates train with the
+adapter. Convert carries the loop into the GGUF (`<arch>.loop.start`, `.end`, `.count` and the `loop.gate.<p>`
+tensors), and the Rust engine runs it, each pass with its own attention cache; `--loop-passes 1` on the engine runs
+the base alone, faster. The GPU graph path does not run a loop yet: a looped model runs matrix by matrix. In the web
+app: Workshop › Train › Loop a model.
+
+```bash
+am2strata-run workshop loop ~/models/Qwen3-8B 12..24x2      # blocks 12 to 23 run twice
+am2strata-run workshop convert ~/Development/Strata-data/workshop/Qwen3-8B-loop12-24x2
+```
+
 **Model library:** ready-made recipes (a base model, a task and a `soup.yaml`) for text, code, tools, reasoning,
 vision, OCR, image, speech, music and video models: Soup's recipe catalogue (Apache-2.0), ported to Rust and compiled
 into the Workshop, and Prastara's own (the Mula series, and the speech, music, image and video models Prastara runs).
