@@ -11,6 +11,11 @@ use strata_workshop::model::{make_looped, LoopSpec, LoraSpec, Target};
 #[test]
 #[ignore]
 fn a_looped_model_trains_the_same_on_two_gpus_as_on_the_cpu() {
+    // AM2_TEST_CHUNKED=1: every attention chunked (3 queries at a time), so its GPU side is checked too
+    if std::env::var("AM2_TEST_CHUNKED").as_deref() == Ok("1") {
+        strata_workshop::model::CHUNKED_ABOVE.store(4, std::sync::atomic::Ordering::Relaxed);
+        strata_workshop::model::ATTENTION_CHUNK.store(3, std::sync::atomic::Ordering::Relaxed);
+    }
     let (root, model, data) = common::model_and_data("gpu-train");
     let looped = root.join("looped");
     make_looped(&model, &looped, LoopSpec { start: 1, end: 3, passes: 2 }).unwrap();

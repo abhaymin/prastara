@@ -61,6 +61,23 @@ enum Cmd {
         #[arg(long, default_value_t = 2)]
         passes: usize,
     },
+    /// a long-context copy of a model folder: YaRN positions to --length, every --full-every-th layer full
+    /// attention, the rest a --window of the last tokens (weights linked; it still needs long-context training)
+    Context {
+        model: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// the context it is set up for, in tokens (e.g. 1048576)
+        #[arg(long)]
+        length: usize,
+        /// the length the model was trained to (default: its max_position_embeddings)
+        #[arg(long)]
+        original: Option<usize>,
+        #[arg(long, default_value_t = 4096)]
+        window: usize,
+        #[arg(long, default_value_t = 4)]
+        full_every: usize,
+    },
     /// a Hugging Face model folder (safetensors + config + tokenizer) to one GGUF, as llama.cpp's converter writes it
     Convert {
         dir: PathBuf,
@@ -727,6 +744,11 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             out.event(json!({"event": "start", "what": format!("loop blocks {start}..{end} of {} x{passes} as {}", model.display(), dst.display())}));
             strata_workshop::model::make_looped(model, dst, strata_workshop::model::LoopSpec { start: *start, end: *end, passes: *passes })
                 .map_err(|e| e.to_string())?;
+            Ok((dst.clone(), "hf-model".into()))
+        }
+        Cmd::Context { model, out: dst, length, original, window, full_every } => {
+            out.event(json!({"event": "start", "what": format!("{} set up for {length} tokens as {}", model.display(), dst.display())}));
+            strata_workshop::model::make_long_context(model, dst, *length, *original, *window, *full_every).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "hf-model".into()))
         }
         Cmd::Merge { base, adapter, out: dst } => {

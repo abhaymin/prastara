@@ -98,7 +98,23 @@ pub fn graph_floats_per_token(cfg: &ModelConfig, lora: &LoraSpec, seq: usize) ->
     let (h, i) = (cfg.hidden_size as f64, cfg.intermediate_size as f64);
     let (q, kv) = ((cfg.num_attention_heads * cfg.head_dim) as f64, (cfg.num_key_value_heads * cfg.head_dim) as f64);
     let adapters: f64 = lora.targets.iter().map(|t| (lora.r + 3 * cfg.target_shape(*t).0) as f64).sum();
-    10.0 * h + 11.5 * q + 8.5 * kv + 4.0 * i + 2.0 * (cfg.num_attention_heads * seq) as f64 + adapters
+    // past CHUNKED_ABOVE tokens the attention keeps no seq x seq table (model.rs, chunked_attention)
+    let table = if seq > chunked_above() { 0.0 } else { 2.0 * (cfg.num_attention_heads * seq) as f64 };
+    10.0 * h + 11.5 * q + 8.5 * kv + 4.0 * i + table + adapters
+}
+
+fn chunked_above() -> usize {
+    crate::model::CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The chunked attention's working set while one block is computed or recomputed: a chunk's probabilities and
+/// two tensors of their size in the backward pass, f32.
+fn chunk_bytes(cfg: &ModelConfig, seq: usize) -> f64 {
+    if seq <= chunked_above() {
+        return 0.0;
+    }
+    let chunk = crate::model::ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    3.0 * 4.0 * cfg.num_attention_heads as f64 * chunk * seq as f64
 }
 
 /// Bytes of the base's 1-D tensors (always f32) and matrices (base dtype), for `blocks` blocks, with or without the
@@ -142,7 +158,7 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     };
     let head = 6.0 * 4.0 * (seq * cfg.vocab_size) as f64;
     let frozen = if cached || first == 0 { 0.0 } else { 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq) };
-    let activations = (graph + head + frozen) as u64;
+    let activations = (graph + head + frozen + chunk_bytes(cfg, seq)) as u64;
 
     let largest = Target::ALL.iter().map(|t| { let (o, i) = cfg.target_shape(*t); o * i }).max().unwrap_or(0).max(cfg.vocab_size * cfg.hidden_size) as u64;
     // a matrix larger than 64 M values is widened a slice at a time (model.rs, WIDEN_VALUES_MAX)

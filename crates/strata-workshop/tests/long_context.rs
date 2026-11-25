@@ -78,3 +78,40 @@ fn a_yarn_config_loads_and_keeps_short_positions_close() {
     assert!(LlamaModel::load(&bad, BaseDtype::F32, &Device::Cpu).is_err());
     for d in [y, bad] { let _ = std::fs::remove_dir_all(d); }
 }
+
+#[test]
+fn the_context_command_writes_a_long_context_copy() {
+    let out = std::env::temp_dir().join(format!("longctx-conv-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&out);
+    strata_workshop::model::make_long_context(&fixture(), &out, 1 << 20, Some(32768), 4096, 4).unwrap();
+    let m = LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap();
+    assert_eq!(m.cfg.yarn.unwrap().factor, 32.0);
+    assert_eq!(m.cfg.max_position_embeddings, 1 << 20);
+    assert_eq!(m.cfg.sliding_window, Some(4096));
+    let full: Vec<usize> = m.cfg.layer_sliding.iter().enumerate().filter(|(_, s)| !**s).map(|(i, _)| i).collect();
+    let n = m.cfg.num_hidden_layers;
+    assert!(!full.is_empty() && full.iter().all(|i| (i + 1) % 4 == 0 || i + 1 == n), "{full:?}");
+    assert!(logits(&out).iter().flatten().all(|v| v.is_finite()));
+    // twice is refused, and so is a length that is not longer
+    assert!(strata_workshop::model::make_long_context(&out, &out.with_extension("2"), 1 << 21, None, 4096, 4).is_err());
+    assert!(strata_workshop::model::make_long_context(&fixture(), &out.with_extension("3"), 1000, Some(32768), 4096, 4).is_err());
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// AM2_MULA_DIRS=<folder>[,<folder>...]: each model's top tokens after "The capital of France is" (Qwen3 ids;
+/// 12095 is " Paris"), on the CPU in BF16. A check that a conversion still answers, not a quality measure.
+#[test]
+#[ignore]
+fn real_models_answer_a_short_prompt() {
+    for dir in std::env::var("AM2_MULA_DIRS").unwrap().split(',') {
+        let m = LlamaModel::load(std::path::Path::new(dir), BaseDtype::BF16, &Device::Cpu).unwrap();
+        let tokens = [785u32, 6722, 315, 9625, 374];
+        let last: Vec<f32> = m.forward(&tokens, &Ctx::eval()).unwrap().get(tokens.len() - 1).unwrap().to_vec1().unwrap();
+        let max = last.iter().cloned().fold(f32::MIN, f32::max);
+        let z: f32 = last.iter().map(|v| (v - max).exp()).sum();
+        let mut idx: Vec<usize> = (0..last.len()).collect();
+        idx.sort_by(|a, b| last[*b].total_cmp(&last[*a]));
+        let top: Vec<String> = idx[..5].iter().map(|i| format!("{i}:{:.3}", (last[*i] - max).exp() / z)).collect();
+        println!("{dir}: {}", top.join(" "));
+    }
+}

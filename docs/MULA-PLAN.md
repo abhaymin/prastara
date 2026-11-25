@@ -130,3 +130,25 @@ contexts, and Mula refining itself on Prastara's own tasks.
   - **Live model:** Cyber-Tiel was off the server for about 1.5 minutes and reloaded in 30 s.
   - **Not measured yet:** long examples. The smoke set's conversations are about 40 tokens, so the 512 and 1,024
     limits were never reached. Long examples need a second run.
+- **1M context, the Workshop's part (2026-11-25):**
+  - **L1, YaRN:** `rope_scaling` / `rope_parameters` with `rope_type: yarn` are read. The frequencies equal
+    transformers' formula within 1e-12 on Qwen3's head (factor 32, 32,768 original).
+  - **L2, sliding windows:** `layer_types` and `sliding_window` are read; a sliding layer's query i sees the keys
+    i - window < j <= i.
+  - **The `context` command:** `am2strata-workshop context <model> --out <dir> --length 1048576 --original 32768
+    --window 4096 --full-every 4` writes the long-context copy with linked weights, keeping a loop. Every fourth
+    layer and the last stay full.
+    - `Strata-data/mula/mula-base-1m-loop-v0.1`: full attention at layers 3, 7, ..., 35, the loop 12..24 kept.
+    - Untrained, it still answers "The capital of France is" with " Paris", at 0.38 probability against the
+      looped base's 0.53. That is the cost of the stretched positions before L4's training.
+  - **L3, chunked attention:** sequences over 2,048 tokens never build a seq x seq table. A chunk of 512 queries is
+    computed at a time against the keys it may see, and the backward pass recomputes each chunk with exact
+    gradients.
+    - Against the table on a looped model: logits within 8e-7 and gradients within 9e-8, full and sliding layers,
+      chunks of 1 to 16, with and without checkpointing.
+    - On two GPUs the same training run matches the CPU (losses 3.6e-7).
+  - **Next:**
+    - L4 needs long data and GPU runs (each run approved).
+    - L5 is the engine: YaRN, sliding windows, the loop and an 8-bit tiered cache in `am2strata-hybrid` for
+      qwen3.
+    - L6, the needle tests, runs on the engine.

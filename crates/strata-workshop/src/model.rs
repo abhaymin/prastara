@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use candle_core::{CpuStorage, CustomOp1, DType, Device, Layout, Shape, Tensor, Var, D};
+use candle_core::{CpuStorage, CustomOp1, CustomOp3, DType, Device, Layout, Shape, Tensor, Var, D};
 use serde_json::Value;
 
 /// The decoder families this forward pass covers (each checked against transformers).
@@ -579,6 +579,104 @@ pub fn masked_softmax(x: &Tensor, scale: f64, mask: &Tensor) -> Result<Tensor> {
     Ok(x.apply_op1(MaskedSoftmax { y: Mutex::new(Some(value)), scale })?)
 }
 
+/// Which keys a query sees: as a table (short sequences), or as a rule, for sequences too long for a seq x seq table.
+#[derive(Debug, Clone)]
+pub enum Mask {
+    Table(Tensor),
+    /// causal, and only the last `window` keys (usize::MAX: all of them)
+    Causal { window: usize },
+}
+
+/// Sequences longer than this use [`chunked_attention`] (set lower in tests).
+pub static CHUNKED_ABOVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+/// Queries per chunk of [`chunked_attention`].
+pub static ATTENTION_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(512);
+
+/// The key range `[k0, k1)` query rows `[r0, r1)` see under a causal rule with `window`, and its mask `[r1-r0, k1-k0]`.
+fn chunk_keys(r0: usize, r1: usize, window: usize, dev: &Device) -> Result<(usize, usize, Tensor)> {
+    let k1 = r1;
+    let k0 = if window == usize::MAX { 0 } else { (r0 + 1).saturating_sub(window) };
+    let m: Vec<f32> = (r0..r1).flat_map(|i| (k0..k1).map(move |j| if j > i || (window != usize::MAX && i - j >= window) { f32::NEG_INFINITY } else { 0.0 })).collect();
+    Ok((k0, k1, Tensor::from_vec(m, (r1 - r0, k1 - k0), dev)?))
+}
+
+/// softmax(q kᵀ · scale + mask) v for `[heads, seq, hd]`, a chunk of queries at a time against only the keys the
+/// rule lets them see. The value is computed outside the graph; the backward pass recomputes each chunk's
+/// probabilities and sends exact gradients to q, k and v. Memory: one chunk's `[heads, chunk, keys]`, never seq x seq.
+struct ChunkedAttention {
+    y: Mutex<Option<Tensor>>,
+    scale: f64,
+    window: usize,
+    chunk: usize,
+}
+
+fn chunk_probs(q: &Tensor, k: &Tensor, r0: usize, r1: usize, window: usize, scale: f64) -> Result<(usize, usize, Tensor)> {
+    let (k0, k1, mask) = chunk_keys(r0, r1, window, q.device())?;
+    let qc = q.narrow(1, r0, r1 - r0)?;
+    let kc = k.narrow(1, k0, k1 - k0)?;
+    let s = (qc.matmul(&kc.transpose(1, 2)?.contiguous()?)? * scale)?.broadcast_add(&mask)?;
+    Ok((k0, k1, candle_nn::ops::softmax_last_dim(&s)?))
+}
+
+impl CustomOp3 for ChunkedAttention {
+    fn name(&self) -> &'static str {
+        "chunked-attention"
+    }
+
+    fn cpu_fwd(&self, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout, _: &CpuStorage, _: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+        take_value(&self.y, "chunked-attention")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(&self, _: &candle_core::CudaStorage, _: &Layout, _: &candle_core::CudaStorage, _: &Layout, _: &candle_core::CudaStorage, _: &Layout)
+        -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        take_cuda(&self.y, "chunked-attention")
+    }
+
+    fn bwd(&self, q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, grad: &Tensor) -> candle_core::Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
+        let err = |e: anyhow::Error| candle_core::Error::Msg(format!("chunked attention: {e}"));
+        let (q, k, v, o, g) = (q.detach(), k.detach(), v.detach(), res.detach(), grad.detach());
+        let seq = q.dim(1)?;
+        let dq = q.zeros_like()?;
+        let dk = k.zeros_like()?;
+        let dv = v.zeros_like()?;
+        for r0 in (0..seq).step_by(self.chunk) {
+            let r1 = (r0 + self.chunk).min(seq);
+            let (k0, k1, p) = chunk_probs(&q, &k, r0, r1, self.window, self.scale).map_err(err)?;
+            let (gc, oc) = (g.narrow(1, r0, r1 - r0)?, o.narrow(1, r0, r1 - r0)?);
+            let (kc, vc) = (k.narrow(1, k0, k1 - k0)?, v.narrow(1, k0, k1 - k0)?);
+            // dV += Pᵀ dO; dP = dO Vᵀ; dS = P (dP - rowsum(dO ∘ O)); dQ = dS K s; dK += dSᵀ Q s
+            let dv_part = p.transpose(1, 2)?.contiguous()?.matmul(&gc.contiguous()?)?;
+            dv.slice_set(&(dv.narrow(1, k0, k1 - k0)? + dv_part)?.contiguous()?, 1, k0)?;
+            let dp = gc.contiguous()?.matmul(&vc.transpose(1, 2)?.contiguous()?)?;
+            let d = (&gc * &oc)?.sum_keepdim(D::Minus1)?;
+            let ds = (p * dp.broadcast_sub(&d)?)?;
+            dq.slice_set(&(ds.matmul(&kc.contiguous()?)? * self.scale)?.contiguous()?, 1, r0)?;
+            let dk_part = (ds.transpose(1, 2)?.contiguous()?.matmul(&q.narrow(1, r0, r1 - r0)?.contiguous()?)? * self.scale)?;
+            dk.slice_set(&(dk.narrow(1, k0, k1 - k0)? + dk_part)?.contiguous()?, 1, k0)?;
+        }
+        Ok((Some(dq), Some(dk), Some(dv)))
+    }
+}
+
+/// See [`ChunkedAttention`]: `[heads, seq, hd]` in, `[heads, seq, hd]` out.
+pub fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, window: usize) -> Result<Tensor> {
+    let seq = q.dim(1)?;
+    let chunk = ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed).max(1);
+    let (qd, kd, vd) = (q.detach(), k.detach(), v.detach());
+    let mut parts = Vec::new();
+    for r0 in (0..seq).step_by(chunk) {
+        let r1 = (r0 + chunk).min(seq);
+        let (k0, k1, p) = chunk_probs(&qd, &kd, r0, r1, window, scale)?;
+        parts.push(p.matmul(&vd.narrow(1, k0, k1 - k0)?.contiguous()?)?);
+    }
+    let value = Tensor::cat(&parts, 1)?;
+    if !(q.track_op() || k.track_op() || v.track_op()) {
+        return Ok(value);
+    }
+    Ok(q.apply_op3(k, v, ChunkedAttention { y: Mutex::new(Some(value)), scale, window, chunk })?)
+}
+
 /// One LoRA adapter: `A` `[r, in]`, `B` `[out, r]`.
 #[derive(Debug, Clone)]
 pub struct Lora {
@@ -701,7 +799,7 @@ struct CheckpointBlock {
     cfg: ModelConfig,
     block: Block,
     rope: (Tensor, Tensor),
-    mask: Tensor,
+    mask: Mask,
     train: bool,
     seed: u64,
     calls: u64,
@@ -739,7 +837,7 @@ impl CustomOp1 for CheckpointBlock {
 }
 
 /// See [`CheckpointBlock`].
-fn checkpointed(cfg: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx, grads: &CkptGrads) -> Result<Tensor> {
+fn checkpointed(cfg: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx, grads: &CkptGrads) -> Result<Tensor> {
     let calls = ctx.calls.get();
     let value = block_forward(cfg, block, &x.detach(), rope, mask, ctx)?.detach();
     if !x.track_op() && !block.has_lora() {
@@ -1139,7 +1237,7 @@ impl LlamaModel {
         Ok((Tensor::from_vec(cos, (seq, hd), dev)?, Tensor::from_vec(sin, (seq, hd), dev)?))
     }
 
-    fn block_forward(&self, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    fn block_forward(&self, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
         if self.checkpoint && x.track_op() || self.checkpoint && block.has_lora() {
             return checkpointed(&self.cfg, block, x, rope, mask, ctx, &self.ckpt_grads);
         }
@@ -1149,7 +1247,7 @@ impl LlamaModel {
 
 /// One decoder block, given the model's settings (what [`LlamaModel::block_forward`] and a checkpointed block's
 /// recomputation both run).
-fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
     {
         let (seq, hd, nh, nkv) = (x.dim(0)?, c.head_dim, c.num_attention_heads, c.num_key_value_heads);
         let h = rms_norm(x, &block.norm1, c.rms_norm_eps)?;
@@ -1176,8 +1274,12 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
             if rep == 1 { Ok(t) } else { Ok(t.unsqueeze(1)?.broadcast_as((nkv, rep, seq, hd))?.reshape((nh, seq, hd))?) }
         };
         let (k, v) = (spread(k)?, spread(v)?);
-        let att = masked_softmax(&q.matmul(&k.transpose(1, 2)?.contiguous()?)?, 1.0 / (hd as f64).sqrt(), mask)?;
-        let out = att.matmul(&v)?.transpose(0, 1)?.reshape((seq, nh * hd))?;
+        let scale = 1.0 / (hd as f64).sqrt();
+        let attended = match mask {
+            Mask::Table(m) => masked_softmax(&q.matmul(&k.transpose(1, 2)?.contiguous()?)?, scale, m)?.matmul(&v)?,
+            Mask::Causal { window } => chunked_attention(&q, &k.contiguous()?, &v.contiguous()?, scale, *window)?,
+        };
+        let out = attended.transpose(0, 1)?.reshape((seq, nh * hd))?;
         let x = (x + block.lin[3].forward(&out, ctx)?)?;
 
         let h = rms_norm(&x, &block.norm2, c.rms_norm_eps)?;
@@ -1206,15 +1308,22 @@ impl LlamaModel {
         }
         // the rotary tables and the mask, once per device the blocks sit on
         // (rope, the causal mask, the sliding layers' mask when there are any) per device
-        let mut per_dev: Vec<Option<((Tensor, Tensor), Tensor, Option<Tensor>)>> = vec![None; self.devs.len()];
+        let long = seq > CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed);
+        let mut per_dev: Vec<Option<((Tensor, Tensor), Mask, Option<Mask>)>> = vec![None; self.devs.len()];
         for i in range.clone() {
             let d = self.block_dev[i];
             if per_dev[d].is_none() {
-                let sw = match self.cfg.sliding_window {
-                    Some(w) if w < seq => Some(self.window_mask(seq, w, &self.devs[d])?),
-                    _ => None,
+                // a long sequence never builds a seq x seq table: the chunked attention applies the rule itself
+                let (full, sw) = if long {
+                    (Mask::Causal { window: usize::MAX }, self.cfg.sliding_window.map(|w| Mask::Causal { window: w }))
+                } else {
+                    let sw = match self.cfg.sliding_window {
+                        Some(w) if w < seq => Some(Mask::Table(self.window_mask(seq, w, &self.devs[d])?)),
+                        _ => None,
+                    };
+                    (Mask::Table(self.causal_mask(seq, &self.devs[d])?), sw)
                 };
-                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, self.causal_mask(seq, &self.devs[d])?, sw));
+                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, full, sw));
             }
         }
         // one block on its own device: the hidden state (and, backwards, its gradient) moves when the device changes
@@ -1403,10 +1512,22 @@ pub fn make_looped(model: &Path, out: &Path, l: LoopSpec) -> Result<()> {
         bail!("{} exists and is not empty", out.display());
     }
     std::fs::create_dir_all(out)?;
+    link_model_files(model, out, &["config.json", LOOP_FILE])?;
+    cfg["prastara_loop"] = l.to_json();
+    std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&cfg)?)?;
+    let zeros: HashMap<String, Tensor> = (1..l.passes)
+        .map(|p| Ok((format!("loop.gate.{p}"), Tensor::zeros(parsed.hidden_size, DType::F32, &Device::Cpu)?)))
+        .collect::<Result<_>>()?;
+    candle_core::safetensors::save(&zeros, out.join(LOOP_FILE))?;
+    Ok(())
+}
+
+/// Every file of `model` except `skip`, linked into `out` (copied where links are not possible).
+fn link_model_files(model: &Path, out: &Path, skip: &[&str]) -> Result<()> {
     for e in std::fs::read_dir(model)? {
         let e = e?;
         let name = e.file_name();
-        if name == "config.json" || name == LOOP_FILE || !e.file_type()?.is_file() && !e.file_type()?.is_symlink() {
+        if skip.iter().any(|s| name == *s) || !e.file_type()?.is_file() && !e.file_type()?.is_symlink() {
             continue;
         }
         let src = std::fs::canonicalize(e.path())?;
@@ -1419,11 +1540,49 @@ pub fn make_looped(model: &Path, out: &Path, l: LoopSpec) -> Result<()> {
             std::fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
         }
     }
-    cfg["prastara_loop"] = l.to_json();
+    Ok(())
+}
+
+/// A long-context copy of a model folder (docs/MULA-PLAN.md L1, L2): YaRN positions stretched to `length` over the
+/// model's original training length, and every `full_every`-th layer kept at full attention while the others
+/// attend to the last `window` tokens. The weights are linked; a loop and its gates are kept. The copy still needs
+/// long-context training (L4) before it is used at that length.
+pub fn make_long_context(model: &Path, out: &Path, length: usize, original: Option<usize>, window: usize, full_every: usize) -> Result<()> {
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(model.join("config.json"))
+        .with_context(|| format!("{}: no config.json", model.display()))?)?;
+    let parsed = ModelConfig::from_json(&cfg)?;
+    if parsed.yarn.is_some() || parsed.layer_sliding.iter().any(|x| *x) {
+        bail!("{} already has a position scaling or sliding layers; start from its base", model.display());
+    }
+    let original = original.unwrap_or(parsed.max_position_embeddings);
+    if length <= original {
+        bail!("{length} tokens is not past the model's {original}");
+    }
+    if full_every == 0 || window == 0 {
+        bail!("--full-every and --window must be above 0");
+    }
+    if out.exists() && std::fs::read_dir(out)?.next().is_some() {
+        bail!("{} exists and is not empty", out.display());
+    }
+    std::fs::create_dir_all(out)?;
+    link_model_files(model, out, &["config.json"])?;
+    let factor = length as f64 / original as f64;
+    let yarn = serde_json::json!({"rope_type": "yarn", "factor": factor, "original_max_position_embeddings": original});
+    cfg["rope_scaling"] = yarn.clone();
+    if cfg.get("rope_parameters").is_some_and(|v| v.is_object()) {
+        let theta = cfg["rope_parameters"]["rope_theta"].clone();
+        let mut rp = yarn;
+        rp["rope_theta"] = theta;
+        cfg["rope_parameters"] = rp;
+    }
+    cfg["max_position_embeddings"] = serde_json::json!(length);
+    // every full_every-th layer full, and the last one always (it reads the whole text before the output)
+    let n = parsed.num_hidden_layers;
+    let types: Vec<&str> = (0..n).map(|i| if (i + 1) % full_every == 0 || i + 1 == n { "full_attention" } else { "sliding_attention" }).collect();
+    cfg["layer_types"] = serde_json::json!(types);
+    cfg["sliding_window"] = serde_json::json!(window);
+    cfg["use_sliding_window"] = serde_json::json!(true);
     std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&cfg)?)?;
-    let zeros: HashMap<String, Tensor> = (1..l.passes)
-        .map(|p| Ok((format!("loop.gate.{p}"), Tensor::zeros(parsed.hidden_size, DType::F32, &Device::Cpu)?)))
-        .collect::<Result<_>>()?;
-    candle_core::safetensors::save(&zeros, out.join(LOOP_FILE))?;
+    ModelConfig::from_json(&cfg).context("the written config")?;
     Ok(())
 }
