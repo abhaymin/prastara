@@ -237,6 +237,9 @@ struct RunArgs {
     /// where to train: cpu (default) or GPUs, e.g. cuda:0,cuda:1 (the blocks split between them; needs a cuda build)
     #[arg(long, value_delimiter = ',')]
     devices: Vec<String>,
+    /// recompute each trained block's activations in the backward pass (less memory, about a third more time)
+    #[arg(long)]
+    gradient_checkpointing: bool,
     #[arg(long)]
     lr: Option<f64>,
     #[arg(long)]
@@ -319,6 +322,7 @@ impl RunArgs {
         if let Some(c) = &self.cache_activations { s.cache_dir = Some(c.clone()); }
         if let Some(d) = &self.base_dtype { s.base_dtype = BaseDtype::from_s(d).map_err(|e| e.to_string())?; }
         s.devices = self.devices.clone();
+        s.gradient_checkpointing = self.gradient_checkpointing;
         if let Some(v) = self.lr { s.lr = v; }
         if let Some(v) = self.epochs { s.epochs = v; }
         if let Some(v) = self.max_steps { s.max_steps = Some(v); }

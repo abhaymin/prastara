@@ -89,5 +89,10 @@ contexts, and Mula refining itself on Prastara's own tasks.
   runs, approved one at a time), since the cards hold the live model.
   - Estimate, not measured: the BF16 weights are 8.2 GB per card. The activations kept for the backward pass, from
     block 12 up with the loop's second pass, come to about 0.5 GB per block pass at 1,024 tokens, about 18 GB.
-    So 1,024-token examples need gradient checkpointing (recompute a block's activations in the backward pass),
-    which is the next piece.
+    So 1,024-token examples need gradient checkpointing.
+- **M2, gradient checkpointing:** `--gradient-checkpointing` keeps only each trained block's input and recomputes
+  its activations in the backward pass, with the same dropout masks. Its gradients equal the plain ones to 6e-8 on
+  a looped model with dropout, and a checkpointed 6-step run on two GPUs gives the CPU's losses and adapter.
+- **Next:** the first run on the cards (owner's yes needed). Load the looped 8B over both GPUs with
+  checkpointing, train a few steps at 512 and 1,024 tokens, and report the peak memory per card and the time per
+  step. Then M3, the data.

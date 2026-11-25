@@ -170,3 +170,44 @@ fn a_model_split_over_two_gpus_matches_the_cpu() {
     };
     split_matches(&devs, 1e-3);
 }
+
+/// Gradient checkpointing (M2): the same gradients as keeping every activation, on a looped model, dropout included.
+#[test]
+fn checkpointing_gives_the_same_gradients() {
+    let out = scratch("ckpt");
+    make_looped(&fixture(), &out, LoopSpec { start: 1, end: 3, passes: 2 }).unwrap();
+    let hidden = LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap().cfg.hidden_size;
+    let gates: HashMap<String, Tensor> = [("loop.gate.1".to_string(), Tensor::full(0.4f32, hidden, &Device::Cpu).unwrap())].into();
+    candle_core::safetensors::save(&gates, out.join(LOOP_FILE)).unwrap();
+    let spec = LoraSpec { targets: vec![Target::Q, Target::K, Target::V, Target::Down], dropout: 0.1, ..LoraSpec::default() };
+    let supervised = vec![true; TOKENS.len()];
+    let grads = |ckpt: bool| -> Vec<Vec<f32>> {
+        let mut m = LlamaModel::load(&out, BaseDtype::F32, &Device::Cpu).unwrap();
+        m.add_lora(&spec).unwrap();
+        // B starts at zero, which hides A's gradient: give B values so every adapter matrix gets one
+        for (n, v) in m.lora_vars() {
+            if n.ends_with("lora_B.weight") {
+                v.set(&Tensor::full(0.01f32, v.as_tensor().shape(), &Device::Cpu).unwrap()).unwrap();
+            }
+        }
+        m.set_checkpointing(ckpt);
+        let ctx = Ctx::train(7);
+        let g = m.loss(&TOKENS, &supervised, &ctx).unwrap().backward().unwrap();
+        let extra = m.take_checkpoint_grads();
+        m.lora_vars().iter().map(|(_, v)| {
+            let mut t = g.get(v).cloned().unwrap_or_else(|| v.as_tensor().zeros_like().unwrap());
+            for (w, e) in &extra {
+                if w.as_tensor().id() == v.as_tensor().id() {
+                    t = (t + e).unwrap();
+                }
+            }
+            t.flatten_all().unwrap().to_vec1().unwrap()
+        }).collect()
+    };
+    let (plain, ckpt) = (grads(false), grads(true));
+    let d = plain.iter().flatten().zip(ckpt.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    let big = plain.iter().flatten().fold(0.0f32, |m, x| m.max(x.abs()));
+    println!("checkpointing: gradients differ by {d:.2e} (largest {big:.2e})");
+    assert!(big > 0.0 && d <= big * 1e-5, "{d}");
+    let _ = std::fs::remove_dir_all(&out);
+}

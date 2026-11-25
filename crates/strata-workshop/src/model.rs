@@ -558,12 +558,79 @@ impl Linear {
 /// One decoder block.
 #[derive(Debug, Clone)]
 struct Block {
-    /// q, k, v, o, gate, up, down — in [`Target::ALL`] order
+    /// q, k, v, o, gate, up, down - in [`Target::ALL`] order
     lin: Vec<Linear>,
     norm1: Tensor,
     norm2: Tensor,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+}
+
+impl Block {
+    fn has_lora(&self) -> bool {
+        self.lin.iter().any(|l| l.lora.is_some())
+    }
+    fn lora_vars(&self) -> Vec<Var> {
+        self.lin.iter().filter_map(|l| l.lora.as_ref()).flat_map(|l| [l.a.clone(), l.b.clone()]).collect()
+    }
+}
+
+/// A block run without keeping its activations: the forward value is computed and its graph dropped; the backward
+/// pass runs the block again from its saved input, with the same dropout masks, and returns the input's gradient,
+/// leaving the adapters' gradients in `grads`.
+struct CheckpointBlock {
+    y: Mutex<Option<Tensor>>,
+    cfg: ModelConfig,
+    block: Block,
+    rope: (Tensor, Tensor),
+    mask: Tensor,
+    train: bool,
+    seed: u64,
+    calls: u64,
+    grads: CkptGrads,
+}
+
+impl CustomOp1 for CheckpointBlock {
+    fn name(&self) -> &'static str {
+        "checkpointed-block"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+        take_value(&self.y, "checkpointed-block")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(&self, _storage: &candle_core::CudaStorage, _layout: &Layout) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        take_cuda(&self.y, "checkpointed-block")
+    }
+
+    fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
+        let err = |e: anyhow::Error| candle_core::Error::Msg(format!("checkpointed block: {e}"));
+        let x = Var::from_tensor(&arg.detach())?;
+        let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls) };
+        let y = block_forward(&self.cfg, &self.block, x.as_tensor(), &self.rope, &self.mask, &ctx).map_err(err)?;
+        let grads = (y * grad_res.detach())?.sum_all()?.backward()?;
+        let mut out = self.grads.lock().map_err(|_| candle_core::Error::Msg("checkpoint gradients: lock".into()))?;
+        for v in self.block.lora_vars() {
+            if let Some(g) = grads.get(&v) {
+                out.push((v, g.clone()));
+            }
+        }
+        Ok(grads.get(&x).cloned())
+    }
+}
+
+/// See [`CheckpointBlock`].
+fn checkpointed(cfg: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx, grads: &CkptGrads) -> Result<Tensor> {
+    let calls = ctx.calls.get();
+    let value = block_forward(cfg, block, &x.detach(), rope, mask, ctx)?.detach();
+    if !x.track_op() && !block.has_lora() {
+        return Ok(value);
+    }
+    // the input may not descend from a variable (the first trained block): give the node something to hang from
+    let x_in = if x.track_op() { x.clone() } else { Var::from_tensor(&x.detach())?.as_tensor().clone() };
+    Ok(x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(value)), cfg: cfg.clone(), block: block.clone(), rope: rope.clone(), mask: mask.clone(),
+                                        train: ctx.train, seed: ctx.seed, calls, grads: grads.clone() })?)
 }
 
 /// The decoder: frozen base, adapters in the trained blocks.
@@ -585,7 +652,14 @@ pub struct LlamaModel {
     devs: Vec<Device>,
     /// the index into `devs` of each block's device; the embeddings sit on the first, the final norm and head on the last
     block_dev: Vec<usize>,
+    /// gradient checkpointing ([`LlamaModel::set_checkpointing`])
+    checkpoint: bool,
+    /// the adapter gradients a checkpointed block's backward pass computes, waiting for [`LlamaModel::take_checkpoint_grads`]
+    ckpt_grads: CkptGrads,
 }
+
+/// Gradients of adapter variables found while recomputing checkpointed blocks: (variable, gradient).
+type CkptGrads = std::sync::Arc<Mutex<Vec<(Var, Tensor)>>>;
 
 /// The weight files of a model folder, in order: `model.safetensors`, or the `model-0000i-of-0000n` shards.
 pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -721,7 +795,7 @@ impl LlamaModel {
             }
         }
         Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone(), loop_gates,
-                  devs: devs.to_vec(), block_dev })
+                  devs: devs.to_vec(), block_dev, checkpoint: false, ckpt_grads: Default::default() })
     }
 
     pub fn device(&self) -> &Device {
@@ -808,6 +882,19 @@ impl LlamaModel {
                 .map(|(p, g)| (format!("base_model.model.model.loop.gate.{}", p + 1), g.clone())).collect(),
             _ => Vec::new(),
         }
+    }
+
+    /// Gradient checkpointing: each trained block keeps only its input for the backward pass, and its activations
+    /// are recomputed there, one block at a time. The adapters' gradients from that recomputation are collected by
+    /// [`LlamaModel::take_checkpoint_grads`]; add them to the graph's own. Memory falls from every block's activations
+    /// to one block's plus each block's input, for about one more forward pass of work.
+    pub fn set_checkpointing(&mut self, on: bool) {
+        self.checkpoint = on;
+    }
+
+    /// The adapter gradients the last backward pass computed inside checkpointed blocks (emptied by the call).
+    pub fn take_checkpoint_grads(&self) -> Vec<(Var, Tensor)> {
+        std::mem::take(&mut *self.ckpt_grads.lock().unwrap())
     }
 
     /// The loop's gates as they are now, under their `loop.safetensors` names.
@@ -925,7 +1012,17 @@ impl LlamaModel {
     }
 
     fn block_forward(&self, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx) -> Result<Tensor> {
-        let c = &self.cfg;
+        if self.checkpoint && x.track_op() || self.checkpoint && block.has_lora() {
+            return checkpointed(&self.cfg, block, x, rope, mask, ctx, &self.ckpt_grads);
+        }
+        block_forward(&self.cfg, block, x, rope, mask, ctx)
+    }
+}
+
+/// One decoder block, given the model's settings (what [`LlamaModel::block_forward`] and a checkpointed block's
+/// recomputation both run).
+fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    {
         let (seq, hd, nh, nkv) = (x.dim(0)?, c.head_dim, c.num_attention_heads, c.num_key_value_heads);
         let h = rms_norm(x, &block.norm1, c.rms_norm_eps)?;
         // [seq, heads·hd] → [heads, seq, hd], with Qwen3's per-head norm before the rotation
@@ -959,6 +1056,9 @@ impl LlamaModel {
         let gated = (candle_nn::ops::silu(&block.lin[4].forward(&h, ctx)?)? * block.lin[5].forward(&h, ctx)?)?;
         Ok((x + block.lin[6].forward(&gated, ctx)?)?)
     }
+}
+
+impl LlamaModel {
 
     fn causal_mask(&self, seq: usize, dev: &Device) -> Result<Tensor> {
         let m: Vec<f32> = (0..seq).flat_map(|i| (0..seq).map(move |j| if j > i { f32::NEG_INFINITY } else { 0.0 })).collect();

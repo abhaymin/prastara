@@ -86,6 +86,9 @@ pub struct TrainSettings {
     pub score_everything: bool,
     /// where the model trains: `cpu` (the default), or GPUs such as `cuda:0,cuda:1`, the blocks split between them
     pub devices: Vec<String>,
+    /// recompute each trained block's activations in the backward pass instead of keeping them (less memory, about
+    /// one more forward pass of work)
+    pub gradient_checkpointing: bool,
 }
 
 /// The devices named by `--devices` (`cpu`, `cuda:N`), opened.
@@ -114,7 +117,7 @@ impl TrainSettings {
             model: model.into(), data: data.into(), data_format: DataFormat::Auto, eval_data: None, val_split: 0.1, out: out.into(),
             lora: LoraSpec::default(), base_dtype: BaseDtype::F32, lr: 2e-4, epochs: 3.0, max_steps: None, accumulation: 4, max_len: 2048,
             warmup_ratio: 0.03, weight_decay: 0.01, max_grad_norm: 1.0, seed: 42, cache_dir: None, save_steps: 100, eval_steps: 0,
-            logging_steps: 10, resume: None, chat_template: None, score_everything: false, devices: Vec::new(),
+            logging_steps: 10, resume: None, chat_template: None, score_everything: false, devices: Vec::new(), gradient_checkpointing: false,
         }
     }
 
@@ -470,6 +473,7 @@ impl Runner {
         let skip = if cache.is_some() { first } else { 0 };
         let mut model = LlamaModel::load_parts_on(&s.model, s.base_dtype, &devs, skip..cfg.num_hidden_layers, skip == 0, true)?;
         model.add_lora(&s.lora)?;
+        model.set_checkpointing(s.gradient_checkpointing);
         let (names, vars): (Vec<String>, Vec<Var>) = model.lora_vars().into_iter().unzip();
         let mut params = ParamsAdamW::default();
         params.lr = s.lr;
@@ -513,8 +517,12 @@ impl Runner {
             loss_sum += value;
             self.tokens_seen += ex.tokens.len() as u64;
             let grads = loss.backward()?;
+            // with checkpointing, the adapters inside a recomputed block get their gradient there
+            let extra = self.model.take_checkpoint_grads();
             for (slot, var) in sum.iter_mut().zip(&self.vars) {
-                if let Some(g) = grads.get(var) {
+                let id = var.as_tensor().id();
+                let parts = grads.get(var).into_iter().chain(extra.iter().filter(|(v, _)| v.as_tensor().id() == id).map(|(_, g)| g));
+                for g in parts {
                     *slot = Some(match slot.take() {
                         Some(acc) => (acc + g)?,
                         None => g.clone(),
