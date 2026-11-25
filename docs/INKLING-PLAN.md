@@ -54,7 +54,7 @@ test oracle, never linked into or shipped with Prastara.
 
 **`main` is Rust only (owner, 2026-11-24): "not to leave main system in any other language".** So on `main` the
 bridge is already gone: no `crates/strata-llama`, no `LLAMA_ARCHS` routing, and Inkling's repo config and `pull`
-run it on the Rust engine (`am2strata-hybrid`, text only until I6v, generation about 6 to 7 tokens/s on two cards
+run it on the Rust engine (`am2strata-hybrid`, with pictures since I6v, generation about 6 to 7 tokens/s on two cards
 until I8). The bridge lives only on a local branch, and the sections below that describe it (I3, I5) are its
 history, not something `main` builds.
 
@@ -65,7 +65,7 @@ Order of work, each with its gate:
 | I6a | `inkling2` blocks in `strata-hybrid` on the CPU: clip, depth mix, short convolutions with their state, relative bias with the sink, windowed and full attention, the SiTU experts with the fused gate/up matrix | the oracle's per-layer dumps on the tiny model, layers 0-1 |
 | I6b | The loop: 3 passes over the core, one KV cache and one convolution state per slot, the controllers' messages | the dumps for every slot, then teacher-forced logits on the tiny model |
 | I6c | The real file, memory capped | teacher-forced parity with the oracle |
-| I6v | The image encoder in Rust (new step): the ViT with a CLS token, learned positions resized bilinearly, 2D RoPE, patch merge, the two-layer projector; `GENI` in `strata-hybrid` (embedding rows skip the token norm) | the rows against mtmd's rows for the golden image; the golden image question |
+| I6v | **Done 2026-11-25 (below).** The image encoder in Rust: the ViT with a CLS token, learned positions resized bilinearly, 2D RoPE, patch merge, the two-layer projector; `GENI` in `strata-hybrid` (embedding rows skip the token norm) | the rows against mtmd's rows for the golden image; the golden image question |
 | I8 | The GPU path: Q5_0 kernels, the new blocks on the device, two cards | the same tokens, and no slower than the bridge's 24 tok/s |
 | I7 | Packing for the native engine | as above |
 | I9 | Remove the bridge: the crate, the routing, the config entries, the docs | the server suites pass with no `strata-llama` in the workspace; the model loads from a fresh install |
@@ -298,8 +298,39 @@ Open before I6 is called passed:
 - the windowed slots keep every token's K and V in f32: trim them to the window before a long context;
 - `--expert-profile`, `--expert-profile-save` and `--resident-experts` still read `layers`, which Inkling leaves
   empty: route them through `expert_layers()`;
-- `GENI` (image rows) in `strata-hybrid`, and the image encoder (I6v);
 - the prompt goes token by token (`forward_chunk`).
 
 I8 is a device graph: the whole token on the devices (the core's passes on one card, the prelude, the last layers and
 the output on the other is the first split to measure), instead of about a thousand round trips per token.
+
+## I6v: pictures on the Rust engine (2026-11-25)
+
+- **The encoder:** `crates/strata-hybrid/src/vision.rs`, binary `am2strata-vision` (the bridge encoder's `ENC <image>
+  <out>` / `OK <tokens>` protocol; `--mmproj`, `--threads`, `--max-tokens`; `--model` only checks the row width,
+  `--gpu` and `--min-tokens` are accepted and ignored). The ViT on the CPU with rayon and `matrixmultiply`, the F16
+  weights widened to f32 (1.9 GB RSS). Decoding with the `image` crate (PNG, JPEG, WebP, GIF, BMP).
+  - As mtmd: the padding is raw -1 before the normalisation (so -1.0078), not -1 after it; CLS at RoPE position (0, 0),
+    the patches 1-indexed; x on the first half of each head, y on the second; positions resized with ggml's bilinear
+    (half-pixel centres, clamped); the merge's 2x2 order is dy outer, dx inner; no post-norm; GELU with erf.
+  - Every product with an F16 weight takes its input rounded to f16, as ggml's CPU backend does: worst cosine 0.999998
+    against 0.999988 with f32 inputs (`AM2_VIS_F32_ACT=1`).
+- **Gate A (rows), against `am2strata-llama-vision` on the CPU** (`tests/vision.rs` `rows_match_mtmd`), worst row:
+  - synthetic 320x192 pagoda PNG (the I5 picture is not on disk): 40 rows, cosine 0.999998, max abs diff 1.1e-3;
+  - 333x217 (padding on both sides): 54 rows, 0.999996, 1.7e-3;
+  - 640x640 (the native 32x32 grid): 256 rows, 0.999990, 1.4e-3;
+  - a real 512x512 photo (PNG): 169 rows, 0.999995, 1.3e-3.
+  - **The same photo as JPEG: 0.99718 worst, 0.99992 mean.** The JPEG decoders differ (zune-jpeg here, stb_image in
+    mtmd; ffmpeg's decode gives 0.99674 against stb too): the encoder is sensitive to 1-level pixel differences.
+- **Encode time, CPU, 8 threads:** 320x192 0.6-0.8 s, 333x217 1.0 s, 512x512 6.8 s (4 threads, beside another job),
+  640x640 5.2 s (4.5 s on 16 threads). The bits are the same for any thread count.
+- **GENI in `am2strata-hybrid`:** `GENI <max_new> [keys] image_pad=<id> <file> <ids>`; each pad id is the next row,
+  through `Model::forward_embd` (no token norm, as llama.cpp's `if (ubatch.token)`), text runs in chunks as before. A
+  file whose size does not match the pads is an `ERR GENI:` naming the width; a model without rows or the device graph
+  is refused. A GENI request starts a fresh state and leaves no history to resume from.
+- **Gate B (answer)**, CPU, greedy, effort 0, the 320x192 picture and "What is in this picture, and what time of day
+  is it?" (75 ids, 40 picture rows): the model starts thinking with "stylized black pagoda/temple silhouette against
+  gradient sunset sky". Prompt 57 s (token by token, under a 16 GB cap), 32 tokens in 22 s.
+- **Tests:** preprocessing (padding, normalisation, tokens = (W/40)(H/40), the shrink over the limit), the bilinear
+  resize at 32x32 is the identity, the merge order, the products; the two gates above as ignored tests.
+- **Open:** JPEG bit-parity with stb_image; the shrink over 4,096 tokens uses Catmull-Rom, not mtmd's bicubic (not
+  compared); the server's config still names `am2strata-llama-vision` as the encoder (switch it with I9).

@@ -28,10 +28,19 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 sha2 = "0.10"
 base64 = "0.22"
 rcgen = "0.13"
+# vision.rs (am2strata-vision): the pictures' decoders, the ViT's products, erf for GELU
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif", "bmp"] }
+matrixmultiply = "0.3"
+libm = "0.2"
 
 [[bin]]
 name = "am2strata-hybrid"
 path = "src/main.rs"
+
+# Inkling 2's image encoder (vision.rs), the ENC protocol of Prastara's image encoder
+[[bin]]
+name = "am2strata-vision"
+path = "src/vision_main.rs"
 
 [dev-dependencies]
 strata-tokenizer = { path = "../strata-tokenizer" }
