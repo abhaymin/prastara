@@ -310,11 +310,20 @@ impl Model {
         if !think {
             body["chat_template_kwargs"] = json!({"enable_thinking": false});
         }
-        let mut rb = self.client.post(format!("{}/v1/chat/completions", self.url)).json(&body);
-        if let Some(k) = &self.key { rb = rb.bearer_auth(k); }
-        let r = rb.send().with_context(|| format!("{} does not answer", self.url))?;
-        let ok = r.status().is_success();
-        let v: Value = r.json().unwrap_or_default();
+        let send = |body: &Value| -> Result<(bool, Value)> {
+            let mut rb = self.client.post(format!("{}/v1/chat/completions", self.url)).json(body);
+            if let Some(k) = &self.key { rb = rb.bearer_auth(k); }
+            let r = rb.send().with_context(|| format!("{} does not answer", self.url))?;
+            let ok = r.status().is_success();
+            Ok((ok, r.json().unwrap_or_default()))
+        };
+        let (mut ok, mut v) = send(&body)?;
+        // a chat template that will not take this system message (the server or the model's own config put one
+        // first): the instructions go at the top of the user's turn instead
+        if !ok && v["error"]["message"].as_str().is_some_and(|m| m.to_lowercase().contains("system message")) {
+            body["messages"] = json!([{"role": "user", "content": format!("{system}\n\n{user}")}]);
+            (ok, v) = send(&body)?;
+        }
         if !ok {
             bail!("the model's answer failed: {}", v["error"]["message"].as_str().unwrap_or("unknown error"));
         }
