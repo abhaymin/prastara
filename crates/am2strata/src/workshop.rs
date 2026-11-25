@@ -9,9 +9,10 @@
 //!   - strata: `"input"` (a .gguf), `"name"`?, `"display_name"`?, `"overwrite"`? — make it a model the server runs: the
 //!     same run config and tokenizer folder a downloaded model gets (strata-hub's config writer, which picks the engine
 //!     for the architecture and refuses one no engine runs), so it appears in the model list
-//!   - datagen: `"recipe"` (qa | chat | instruct), `"sources"` (documents: files or folders; qa and chat), `"seeds"`? (a
-//!     JSONL of example chats; instruct), `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?,
-//!     `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`? — training data written by the
+//!   - datagen: `"recipe"` (qa | chat | instruct | code | indic | translate), `"sources"` (documents: files or
+//!     folders; needed for qa and chat, optional for code and translate), `"seeds"`? (a JSONL of example chats;
+//!     instruct), `"seed"`? and `"check_code"`? (the built-in recipes' draw, and compiling Rust answers),
+//!     `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?, `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`? — training data written by the
 //!     loaded model, through this server's own chat API (its address and key reach the command in its environment,
 //!     never on its command line)
 //! - `POST /v1/workshop/uploads?name=notes.pdf` (the file as the body) saves a document into `<data>/workshop/uploads`.
@@ -19,6 +20,8 @@
 //!   `POST /v1/workshop/dataset` `{"path", "remove": [i, …], "replace": {"i": record}}` edits it in place.
 //! - `GET /v1/workshop/jobs` lists jobs, `GET /v1/workshop/jobs/{id}` one (with its log), `DELETE` cancels.
 //! - `GET /v1/workshop/files` lists the models and adapters the Workshop may use, for its pickers.
+//! - `GET /v1/workshop/library` lists the model library's recipes (abilities, and whether the Workshop trains each);
+//!   `POST /v1/workshop/library` `{"name"}` writes one's soup.yaml and DATA.md into `<data>/workshop/recipes/`.
 //!
 //! **Paths** must be inside the models folder, `<data>/workshop`, or a folder listed in the run config's
 //! `"workshop": {"dirs": [...]}` — the API cannot read or write anywhere else on the PC. Only the server's own key may
@@ -275,8 +278,9 @@ impl Workshop {
             }
             "datagen" => {
                 let recipe = s("recipe").unwrap_or("qa");
-                if !["qa", "chat", "instruct"].contains(&recipe) {
-                    return Err("\"recipe\" is qa, chat or instruct".into());
+                const RECIPES: [&str; 6] = ["qa", "chat", "instruct", "code", "indic", "translate"];
+                if !RECIPES.contains(&recipe) {
+                    return Err(format!("\"recipe\" is one of {}", RECIPES.join(", ")));
                 }
                 let mut sources = vec![];
                 for v in req["sources"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
@@ -284,7 +288,7 @@ impl Workshop {
                     sources.push(self.allowed(p, true)?);
                 }
                 let seeds = s("seeds").map(|p| self.allowed(p, true)).transpose()?;
-                if recipe != "instruct" && sources.is_empty() {
+                if matches!(recipe, "qa" | "chat") && sources.is_empty() {
                     return Err(format!("{recipe} needs \"sources\": documents (files or folders) to write the data from"));
                 }
                 if recipe == "instruct" && seeds.is_none() {
@@ -312,7 +316,14 @@ impl Workshop {
                 if let Some(p) = &seeds {
                     args.extend(["--seeds".into(), p.display().to_string()]);
                 }
-                for (k, flag, lo, hi) in [("count", "--count", 1.0, 100_000.0), ("per_chunk", "--per-chunk", 1.0, 20.0),
+                if recipe == "indic" && !sources.is_empty() {
+                    return Err("indic writes from its built-in catalogue: leave out \"sources\"".into());
+                }
+                if req["check_code"] == true {
+                    if recipe != "code" { return Err("\"check_code\" is for the code recipe".into()); }
+                    args.push("--check-code".into());
+                }
+                for (k, flag, lo, hi) in [("seed", "--seed", 0.0, 1e15), ("count", "--count", 1.0, 100_000.0), ("per_chunk", "--per-chunk", 1.0, 20.0),
                                           ("chunk_chars", "--chunk-chars", 500.0, 20_000.0), ("temperature", "--temperature", 0.0, 2.0),
                                           ("min_score", "--min-score", 0.0, 5.0)] {
                     if let Some(v) = num(k, lo, hi)? {
@@ -610,6 +621,50 @@ pub async fn job_delete(State(s): State<AppState>, headers: HeaderMap, UrlPath(i
 pub async fn files_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
     let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
     Json(w.files()).into_response()
+}
+
+/// Runs `am2strata-workshop --json library <args>` and returns its event (the library is compiled into that command).
+async fn library_call(args: &[&str]) -> Result<Value, String> {
+    let exe = exe().ok_or("the am2strata-workshop command is not installed beside the server")?;
+    let o = tokio::process::Command::new(exe).arg("--json").arg("library").args(args).output().await
+        .map_err(|e| format!("am2strata-workshop: {e}"))?;
+    let text = String::from_utf8_lossy(&o.stdout);
+    let events: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if let Some(e) = events.iter().find(|e| e["event"] == "error") {
+        return Err(e["message"].as_str().unwrap_or("failed").to_string());
+    }
+    if !o.status.success() {
+        return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
+    }
+    events.into_iter().find(|e| e["event"] == "library" || e["event"] == "done").ok_or_else(|| "no answer from the library".into())
+}
+
+/// `GET /v1/workshop/library`: every recipe (Soup's catalogue, ported, and Prastara's own) with its abilities and
+/// whether this Workshop trains it.
+pub async fn library_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(r) = admin(&s, &headers) { return r; }
+    match library_call(&["list"]).await {
+        Ok(v) => Json(json!({"recipes": v["recipes"], "sources": v["sources"]})).into_response(),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
+    }
+}
+
+/// `POST /v1/workshop/library` `{"name"}`: the recipe's soup.yaml and DATA.md in `<data>/workshop/recipes/<name>`
+/// (a new folder each time).
+pub async fn library_post(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("recipes can be set up in the Workshop");
+    }
+    let Some(name) = req["name"].as_str().and_then(safe_name) else {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", "give the recipe's \"name\"");
+    };
+    let dir = Workshop::fresh(&w.out_dir.join("recipes"), &name, "");
+    match library_call(&["init", &name, "--out", &dir.display().to_string()]).await {
+        Ok(_) => Json(json!({"folder": dir.display().to_string(), "config": dir.join("soup.yaml").display().to_string(),
+                             "guide": dir.join("DATA.md").display().to_string()})).into_response(),
+        Err(e) => error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    }
 }
 
 /// A file name made safe: letters, digits, `.`, `-` and `_` only, no leading dot, at most 120 characters.

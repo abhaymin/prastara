@@ -77,7 +77,7 @@ enough. Qwen3-8B is trained to 32K (its config allows 40,960 positions).
 | M0 | Qwen3-8B downloaded and checked (licence, files, revision); runs in the Workshop's forward pass | logits equal the reference within the Workshop's parity gate |
 | M1 | **Loop conversion** in the Workshop: choose the core layers and the passes; each extra pass enters through a gate that starts at zero | the converted model's logits equal the base's exactly; the gate trains |
 | M2 | **GPU training** in the Workshop: the CUDA side of its two custom nodes, the base in BF16 across the two cards, LoRA on the looped model | the GPU run's loss and adapter match the CPU run's on a small model; 8B fits in 2×16 GB with measured peak memory |
-| M3 | **Data:** datagen from the teachers through the server queue (only when it is idle), the content gate, de-duplication, a licence log per source, held-out splits | every kept example has a source, a licence and a gate verdict |
+| M3 | **Data:** datagen from the teachers through the server queue (only when it is idle; the Workshop's built-in `code`, `indic` and `translate` recipes, with compile and script checks, plus `code` over Prastara's own source), the content gate, de-duplication, a licence log per source, held-out splits | every kept example has a source, a licence and a gate verdict |
 | M4 | **Evals** for each skill (the gates in the table above), run on the base first as the baseline | a report per skill |
 | M5 | Mula Setu, Code, Agent v0.1: train, merge, export to GGUF and Kosha | each beats the base on its gate; no regressions on the others |
 | M6 | Mula Gita, Katha, Karma v0.1 | as above |

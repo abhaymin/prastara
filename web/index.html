@@ -526,9 +526,17 @@
                 <select class="st-input" id="ws-d-recipe">
                   <option value="qa">Questions and answers from documents</option>
                   <option value="chat">Multi-turn chats about documents</option>
-                  <option value="instruct">More examples like my own (seed JSONL)</option></select></div>
+                  <option value="instruct">More examples like my own (seed JSONL)</option>
+                  <option value="code">Coding: requests and expert answers (built in; your code optional)</option>
+                  <option value="indic">Indic text: native writing in 15 Indian languages (built in)</option>
+                  <option value="translate">Translation: English and Indian languages (built in; your texts optional)</option></select></div>
+              <div class="ws-field ws-field--wide" id="ws-d-langs-box" hidden>
+                <label class="st-label" for="ws-d-langs">Languages <output id="ws-d-langs-note">all when empty</output></label>
+                <input class="st-input" id="ws-d-langs" placeholder="hi, ta, te, bn, mr … or Hindi, Tamil …"></div>
+              <label class="ws-field--wide small ws-check" id="ws-d-check-box" hidden><input type="checkbox" id="ws-d-check" checked>
+                Compile the Rust answers and drop the ones that fail (needs rustc on the server)</label>
               <div class="ws-field ws-field--wide" id="ws-d-src-box">
-                <label class="st-label" for="ws-d-sources">Documents <output>files or folders, one per line</output></label>
+                <label class="st-label" for="ws-d-sources">Documents <output id="ws-d-src-note">files or folders, one per line</output></label>
                 <textarea class="st-input mono" id="ws-d-sources" rows="3" placeholder="~/docs/manual.pdf&#10;~/notes/"></textarea>
                 <div class="ws-data__row">
                   <label class="st-btn st-btn--secondary" for="ws-d-files">Add files…</label>
@@ -554,6 +562,8 @@
                     <input class="st-input" id="ws-d-per" type="number" min="1" max="20" value="4"></div>
                   <div class="ws-field"><label class="st-label" for="ws-d-chunk">Passage length (characters)</label>
                     <input class="st-input" id="ws-d-chunk" type="number" min="500" max="20000" step="500" value="3000"></div>
+                  <div class="ws-field"><label class="st-label" for="ws-d-seed">Draw <output>built-in recipes</output></label>
+                    <input class="st-input" id="ws-d-seed" type="number" min="0" step="1" value="1"></div>
                   <div class="ws-field"><label class="st-label" for="ws-d-temp">Temperature</label>
                     <input class="st-input" id="ws-d-temp" type="number" min="0" max="2" step="0.1" value="0.7"></div>
                   <div class="ws-field"><label class="st-label" for="ws-d-lang">Language <output>optional</output></label>
@@ -589,6 +599,27 @@
                 (training from this tab comes next). <code>profile</code> and <code>autopilot</code> say what fits this PC.</p></div>
             <pre class="ws-cmd">am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt;</pre>
             <p class="muted small">Use a dataset from step 1, then merge the adapter in step 3.</p>
+            <div class="ws-lib">
+              <span class="card-title">Model library</span>
+              <p class="muted small">Ready-made recipes for text, code, tools, vision, OCR, image, speech, music and video
+                models: Soup's recipe catalogue, ported to Rust, and Prastara's own (the Mula series and the media models
+                Prastara runs). Each says what the model does and whether this Workshop trains it yet.</p>
+              <div class="ws-data__row">
+                <select class="st-input" id="ws-l-ability" aria-label="Ability"><option value="">Every ability</option></select>
+                <input class="st-input" id="ws-l-q" placeholder="Search: qwen, whisper, ocr…" aria-label="Search the library">
+                <label class="small ws-check"><input type="checkbox" id="ws-l-trains"> Trains here</label>
+              </div>
+              <p class="muted small" id="ws-l-count"></p>
+              <div class="ws-lib__list" id="ws-l-list" role="list"></div>
+              <div class="ws-lib__detail" id="ws-l-detail" hidden>
+                <p class="small"><strong id="ws-l-name"></strong> <span class="muted" id="ws-l-model"></span></p>
+                <p class="small" id="ws-l-desc"></p>
+                <p class="small" id="ws-l-status"></p>
+                <details class="small"><summary>soup.yaml</summary><pre class="ws-review__card" id="ws-l-yaml"></pre></details>
+                <div class="ws-data__row"><button type="button" class="st-btn st-btn--secondary" id="ws-l-init">Set up this recipe</button>
+                  <span class="muted small" id="ws-l-done"></span></div>
+              </div>
+            </div>
           </div>
           <div class="st-card ws-panel" data-ws-panel="merge" hidden>
             <div class="ws-panel__head"><span class="card-title">Merge an adapter</span>

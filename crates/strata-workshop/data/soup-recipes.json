@@ -1,0 +1,3327 @@
+{
+  "source": {
+    "name": "Soup",
+    "repository": "https://github.com/MakazhanAlpamys/Soup",
+    "licence": "Apache-2.0",
+    "commit": "83d4e9dc963cee46de02b9021d616e7cfb0de8e9",
+    "files": [
+      "src/soup_cli/recipes/catalog.py",
+      "tests/fixtures/recipe_base_architectures.json"
+    ],
+    "note": "Soup's recipe catalogue, read as text and ported to this library; see NOTICE-soup.md"
+  },
+  "recipes": [
+    {
+      "name": "llama3.1-8b-sft",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "sft",
+        "chat",
+        "instruction"
+      ],
+      "description": "Llama 3.1 8B instruction tuning with LoRA",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-8b-dpo",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "dpo",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "dpo",
+        "alignment",
+        "preference"
+      ],
+      "description": "Llama 3.1 8B DPO alignment",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-8b-grpo",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "grpo",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "grpo",
+        "reasoning",
+        "deepseek"
+      ],
+      "description": "Llama 3.1 8B GRPO reasoning training",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-8b-kto",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "kto",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "kto",
+        "alignment",
+        "unpaired"
+      ],
+      "description": "Llama 3.1 8B KTO unpaired preference alignment",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: kto\n\ndata:\n  train: ./data/kto_train.jsonl\n  format: kto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  kto_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-70b-sft",
+      "model": "meta-llama/Llama-3.1-70B-Instruct",
+      "task": "sft",
+      "size": "70B",
+      "tags": [
+        "llama",
+        "sft",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Llama 3.1 70B SFT with DeepSpeed ZeRO-3",
+      "yaml": "base: meta-llama/Llama-3.1-70B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 70553706496
+    },
+    {
+      "name": "llama3.2-3b-sft",
+      "model": "meta-llama/Llama-3.2-3B-Instruct",
+      "task": "sft",
+      "size": "3B",
+      "tags": [
+        "llama",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "Llama 3.2 3B instruction tuning (edge-friendly)",
+      "yaml": "base: meta-llama/Llama-3.2-3B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 3212749824
+    },
+    {
+      "name": "llama3.2-1b-sft",
+      "model": "meta-llama/Llama-3.2-1B-Instruct",
+      "task": "sft",
+      "size": "1B",
+      "tags": [
+        "llama",
+        "sft",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "Llama 3.2 1B instruction tuning (mobile-friendly)",
+      "yaml": "base: meta-llama/Llama-3.2-1B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 3e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 8bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 1235814400
+    },
+    {
+      "name": "qwen2.5-coder-7b-sft",
+      "model": "Qwen/Qwen2.5-Coder-7B-Instruct",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "coder",
+        "code",
+        "sft"
+      ],
+      "description": "Qwen 2.5 Coder 7B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-Coder-7B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "qwen2.5-7b-sft",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "sft",
+        "chat",
+        "instruction"
+      ],
+      "description": "Qwen 2.5 7B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-7B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "qwen2.5-7b-dpo",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "task": "dpo",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "dpo",
+        "alignment",
+        "preference"
+      ],
+      "description": "Qwen 2.5 7B DPO alignment",
+      "yaml": "base: Qwen/Qwen2.5-7B-Instruct\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "qwen2.5-7b-grpo",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "task": "grpo",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "grpo",
+        "reasoning"
+      ],
+      "description": "Qwen 2.5 7B GRPO reasoning training",
+      "yaml": "base: Qwen/Qwen2.5-7B-Instruct\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "qwen2.5-72b-sft",
+      "model": "Qwen/Qwen2.5-72B-Instruct",
+      "task": "sft",
+      "size": "72B",
+      "tags": [
+        "qwen",
+        "sft",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 2.5 72B SFT with DeepSpeed ZeRO-3",
+      "yaml": "base: Qwen/Qwen2.5-72B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 72706203648
+    },
+    {
+      "name": "qwen3-8b-sft",
+      "model": "Qwen/Qwen3-8B",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "qwen",
+        "sft",
+        "qwen3"
+      ],
+      "description": "Qwen 3 8B instruction tuning",
+      "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 8190735360
+    },
+    {
+      "name": "qwen3-30b-a3b-sft",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "task": "sft",
+      "size": "30B",
+      "tags": [
+        "qwen",
+        "sft",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3 30B-A3B MoE instruction tuning",
+      "yaml": "base: Qwen/Qwen3-30B-A3B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_moe",
+      "parameters": 30532122624
+    },
+    {
+      "name": "mistral-7b-sft",
+      "model": "mistralai/Mistral-7B-Instruct-v0.3",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "mistral",
+        "sft",
+        "chat"
+      ],
+      "description": "Mistral 7B instruction tuning",
+      "yaml": "base: mistralai/Mistral-7B-Instruct-v0.3\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 7248023552
+    },
+    {
+      "name": "mistral-7b-dpo",
+      "model": "mistralai/Mistral-7B-Instruct-v0.3",
+      "task": "dpo",
+      "size": "7B",
+      "tags": [
+        "mistral",
+        "dpo",
+        "alignment"
+      ],
+      "description": "Mistral 7B DPO alignment",
+      "yaml": "base: mistralai/Mistral-7B-Instruct-v0.3\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 7248023552
+    },
+    {
+      "name": "gemma3-27b-sft",
+      "model": "google/gemma-3-27b-it",
+      "task": "sft",
+      "size": "27B",
+      "tags": [
+        "gemma",
+        "google",
+        "sft",
+        "deepspeed"
+      ],
+      "description": "Gemma 3 27B SFT with DeepSpeed ZeRO-2",
+      "yaml": "base: google/gemma-3-27b-it\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 27432406640
+    },
+    {
+      "name": "phi4-14b-sft",
+      "model": "microsoft/phi-4",
+      "task": "sft",
+      "size": "14B",
+      "tags": [
+        "phi",
+        "microsoft",
+        "sft",
+        "reasoning"
+      ],
+      "description": "Phi-4 14B instruction tuning",
+      "yaml": "base: microsoft/phi-4\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "phi3",
+      "parameters": 14659507200
+    },
+    {
+      "name": "deepseek-r1-8b-grpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+      "task": "grpo",
+      "size": "8B",
+      "tags": [
+        "deepseek",
+        "grpo",
+        "reasoning",
+        "r1"
+      ],
+      "description": "DeepSeek R1 8B GRPO reasoning",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Llama-8B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 8030261248
+    },
+    {
+      "name": "deepseek-r1-32b-grpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B",
+      "task": "grpo",
+      "size": "32B",
+      "tags": [
+        "deepseek",
+        "grpo",
+        "reasoning",
+        "r1",
+        "deepspeed"
+      ],
+      "description": "DeepSeek R1 32B GRPO with DeepSpeed",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 32763876352
+    },
+    {
+      "name": "deepseek-v3-reasoning",
+      "model": "deepseek-ai/DeepSeek-V3",
+      "task": "grpo",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "grpo",
+        "reasoning",
+        "v3",
+        "moe",
+        "deepspeed"
+      ],
+      "description": "DeepSeek V3 (671B-parameter MoE) GRPO reasoning recipe (v0.53.5 #17). Requires multi-node DeepSpeed; verifiable_domain='math' RLVR rewards.",
+      "yaml": "base: deepseek-ai/DeepSeek-V3\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 16\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy,format\n  verifiable_domain: math\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v3",
+      "parameters": 684531386000
+    },
+    {
+      "name": "llama3.1-8b-orpo",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "orpo",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "orpo",
+        "alignment",
+        "reference-free"
+      ],
+      "description": "Llama 3.1 8B ORPO reference-free alignment",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: orpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  orpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-8b-simpo",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "simpo",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "simpo",
+        "alignment",
+        "simple"
+      ],
+      "description": "Llama 3.1 8B SimPO length-normalized alignment",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: simpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  simpo_gamma: 0.5\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-8b-embed",
+      "model": "meta-llama/Llama-3.1-8B",
+      "task": "embedding",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "embedding",
+        "sentence",
+        "cosine"
+      ],
+      "description": "Llama 3.1 8B sentence embedding with cosine loss",
+      "yaml": "base: meta-llama/Llama-3.1-8B\ntask: embedding\n\ndata:\n  train: ./data/embedding_train.jsonl\n  format: embedding\n  max_length: 512\n\ntraining:\n  epochs: 3\n  lr: 2e-5\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n  embedding_loss: cosine\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "qwen2.5-7b-pretrain",
+      "model": "Qwen/Qwen2.5-7B",
+      "task": "pretrain",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "pretrain",
+        "continued",
+        "domain"
+      ],
+      "description": "Qwen 2.5 7B continued pre-training",
+      "yaml": "base: Qwen/Qwen2.5-7B\ntask: pretrain\n\ndata:\n  train: ./data/corpus.jsonl\n  format: plaintext\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "llama3.2-11b-vision",
+      "model": "meta-llama/Llama-3.2-11B-Vision-Instruct",
+      "task": "sft",
+      "size": "11B",
+      "tags": [
+        "llama",
+        "vision",
+        "multimodal",
+        "image"
+      ],
+      "description": "Llama 3.2 11B Vision multimodal fine-tuning",
+      "yaml": "base: meta-llama/Llama-3.2-11B-Vision-Instruct\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 10670220835
+    },
+    {
+      "name": "qwen2.5-7b-reward",
+      "model": "Qwen/Qwen2.5-7B-Instruct",
+      "task": "reward_model",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "reward",
+        "rlhf",
+        "stage2"
+      ],
+      "description": "Qwen 2.5 7B reward model (RLHF stage 2)",
+      "yaml": "base: Qwen/Qwen2.5-7B-Instruct\ntask: reward_model\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output_rm\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "llama3.1-8b-ppo",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "ppo",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "ppo",
+        "rlhf",
+        "stage3"
+      ],
+      "description": "Llama 3.1 8B PPO (RLHF stage 3)",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: ppo\n\ndata:\n  train: ./data/prompts.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 1\n  lr: 1e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  reward_model: ./output_rm\n  ppo_epochs: 4\n  ppo_clip_ratio: 0.2\n  ppo_kl_penalty: 0.05\n\noutput: ./output_ppo\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3.1-8b-longctx",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "sft",
+        "longcontext",
+        "yarn",
+        "rope"
+      ],
+      "description": "Llama 3.1 8B long-context (32k) with YaRN RoPE scaling",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: sft\n\ndata:\n  train: ./data/long_context_train.jsonl\n  format: auto\n  max_length: 32768\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  rope_scaling_type: yarn\n  use_flash_attn: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama4-scout-17b-sft",
+      "model": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "task": "sft",
+      "size": "109B",
+      "tags": [
+        "llama",
+        "llama4",
+        "sft",
+        "chat",
+        "instruction"
+      ],
+      "description": "Llama 4 Scout 17B active SFT with LoRA (4bit)",
+      "yaml": "base: meta-llama/Llama-4-Scout-17B-16E-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 108641793536
+    },
+    {
+      "name": "llama4-scout-17b-dpo",
+      "model": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "task": "dpo",
+      "size": "109B",
+      "tags": [
+        "llama",
+        "llama4",
+        "dpo",
+        "alignment",
+        "preference"
+      ],
+      "description": "Llama 4 Scout 17B active DPO alignment",
+      "yaml": "base: meta-llama/Llama-4-Scout-17B-16E-Instruct\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 108641793536
+    },
+    {
+      "name": "llama4-scout-17b-grpo",
+      "model": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "task": "grpo",
+      "size": "109B",
+      "tags": [
+        "llama",
+        "llama4",
+        "grpo",
+        "reasoning"
+      ],
+      "description": "Llama 4 Scout 17B active GRPO reasoning training",
+      "yaml": "base: meta-llama/Llama-4-Scout-17B-16E-Instruct\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 108641793536
+    },
+    {
+      "name": "qwen3-14b-sft",
+      "model": "Qwen/Qwen3-14B",
+      "task": "sft",
+      "size": "14B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "sft",
+        "chat"
+      ],
+      "description": "Qwen 3 14B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen3-14B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 14768307200
+    },
+    {
+      "name": "qwen3-32b-sft",
+      "model": "Qwen/Qwen3-32B",
+      "task": "sft",
+      "size": "32B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "sft",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 3 32B SFT with DeepSpeed ZeRO-2",
+      "yaml": "base: Qwen/Qwen3-32B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 32762123264
+    },
+    {
+      "name": "qwen3-8b-grpo",
+      "model": "Qwen/Qwen3-8B",
+      "task": "grpo",
+      "size": "8B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "grpo",
+        "reasoning"
+      ],
+      "description": "Qwen 3 8B GRPO reasoning training",
+      "yaml": "base: Qwen/Qwen3-8B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 8190735360
+    },
+    {
+      "name": "gemma3-12b-sft",
+      "model": "google/gemma-3-12b-it",
+      "task": "sft",
+      "size": "12B",
+      "tags": [
+        "gemma",
+        "gemma3",
+        "google",
+        "sft",
+        "chat"
+      ],
+      "description": "Gemma 3 12B instruction tuning",
+      "yaml": "base: google/gemma-3-12b-it\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 12187325040
+    },
+    {
+      "name": "gemma3-27b-dpo",
+      "model": "google/gemma-3-27b-it",
+      "task": "dpo",
+      "size": "27B",
+      "tags": [
+        "gemma",
+        "gemma3",
+        "google",
+        "dpo",
+        "alignment"
+      ],
+      "description": "Gemma 3 27B DPO alignment",
+      "yaml": "base: google/gemma-3-27b-it\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 27432406640
+    },
+    {
+      "name": "deepseek-v3-7b-sft",
+      "model": "deepseek-ai/DeepSeek-V3-0324",
+      "task": "sft",
+      "size": "685B",
+      "tags": [
+        "deepseek",
+        "sft",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "DeepSeek V3 SFT with MoE LoRA",
+      "yaml": "base: deepseek-ai/DeepSeek-V3-0324\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v3",
+      "parameters": 684531386000
+    },
+    {
+      "name": "llama3.1-8b-sft-mlx",
+      "model": "mlx-community/Llama-3.1-8B-Instruct-4bit",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "mlx",
+        "apple-silicon",
+        "sft"
+      ],
+      "description": "Llama 3.1 8B SFT on Apple Silicon via MLX (M2+ 16GB)",
+      "yaml": "base: mlx-community/Llama-3.1-8B-Instruct-4bit\ntask: sft\nbackend: mlx\n\ndata:\n  train: ./data/train.jsonl\n  format: chatml\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: 2\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 8030261248
+    },
+    {
+      "name": "qwen3-8b-sft-mlx",
+      "model": "mlx-community/Qwen3-8B-4bit",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "mlx",
+        "apple-silicon",
+        "sft"
+      ],
+      "description": "Qwen 3 8B SFT on Apple Silicon via MLX (M2+ 16GB)",
+      "yaml": "base: mlx-community/Qwen3-8B-4bit\ntask: sft\nbackend: mlx\n\ndata:\n  train: ./data/train.jsonl\n  format: chatml\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: 2\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 8190735360
+    },
+    {
+      "name": "gemma3-4b-sft-mlx",
+      "model": "mlx-community/gemma-3-4b-it-4bit",
+      "task": "sft",
+      "size": "4B",
+      "tags": [
+        "gemma",
+        "gemma3",
+        "mlx",
+        "apple-silicon",
+        "sft"
+      ],
+      "description": "Gemma 3 4B SFT on Apple Silicon via MLX (M1+ 16GB)",
+      "yaml": "base: mlx-community/gemma-3-4b-it-4bit\ntask: sft\nbackend: mlx\n\ndata:\n  train: ./data/train.jsonl\n  format: chatml\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: 2\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "gemma3",
+      "parameters": 4971331952
+    },
+    {
+      "name": "qwen3-8b-tools",
+      "model": "Qwen/Qwen3-8B",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "sft",
+        "tool-calling",
+        "agentic",
+        "function-calling"
+      ],
+      "description": "Qwen 3 8B tool-calling / function-calling SFT",
+      "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/tool_calling_train.jsonl\n  format: tool-calling\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  gradient_accumulation_steps: 4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 8190735360
+    },
+    {
+      "name": "llama4-scout-tools",
+      "model": "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+      "task": "sft",
+      "size": "109B",
+      "tags": [
+        "llama",
+        "llama4",
+        "sft",
+        "tool-calling",
+        "agentic",
+        "function-calling"
+      ],
+      "description": "Llama 4 Scout 17B active tool-calling / function-calling SFT",
+      "yaml": "base: meta-llama/Llama-4-Scout-17B-16E-Instruct\ntask: sft\n\ndata:\n  train: ./data/tool_calling_train.jsonl\n  format: tool-calling\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  gradient_accumulation_steps: 4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 108641793536
+    },
+    {
+      "name": "llama3.1-8b-ipo",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "ipo",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "ipo",
+        "alignment",
+        "regularized"
+      ],
+      "description": "Llama 3.1 8B IPO regularized preference alignment",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: ipo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  ipo_tau: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "llama3-70b-fsdp2",
+      "model": "meta-llama/Llama-3.1-70B-Instruct",
+      "task": "sft",
+      "size": "70B",
+      "tags": [
+        "llama",
+        "sft",
+        "fsdp2",
+        "multi-gpu",
+        "torch-compile"
+      ],
+      "description": "Llama 3.1 70B SFT with FSDP2 full shard + torch.compile. Requires 8 x A100/H100 80GB.",
+      "yaml": "base: meta-llama/Llama-3.1-70B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  batch_size: 1\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  bnb_4bit_quant_storage: bfloat16\n  use_fsdp2_compile: true\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 70553706496
+    },
+    {
+      "name": "qwen3-32b-zeropp",
+      "model": "Qwen/Qwen3-32B",
+      "task": "sft",
+      "size": "32B",
+      "tags": [
+        "qwen",
+        "sft",
+        "zeropp",
+        "deepspeed",
+        "multi-gpu"
+      ],
+      "description": "Qwen3 32B SFT with DeepSpeed ZeRO++ (quantized gradients + hierarchical partitioning). Launch with --deepspeed zero++.",
+      "yaml": "base: Qwen/Qwen3-32B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3",
+      "parameters": 32762123264
+    },
+    {
+      "name": "deepseek-v3-pipeline",
+      "model": "deepseek-ai/DeepSeek-V3",
+      "task": "sft",
+      "size": "671B",
+      "tags": [
+        "deepseek",
+        "sft",
+        "pipeline",
+        "multi-gpu",
+        "moe"
+      ],
+      "description": "DeepSeek V3 SFT scaffold with pipeline parallelism (4 stages). Pipeline execution wiring ships in v0.27.1.",
+      "yaml": "base: deepseek-ai/DeepSeek-V3\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-5\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  parallelism: pipeline\n  pipeline_stages: 4\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v3",
+      "parameters": 684531386000
+    },
+    {
+      "name": "llama3.2-vision-90b-sft",
+      "model": "meta-llama/Llama-3.2-90B-Vision-Instruct",
+      "task": "sft",
+      "size": "90B",
+      "tags": [
+        "llama",
+        "vision",
+        "multimodal",
+        "image",
+        "large"
+      ],
+      "description": "Llama 3.2 90B Vision multimodal SFT (8 x A100/H100 80GB)",
+      "yaml": "base: meta-llama/Llama-3.2-90B-Vision-Instruct\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 88593355323
+    },
+    {
+      "name": "pixtral-12b-sft",
+      "model": "mistralai/Pixtral-12B-2409",
+      "task": "sft",
+      "size": "12B",
+      "tags": [
+        "mistral",
+        "pixtral",
+        "vision",
+        "multimodal",
+        "image"
+      ],
+      "description": "Pixtral 12B vision-language SFT with LoRA",
+      "yaml": "base: mistralai/Pixtral-12B-2409\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup"
+    },
+    {
+      "name": "qwen2-vl-7b-sft",
+      "model": "Qwen/Qwen2-VL-7B-Instruct",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "qwen2",
+        "vision",
+        "multimodal",
+        "image"
+      ],
+      "description": "Qwen2-VL 7B vision-language SFT",
+      "yaml": "base: Qwen/Qwen2-VL-7B-Instruct\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: sharegpt4v\n  image_dir: ./data/images\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2_vl",
+      "parameters": 8291375616
+    },
+    {
+      "name": "qwen2-vl-72b-sft",
+      "model": "Qwen/Qwen2-VL-72B-Instruct",
+      "task": "sft",
+      "size": "72B",
+      "tags": [
+        "qwen",
+        "qwen2",
+        "vision",
+        "multimodal",
+        "image",
+        "large"
+      ],
+      "description": "Qwen2-VL 72B vision-language SFT (multi-GPU recommended)",
+      "yaml": "base: Qwen/Qwen2-VL-72B-Instruct\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: sharegpt4v\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2_vl",
+      "parameters": 73405560320
+    },
+    {
+      "name": "internvl-2.5-8b-sft",
+      "model": "OpenGVLab/InternVL2_5-8B",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "internvl",
+        "vision",
+        "multimodal",
+        "image"
+      ],
+      "description": "InternVL 2.5 8B vision-language SFT",
+      "yaml": "base: OpenGVLab/InternVL2_5-8B\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "internvl_chat",
+      "parameters": 8075365376
+    },
+    {
+      "name": "minicpm-v-2.6-sft",
+      "model": "openbmb/MiniCPM-V-2_6",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "minicpm",
+        "vision",
+        "multimodal",
+        "image",
+        "edge"
+      ],
+      "description": "MiniCPM-V 2.6 vision-language SFT (edge-friendly multimodal)",
+      "yaml": "base: openbmb/MiniCPM-V-2_6\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8099175152
+    },
+    {
+      "name": "qwen2-audio-7b-sft",
+      "model": "Qwen/Qwen2-Audio-7B-Instruct",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "qwen2",
+        "audio",
+        "multimodal",
+        "speech"
+      ],
+      "description": "Qwen2-Audio 7B audio-language SFT",
+      "yaml": "base: Qwen/Qwen2-Audio-7B-Instruct\ntask: sft\nmodality: audio\n\ndata:\n  train: ./data/audio_train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2_audio",
+      "parameters": 8397094912
+    },
+    {
+      "name": "seamlessm4t-v2-sft",
+      "model": "facebook/seamless-m4t-v2-large",
+      "task": "sft",
+      "size": "2.3B",
+      "tags": [
+        "meta",
+        "seamless",
+        "audio",
+        "translation",
+        "multilingual"
+      ],
+      "description": "SeamlessM4T v2 multilingual speech-to-text SFT",
+      "yaml": "base: facebook/seamless-m4t-v2-large\ntask: sft\nmodality: audio\n\ndata:\n  train: ./data/audio_train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  max_length: 1024\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "seamless_m4t_v2",
+      "parameters": 2309249669
+    },
+    {
+      "name": "whisper-large-v3-ft",
+      "model": "openai/whisper-large-v3",
+      "task": "sft",
+      "size": "1.5B",
+      "tags": [
+        "openai",
+        "whisper",
+        "audio",
+        "asr",
+        "transcription"
+      ],
+      "description": "Whisper Large v3 ASR fine-tuning",
+      "yaml": "base: openai/whisper-large-v3\ntask: sft\nmodality: audio\n\ndata:\n  train: ./data/audio_train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  max_length: 448\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 8bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "whisper",
+      "parameters": 1543490560
+    },
+    {
+      "name": "r1-distill-qwen-1.5b-grpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+      "task": "grpo",
+      "size": "1.5B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "qwen",
+        "grpo",
+        "reasoning",
+        "small",
+        "distill"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 1.5B GRPO reasoning training",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 1777088000
+    },
+    {
+      "name": "r1-distill-qwen-7b-grpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+      "task": "grpo",
+      "size": "7B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "qwen",
+        "grpo",
+        "reasoning",
+        "distill"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 7B GRPO reasoning training",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "r1-distill-qwen-14b-grpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+      "task": "grpo",
+      "size": "14B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "qwen",
+        "grpo",
+        "reasoning",
+        "distill"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 14B GRPO reasoning training",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-14B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 14770033664
+    },
+    {
+      "name": "r1-distill-llama-70b-grpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-70B",
+      "task": "grpo",
+      "size": "70B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "llama",
+        "grpo",
+        "reasoning",
+        "distill",
+        "large"
+      ],
+      "description": "DeepSeek-R1-Distill Llama 70B GRPO reasoning (multi-GPU)",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Llama-70B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 70553706496
+    },
+    {
+      "name": "qwen3-coder-30b-sft",
+      "model": "Qwen/Qwen3-Coder-30B-A3B-Instruct",
+      "task": "sft",
+      "size": "30B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "coder",
+        "code",
+        "sft",
+        "moe"
+      ],
+      "description": "Qwen3-Coder 30B (A3B MoE) code-specialist SFT",
+      "yaml": "base: Qwen/Qwen3-Coder-30B-A3B-Instruct\ntask: sft\n\ndata:\n  train: ./data/code_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_moe",
+      "parameters": 30532122624
+    },
+    {
+      "name": "qwen3-30b-a3b-reasoning-grpo",
+      "model": "Qwen/Qwen3-30B-A3B",
+      "task": "grpo",
+      "size": "30B",
+      "tags": [
+        "qwen",
+        "qwen3",
+        "grpo",
+        "reasoning",
+        "moe",
+        "thinking"
+      ],
+      "description": "Qwen3 30B-A3B GRPO reasoning training (MoE thinking model)",
+      "yaml": "base: Qwen/Qwen3-30B-A3B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_moe",
+      "parameters": 30532122624
+    },
+    {
+      "name": "phi4-reasoning-grpo",
+      "model": "microsoft/phi-4",
+      "task": "grpo",
+      "size": "14B",
+      "tags": [
+        "microsoft",
+        "phi",
+        "phi4",
+        "grpo",
+        "reasoning"
+      ],
+      "description": "Phi-4 14B GRPO reasoning training",
+      "yaml": "base: microsoft/phi-4\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "phi3",
+      "parameters": 14659507200
+    },
+    {
+      "name": "qwen2.5-0.5b-sft",
+      "model": "Qwen/Qwen2.5-0.5B-Instruct",
+      "task": "sft",
+      "size": "0.5B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "sft",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "Qwen 2.5 0.5B SFT (mobile / edge)",
+      "yaml": "base: Qwen/Qwen2.5-0.5B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 8bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 494032768
+    },
+    {
+      "name": "qwen2.5-1.5b-sft",
+      "model": "Qwen/Qwen2.5-1.5B-Instruct",
+      "task": "sft",
+      "size": "1.5B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "sft",
+        "tiny",
+        "edge"
+      ],
+      "description": "Qwen 2.5 1.5B SFT (edge-friendly)",
+      "yaml": "base: Qwen/Qwen2.5-1.5B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 3e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 8bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 1543714304
+    },
+    {
+      "name": "qwen2.5-3b-sft",
+      "model": "Qwen/Qwen2.5-3B-Instruct",
+      "task": "sft",
+      "size": "3B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "Qwen 2.5 3B SFT (small / edge)",
+      "yaml": "base: Qwen/Qwen2.5-3B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 3085938688
+    },
+    {
+      "name": "gemma2-2b-sft",
+      "model": "google/gemma-2-2b-it",
+      "task": "sft",
+      "size": "2B",
+      "tags": [
+        "gemma",
+        "gemma2",
+        "google",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "Gemma 2 2B SFT (edge-friendly)",
+      "yaml": "base: google/gemma-2-2b-it\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 2614341888
+    },
+    {
+      "name": "smollm2-135m-sft",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "task": "sft",
+      "size": "135M",
+      "tags": [
+        "smollm",
+        "smollm2",
+        "huggingface",
+        "sft",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "SmolLM2 135M SFT (ultra-tiny / mobile)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-135M-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: none\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 134515008
+    },
+    {
+      "name": "online-dpo-smollm2-135m",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "task": "online_dpo",
+      "size": "135M",
+      "tags": [
+        "smollm",
+        "smollm2",
+        "online_dpo",
+        "judge",
+        "rlhf",
+        "tiny",
+        "edge"
+      ],
+      "description": "SmolLM2 135M Online DPO — on-policy generation judged by a pairwise LLM judge (point training.online_dpo_judge at a local ollama model)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-135M-Instruct\ntask: online_dpo\n\ndata:\n  train: ./data/prompts.jsonl\n  format: auto\n  max_length: 1024\n\ntraining:\n  # On-policy: the model generates 2 completions per prompt each step and the\n  # judge picks chosen/rejected. Point online_dpo_judge at a local judge, OR set\n  # reward_model instead (exactly one of the two).\n  online_dpo_judge: \"ollama://llama3.1\"\n  online_dpo_loss_type: sigmoid\n  online_dpo_max_new_tokens: 64\n  dpo_beta: 0.1\n  epochs: 1\n  lr: 5e-5\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: none\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 134515008
+    },
+    {
+      "name": "whisper-tiny-asr",
+      "model": "openai/whisper-tiny",
+      "task": "asr",
+      "size": "39M",
+      "tags": [
+        "whisper",
+        "asr",
+        "speech",
+        "audio",
+        "tiny",
+        "edge"
+      ],
+      "description": "Whisper tiny (39M) ASR fine-tune with LoRA on q/v projections — fits a 4 GB GPU. Rows: {\"audio\": path, \"text\": transcript}",
+      "yaml": "base: openai/whisper-tiny\ntask: asr\n\ndata:\n  train: ./data/train.jsonl\n  format: asr\n  # Relative audio paths resolve against audio_dir (defaults to the data dir).\n  audio_dir: ./data/audio\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  asr_language: en\n  asr_task: transcribe\n  asr_lora: true\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: [q_proj, v_proj]\n  quantization: none\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "whisper",
+      "parameters": 37760640
+    },
+    {
+      "name": "whisper-base-asr",
+      "model": "openai/whisper-base",
+      "task": "asr",
+      "size": "74M",
+      "tags": [
+        "whisper",
+        "asr",
+        "speech",
+        "audio",
+        "base",
+        "edge"
+      ],
+      "description": "Whisper base (74M) ASR fine-tune with LoRA on q/v projections — fits a 4 GB GPU",
+      "yaml": "base: openai/whisper-base\ntask: asr\n\ndata:\n  train: ./data/train.jsonl\n  format: asr\n  audio_dir: ./data/audio\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  asr_language: en\n  asr_task: transcribe\n  asr_lora: true\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: [q_proj, v_proj]\n  quantization: none\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "whisper",
+      "parameters": 72593920
+    },
+    {
+      "name": "whisper-large-v3-asr",
+      "model": "openai/whisper-large-v3",
+      "task": "asr",
+      "size": "1.5B",
+      "tags": [
+        "whisper",
+        "asr",
+        "speech",
+        "audio",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Whisper large-v3 (1.5B) ASR fine-tune with LoRA — needs a larger GPU (>= 16 GB); the tiny/base recipes fit a 4 GB card",
+      "yaml": "base: openai/whisper-large-v3\ntask: asr\n\ndata:\n  train: ./data/train.jsonl\n  format: asr\n  audio_dir: ./data/audio\n\ntraining:\n  epochs: 2\n  lr: 5e-5\n  batch_size: auto\n  asr_language: en\n  asr_task: transcribe\n  asr_lora: true\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: [q_proj, v_proj]\n  quantization: none\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "whisper",
+      "parameters": 1543490560
+    },
+    {
+      "name": "smolvlm-256m-sft",
+      "model": "HuggingFaceTB/SmolVLM-256M-Instruct",
+      "task": "sft",
+      "size": "256M",
+      "tags": [
+        "smolvlm",
+        "vision",
+        "multimodal",
+        "vlm",
+        "sft",
+        "tiny",
+        "edge"
+      ],
+      "description": "SmolVLM 256M vision SFT (llava format) — a tiny VLM. SmolVLM uses an Idefics3 processor; Soup mirrors its nested tokenizer surface and performs processor-aware vision collation so image-token expansion and pixel_values reach the model (#302). target_modules are pinned to q_proj/v_proj (auto cannot infer them for Idefics3).",
+      "yaml": "base: HuggingFaceTB/SmolVLM-256M-Instruct\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: [q_proj, v_proj]\n  quantization: none\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "idefics3",
+      "parameters": 256484928
+    },
+    {
+      "name": "smollm2-360m-sft",
+      "model": "HuggingFaceTB/SmolLM2-360M-Instruct",
+      "task": "sft",
+      "size": "360M",
+      "tags": [
+        "smollm",
+        "smollm2",
+        "huggingface",
+        "sft",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "SmolLM2 360M SFT (tiny / mobile)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-360M-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: none\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 361821120
+    },
+    {
+      "name": "smollm2-1.7b-sft",
+      "model": "HuggingFaceTB/SmolLM2-1.7B-Instruct",
+      "task": "sft",
+      "size": "1.7B",
+      "tags": [
+        "smollm",
+        "smollm2",
+        "huggingface",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "SmolLM2 1.7B SFT (small / edge)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-1.7B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 3e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 8bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 1711376384
+    },
+    {
+      "name": "smollm3-3b-sft",
+      "model": "HuggingFaceTB/SmolLM3-3B",
+      "task": "sft",
+      "size": "3B",
+      "tags": [
+        "smollm",
+        "smollm3",
+        "huggingface",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "SmolLM3 3B SFT (small / edge)",
+      "yaml": "base: HuggingFaceTB/SmolLM3-3B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 3e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 8bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "smollm3",
+      "parameters": 3075098624
+    },
+    {
+      "name": "phi3.5-mini-sft",
+      "model": "microsoft/Phi-3.5-mini-instruct",
+      "task": "sft",
+      "size": "3.8B",
+      "tags": [
+        "microsoft",
+        "phi",
+        "phi3.5",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "Phi-3.5-mini 3.8B SFT (small / edge)",
+      "yaml": "base: microsoft/Phi-3.5-mini-instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "phi3",
+      "parameters": 3821079552
+    },
+    {
+      "name": "biomistral-7b-sft",
+      "model": "BioMistral/BioMistral-7B",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "biomistral",
+        "mistral",
+        "medical",
+        "biomedical",
+        "sft",
+        "domain"
+      ],
+      "description": "BioMistral 7B medical/biomedical domain SFT",
+      "yaml": "base: BioMistral/BioMistral-7B\ntask: sft\n\ndata:\n  train: ./data/medical_train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral"
+    },
+    {
+      "name": "meditron-7b-sft",
+      "model": "epfl-llm/meditron-7b",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "meditron",
+        "epfl",
+        "medical",
+        "clinical",
+        "sft",
+        "domain"
+      ],
+      "description": "Meditron 7B medical / clinical domain SFT",
+      "yaml": "base: epfl-llm/meditron-7b\ntask: sft\n\ndata:\n  train: ./data/medical_train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 6738554880
+    },
+    {
+      "name": "codellama-70b-sft",
+      "model": "codellama/CodeLlama-70b-Instruct-hf",
+      "task": "sft",
+      "size": "70B",
+      "tags": [
+        "codellama",
+        "code",
+        "sft",
+        "domain",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Code Llama 70B code-specialist SFT (multi-GPU)",
+      "yaml": "base: codellama/CodeLlama-70b-Instruct-hf\ntask: sft\n\ndata:\n  train: ./data/code_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 68976910336
+    },
+    {
+      "name": "codellama-13b-sft",
+      "model": "codellama/CodeLlama-13b-Instruct-hf",
+      "task": "sft",
+      "size": "13B",
+      "tags": [
+        "codellama",
+        "code",
+        "sft",
+        "domain"
+      ],
+      "description": "Code Llama 13B code-specialist SFT",
+      "yaml": "base: codellama/CodeLlama-13b-Instruct-hf\ntask: sft\n\ndata:\n  train: ./data/code_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 13016028160
+    },
+    {
+      "name": "magicoder-7b-sft",
+      "model": "ise-uiuc/Magicoder-S-DS-6.7B",
+      "task": "sft",
+      "size": "6.7B",
+      "tags": [
+        "magicoder",
+        "deepseek",
+        "code",
+        "sft",
+        "domain"
+      ],
+      "description": "Magicoder S-DS 6.7B code-specialist SFT",
+      "yaml": "base: ise-uiuc/Magicoder-S-DS-6.7B\ntask: sft\n\ndata:\n  train: ./data/code_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 6740512768
+    },
+    {
+      "name": "nemotron-4-340b-sft",
+      "model": "nvidia/Nemotron-4-340B-Instruct",
+      "task": "sft",
+      "size": "340B",
+      "tags": [
+        "nvidia",
+        "nemotron",
+        "sft",
+        "large",
+        "domain",
+        "deepspeed"
+      ],
+      "description": "Nemotron-4 340B SFT (massive multi-node deployment)",
+      "yaml": "base: nvidia/Nemotron-4-340B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup"
+    },
+    {
+      "name": "llama2-13b-finance-sft",
+      "model": "meta-llama/Llama-2-13b-hf",
+      "task": "sft",
+      "size": "13B",
+      "tags": [
+        "llama",
+        "llama2",
+        "finance",
+        "financial",
+        "sft",
+        "domain"
+      ],
+      "description": "Llama 2 13B finance-domain SFT (FinGPT-style starter recipe)",
+      "yaml": "base: meta-llama/Llama-2-13b-hf\ntask: sft\n\ndata:\n  train: ./data/finance_train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 13015866880
+    },
+    {
+      "name": "mathstral-7b-sft",
+      "model": "mistralai/Mathstral-7B-v0.1",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "mistral",
+        "mathstral",
+        "math",
+        "stem",
+        "sft",
+        "domain"
+      ],
+      "description": "Mathstral 7B math/STEM-specialist SFT",
+      "yaml": "base: mistralai/Mathstral-7B-v0.1\ntask: sft\n\ndata:\n  train: ./data/math_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 7248023552
+    },
+    {
+      "name": "llama3.2-vision-grpo",
+      "model": "meta-llama/Llama-3.2-11B-Vision-Instruct",
+      "task": "grpo",
+      "size": "11B",
+      "tags": [
+        "llama",
+        "vision",
+        "multimodal",
+        "grpo",
+        "reasoning"
+      ],
+      "description": "Llama 3.2 11B Vision GRPO multimodal reasoning training",
+      "yaml": "base: meta-llama/Llama-3.2-11B-Vision-Instruct\ntask: grpo\nmodality: vision\n\ndata:\n  train: ./data/vision_reasoning_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 10670220835
+    },
+    {
+      "name": "gpt-oss-20b-sft",
+      "model": "openai/gpt-oss-20b",
+      "task": "sft",
+      "size": "20B",
+      "tags": [
+        "gpt-oss",
+        "openai",
+        "reasoning",
+        "agent"
+      ],
+      "description": "GPT-OSS 20B SFT (reasoning_effort=medium)",
+      "yaml": "base: openai/gpt-oss-20b\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "gpt_oss",
+      "parameters": 20914757184
+    },
+    {
+      "name": "gpt-oss-120b-sft",
+      "model": "openai/gpt-oss-120b",
+      "task": "sft",
+      "size": "120B",
+      "tags": [
+        "gpt-oss",
+        "openai",
+        "reasoning",
+        "large"
+      ],
+      "description": "GPT-OSS 120B SFT (multi-GPU recommended)",
+      "yaml": "base: openai/gpt-oss-120b\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-5\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "gpt_oss",
+      "parameters": 116829156672
+    },
+    {
+      "name": "glm-4.6-sft",
+      "model": "zai-org/GLM-4.6",
+      "task": "sft",
+      "size": "357B",
+      "tags": [
+        "glm",
+        "zai-org",
+        "chat",
+        "instruction"
+      ],
+      "description": "GLM 4.6 MoE instruction tuning with LoRA",
+      "yaml": "base: zai-org/GLM-4.6\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "glm4_moe",
+      "parameters": 356785898816
+    },
+    {
+      "name": "glm-5-sft",
+      "model": "zai-org/GLM-5",
+      "task": "sft",
+      "size": "754B",
+      "tags": [
+        "glm",
+        "zai-org",
+        "chat",
+        "next-gen"
+      ],
+      "description": "GLM 5 MoE SFT (next-gen GLM family)",
+      "yaml": "base: zai-org/GLM-5\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "glm_moe_dsa",
+      "parameters": 753864139008
+    },
+    {
+      "name": "kimi-k2-sft",
+      "model": "moonshotai/Kimi-K2-Base",
+      "task": "sft",
+      "size": "N/A",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "moe",
+        "long-context"
+      ],
+      "description": "Kimi K2 SFT: resident unsupported; guarded streaming only (see recipes use).",
+      "yaml": "base: moonshotai/Kimi-K2-Base\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  batch_size: auto\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "unavailable": "Soup refuses it on this kind of setup (resident_kimi_k2_quantization_refusal(\"4bit\"))",
+      "model_type": "kimi_k2",
+      "parameters": 1026470731056
+    },
+    {
+      "name": "kimi-k2-thinking-grpo",
+      "model": "moonshotai/Kimi-K2-Thinking",
+      "task": "grpo",
+      "size": "N/A",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "thinking",
+        "grpo",
+        "reasoning"
+      ],
+      "description": "Kimi K2 Thinking GRPO: unsupported resident route; no supported route yet.",
+      "yaml": "base: moonshotai/Kimi-K2-Thinking\ntask: grpo\n\ndata:\n  train: ./data/reasoning_prompts.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.04\n  num_generations: 4\n  reward_fn: accuracy\n  verifiable_domain: math\n\noutput: ./output\n",
+      "origin": "soup",
+      "unavailable": "Soup refuses it on this kind of setup (KIMI_K2_NO_SUPPORTED_ROUTE_REASON)",
+      "model_type": "kimi_k2",
+      "parameters": 1026408240256
+    },
+    {
+      "name": "minimax-m2-sft",
+      "model": "MiniMaxAI/MiniMax-M2",
+      "task": "sft",
+      "size": "230B",
+      "tags": [
+        "minimax",
+        "chat",
+        "instruction"
+      ],
+      "description": "MiniMax M2 MoE SFT instruction tuning",
+      "yaml": "base: MiniMaxAI/MiniMax-M2\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "minimax_m2",
+      "parameters": 228689764864
+    },
+    {
+      "name": "qwq-32b-grpo",
+      "model": "Qwen/QwQ-32B",
+      "task": "grpo",
+      "size": "32B",
+      "tags": [
+        "qwen",
+        "qwq",
+        "reasoning",
+        "grpo"
+      ],
+      "description": "QwQ 32B GRPO reasoning training",
+      "yaml": "base: Qwen/QwQ-32B\ntask: grpo\n\ndata:\n  train: ./data/reasoning_prompts.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.04\n  num_generations: 4\n  reward_fn: accuracy\n  verifiable_domain: math\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 32763876352
+    },
+    {
+      "name": "qvq-72b-sft",
+      "model": "Qwen/QVQ-72B-Preview",
+      "task": "sft",
+      "size": "72B",
+      "tags": [
+        "qwen",
+        "qvq",
+        "vision",
+        "reasoning"
+      ],
+      "description": "QVQ 72B vision-reasoning SFT",
+      "yaml": "base: Qwen/QVQ-72B-Preview\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2_vl",
+      "parameters": 73405560320
+    },
+    {
+      "name": "granite-4-sft",
+      "model": "ibm-granite/granite-4.0-h-tiny-base",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "granite",
+        "ibm",
+        "small",
+        "instruction"
+      ],
+      "description": "IBM Granite 4.0 tiny SFT",
+      "yaml": "base: ibm-granite/granite-4.0-h-tiny-base\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "granitemoehybrid",
+      "parameters": 6939037248
+    },
+    {
+      "name": "lfm2-sft",
+      "model": "LiquidAI/LFM2-1.2B",
+      "task": "sft",
+      "size": "1.2B",
+      "tags": [
+        "liquid",
+        "lfm2",
+        "small",
+        "edge"
+      ],
+      "description": "Liquid LFM2 1.2B SFT (edge-optimised)",
+      "yaml": "base: LiquidAI/LFM2-1.2B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "lfm2",
+      "parameters": 1170340608
+    },
+    {
+      "name": "mistral-small-3-sft",
+      "model": "mistralai/Mistral-Small-24B-Instruct-2501",
+      "task": "sft",
+      "size": "24B",
+      "tags": [
+        "mistral",
+        "small",
+        "instruction"
+      ],
+      "description": "Mistral Small 3 24B SFT",
+      "yaml": "base: mistralai/Mistral-Small-24B-Instruct-2501\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 23572403200
+    },
+    {
+      "name": "mistral-medium-3-5-sft",
+      "model": "mistralai/Mistral-Medium-3.5-128B",
+      "task": "sft",
+      "size": "128B",
+      "tags": [
+        "mistral",
+        "medium",
+        "instruction",
+        "large"
+      ],
+      "description": "Mistral Medium 3.5 SFT",
+      "yaml": "base: mistralai/Mistral-Medium-3.5-128B\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral3",
+      "parameters": 127704210176
+    },
+    {
+      "name": "magistral-small-sft",
+      "model": "mistralai/Magistral-Small",
+      "task": "sft",
+      "size": "24B",
+      "tags": [
+        "mistral",
+        "magistral",
+        "reasoning",
+        "instruction"
+      ],
+      "description": "Magistral Small reasoning SFT",
+      "yaml": "base: mistralai/Magistral-Small\ntask: sft\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 23572403200
+    },
+    {
+      "name": "devstral-sft",
+      "model": "mistralai/Devstral-Small-2507",
+      "task": "sft",
+      "size": "24B",
+      "tags": [
+        "mistral",
+        "devstral",
+        "code",
+        "agent"
+      ],
+      "description": "Devstral Small code/agent SFT",
+      "yaml": "base: mistralai/Devstral-Small-2507\ntask: sft\n\ndata:\n  train: ./data/code_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 23572403200
+    },
+    {
+      "name": "ministral-sft",
+      "model": "mistralai/Ministral-8B-Instruct-2410",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "mistral",
+        "ministral",
+        "small",
+        "instruction"
+      ],
+      "description": "Ministral 8B SFT",
+      "yaml": "base: mistralai/Ministral-8B-Instruct-2410\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mistral",
+      "parameters": 8019808256
+    },
+    {
+      "name": "medgemma-sft",
+      "model": "google/medgemma-4b-it",
+      "task": "sft",
+      "size": "4B",
+      "tags": [
+        "gemma",
+        "medgemma",
+        "medical",
+        "domain"
+      ],
+      "description": "MedGemma 4B medical SFT",
+      "yaml": "base: google/medgemma-4b-it\ntask: sft\n\ndata:\n  train: ./data/medical_train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 4300079472
+    },
+    {
+      "name": "embedding-gemma-sft",
+      "model": "google/embeddinggemma-300m",
+      "task": "embedding",
+      "size": "300M",
+      "tags": [
+        "gemma",
+        "embedding",
+        "small",
+        "sentence"
+      ],
+      "description": "EmbeddingGemma 300M sentence-embedding SFT",
+      "yaml": "base: google/embeddinggemma-300m\ntask: embedding\n\ndata:\n  train: ./data/embedding_train.jsonl\n  format: embedding\n  max_length: 512\n\ntraining:\n  epochs: 3\n  lr: 2e-5\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n  embedding_loss: cosine\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 302863104
+    },
+    {
+      "name": "llava-next-sft",
+      "model": "llava-hf/llava-v1.6-mistral-7b-hf",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "llava",
+        "llava-next",
+        "vision",
+        "multimodal"
+      ],
+      "description": "LLaVA-Next 7B vision SFT",
+      "yaml": "base: llava-hf/llava-v1.6-mistral-7b-hf\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llava_next",
+      "parameters": 7566747648
+    },
+    {
+      "name": "internvl-3-5-sft",
+      "model": "OpenGVLab/InternVL3_5-8B",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "internvl",
+        "vision",
+        "multimodal",
+        "opengvlab"
+      ],
+      "description": "InternVL 3.5 vision SFT",
+      "yaml": "base: OpenGVLab/InternVL3_5-8B\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/vision_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "internvl_chat",
+      "parameters": 8528318464
+    },
+    {
+      "name": "voxtral-sft",
+      "model": "mistralai/Voxtral-Mini-3B-2507",
+      "task": "sft",
+      "size": "4.7B",
+      "tags": [
+        "mistral",
+        "voxtral",
+        "audio",
+        "multimodal"
+      ],
+      "description": "Voxtral Mini 3B audio SFT",
+      "yaml": "base: mistralai/Voxtral-Mini-3B-2507\ntask: sft\nmodality: audio\n\ndata:\n  train: ./data/audio_train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "voxtral",
+      "parameters": 4676271104
+    },
+    {
+      "name": "baichuan-sft",
+      "model": "baichuan-inc/Baichuan2-13B-Chat",
+      "task": "sft",
+      "size": "13B",
+      "tags": [
+        "baichuan",
+        "chinese",
+        "instruction"
+      ],
+      "description": "Baichuan 2 13B chat SFT",
+      "yaml": "base: baichuan-inc/Baichuan2-13B-Chat\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  hub: modelscope\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "baichuan"
+    },
+    {
+      "name": "qwen-image-sft",
+      "model": "Qwen/Qwen-Image",
+      "task": "sft",
+      "size": "N/A",
+      "tags": [
+        "qwen",
+        "image",
+        "image-output",
+        "multimodal"
+      ],
+      "description": "Qwen-Image image-output multimodal SFT",
+      "yaml": "base: Qwen/Qwen-Image\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/image_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 20430401088
+    },
+    {
+      "name": "deepseek-ocr-sft",
+      "model": "deepseek-ai/DeepSeek-OCR",
+      "task": "sft",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "ocr",
+        "vision",
+        "specialised"
+      ],
+      "description": "DeepSeek-OCR vision OCR SFT",
+      "yaml": "base: deepseek-ai/DeepSeek-OCR\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/ocr_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_vl_v2",
+      "parameters": 3336106240
+    },
+    {
+      "name": "paddle-ocr-sft",
+      "model": "PaddlePaddle/PaddleOCR-VL",
+      "task": "sft",
+      "size": "N/A",
+      "tags": [
+        "paddle",
+        "ocr",
+        "vision",
+        "specialised"
+      ],
+      "description": "Paddle-OCR-VL OCR SFT",
+      "yaml": "base: PaddlePaddle/PaddleOCR-VL\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/ocr_train.jsonl\n  format: llava\n  image_dir: ./data/images\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "paddleocr_vl",
+      "parameters": 958588736
+    },
+    {
+      "name": "orpheus-tts-sft",
+      "model": "canopylabs/orpheus-3b-0.1-ft",
+      "task": "tts",
+      "size": "3B",
+      "tags": [
+        "tts",
+        "orpheus",
+        "audio_out",
+        "v0.52.0"
+      ],
+      "description": "Orpheus emotional TTS — live (v0.71.20)",
+      "yaml": "base: canopylabs/orpheus-3b-0.1-ft\ntask: tts\nmodality: audio_out\n\ndata:\n  train: ./data/tts_train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  tts_family: orpheus\n  tts_emotion: neutral\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 3782986752
+    },
+    {
+      "name": "llasa-tts",
+      "model": "HKUSTAudio/Llasa-1B",
+      "task": "tts",
+      "size": "1B",
+      "tags": [
+        "tts",
+        "llasa",
+        "audio_out",
+        "v0.52.0"
+      ],
+      "description": "Llasa-TTS — live XCodec2 encode-at-train-time path",
+      "yaml": "base: HKUSTAudio/Llasa-1B\ntask: tts\nmodality: audio_out\n\ndata:\n  train: ./data/tts_train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  tts_family: llasa\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 1370048512
+    },
+    {
+      "name": "oute-tts",
+      "model": "OuteAI/OuteTTS-0.3-500M",
+      "task": "tts",
+      "size": "0.5B",
+      "tags": [
+        "tts",
+        "oute",
+        "audio_out",
+        "emotion",
+        "v0.52.0"
+      ],
+      "description": "OuteTTS v0.3 pre-encoded SFT; raw-audio live codec refused by upstream pin",
+      "yaml": "base: OuteAI/OuteTTS-0.3-500M\ntask: tts\nmodality: audio_out\n\ndata:\n  train: ./data/tts_pre_encoded.jsonl\n  format: chatml\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  batch_size: auto\n  tts_family: oute\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 499193728
+    },
+    {
+      "name": "ra-dit-retriever",
+      "model": "sentence-transformers/all-mpnet-base-v2",
+      "task": "embedding",
+      "size": "N/A",
+      "tags": [
+        "ra-dit",
+        "rag",
+        "retriever",
+        "contrastive",
+        "v0.62.0"
+      ],
+      "description": "RA-DIT stage 1 (Meta 2023) — contrastive retriever training. Pairs with `ra-dit-llama3-8b` (stage 2) for the full pipeline.",
+      "yaml": "base: sentence-transformers/all-mpnet-base-v2\ntask: embedding\n\ndata:\n  train: ./data/triples.jsonl\n  format: embedding\n  max_length: 512\n\ntraining:\n  epochs: 1\n  lr: 2e-5\n  batch_size: auto\n  ra_dit_stage: retriever\n  embedding_loss: triplet\n  embedding_margin: 0.5\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "mpnet",
+      "parameters": 109486978
+    },
+    {
+      "name": "ra-dit-llama3-8b",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "sft",
+        "ra-dit",
+        "rag",
+        "raft",
+        "v0.62.0"
+      ],
+      "description": "RA-DIT stage 2 (Meta 2023) — RAFT-style SFT on the generator. Pairs with `ra-dit-retriever` (stage 1). Uses RAFT data format.",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: sft\n\ndata:\n  train: ./data/raft.jsonl\n  format: raft\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 2e-4\n  batch_size: auto\n  ra_dit_stage: generator\n  ra_dit_retriever_model: sentence-transformers/all-mpnet-base-v2\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "raft-llama3-8b",
+      "model": "meta-llama/Llama-3.1-8B-Instruct",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "llama",
+        "sft",
+        "raft",
+        "rag",
+        "v0.62.0"
+      ],
+      "description": "RAFT (Retrieval-Augmented Fine-Tuning, Stanford 2024) — train an 8B Llama 3.1 to answer queries given a golden doc + distractor docs. Rows: {query, golden_doc, distractor_docs, answer}. Live training loop ships in v0.62.1.",
+      "yaml": "base: meta-llama/Llama-3.1-8B-Instruct\ntask: sft\n\ndata:\n  train: ./data/raft.jsonl\n  format: raft\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "parameters": 8030261248
+    },
+    {
+      "name": "qwen3.5-0.8b-sft",
+      "model": "Qwen/Qwen3.5-0.8B",
+      "task": "sft",
+      "size": "0.8B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "Qwen 3.5 0.8B SFT (Apache-2.0, tiny / mobile)",
+      "yaml": "base: Qwen/Qwen3.5-0.8B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 3e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 873438784
+    },
+    {
+      "name": "qwen3.5-0.8b-dpo",
+      "model": "Qwen/Qwen3.5-0.8B",
+      "task": "dpo",
+      "size": "0.8B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "Qwen 3.5 0.8B text DPO alignment (Apache-2.0, tiny / mobile)",
+      "yaml": "base: Qwen/Qwen3.5-0.8B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 873438784
+    },
+    {
+      "name": "qwen3.5-0.8b-grpo",
+      "model": "Qwen/Qwen3.5-0.8B",
+      "task": "grpo",
+      "size": "0.8B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "thinking",
+        "tiny",
+        "edge",
+        "mobile"
+      ],
+      "description": "Qwen 3.5 0.8B GRPO reasoning training (Apache-2.0, tiny / mobile)",
+      "yaml": "base: Qwen/Qwen3.5-0.8B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 873438784
+    },
+    {
+      "name": "qwen3.5-0.8b-pretrain",
+      "model": "Qwen/Qwen3.5-0.8B-Base",
+      "task": "pretrain",
+      "size": "0.8B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "pretrain",
+        "continued",
+        "domain"
+      ],
+      "description": "Qwen 3.5 0.8B Base continued pre-training (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-0.8B-Base\ntask: pretrain\nmodality: text\n\ndata:\n  train: ./data/corpus.jsonl\n  format: plaintext\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 873438784
+    },
+    {
+      "name": "qwen3.5-2b-sft",
+      "model": "Qwen/Qwen3.5-2B",
+      "task": "sft",
+      "size": "2B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "small",
+        "edge"
+      ],
+      "description": "Qwen 3.5 2B SFT (Apache-2.0, small / edge)",
+      "yaml": "base: Qwen/Qwen3.5-2B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 2048\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 8\n    alpha: 16\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 2274069824
+    },
+    {
+      "name": "qwen3.5-2b-dpo",
+      "model": "Qwen/Qwen3.5-2B",
+      "task": "dpo",
+      "size": "2B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "small",
+        "edge"
+      ],
+      "description": "Qwen 3.5 2B text DPO alignment (Apache-2.0, small / edge)",
+      "yaml": "base: Qwen/Qwen3.5-2B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 2274069824
+    },
+    {
+      "name": "qwen3.5-2b-grpo",
+      "model": "Qwen/Qwen3.5-2B",
+      "task": "grpo",
+      "size": "2B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "thinking",
+        "small",
+        "edge"
+      ],
+      "description": "Qwen 3.5 2B GRPO reasoning training (Apache-2.0, small / edge)",
+      "yaml": "base: Qwen/Qwen3.5-2B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 2274069824
+    },
+    {
+      "name": "qwen3.5-2b-pretrain",
+      "model": "Qwen/Qwen3.5-2B-Base",
+      "task": "pretrain",
+      "size": "2B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "pretrain",
+        "continued",
+        "domain"
+      ],
+      "description": "Qwen 3.5 2B Base continued pre-training (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-2B-Base\ntask: pretrain\nmodality: text\n\ndata:\n  train: ./data/corpus.jsonl\n  format: plaintext\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 2274069824
+    },
+    {
+      "name": "qwen3.5-4b-sft",
+      "model": "Qwen/Qwen3.5-4B",
+      "task": "sft",
+      "size": "4B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "small"
+      ],
+      "description": "Qwen 3.5 4B SFT (Apache-2.0, 262K context)",
+      "yaml": "base: Qwen/Qwen3.5-4B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 4659865088
+    },
+    {
+      "name": "qwen3.5-4b-dpo",
+      "model": "Qwen/Qwen3.5-4B",
+      "task": "dpo",
+      "size": "4B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "small"
+      ],
+      "description": "Qwen 3.5 4B text DPO alignment (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-4B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 4659865088
+    },
+    {
+      "name": "qwen3.5-4b-grpo",
+      "model": "Qwen/Qwen3.5-4B",
+      "task": "grpo",
+      "size": "4B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "thinking",
+        "small"
+      ],
+      "description": "Qwen 3.5 4B text GRPO reasoning training (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-4B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 4659865088
+    },
+    {
+      "name": "qwen3.5-4b-pretrain",
+      "model": "Qwen/Qwen3.5-4B-Base",
+      "task": "pretrain",
+      "size": "4B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "pretrain",
+        "continued",
+        "domain"
+      ],
+      "description": "Qwen 3.5 4B Base continued pre-training (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-4B-Base\ntask: pretrain\nmodality: text\n\ndata:\n  train: ./data/corpus.jsonl\n  format: plaintext\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 4659865088
+    },
+    {
+      "name": "qwen3.5-9b-sft",
+      "model": "Qwen/Qwen3.5-9B",
+      "task": "sft",
+      "size": "9B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "chat",
+        "instruction"
+      ],
+      "description": "Qwen 3.5 9B SFT (Apache-2.0, 262K context)",
+      "yaml": "base: Qwen/Qwen3.5-9B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 9653104368
+    },
+    {
+      "name": "qwen3.5-9b-grpo",
+      "model": "Qwen/Qwen3.5-9B",
+      "task": "grpo",
+      "size": "9B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "thinking"
+      ],
+      "description": "Qwen 3.5 9B GRPO reasoning training (Apache-2.0, 262K context)",
+      "yaml": "base: Qwen/Qwen3.5-9B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 9653104368
+    },
+    {
+      "name": "qwen3.5-9b-dpo",
+      "model": "Qwen/Qwen3.5-9B",
+      "task": "dpo",
+      "size": "9B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference"
+      ],
+      "description": "Qwen 3.5 9B DPO alignment (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-9B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 9653104368
+    },
+    {
+      "name": "qwen3.5-9b-pretrain",
+      "model": "Qwen/Qwen3.5-9B-Base",
+      "task": "pretrain",
+      "size": "9B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "pretrain",
+        "continued",
+        "domain"
+      ],
+      "description": "Qwen 3.5 9B Base continued pre-training (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-9B-Base\ntask: pretrain\nmodality: text\n\ndata:\n  train: ./data/corpus.jsonl\n  format: plaintext\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 9653104368
+    },
+    {
+      "name": "qwen3.5-27b-sft",
+      "model": "Qwen/Qwen3.5-27B",
+      "task": "sft",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 3.5 27B SFT (Apache-2.0) with DeepSpeed ZeRO-2",
+      "yaml": "base: Qwen/Qwen3.5-27B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "qwen3.5-27b-dpo",
+      "model": "Qwen/Qwen3.5-27B",
+      "task": "dpo",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "large"
+      ],
+      "description": "Qwen 3.5 27B text DPO alignment (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-27B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "qwen3.5-27b-grpo",
+      "model": "Qwen/Qwen3.5-27B",
+      "task": "grpo",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "thinking",
+        "large"
+      ],
+      "description": "Qwen 3.5 27B text GRPO reasoning training (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-27B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "qwen3.5-35b-a3b-sft",
+      "model": "Qwen/Qwen3.5-35B-A3B",
+      "task": "sft",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3.5 35B-A3B MoE SFT (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.5-35B-A3B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.5-35b-a3b-dpo",
+      "model": "Qwen/Qwen3.5-35B-A3B",
+      "task": "dpo",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3.5 35B-A3B MoE DPO alignment (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.5-35B-A3B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.5-35b-a3b-grpo",
+      "model": "Qwen/Qwen3.5-35B-A3B",
+      "task": "grpo",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3.5 35B-A3B MoE GRPO reasoning (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.5-35B-A3B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.5-35b-a3b-pretrain",
+      "model": "Qwen/Qwen3.5-35B-A3B-Base",
+      "task": "pretrain",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "pretrain",
+        "continued",
+        "domain",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3.5 35B-A3B Base MoE continued pre-training (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.5-35B-A3B-Base\ntask: pretrain\nmodality: text\n\ndata:\n  train: ./data/corpus.jsonl\n  format: plaintext\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.5-122b-a10b-sft",
+      "model": "Qwen/Qwen3.5-122B-A10B",
+      "task": "sft",
+      "size": "122B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Qwen 3.5 122B-A10B MoE SFT (Apache-2.0, 10B active). Multi-GPU recommended (8 x A100/H100 80GB).",
+      "yaml": "base: Qwen/Qwen3.5-122B-A10B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 125086497008
+    },
+    {
+      "name": "qwen3.5-122b-a10b-dpo",
+      "model": "Qwen/Qwen3.5-122B-A10B",
+      "task": "dpo",
+      "size": "122B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Qwen 3.5 122B-A10B MoE DPO alignment (Apache-2.0, 10B active). Inherited starting settings; multi-GPU memory fit is unverified.",
+      "yaml": "base: Qwen/Qwen3.5-122B-A10B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 125086497008
+    },
+    {
+      "name": "qwen3.5-122b-a10b-grpo",
+      "model": "Qwen/Qwen3.5-122B-A10B",
+      "task": "grpo",
+      "size": "122B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Qwen 3.5 122B-A10B text MoE GRPO (Apache-2.0, 10B active). Untuned multi-GPU starting configuration; memory fit is unverified.",
+      "yaml": "base: Qwen/Qwen3.5-122B-A10B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 125086497008
+    },
+    {
+      "name": "qwen3.5-397b-a17b-sft",
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "task": "sft",
+      "size": "397B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Qwen 3.5 397B-A17B flagship MoE SFT (Apache-2.0, 17B active). Requires multi-node DeepSpeed / FSDP.",
+      "yaml": "base: Qwen/Qwen3.5-397B-A17B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 403397928944
+    },
+    {
+      "name": "qwen3.5-397b-a17b-dpo",
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "task": "dpo",
+      "size": "397B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Qwen 3.5 397B-A17B text MoE DPO starting configuration (Apache-2.0)",
+      "yaml": "base: Qwen/Qwen3.5-397B-A17B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  dpo_beta: 0.1\n  moe_lora: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 403397928944
+    },
+    {
+      "name": "qwen3.5-397b-a17b-grpo",
+      "model": "Qwen/Qwen3.5-397B-A17B",
+      "task": "grpo",
+      "size": "397B",
+      "tags": [
+        "qwen",
+        "qwen3.5",
+        "grpo",
+        "reasoning",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Qwen 3.5 397B-A17B text MoE GRPO (Apache-2.0, 17B active). Untuned multi-node starting configuration; memory fit is unverified.",
+      "yaml": "base: Qwen/Qwen3.5-397B-A17B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 403397928944
+    },
+    {
+      "name": "qwen3.6-27b-sft",
+      "model": "Qwen/Qwen3.6-27B",
+      "task": "sft",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.6",
+        "sft",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 3.6 27B SFT (Apache-2.0) with DeepSpeed ZeRO-2",
+      "yaml": "base: Qwen/Qwen3.6-27B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "qwen3.6-27b-dpo",
+      "model": "Qwen/Qwen3.6-27B",
+      "task": "dpo",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.6",
+        "dpo",
+        "alignment",
+        "preference",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 3.6 27B DPO alignment (Apache-2.0) with DeepSpeed ZeRO-2",
+      "yaml": "base: Qwen/Qwen3.6-27B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "qwen3.6-27b-grpo",
+      "model": "Qwen/Qwen3.6-27B",
+      "task": "grpo",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.6",
+        "grpo",
+        "reasoning",
+        "thinking",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 3.6 27B GRPO reasoning training (Apache-2.0) with DeepSpeed ZeRO-2",
+      "yaml": "base: Qwen/Qwen3.6-27B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "qwen3.6-35b-a3b-sft",
+      "model": "Qwen/Qwen3.6-35B-A3B",
+      "task": "sft",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.6",
+        "sft",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3.6 35B-A3B MoE SFT (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.6-35B-A3B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.6-35b-a3b-dpo",
+      "model": "Qwen/Qwen3.6-35B-A3B",
+      "task": "dpo",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.6",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "Qwen 3.6 35B-A3B MoE DPO alignment (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.6-35B-A3B\ntask: dpo\nmodality: text\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.6-35b-a3b-grpo",
+      "model": "Qwen/Qwen3.6-35B-A3B",
+      "task": "grpo",
+      "size": "35B",
+      "tags": [
+        "qwen",
+        "qwen3.6",
+        "grpo",
+        "reasoning",
+        "moe",
+        "mixture-of-experts",
+        "thinking"
+      ],
+      "description": "Qwen 3.6 35B-A3B MoE GRPO reasoning training (Apache-2.0, 3B active)",
+      "yaml": "base: Qwen/Qwen3.6-35B-A3B\ntask: grpo\nmodality: text\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5_moe",
+      "parameters": 35951822704
+    },
+    {
+      "name": "qwen3.8-27b-sft",
+      "model": "Qwen/Qwen3.8-27B",
+      "task": "sft",
+      "size": "27B",
+      "tags": [
+        "qwen",
+        "qwen3.8",
+        "sft",
+        "text",
+        "large",
+        "deepspeed"
+      ],
+      "description": "Qwen 3.8 27B text-only SFT (Apache-2.0) with DeepSpeed ZeRO-2",
+      "yaml": "base: Qwen/Qwen3.8-27B\ntask: sft\nmodality: text\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen3_5",
+      "parameters": 27781427952
+    },
+    {
+      "name": "deepseek-v4-flash-sft",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "task": "sft",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "deepseek-v4",
+        "sft",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "DeepSeek V4 Flash MoE SFT (MIT, efficiency-tier)",
+      "yaml": "base: deepseek-ai/DeepSeek-V4-Flash\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v4",
+      "parameters": 290944616402
+    },
+    {
+      "name": "deepseek-v4-flash-grpo",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "task": "grpo",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "deepseek-v4",
+        "grpo",
+        "reasoning",
+        "moe"
+      ],
+      "description": "DeepSeek V4 Flash MoE GRPO reasoning training (MIT, efficiency-tier)",
+      "yaml": "base: deepseek-ai/DeepSeek-V4-Flash\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v4",
+      "parameters": 290944616402
+    },
+    {
+      "name": "deepseek-v4-flash-dpo",
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "task": "dpo",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "deepseek-v4",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "mixture-of-experts"
+      ],
+      "description": "DeepSeek V4 Flash MoE DPO alignment (MIT, efficiency-tier)",
+      "yaml": "base: deepseek-ai/DeepSeek-V4-Flash\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  gradient_accumulation_steps: 8\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v4",
+      "parameters": 290944616402
+    },
+    {
+      "name": "deepseek-v4-pro-sft",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "task": "sft",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "deepseek-v4",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "DeepSeek V4 Pro flagship MoE SFT (MIT, 1.6T-class). Requires multi-node DeepSpeed.",
+      "yaml": "base: deepseek-ai/DeepSeek-V4-Pro\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v4",
+      "parameters": 1598839674782
+    },
+    {
+      "name": "deepseek-v4-pro-dpo",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "task": "dpo",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "deepseek-v4",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "DeepSeek V4 Pro flagship MoE DPO alignment (MIT, 1.6T-class). Requires multi-node DeepSpeed.",
+      "yaml": "base: deepseek-ai/DeepSeek-V4-Pro\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v4",
+      "parameters": 1598839674782
+    },
+    {
+      "name": "deepseek-v4-pro-grpo",
+      "model": "deepseek-ai/DeepSeek-V4-Pro",
+      "task": "grpo",
+      "size": "N/A",
+      "tags": [
+        "deepseek",
+        "deepseek-v4",
+        "grpo",
+        "reasoning",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "DeepSeek V4 Pro flagship MoE GRPO reasoning training (MIT, 1.6T-class). Requires multi-node DeepSpeed.",
+      "yaml": "base: deepseek-ai/DeepSeek-V4-Pro\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "deepseek_v4",
+      "parameters": 1598839674782
+    },
+    {
+      "name": "glm-5.1-sft",
+      "model": "zai-org/GLM-5.1",
+      "task": "sft",
+      "size": "754B",
+      "tags": [
+        "glm",
+        "zai-org",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "GLM 5.1 MoE SFT (MIT, 754B). Multi-GPU / multi-node recommended.",
+      "yaml": "base: zai-org/GLM-5.1\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "glm_moe_dsa",
+      "parameters": 753864139008
+    },
+    {
+      "name": "glm-5.1-dpo",
+      "model": "zai-org/GLM-5.1",
+      "task": "dpo",
+      "size": "754B",
+      "tags": [
+        "glm",
+        "zai-org",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "GLM 5.1 MoE DPO alignment (MIT, 754B). Multi-GPU / multi-node recommended.",
+      "yaml": "base: zai-org/GLM-5.1\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 8192\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "glm_moe_dsa",
+      "parameters": 753864139008
+    },
+    {
+      "name": "glm-5.1-grpo",
+      "model": "zai-org/GLM-5.1",
+      "task": "grpo",
+      "size": "754B",
+      "tags": [
+        "glm",
+        "zai-org",
+        "grpo",
+        "reasoning",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "GLM 5.1 MoE GRPO reasoning training (MIT, 754B). Multi-GPU / multi-node recommended.",
+      "yaml": "base: zai-org/GLM-5.1\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "glm_moe_dsa",
+      "parameters": 753864139008
+    },
+    {
+      "name": "kimi-k2.5-sft",
+      "model": "moonshotai/Kimi-K2.5",
+      "task": "sft",
+      "size": "1T",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Kimi K2.5 MoE SFT (Modified MIT, ~1T / 32B active). Requires multi-node DeepSpeed.",
+      "yaml": "base: moonshotai/Kimi-K2.5\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "kimi_k25",
+      "parameters": 1026879376368
+    },
+    {
+      "name": "kimi-k2.5-dpo",
+      "model": "moonshotai/Kimi-K2.5",
+      "task": "dpo",
+      "size": "1T",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Kimi K2.5 MoE DPO alignment (Modified MIT, ~1T / 32B active). Requires multi-node DeepSpeed.",
+      "yaml": "base: moonshotai/Kimi-K2.5\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 8192\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "kimi_k25",
+      "parameters": 1026879376368
+    },
+    {
+      "name": "kimi-k2.5-grpo",
+      "model": "moonshotai/Kimi-K2.5",
+      "task": "grpo",
+      "size": "1T",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "grpo",
+        "reasoning",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Kimi K2.5 MoE GRPO reasoning (Modified MIT, ~1T / 32B active). Requires multi-node DeepSpeed.",
+      "yaml": "base: moonshotai/Kimi-K2.5\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "kimi_k25",
+      "parameters": 1026879376368
+    },
+    {
+      "name": "kimi-k2.6-sft",
+      "model": "moonshotai/Kimi-K2.6",
+      "task": "sft",
+      "size": "1T",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Kimi K2.6 MoE SFT (Modified MIT, ~1T / 32B active). Requires multi-node DeepSpeed.",
+      "yaml": "base: moonshotai/Kimi-K2.6\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 32\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "kimi_k25",
+      "parameters": 1026879376368
+    },
+    {
+      "name": "kimi-k2.6-grpo",
+      "model": "moonshotai/Kimi-K2.6",
+      "task": "grpo",
+      "size": "1T",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "grpo",
+        "reasoning",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Kimi K2.6 MoE GRPO reasoning (Modified MIT, ~1T / 32B active). Requires multi-node DeepSpeed.",
+      "yaml": "base: moonshotai/Kimi-K2.6\ntask: grpo\n\ndata:\n  train: ./data/reasoning_train.jsonl\n  format: auto\n  max_length: 8192\n\ntraining:\n  epochs: 3\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  grpo_beta: 0.1\n  num_generations: 4\n  reward_fn: accuracy\n  moe_lora: true\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "kimi_k25",
+      "parameters": 1026879376368
+    },
+    {
+      "name": "kimi-k2.6-dpo",
+      "model": "moonshotai/Kimi-K2.6",
+      "task": "dpo",
+      "size": "1T",
+      "tags": [
+        "kimi",
+        "moonshot",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "Kimi K2.6 MoE DPO alignment (Modified MIT, ~1T / 32B active). Requires multi-node DeepSpeed.",
+      "yaml": "base: moonshotai/Kimi-K2.6\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 8192\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # peft's ParamWrapper refuses dropout on fused MoE experts (#798)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  moe_lora: true\n  moe_aux_loss_coeff: 0.01\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "kimi_k25",
+      "parameters": 1026879376368
+    },
+    {
+      "name": "minimax-m3-sft",
+      "model": "MiniMaxAI/MiniMax-M3",
+      "task": "sft",
+      "size": "428B",
+      "tags": [
+        "minimax",
+        "sft",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "MiniMax M3 MoE SFT (428B / 23B active). MiniMax Community License - commercial use requires a separate agreement. Multi-GPU recommended. Loads through the vision path, whose processor is custom code: run soup train --trust-remote-code.",
+      "yaml": "base: MiniMaxAI/MiniMax-M3\ntask: sft\n# A vision-language checkpoint (minimax_m3_vl): only the image-text class builds\n# it. target_modules: auto attaches to the language tower alone (#1102), so the\n# fine-tune stays textual (#1145). The vision collator supervises every token,\n# prompt included: train_on_responses_only is not applied on this path (#1156).\nmodality: vision\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 1e-5\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # kept from the moe_lora version; this recipe now targets no experts (#1145)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "minimax_m3_vl",
+      "parameters": 427040140160
+    },
+    {
+      "name": "minimax-m3-dpo",
+      "model": "MiniMaxAI/MiniMax-M3",
+      "task": "dpo",
+      "size": "428B",
+      "tags": [
+        "minimax",
+        "dpo",
+        "alignment",
+        "preference",
+        "moe",
+        "large",
+        "multi-gpu"
+      ],
+      "description": "MiniMax M3 MoE DPO alignment (428B / 23B active). MiniMax Community License - commercial use requires a separate agreement. Multi-GPU recommended. Loads through the vision path, whose processor is custom code: run soup train --trust-remote-code.",
+      "yaml": "base: MiniMaxAI/MiniMax-M3\ntask: dpo\n# A vision-language checkpoint (minimax_m3_vl): DPO builds it through the\n# image-text class since #1393. target_modules: auto attaches to the language\n# tower alone (#1102), so the preference tune stays textual: rows are text-only\n# prompt / chosen / rejected, tokenized through the processor.\nmodality: vision\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 1\n  lr: 5e-6\n  batch_size: 1\n  gradient_accumulation_steps: 16\n  lora:\n    dropout: 0.0        # as minimax-m3-sft; no moe_lora, the minimax experts take none (#1145)\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "minimax_m3_vl",
+      "parameters": 427040140160
+    },
+    {
+      "name": "grpo-env-calculator",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "task": "grpo",
+      "size": "135M",
+      "tags": [
+        "grpo",
+        "openenv",
+        "rollout",
+        "calculator",
+        "reasoning"
+      ],
+      "description": "SmolLM2-135M GRPO on the bundled calculator env (openenv rollout)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-135M-Instruct\ntask: grpo\n\ndata:\n  train: ./data/seed_prompts.jsonl\n  format: auto\n  max_length: 512\n\ntraining:\n  epochs: 1\n  lr: 1e-6\n  batch_size: 4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  gradient_checkpointing: true\n  grpo_beta: 0.04\n  num_generations: 4\n  reward_fn: verifiable\n  verifiable_domain: math\n  rollout_backend: openenv\n  rollout_func: soup_cli.envs.calculator:rollout\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 134515008
+    },
+    {
+      "name": "grpo-env-retrieval-qa",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "task": "grpo",
+      "size": "135M",
+      "tags": [
+        "grpo",
+        "openenv",
+        "rollout",
+        "retrieval",
+        "qa"
+      ],
+      "description": "SmolLM2-135M GRPO on the bundled retrieval-QA env (openenv rollout)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-135M-Instruct\ntask: grpo\n\ndata:\n  train: ./data/seed_prompts.jsonl\n  format: auto\n  max_length: 512\n\ntraining:\n  epochs: 1\n  lr: 1e-6\n  batch_size: 4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  gradient_checkpointing: true\n  grpo_beta: 0.04\n  num_generations: 4\n  reward_fn: accuracy\n  rollout_backend: openenv\n  rollout_func: soup_cli.envs.retrieval_qa:rollout\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 134515008
+    },
+    {
+      "name": "grpo-env-guess-number",
+      "model": "HuggingFaceTB/SmolLM2-135M-Instruct",
+      "task": "grpo",
+      "size": "135M",
+      "tags": [
+        "grpo",
+        "openenv",
+        "rollout",
+        "deduction",
+        "game"
+      ],
+      "description": "SmolLM2-135M GRPO on the bundled number-deduction env (openenv rollout)",
+      "yaml": "base: HuggingFaceTB/SmolLM2-135M-Instruct\ntask: grpo\n\ndata:\n  train: ./data/seed_prompts.jsonl\n  format: auto\n  max_length: 512\n\ntraining:\n  epochs: 1\n  lr: 1e-6\n  batch_size: 4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  gradient_checkpointing: true\n  grpo_beta: 0.04\n  num_generations: 4\n  reward_fn: verifiable\n  verifiable_domain: math\n  rollout_backend: openenv\n  rollout_func: soup_cli.envs.guess_number:rollout\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 134515008
+    },
+    {
+      "name": "qwen2.5-coder-1.5b-sft",
+      "model": "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+      "task": "sft",
+      "size": "1.5B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "coder",
+        "code",
+        "sft"
+      ],
+      "description": "Qwen 2.5 Coder 1.5B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-Coder-1.5B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 1543714304
+    },
+    {
+      "name": "qwen2.5-coder-14b-sft",
+      "model": "Qwen/Qwen2.5-Coder-14B-Instruct",
+      "task": "sft",
+      "size": "14B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "coder",
+        "code",
+        "sft"
+      ],
+      "description": "Qwen 2.5 Coder 14B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-Coder-14B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 14770033664
+    },
+    {
+      "name": "qwen2.5-coder-32b-sft",
+      "model": "Qwen/Qwen2.5-Coder-32B-Instruct",
+      "task": "sft",
+      "size": "32B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "coder",
+        "code",
+        "sft"
+      ],
+      "description": "Qwen 2.5 Coder 32B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-Coder-32B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 1e-4\n  batch_size: auto\n  lora:\n    r: 32\n    alpha: 64\n    target_modules: auto\n  quantization: 4bit\n  gradient_checkpointing: true\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 32763876352
+    },
+    {
+      "name": "qwen2.5-math-1.5b-sft",
+      "model": "Qwen/Qwen2.5-Math-1.5B-Instruct",
+      "task": "sft",
+      "size": "1.5B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "math",
+        "reasoning",
+        "sft"
+      ],
+      "description": "Qwen 2.5 Math 1.5B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-Math-1.5B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 1543714304
+    },
+    {
+      "name": "qwen2.5-math-7b-sft",
+      "model": "Qwen/Qwen2.5-Math-7B-Instruct",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "qwen",
+        "qwen2.5",
+        "math",
+        "reasoning",
+        "sft"
+      ],
+      "description": "Qwen 2.5 Math 7B instruction tuning with LoRA",
+      "yaml": "base: Qwen/Qwen2.5-Math-7B-Instruct\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "deepseek-r1-distill-qwen-1.5b-sft",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+      "task": "sft",
+      "size": "1.5B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "distill",
+        "sft",
+        "reasoning"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 1.5B reasoning SFT",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 1777088000
+    },
+    {
+      "name": "deepseek-r1-distill-qwen-7b-sft",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+      "task": "sft",
+      "size": "7B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "distill",
+        "sft",
+        "reasoning"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 7B reasoning SFT",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "deepseek-r1-distill-llama-8b-sft",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+      "task": "sft",
+      "size": "8B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "distill",
+        "sft",
+        "reasoning"
+      ],
+      "description": "DeepSeek-R1-Distill Llama 8B reasoning SFT",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Llama-8B\ntask: sft\n\ndata:\n  train: ./data/train.jsonl\n  format: auto\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 2e-4\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 8030261248
+    },
+    {
+      "name": "deepseek-r1-distill-qwen-1.5b-dpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+      "task": "dpo",
+      "size": "1.5B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "distill",
+        "dpo",
+        "reasoning"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 1.5B DPO alignment",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 1777088000
+    },
+    {
+      "name": "deepseek-r1-distill-qwen-7b-dpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+      "task": "dpo",
+      "size": "7B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "distill",
+        "dpo",
+        "reasoning"
+      ],
+      "description": "DeepSeek-R1-Distill Qwen 7B DPO alignment",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Qwen-7B\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "qwen2",
+      "parameters": 7615616512
+    },
+    {
+      "name": "deepseek-r1-distill-llama-8b-dpo",
+      "model": "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+      "task": "dpo",
+      "size": "8B",
+      "tags": [
+        "deepseek",
+        "r1",
+        "distill",
+        "dpo",
+        "reasoning"
+      ],
+      "description": "DeepSeek-R1-Distill Llama 8B DPO alignment",
+      "yaml": "base: deepseek-ai/DeepSeek-R1-Distill-Llama-8B\ntask: dpo\n\ndata:\n  train: ./data/preference_train.jsonl\n  format: dpo\n  max_length: 4096\n\ntraining:\n  epochs: 3\n  lr: 5e-6\n  batch_size: auto\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: 4bit\n  dpo_beta: 0.1\n\noutput: ./output\n",
+      "origin": "soup",
+      "model_type": "llama",
+      "parameters": 8030261248
+    }
+  ]
+}

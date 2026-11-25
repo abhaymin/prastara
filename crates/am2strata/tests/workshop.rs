@@ -199,6 +199,12 @@ fn fake_datagen(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(&p, r#"#!/bin/sh
 here="$(dirname "$0")"
+if [ "$1" = "--json" ] && [ "$2" = "library" ]; then
+  echo "$@" > "$here/library-args.txt"
+  [ "$3" = "init" ] && { mkdir -p "$6"; echo 'base: x' > "$6/soup.yaml"; echo '# x' > "$6/DATA.md"; }
+  echo '{"event":"library","recipes":[{"name":"qwen3-8b-sft","abilities":["text"],"workshop":{"status":"trains"}}],"sources":[{"name":"Soup"}]}'
+  exit 0
+fi
 echo "$@" > "$here/args.txt"
 printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/env.txt"
 out=""; prev=""
@@ -250,7 +256,9 @@ fn training_data_jobs_get_the_server_by_environment_and_their_datasets_can_be_re
                        (json!({"kind": "datagen", "sources": ["/etc/hostname"]}), "/etc/hostname"),
                        (json!({"kind": "datagen", "sources": [doc], "count": 0}), "\"count\""),
                        (json!({"kind": "datagen", "recipe": "instruct"}), "\"seeds\""),
-                       (json!({"kind": "datagen", "recipe": "poems", "sources": [doc]}), "\"recipe\"")] {
+                       (json!({"kind": "datagen", "recipe": "poems", "sources": [doc]}), "\"recipe\""),
+                       (json!({"kind": "datagen", "recipe": "indic", "sources": [doc]}), "built-in catalogue"),
+                       (json!({"kind": "datagen", "recipe": "translate", "check_code": true}), "code recipe")] {
         let (code, e) = s.post("/v1/workshop/jobs", &bad);
         assert_eq!(code, 400, "{bad}: {e}");
         assert!(e["error"]["message"].as_str().unwrap().contains(why), "{bad}: {e}");
@@ -276,6 +284,37 @@ fn training_data_jobs_get_the_server_by_environment_and_their_datasets_can_be_re
     let (_, j2) = s.post("/v1/workshop/jobs", &json!({"kind": "datagen", "sources": [doc]}));
     assert!(j2["output"].as_str().unwrap().ends_with("notes-qa-2.jsonl"), "{j2}");
     wait_state(&s, j2["id"].as_u64().unwrap(), "done");
+
+    // the built-in recipes need no documents; their draw, languages and compile check reach the command
+    let (code, j3) = s.post("/v1/workshop/jobs", &json!({"kind": "datagen", "recipe": "code", "seed": 7, "check_code": true,
+                                                         "language": "Rust", "count": 2}));
+    assert_eq!(code, 202, "{j3}");
+    assert!(j3["output"].as_str().unwrap().ends_with("/workshop/datasets/data-code.jsonl"), "{j3}");
+    wait_state(&s, j3["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    assert!(args.contains("--recipe code") && args.contains("--seed 7") && args.contains("--check-code")
+            && args.contains("--language Rust") && !args.contains("--source"), "{args}");
+    for recipe in ["indic", "translate"] {
+        let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "datagen", "recipe": recipe, "language": "hi,ta"}));
+        assert_eq!(code, 202, "{recipe}: {j}");
+        wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    }
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    assert!(args.contains("--recipe translate") && args.contains("--language hi,ta") && !args.contains("--check-code"), "{args}");
+
+    // the model library: listed through the workshop command, and a recipe set up in the Workshop's recipes folder
+    let (code, lib) = s.get("/v1/workshop/library", true);
+    assert_eq!(code, 200, "{lib}");
+    assert_eq!(lib["recipes"][0]["name"], "qwen3-8b-sft");
+    assert_eq!(s.get("/v1/workshop/library", false).0, 401);
+    let (code, made) = s.post("/v1/workshop/library", &json!({"name": "qwen3-8b-sft"}));
+    assert_eq!(code, 200, "{made}");
+    assert!(made["config"].as_str().unwrap().ends_with("/workshop/recipes/qwen3-8b-sft/soup.yaml"), "{made}");
+    assert!(std::path::Path::new(made["guide"].as_str().unwrap()).exists());
+    let (code, _) = s.post("/v1/workshop/library", &json!({"name": "../../etc"}));
+    assert!(code == 200 || code == 400);
+    let largs = std::fs::read_to_string(tools.join("library-args.txt")).unwrap();
+    assert!(!largs.contains(".."), "a name is made safe before it reaches the command: {largs}");
 
     // review: a page of records with the card
     let q = |p: &str| format!("/v1/workshop/dataset?path={}&{p}", urlencode(&out));

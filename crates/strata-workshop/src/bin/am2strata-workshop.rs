@@ -100,9 +100,10 @@ enum Cmd {
         ty: String,
     },
     /// training data written by the server's loaded model (AM2STRATA_URL, AM2STRATA_API_KEY): from documents (qa,
-    /// chat) or from seed examples (instruct), filtered, de-duplicated and optionally judged
+    /// chat), from seed examples (instruct), or from the built-in catalogues (code, indic, translate), filtered,
+    /// de-duplicated and optionally judged
     Datagen {
-        /// qa, chat or instruct
+        /// qa, chat, instruct, code, indic or translate
         #[arg(long, default_value = "qa")]
         recipe: String,
         /// documents: files or folders (text, Markdown, code, HTML, PDF)
@@ -128,8 +129,51 @@ enum Cmd {
         min_score: u8,
         #[arg(long)]
         topic: Option<String>,
+        /// qa/chat/instruct: the language to write in; indic/translate: Indian languages (codes or names,
+        /// comma-separated; all 15 when not given); code: programming languages (Rust, Python, ...)
         #[arg(long)]
         language: Option<String>,
+        /// code, indic, translate: the draw from the built-in catalogue (the same seed gives the same requests)
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        /// code: compile each self-contained Rust answer with rustc and drop those that fail
+        #[arg(long)]
+        check_code: bool,
+        /// let a thinking model think before it writes (slower)
+        #[arg(long)]
+        think: bool,
+    },
+    /// the model library: ready-made recipes (Soup's catalogue, ported, and Prastara's own) for text, code, tools,
+    /// vision, OCR, image, speech, music and video models:
+    /// list [--ability A] [--task T] [--origin soup|prastara] [--query Q] [--trains] | show <name> |
+    /// init <name> --out <folder> (soup.yaml and DATA.md) | import --catalog catalog.py [--archs archs.json] --commit SHA --out soup-recipes.json
+    Library {
+        action: String,
+        name: Option<String>,
+        /// text, code, tools, reasoning, translation, embedding, image-understanding, ocr, image-generation,
+        /// audio-understanding, speech-recognition, speech-generation, music-generation, video-generation
+        #[arg(long)]
+        ability: Option<String>,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        origin: Option<String>,
+        #[arg(long)]
+        query: Option<String>,
+        /// only the recipes this Workshop trains now
+        #[arg(long)]
+        trains: bool,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// import: Soup's src/soup_cli/recipes/catalog.py
+        #[arg(long)]
+        catalog: Option<PathBuf>,
+        /// import: Soup's tests/fixtures/recipe_base_architectures.json
+        #[arg(long)]
+        archs: Option<PathBuf>,
+        /// import: the Soup commit the files are from
+        #[arg(long)]
+        commit: Option<String>,
     },
     /// a LoRA adapter (PEFT or Unsloth: adapter_model.safetensors + adapter_config.json) into its base model
     Merge {
@@ -440,7 +484,7 @@ impl Out {
                                      v["output"].as_str().unwrap_or(""), human(v["bytes"].as_u64().unwrap_or(0))),
             Some("error") => eprintln!("error: {}", v["message"].as_str().unwrap_or("")),
             Some("info") => println!("{}", serde_json::to_string_pretty(&v["info"]).unwrap_or_default()),
-            Some("profile") | Some("plan") | Some("find-lr") => {
+            Some("profile") | Some("plan") | Some("find-lr") | Some("library") => {
                 for l in v["lines"].as_array().into_iter().flatten() {
                     println!("{}", l.as_str().unwrap_or(""));
                 }
@@ -690,6 +734,64 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
 
 fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
     match cmd {
+        Cmd::Library { action, name, ability, task, origin, query, trains, out: dst, catalog, archs, commit } => {
+            use strata_workshop::library::{self, Ability, Query, Status};
+            let e = |s: String| s;
+            match action.as_str() {
+                "list" => {
+                    let q = Query { text: query.clone(), task: task.clone(), origin: origin.clone(), trains_only: *trains,
+                                    ability: ability.as_deref().map(Ability::from_s).transpose().map_err(|x| x.to_string())? };
+                    let found = library::search(&q);
+                    let mut lines: Vec<String> = found.iter().map(|r| format!("{:<34} {:<5} {:<8} {:<9} {:<38} {}",
+                        r.name, r.size, r.task, if r.status() == Status::Trains { "trains" } else { "not yet" },
+                        r.abilities().iter().map(|a| a.as_str()).collect::<Vec<_>>().join(","), r.model)).collect();
+                    let trains_n = found.iter().filter(|r| r.status() == Status::Trains).count();
+                    lines.insert(0, format!("{:<34} {:<5} {:<8} {:<9} {:<38} {}", "RECIPE", "SIZE", "TASK", "WORKSHOP", "ABILITIES", "BASE MODEL"));
+                    lines.push(format!("{} recipes ({trains_n} train in this Workshop now); `library show <name>` for one",
+                                       found.len()));
+                    out.event(json!({"event": "library", "lines": lines, "recipes": found.iter().map(|r| r.summary()).collect::<Vec<_>>(),
+                                     "sources": library::sources()}));
+                    Ok((PathBuf::new(), "info".into()))
+                }
+                "show" => {
+                    let n = name.as_deref().ok_or("library show <name>")?;
+                    let r = library::get(n).ok_or_else(|| format!("no recipe {n:?}: `library list --query ...` finds one"))?;
+                    let mut lines: Vec<String> = r.data_guide().lines().map(str::to_string).collect();
+                    lines.push(String::new());
+                    lines.push("## soup.yaml".into());
+                    lines.push(String::new());
+                    lines.extend(r.yaml.lines().map(str::to_string));
+                    out.event(json!({"event": "library", "lines": lines, "recipe": r.summary()}));
+                    Ok((PathBuf::new(), "info".into()))
+                }
+                "init" => {
+                    let n = name.as_deref().ok_or("library init <name> --out <folder>")?;
+                    let dir = dst.as_ref().ok_or("library init <name> --out <folder>")?;
+                    let r = library::get(n).ok_or_else(|| format!("no recipe {n:?}"))?;
+                    let files = library::init(&r, dir).map_err(|x| e(x.to_string()))?;
+                    out.event(json!({"event": "log", "message": format!("wrote {}", files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join(" and "))}));
+                    Ok((dir.clone(), "recipe".into()))
+                }
+                "import" => {
+                    let cat = catalog.as_ref().ok_or("library import --catalog catalog.py")?;
+                    let dst = dst.as_ref().ok_or("library import ... --out soup-recipes.json")?;
+                    let py = std::fs::read_to_string(cat).map_err(|x| format!("{}: {x}", cat.display()))?;
+                    let a: Option<Value> = match archs {
+                        Some(p) => Some(serde_json::from_str(&std::fs::read_to_string(p).map_err(|x| format!("{}: {x}", p.display()))?)
+                            .map_err(|x| format!("{}: {x}", p.display()))?),
+                        None => None,
+                    };
+                    let recipes = library::import_catalog(&py, a.as_ref()).map_err(|x| x.to_string())?;
+                    let c = library::Catalogue { source: json!({"name": "Soup", "repository": "https://github.com/MakazhanAlpamys/Soup",
+                        "licence": "Apache-2.0", "commit": commit, "files": ["src/soup_cli/recipes/catalog.py", "tests/fixtures/recipe_base_architectures.json"],
+                        "note": "Soup's recipe catalogue, read as text and ported to this library; see NOTICE-soup.md"}), recipes };
+                    out.event(json!({"event": "log", "message": format!("{} recipes from {}", c.recipes.len(), cat.display())}));
+                    std::fs::write(dst, serde_json::to_string_pretty(&c).unwrap() + "\n").map_err(|x| format!("{}: {x}", dst.display()))?;
+                    Ok((dst.clone(), "recipes".into()))
+                }
+                other => Err(format!("library {other:?}: list, show, init or import")),
+            }
+        }
         Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
@@ -709,12 +811,12 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             quantize_gguf::quantize(input, dst, t).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "gguf".into()))
         }
-        Cmd::Datagen { recipe, sources, seeds, out: dst, count, per_chunk, chunk_chars, overlap, temperature, min_score, topic, language } => {
+        Cmd::Datagen { recipe, sources, seeds, out: dst, count, per_chunk, chunk_chars, overlap, temperature, min_score, topic, language, seed, check_code, think } => {
             let settings = datagen::Settings {
                 recipe: datagen::Recipe::from_s(recipe).map_err(|e| e.to_string())?, sources: sources.clone(), seeds: seeds.clone(),
                 count: *count, per_chunk: (*per_chunk).clamp(1, 20), chunk_chars: (*chunk_chars).clamp(500, 20_000),
                 overlap: *overlap, temperature: *temperature, min_score: (*min_score).min(5), topic: topic.clone(),
-                language: language.clone(), out: dst.clone(),
+                language: language.clone(), out: dst.clone(), seed: *seed, check_code: *check_code, think: *think,
             };
             let model = datagen::Model::from_env().map_err(|e| e.to_string())?;
             out.event(json!({"event": "start", "what": format!("{} data with {} into {}", recipe, model.name, dst.display())}));

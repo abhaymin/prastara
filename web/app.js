@@ -4747,9 +4747,15 @@ wsStep(store.get("ws-step", "data"));
 
 // ------------------------------------------------------------------ Workshop: training data (datagen) and its review
 const wsRecipe = () => {
-  const instruct = $("ws-d-recipe").value === "instruct";
-  $("ws-d-src-box").hidden = instruct; $("ws-d-seed-box").hidden = !instruct;
+  const r = $("ws-d-recipe").value, builtIn = ["code", "indic", "translate"].includes(r);
+  $("ws-d-src-box").hidden = r === "instruct" || r === "indic"; $("ws-d-seed-box").hidden = r !== "instruct";
+  $("ws-d-src-note").textContent = builtIn ? (r === "code" ? "optional: your code, to ask about it" : "optional: texts to translate")
+    : "files or folders, one per line";
+  $("ws-d-langs-box").hidden = !builtIn; $("ws-d-check-box").hidden = r !== "code";
+  $("ws-d-langs").placeholder = r === "code" ? "Rust, Python, TypeScript … (Rust most when empty)" : "hi, ta, te, bn, mr … or Hindi, Tamil …";
+  $("ws-d-langs-note").textContent = r === "code" ? "programming languages" : "all 15 when empty";
 };
+wsRecipe();
 $("ws-d-recipe").onchange = wsRecipe;
 $("ws-d-files").onchange = async (e) => {
   const files = [...e.target.files];
@@ -4773,9 +4779,65 @@ $("ws-datagen").onclick = (e) => {
     per_chunk: n("ws-d-per"), chunk_chars: n("ws-d-chunk"), temperature: n("ws-d-temp"), topic: $("ws-d-topic").value.trim(),
     language: $("ws-d-lang").value.trim(), output: $("ws-d-out").value.trim()};
   if (body.recipe === "instruct") body.seeds = $("ws-d-seeds").value.trim();
-  else body.sources = $("ws-d-sources").value.split("\n").map((x) => x.trim()).filter(Boolean);
+  else if (body.recipe !== "indic") body.sources = $("ws-d-sources").value.split("\n").map((x) => x.trim()).filter(Boolean);
+  if (["code", "indic", "translate"].includes(body.recipe)) {
+    body.language = $("ws-d-langs").value.trim();
+    if ($("ws-d-seed").value.trim() !== "") body.seed = n("ws-d-seed");
+    if (body.recipe === "code") body.check_code = $("ws-d-check").checked;
+  }
   wsSubmit(body, e.currentTarget);
 };
+
+// ------------------------------------------------------------------ Workshop: the model library (recipes)
+const wsLib = {recipes: [], pick: null, loaded: false};
+async function wsLibLoad() {
+  if (wsLib.loaded) return;
+  wsLib.loaded = true;
+  try {
+    const j = await wsFetch("v1/workshop/library");
+    wsLib.recipes = j.recipes || [];
+    const abilities = [...new Set(wsLib.recipes.flatMap((x) => x.abilities))].sort();
+    for (const a of abilities) $("ws-l-ability").add(new Option(a.replace(/-/g, " "), a));
+    wsLibShow();
+  } catch (err) { wsLib.loaded = false; $("ws-l-count").textContent = `The library could not be read: ${err.message}`; }
+}
+function wsLibShow() {
+  const a = $("ws-l-ability").value, q = $("ws-l-q").value.trim().toLowerCase(), t = $("ws-l-trains").checked;
+  const found = wsLib.recipes.filter((x) => (!a || x.abilities.includes(a)) && (!t || x.workshop.status === "trains")
+    && (!q || [x.name, x.model, x.description, ...x.tags].some((s) => String(s).toLowerCase().includes(q))));
+  $("ws-l-count").textContent = `${found.length} of ${wsLib.recipes.length} recipes; ${found.filter((x) => x.workshop.status === "trains").length} train here now.`;
+  $("ws-l-list").innerHTML = found.map((x, i) => `<button type="button" class="ws-lib__item" role="listitem" data-i="${wsLib.recipes.indexOf(x)}">
+    <span><strong>${esc(x.name)}</strong> <span class="muted">${esc(x.size)} · ${esc(x.task)}</span></span>
+    <span class="ws-lib__tag${x.workshop.status === "trains" ? " ws-lib__tag--yes" : ""}">${x.workshop.status === "trains" ? "trains here" : "not yet"}</span>
+    <small>${esc(x.abilities.join(", ").replace(/-/g, " "))} · ${esc(x.origin === "prastara" ? "Prastara" : "Soup")}</small></button>`).join("");
+}
+$("ws-l-list").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-i]");
+  if (!b) return;
+  for (const x of $("ws-l-list").children) x.removeAttribute("aria-current");
+  b.setAttribute("aria-current", "true");
+  const x = wsLib.pick = wsLib.recipes[Number(b.dataset.i)];
+  $("ws-l-detail").hidden = false;
+  $("ws-l-name").textContent = x.name;
+  $("ws-l-model").textContent = x.model + (x.serves ? ` · runs in Prastara: ${x.serves}` : "");
+  $("ws-l-desc").textContent = x.description;
+  $("ws-l-status").textContent = x.workshop.status === "trains" ? "This Workshop trains it."
+    : `Not in this Workshop yet: ${x.workshop.why.join("; ")}.`;
+  $("ws-l-yaml").textContent = x.yaml;
+  $("ws-l-done").textContent = "";
+});
+for (const id of ["ws-l-ability", "ws-l-trains"]) $(id).onchange = wsLibShow;
+$("ws-l-q").oninput = wsLibShow;
+$("ws-l-init").onclick = async () => {
+  if (!wsLib.pick) return;
+  try {
+    const j = await wsFetch("v1/workshop/library", {method: "POST", body: JSON.stringify({name: wsLib.pick.name})});
+    $("ws-l-done").textContent = wsLib.pick.workshop.status === "trains"
+      ? `Ready: am2strata-workshop train --soup ${j.config} --model <the base folder>` : `Written to ${j.folder} (soup.yaml and DATA.md).`;
+  } catch (err) { $("ws-l-done").textContent = err.message; }
+};
+document.querySelector('[data-ws-step="train"]').addEventListener("click", wsLibLoad);
+if (store.get("ws-step", "data") === "train") wsLibLoad();
 
 const wsRev = {path: "", offset: 0, limit: 20, total: 0, records: [], selected: new Set()};
 function wsReviewOpen(path) {

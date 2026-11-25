@@ -1,0 +1,293 @@
+{
+ "source": {
+  "name": "Prastara",
+  "licence": "AGPL-3.0-only",
+  "note": "Prastara's own recipes: the Mula series and the media models Prastara runs"
+ },
+ "recipes": [
+  {
+   "name": "mula-setu-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "tools",
+    "mcp"
+   ],
+   "description": "Mula Setu (सेतु): tool calls and MCP, picking the tool and exact arguments. Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-setu.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-setu-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text",
+    "tools"
+   ]
+  },
+  {
+   "name": "mula-code-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "code"
+   ],
+   "description": "Mula Code: Rust first (Prastara's own code), then Python, TypeScript and C++. Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-code.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-code-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text",
+    "code"
+   ]
+  },
+  {
+   "name": "mula-agent-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "agent"
+   ],
+   "description": "Mula Agent: plan, act, check and recover in agentic work. Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-agent.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-agent-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text",
+    "code",
+    "tools",
+    "reasoning"
+   ]
+  },
+  {
+   "name": "mula-gita-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "song",
+    "lyrics",
+    "indic"
+   ],
+   "description": "Mula Gita (गीत): song lyrics with structure for the song engine, English, Hindi and Sanskrit. Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-gita.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-gita-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text",
+    "translation"
+   ]
+  },
+  {
+   "name": "mula-katha-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "narrative",
+    "story"
+   ],
+   "description": "Mula Katha (कथा): narrative, scripts and narration. Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-katha.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-katha-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text"
+   ]
+  },
+  {
+   "name": "mula-karma-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "action",
+    "computer-use"
+   ],
+   "description": "Mula Karma (कर्म): computer and browser actions (screen described as text first; screenshots with Drishti). Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-karma.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-karma-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text",
+    "tools"
+   ]
+  },
+  {
+   "name": "mula-indic-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "looped",
+    "indic",
+    "translation"
+   ],
+   "description": "Indic text and translation in 15 Indian languages, trained on the Workshop's indic and translate recipes. Base: Qwen3-8B looped with Avarta (am2strata-workshop loop), Orca teaching; set --model to the looped folder.",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\n\ndata:\n  train: ./data/mula-bhasha-data.jsonl\n  format: auto\n  max_length: 4096\n  train_on_responses_only: true\n\ntraining:\n  epochs: 2\n  lr: 1e-4\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-bhasha-data-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat, agent and API (as GGUF or Kosha)",
+   "abilities": [
+    "text",
+    "translation"
+   ]
+  },
+  {
+   "name": "mula-drishti-v0.1",
+   "model": "Qwen/Qwen3-8B",
+   "task": "sft",
+   "size": "8B",
+   "tags": [
+    "mula",
+    "prastara",
+    "vision",
+    "ocr"
+   ],
+   "description": "Mula Drishti (दृष्टि): pictures in, OCR, charts, screenshots and documents; an open vision encoder and projector on the looped Mula base (Mula M7)",
+   "yaml": "base: Qwen/Qwen3-8B\ntask: sft\nmodality: vision\n\ndata:\n  train: ./data/train.jsonl\n  format: llava\n  image_dir: ./data/image\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/mula-drishti-v0.1\n",
+   "origin": "prastara",
+   "model_type": "qwen3",
+   "serves": "Prastara's chat with images, OCR and the Computer tab",
+   "abilities": [
+    "image-understanding",
+    "ocr",
+    "text"
+   ]
+  },
+  {
+   "name": "indic-parler-tts-voice",
+   "model": "ai4bharat/indic-parler-tts",
+   "task": "tts",
+   "size": "0.9B",
+   "tags": [
+    "tts",
+    "indic",
+    "parler"
+   ],
+   "description": "Indic Parler-TTS voice fine-tune: a described voice speaking 21 Indian languages and English",
+   "yaml": "base: ai4bharat/indic-parler-tts\ntask: tts\nmodality: audio_out\n\ndata:\n  train: ./data/train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n  tts_language: hi\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/indic-parler-tts-voice\n",
+   "origin": "prastara",
+   "serves": "the Audio tab's speech (Parler engine, Rust)",
+   "abilities": [
+    "speech-generation"
+   ]
+  },
+  {
+   "name": "chatterbox-multilingual-voice",
+   "model": "ResembleAI/chatterbox",
+   "task": "tts",
+   "size": "0.5B",
+   "tags": [
+    "tts",
+    "chatterbox"
+   ],
+   "description": "Chatterbox multilingual TTS voice fine-tune",
+   "yaml": "base: ResembleAI/chatterbox\ntask: tts\nmodality: audio_out\n\ndata:\n  train: ./data/train.jsonl\n  format: audio\n  audio_dir: ./data/audio\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/chatterbox-multilingual-voice\n",
+   "origin": "prastara",
+   "serves": "the Audio tab's speech (Chatterbox through ONNX)",
+   "abilities": [
+    "speech-generation"
+   ]
+  },
+  {
+   "name": "whisper-large-v3-turbo-indic",
+   "model": "openai/whisper-large-v3-turbo",
+   "task": "asr",
+   "size": "0.8B",
+   "tags": [
+    "asr",
+    "whisper",
+    "indic"
+   ],
+   "description": "Whisper large-v3 turbo speech recognition fine-tuned for an Indian language",
+   "yaml": "base: openai/whisper-large-v3-turbo\ntask: asr\nmodality: audio\n\ndata:\n  train: ./data/train.jsonl\n  format: asr\n  audio_dir: ./data/audio\n  asr_language: hi\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/whisper-large-v3-turbo-indic\n",
+   "origin": "prastara",
+   "serves": "transcription and captions (Whisper, Rust)",
+   "abilities": [
+    "speech-recognition",
+    "translation"
+   ]
+  },
+  {
+   "name": "ace-step-1.5-style",
+   "model": "ACE-Step/Ace-Step1.5",
+   "task": "music",
+   "size": "3.5B",
+   "tags": [
+    "music",
+    "song",
+    "ace-step"
+   ],
+   "description": "ACE-Step 1.5 song model LoRA: a style or instrument palette (for example ragas, bansuri, tabla) from your own licensed songs",
+   "yaml": "base: ACE-Step/Ace-Step1.5\ntask: music\nmodality: audio_out\n\ndata:\n  train: ./data/train.jsonl\n  format: song\n  audio_dir: ./data/audio\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/ace-step-1.5-style\n",
+   "origin": "prastara",
+   "serves": "the Audio tab's songs (ACE-Step, Rust)",
+   "abilities": [
+    "music-generation"
+   ]
+  },
+  {
+   "name": "z-image-turbo-style",
+   "model": "Tongyi-MAI/Z-Image-Turbo",
+   "task": "sft",
+   "size": "6B",
+   "tags": [
+    "image",
+    "image-output",
+    "diffusion"
+   ],
+   "description": "Z-Image Turbo image generation LoRA: a visual style or subject from captioned images",
+   "yaml": "base: Tongyi-MAI/Z-Image-Turbo\ntask: sft\nmodality: image_out\n\ndata:\n  train: ./data/train.jsonl\n  format: image\n  image_dir: ./data/image\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/z-image-turbo-style\n",
+   "origin": "prastara",
+   "serves": "the Image tab",
+   "abilities": [
+    "image-generation"
+   ]
+  },
+  {
+   "name": "wan2.2-ti2v-5b-style",
+   "model": "Wan-AI/Wan2.2-TI2V-5B",
+   "task": "sft",
+   "size": "5B",
+   "tags": [
+    "video",
+    "video-output",
+    "diffusion"
+   ],
+   "description": "Wan 2.2 TI2V 5B text and image to video LoRA: a motion or visual style from captioned clips",
+   "yaml": "base: Wan-AI/Wan2.2-TI2V-5B\ntask: sft\nmodality: video_out\n\ndata:\n  train: ./data/train.jsonl\n  format: video\n  media_dir: ./data/media\n\ntraining:\n  epochs: 3\n  lr: 5e-5\n  lora:\n    r: 16\n    alpha: 32\n    target_modules: auto\n  quantization: none\n\noutput: ./output/wan2.2-ti2v-5b-style\n",
+   "origin": "prastara",
+   "serves": "the Video tab",
+   "abilities": [
+    "video-generation"
+   ]
+  }
+ ]
+}

@@ -839,3 +839,14 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
   .ws-form { grid-template-columns: minmax(0, 1fr); }
   .ws-steps button { min-width: 7rem; }
 }
+
+.ws-lib { display: flex; flex-direction: column; gap: .6rem; }
+.ws-lib__list { max-height: 20rem; overflow: auto; border: 1px solid var(--st-border, rgba(127,127,127,.25)); border-radius: 8px; }
+.ws-lib__item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .2rem .8rem; width: 100%; padding: .45rem .7rem;
+  border: 0; border-bottom: 1px solid var(--st-border, rgba(127,127,127,.15)); background: none; color: inherit; text-align: left;
+  font: inherit; font-size: .85rem; cursor: pointer; }
+.ws-lib__item:hover, .ws-lib__item[aria-current="true"] { background: var(--st-code-bg); }
+.ws-lib__item small { grid-column: 1 / -1; opacity: .75; }
+.ws-lib__tag { font-size: .75rem; padding: 0 .4rem; border-radius: 999px; background: var(--st-code-bg); white-space: nowrap; }
+.ws-lib__tag--yes { outline: 1px solid currentColor; }
+.ws-lib__detail { display: flex; flex-direction: column; gap: .4rem; }

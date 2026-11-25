@@ -6,6 +6,9 @@
 //! - **instruct**: from a few seed examples (a JSONL of chat records), the model writes new, varied ones on the same
 //!   theme (self-instruct).
 //! - **chat**: from documents, short multi-turn conversations grounded in each chunk.
+//! - **code**, **indic**, **translate**: built in, with their own catalogues and checks (see [`crate::recipes`]):
+//!   programming requests and expert answers (optionally about your own code), native writing in 15 Indian languages,
+//!   and translation pairs between English and those languages (optionally of your own documents).
 //!
 //! Then quality: dropped are records the filters refuse (too short or long, refusals, empty or echoed answers),
 //! near-duplicates (MinHash), and — with a judge pass — answers the model scores below the cut-off as not supported by
@@ -21,12 +24,16 @@ use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
 
 use crate::dataset::{self, Record, Rules};
+use crate::recipes::{self, Draw, Plan};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Recipe {
     Qa,
     Instruct,
     Chat,
+    Code,
+    Indic,
+    Translate,
 }
 
 impl Recipe {
@@ -35,12 +42,21 @@ impl Recipe {
             "qa" => Recipe::Qa,
             "instruct" => Recipe::Instruct,
             "chat" => Recipe::Chat,
-            other => bail!("recipe {other:?}: qa, instruct or chat"),
+            "code" => Recipe::Code,
+            "indic" => Recipe::Indic,
+            "translate" => Recipe::Translate,
+            other => bail!("recipe {other:?}: {}", Recipe::NAMES.join(", ")),
         })
     }
+    pub const NAMES: [&'static str; 6] = ["qa", "chat", "instruct", "code", "indic", "translate"];
     pub fn as_str(self) -> &'static str {
-        match self { Recipe::Qa => "qa", Recipe::Instruct => "instruct", Recipe::Chat => "chat" }
+        match self {
+            Recipe::Qa => "qa", Recipe::Instruct => "instruct", Recipe::Chat => "chat",
+            Recipe::Code => "code", Recipe::Indic => "indic", Recipe::Translate => "translate",
+        }
     }
+    /// The built-in recipes (their own catalogue; documents optional).
+    pub fn built_in(self) -> bool { matches!(self, Recipe::Code | Recipe::Indic | Recipe::Translate) }
 }
 
 #[derive(Debug, Clone)]
@@ -59,8 +75,16 @@ pub struct Settings {
     /// a second pass scores each answer 1–5 for how well its source supports it; below this it is dropped (0 = off)
     pub min_score: u8,
     pub topic: Option<String>,
+    /// the language to write in (qa, chat, instruct); the Indian languages (indic, translate: codes or names,
+    /// comma-separated, all when empty); the programming languages (code)
     pub language: Option<String>,
     pub out: PathBuf,
+    /// the built-in recipes' draw from their catalogue (the same seed, the same plans)
+    pub seed: u64,
+    /// code: compile every self-contained Rust block with rustc and drop the records that fail
+    pub check_code: bool,
+    /// let a thinking model think before writing the records (slower; off by default — the judge never thinks)
+    pub think: bool,
 }
 
 // ------------------------------------------------------------------------------------------------------- sources
@@ -151,6 +175,7 @@ pub fn prompt(s: &Settings, chunk: Option<&str>, seeds: &[Record]) -> String {
              array of conversations: [[{{\"role\": \"user\", \"content\": \"...\"}}, {{\"role\": \"assistant\", \
              \"content\": \"...\"}}, ...]]\n\nTEXT:\n{text}",
             n = s.per_chunk, text = chunk.unwrap_or("")),
+        Recipe::Code | Recipe::Indic | Recipe::Translate => unreachable!("the built-in recipes' prompts are recipes::prompt"),
         Recipe::Instruct => {
             let examples: Vec<Value> = seeds.iter().take(5).map(|r| json!(r.messages.iter()
                 .map(|(role, content)| json!({"role": role, "content": content})).collect::<Vec<_>>())).collect();
@@ -212,7 +237,7 @@ pub fn records_from(recipe: Recipe, v: &Value) -> Vec<Record> {
                 (Some(q), Some(a)) => vec![("user".into(), q.trim().into()), ("assistant".into(), a.trim().into())],
                 _ => continue,
             },
-            Recipe::Chat | Recipe::Instruct => {
+            Recipe::Chat | Recipe::Instruct | Recipe::Code | Recipe::Indic | Recipe::Translate => {
                 let turns = it.as_array().or_else(|| it["messages"].as_array()).cloned().unwrap_or_default();
                 turns.iter().filter_map(|t| Some((t["role"].as_str()?.to_string(), t["content"].as_str()?.trim().to_string())))
                     .filter(|(r, _)| matches!(r.as_str(), "system" | "user" | "assistant")).collect()
@@ -258,10 +283,14 @@ impl Model {
         Ok(r.json()?)
     }
 
-    /// One answer (its content; thinking is not part of it).
-    pub fn ask(&self, system: &str, user: &str, temperature: f64, max_tokens: u32) -> Result<String> {
-        let body = json!({"model": self.name, "temperature": temperature, "max_tokens": max_tokens,
-                          "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]});
+    /// One answer (its content; thinking is not part of it). `think: false` asks a thinking model to answer
+    /// straight away (its chat template's `enable_thinking`), so a short budget is not spent before the answer.
+    pub fn ask(&self, system: &str, user: &str, temperature: f64, max_tokens: u32, think: bool) -> Result<String> {
+        let mut body = json!({"model": self.name, "temperature": temperature, "max_tokens": max_tokens,
+                              "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]});
+        if !think {
+            body["chat_template_kwargs"] = json!({"enable_thinking": false});
+        }
         let mut rb = self.client.post(format!("{}/v1/chat/completions", self.url)).json(&body);
         if let Some(k) = &self.key { rb = rb.bearer_auth(k); }
         let r = rb.send().with_context(|| format!("{} does not answer", self.url))?;
@@ -297,8 +326,10 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
     // the work: chunks of the documents, or batches from the seeds
     let mut units: Vec<(Option<String>, Option<String>)> = vec![]; // (chunk text, its source "file:start-end")
     let mut seeds = vec![];
+    let with_docs = matches!(s.recipe, Recipe::Qa | Recipe::Chat)
+        || (matches!(s.recipe, Recipe::Code | Recipe::Translate) && !s.sources.is_empty());
     match s.recipe {
-        Recipe::Qa | Recipe::Chat => {
+        _ if with_docs => {
             let files = source_files(&s.sources);
             if files.is_empty() {
                 bail!("no documents found in the sources (text, Markdown, code, HTML or PDF files)");
@@ -328,23 +359,62 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
             seeds = recs;
             units = vec![(None, None); s.count.div_ceil(s.per_chunk.max(1))];
         }
+        Recipe::Code | Recipe::Indic | Recipe::Translate => {
+            rep.sources.push(format!("the Workshop's built-in {} catalogue (seed {})", s.recipe.as_str(), s.seed));
+            units = vec![(None, None); s.count.div_ceil(s.per_chunk.max(1))];
+        }
+        Recipe::Qa | Recipe::Chat => unreachable!(),
     }
+    // the built-in recipes: one plan per request, drawn from the catalogue
+    let indic_langs = match s.recipe {
+        Recipe::Indic | Recipe::Translate => recipes::langs(s.language.as_deref()).map_err(|e| anyhow!(e))?,
+        _ => vec![],
+    };
+    let mut draw = Draw::new(s.seed);
+    let plans: Vec<Option<Plan>> = (0..units.len()).map(|i| match s.recipe {
+        Recipe::Code => Some(recipes::draw_code(&mut draw, s.language.as_deref())),
+        Recipe::Indic => Some(recipes::draw_indic(&mut draw, &indic_langs)),
+        Recipe::Translate => Some(recipes::draw_translate(&mut draw, &indic_langs, i)),
+        _ => None,
+    }).collect();
+    let rustc = if s.check_code && s.recipe == Recipe::Code {
+        Some(recipes::find_rustc().ok_or_else(|| anyhow!("--check-code needs rustc on the PATH (or $RUSTC)"))?)
+    } else { None };
     let total = units.len();
-    let mut records: Vec<(Record, Option<String>, Option<String>)> = vec![]; // (record, source ref, chunk)
+    // (record, source ref, the text it is grounded in: a chunk, or what a translation translates; its plan)
+    let mut records: Vec<(Record, Option<String>, Option<String>, Option<usize>)> = vec![];
     for (i, (chunk, src)) in units.iter().enumerate() {
         if should_stop() {
             progress(i, total, "stopped: writing what was made so far");
             break;
         }
         rep.asked += 1;
-        let reply = model.ask(SYSTEM, &prompt(s, chunk.as_deref(), &seeds), s.temperature, 4096)?;
-        let made = extract_json(&reply).map(|v| records_from(s.recipe, &v)).unwrap_or_default();
+        let request = match &plans[i] {
+            Some(plan) => recipes::prompt(plan, s.per_chunk, chunk.as_deref(), s.topic.as_deref()),
+            None => prompt(s, chunk.as_deref(), &seeds),
+        };
+        // code answers carry whole programs: a larger budget
+        let budget = if s.recipe == Recipe::Code { 12_288 } else { 6144 };
+        let reply = model.ask(SYSTEM, &request, s.temperature, budget, s.think)?;
+        let made: Vec<(Record, Option<String>)> = match (&plans[i], extract_json(&reply)) {
+            (Some(plan), Some(v)) => recipes::records_from(plan, &v, &mut draw),
+            (None, Some(v)) => records_from(s.recipe, &v).into_iter().map(|r| (r, None)).collect(),
+            (_, None) => vec![],
+        };
         if made.is_empty() {
             rep.unparsable += 1;
         }
         rep.generated += made.len();
-        for r in made {
-            records.push((r, src.clone(), chunk.clone()));
+        for (r, translated) in made {
+            // the recipe's own checks (script, code blocks, compiling) before anything else
+            if let Some(plan) = &plans[i] {
+                if let Some(why) = recipes::check(plan, &r, translated.as_deref(), rustc.as_deref()) {
+                    *rep.filtered.entry(why.to_string()).or_default() += 1;
+                    continue;
+                }
+            }
+            let grounded = translated.or_else(|| chunk.clone());
+            records.push((r, src.clone(), grounded, plans[i].is_some().then_some(i)));
         }
         progress(i + 1, total, &format!("{} records so far", records.len()));
         if records.len() >= s.count * 2 {
@@ -354,23 +424,30 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
 
     // quality: filters, then near-duplicates, then the judge
     let rules = Rules::default();
-    records.retain(|(r, _, _)| match dataset::filter(r, &rules) {
+    records.retain(|(r, _, _, _)| match dataset::filter(r, &rules) {
         Some(why) => { *rep.filtered.entry(why.to_string()).or_default() += 1; false }
         None => true,
     });
-    let texts: Vec<String> = records.iter().map(|(r, _, _)| r.messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\n")).collect();
+    let texts: Vec<String> = records.iter().map(|(r, _, _, _)| r.messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\n")).collect();
     let drop = dataset::near_duplicates(&texts, 0.8);
     rep.duplicates = drop.len();
     let mut keep: Vec<bool> = vec![true; records.len()];
     for d in drop { keep[d] = false; }
-    let mut kept: Vec<(Record, Option<String>, Option<u8>)> = vec![];
-    for (i, (r, src, chunk)) in records.into_iter().enumerate() {
+    let mut kept: Vec<(Record, Option<String>, Option<u8>, Option<usize>)> = vec![];
+    for (i, (r, src, chunk, plan)) in records.into_iter().enumerate() {
         if !keep[i] { continue; }
         let mut score = None;
         if s.min_score > 0 {
             let q = r.messages.iter().find(|(role, _)| role == "user").map(|(_, c)| c.as_str()).unwrap_or("");
             let a = r.messages.iter().rev().find(|(role, _)| role == "assistant").map(|(_, c)| c.as_str()).unwrap_or("");
-            let reply = model.ask(SYSTEM, &judge_prompt(q, a, chunk.as_deref()), 0.0, 512)?;
+            let ask = match plan.and_then(|p| plans[p].as_ref()) {
+                Some(Plan::Translate { lang, to_indic, .. }) =>
+                    recipes::judge_translation(chunk.as_deref().unwrap_or(q), a, if *to_indic { lang.name } else { "English" }),
+                // a built-in recipe without documents has no source: the answer is judged on its own
+                Some(_) if src.is_none() => judge_prompt(q, a, None),
+                _ => judge_prompt(q, a, chunk.as_deref()),
+            };
+            let reply = model.ask(SYSTEM, &ask, 0.0, 512, false)?;
             let sc = extract_json(&reply).and_then(|v| v["score"].as_u64()).unwrap_or(0) as u8;
             if sc < s.min_score {
                 rep.judged_out += 1;
@@ -378,7 +455,7 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
             }
             score = Some(sc);
         }
-        kept.push((r, src, score));
+        kept.push((r, src, score, plan));
         if kept.len() >= s.count { break; }
     }
     rep.kept = kept.len();
@@ -386,8 +463,11 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
     // write the dataset and its card
     if let Some(d) = s.out.parent() { std::fs::create_dir_all(d)?; }
     let mut lines = String::new();
-    for (r, src, score) in &kept {
+    for (r, src, score, plan) in &kept {
         let mut meta = json!({"recipe": s.recipe.as_str(), "model": model.name});
+        if let Some(p) = plan.and_then(|p| plans[p].as_ref()) {
+            for (k, v) in p.meta().as_object().into_iter().flatten() { meta[k] = v.clone(); }
+        }
         if let Some(src) = src { meta["source"] = json!(src); }
         if let Some(sc) = score { meta["score"] = json!(sc); }
         lines.push_str(&json!({"messages": r.messages.iter().map(|(role, c)| json!({"role": role, "content": c})).collect::<Vec<_>>(),
@@ -429,7 +509,11 @@ Made by Prastara's Workshop with the **{recipe}** recipe, using the model **{mod
 
 ## Notes
 
-- Every record's `meta.source` names the document and the character range it was made from (qa and chat recipes).
+- Every record's `meta.source` names the document and the character range it was made from (qa and chat recipes,
+  and code and translate when they had documents). The built-in recipes add their plan to `meta`: the language (or
+  the translation's `from` and `to`), the kind of task and its topic.
+- The built-in recipes' own checks show among the filters: `indic`/`translate` records not in the language's
+  script, `code` answers with no code block or (with the compile check) Rust that does not compile.
 - **You are responsible for having the right to use the source documents** for training, and for checking the data
   before you train on it (Workshop › Review).
 - Generated by a language model: it can be wrong, even after the filters and the judge.
@@ -484,7 +568,7 @@ mod tests {
     fn prompts_carry_the_settings() {
         let s = Settings { recipe: Recipe::Qa, sources: vec![], seeds: None, count: 10, per_chunk: 3, chunk_chars: 2000,
                            overlap: 200, temperature: 0.7, min_score: 3, topic: Some("billing".into()),
-                           language: Some("German".into()), out: PathBuf::from("/tmp/x.jsonl") };
+                           language: Some("German".into()), out: PathBuf::from("/tmp/x.jsonl"), seed: 0, check_code: false, think: false };
         let p = prompt(&s, Some("THE TEXT"), &[]);
         assert!(p.contains("3 question-and-answer pairs") && p.contains("billing") && p.contains("German") && p.contains("THE TEXT"));
         assert!(judge_prompt("q", "a", Some("src")).contains("SOURCE:\nsrc"));

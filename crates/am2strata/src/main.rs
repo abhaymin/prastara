@@ -697,6 +697,7 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/jobs", get(workshop::jobs_get).post(workshop::jobs_post))
         .route("/v1/workshop/jobs/{id}", get(workshop::job_get).delete(workshop::job_delete))
         .route("/v1/workshop/files", get(workshop::files_get))
+        .route("/v1/workshop/library", get(workshop::library_get).post(workshop::library_post))
         .route("/v1/workshop/uploads", axum::routing::post(workshop::upload_post))
         .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))

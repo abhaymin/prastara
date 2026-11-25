@@ -19,6 +19,8 @@ pub mod convert;
 pub mod dataset;
 pub mod finetune;
 pub mod datagen;
+pub mod recipes;
+pub mod library;
 pub mod lora;
 pub mod merge;
 pub mod model;

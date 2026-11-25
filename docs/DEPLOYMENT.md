@@ -501,8 +501,46 @@ am2strata-run workshop datagen --source ~/Development/Strata-data/workshop/uploa
 am2strata-run workshop dataset ~/Development/Strata-data/workshop/datasets/manual-qa.jsonl --limit 5
 ```
 
+**Built-in recipes** need no documents: each has its own catalogue of task kinds, languages and topics compiled into the
+Workshop, draws one plan per request (the same **Draw** number gives the same plans), and adds its own checks.
+
+| Recipe | Writes | Its own checks | Options |
+|---|---|---|---|
+| `code` | programming requests and expert answers: write, fix, explain, test, refactor, review, design, error messages, CLI tools, agentic plans; Rust drawn most | a task that asks for code has a fenced code block; with **Compile** (`--check-code`), every standard-library-only Rust block must compile with `rustc` | **Languages**: Rust, Python, TypeScript, Go, C, SQL, Bash, HTML and CSS; **Documents**: your own code, to make requests about it |
+| `indic` | native writing in 15 Indian languages: explanations, stories, poems, letters, conversations, instructions, proverbs, summaries | the request and the answer are in the language's own script (70% of the letters, code aside), not transliterated | **Languages**: hi, bn, mr, te, ta, gu, ur, kn, or, ml, pa, as, sa, ne, kok (codes or names; all when empty) |
+| `translate` | translation pairs, half from English into the language and half out of it, with the request worded several ways | the translation is in the target's script, not a copy of the source, and of a plausible length; the judge scores faithfulness | **Languages** as for `indic`; **Documents**: your own texts, translated passage by passage |
+
+```bash
+am2strata-run workshop datagen --recipe code --check-code --count 500 --wait
+am2strata-run workshop datagen --recipe indic --language hi,ta,te,bn --count 1000 --wait
+am2strata-run workshop datagen --recipe translate --language hi,ta --min-score 4 --count 1000 --wait
+am2strata-run workshop datagen --recipe code --source ~/Development/prastara/crates --count 300 --wait
+```
+
+Each record's `meta` holds its plan (the language, or `from` and `to`, and the kind and topic), so a dataset can be
+split or balanced by language afterwards.
+
 A small or base model may not write the JSON the recipe asks for. The job then fails, saying so, and leaves no empty
 file. An instruction-tuned model of 7B or more works best. The judge roughly doubles the time.
+
+**Model library:** ready-made recipes (a base model, a task and a `soup.yaml`) for text, code, tools, reasoning,
+vision, OCR, image, speech, music and video models: Soup's recipe catalogue (Apache-2.0), ported to Rust and compiled
+into the Workshop, and Prastara's own (the Mula series, and the speech, music, image and video models Prastara runs).
+Each recipe lists its abilities and whether this Workshop trains it now. The Workshop trains supervised fine-tuning of
+Llama, Mistral, Qwen2 and Qwen3 text models; every other recipe names what is missing, and its config runs in Soup
+itself. In the web app: Workshop › Train › Model library.
+
+```bash
+am2strata-workshop library list --ability ocr
+am2strata-workshop library list --trains
+am2strata-workshop library show mula-code-v0.1
+am2strata-workshop library init qwen3-8b-sft --out ~/runs/qwen3-sft      # soup.yaml and DATA.md
+am2strata-workshop train --soup ~/runs/qwen3-sft/soup.yaml --model ~/models/Qwen3-8B
+am2strata-run workshop library whisper
+```
+
+To take in a newer Soup catalogue: `am2strata-workshop library import --catalog catalog.py --archs
+recipe_base_architectures.json --commit <sha> --out crates/strata-workshop/data/soup-recipes.json`, then rebuild.
 
 **Models:** merge a LoRA adapter (PEFT or Unsloth) into its base, convert a Hugging Face Llama-family model to GGUF
 (byte for byte as llama.cpp's converter), quantize it (as `llama-quantize --pure`), and install it so it appears in the

@@ -155,7 +155,8 @@ enum Cmd {
     },
     /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
     /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
-    /// | datagen [<doc>] --source <doc> --recipe qa --count 100 | upload <file> | dataset <jsonl>
+    /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
+    /// | dataset <jsonl> | library [<search>] | library-init <recipe>
     /// | jobs | job <id> | cancel <id> | files
     Workshop {
         action: String,
@@ -1356,8 +1357,8 @@ fn media_pull(model: &str, data_dir: &Path) -> ExitCode {
 /// `workshop datagen` (training data written by the loaded model) and `workshop dataset` (paging through one).
 #[derive(clap::Args, Debug, Default)]
 struct DatagenOpts {
-    /// datagen: qa (questions and answers from documents), chat (multi-turn chats about them) or instruct (more like
-    /// the --seeds examples)
+    /// datagen: qa (questions and answers from documents), chat (multi-turn chats about them), instruct (more like
+    /// the --seeds examples), or the built-in code, indic (15 Indian languages) and translate (English <-> them)
     #[arg(long)]
     recipe: Option<String>,
     /// datagen: a document or folder (repeat it); text, Markdown, code, HTML or PDF
@@ -1380,8 +1381,16 @@ struct DatagenOpts {
     min_score: Option<u64>,
     #[arg(long)]
     topic: Option<String>,
+    /// datagen: the language to write in; indic/translate: Indian languages (hi,ta,... or names; all when not given);
+    /// code: programming languages
     #[arg(long)]
     language: Option<String>,
+    /// datagen code/indic/translate: the draw from the built-in catalogue
+    #[arg(long)]
+    seed: Option<u64>,
+    /// datagen code: compile each self-contained Rust answer and drop those that fail
+    #[arg(long)]
+    check_code: bool,
     /// dataset: the first record to show, and how many
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -1434,7 +1443,8 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 serde_json::json!({"kind": "datagen", "recipe": dg.recipe.clone().unwrap_or_else(|| "qa".into()), "sources": sources,
                                    "seeds": dg.seeds.clone().map(abs), "output": out.clone().map(abs), "count": dg.count,
                                    "per_chunk": dg.per_chunk, "chunk_chars": dg.chunk_chars, "temperature": dg.temperature,
-                                   "min_score": dg.min_score, "topic": dg.topic.clone(), "language": dg.language.clone()})
+                                   "min_score": dg.min_score, "topic": dg.topic.clone(), "language": dg.language.clone(),
+                                   "seed": dg.seed, "check_code": dg.check_code})
             }
             "upload" => {
                 let file = first.clone().ok_or("upload <file>")?;
@@ -1463,6 +1473,28 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
             "jobs" => {
                 let j = send(client.get(format!("{url}/v1/workshop/jobs")))?;
                 for x in j["jobs"].as_array().into_iter().flatten() { show(x); }
+                return Ok(());
+            }
+            "library" => {
+                // library [<search>] lists the recipes; library <name> --out x is not here: `library-init <name>`
+                let j = send(client.get(format!("{url}/v1/workshop/library")))?;
+                let q = first.clone().unwrap_or_default().to_lowercase();
+                let mut n = 0;
+                for r in j["recipes"].as_array().into_iter().flatten() {
+                    let hay = format!("{} {} {} {}", r["name"], r["model"], r["description"], r["abilities"]).to_lowercase();
+                    if !q.is_empty() && !hay.contains(&q) { continue; }
+                    n += 1;
+                    println!("{:<34} {:<8} {:<9} {}", r["name"].as_str().unwrap_or(""), r["task"].as_str().unwrap_or(""),
+                             if r["workshop"]["status"] == "trains" { "trains" } else { "not yet" },
+                             r["abilities"].as_array().map(|a| a.iter().filter_map(|x| x.as_str()).collect::<Vec<_>>().join(",")).unwrap_or_default());
+                }
+                println!("{n} recipes; `workshop library-init <name>` sets one up");
+                return Ok(());
+            }
+            "library-init" => {
+                let name = first.clone().ok_or("library-init <recipe name>")?;
+                let j = send(client.post(format!("{url}/v1/workshop/library")).json(&serde_json::json!({"name": name})))?;
+                println!("{}", serde_json::to_string_pretty(&j).unwrap_or_default());
                 return Ok(());
             }
             "files" => {
