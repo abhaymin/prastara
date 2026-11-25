@@ -1,6 +1,7 @@
 //! am2strata-hybrid: an engine in Rust for the architectures in model.rs (Nemotron-H, Mistral / Mixtral, GLM-4.7-Flash,
 //! the DeepSeek family and Qwen3.5/3.6 MoE), speaking the strata
-//! engine protocol (docs/PROTOCOL.md) so Prastara's server drives it like `strata` and `strata-poly`:
+//! engine protocol (docs/PROTOCOL.md) so Prastara's server drives it like `strata` and `strata-poly` (with `GENI`'s
+//! picture rows for Inkling 2, from am2strata-vision):
 //!   am2strata-hybrid --serve --model <shard 1>.gguf [--max-context N] [--threads N]
 //!       [--pack DIR] [--expert-profile FILE] [--expert-profile-save FILE] [--resident-experts [--expert-ram-gib N]]
 //!       [--remote-experts HOST:PORT --remote-pin PIN --identity node-tls.json]     (another machine's memory, remote.rs)
@@ -389,23 +390,33 @@ fn main() {
         if line == "STOP" || line.is_empty() {
             continue;
         }
-        let Some(rest) = line.strip_prefix("GEN ") else {
-            out(&format!("ERR unsupported command: {}", line.split_whitespace().next().unwrap_or("")));
-            continue;
+        // GENI <max_new> [key=value ...] <embeddings file> <ids>: each `image_pad` id is the next row of the file
+        // (raw f32, n_embd wide, the request's pictures in prompt order: am2strata-vision's rows)
+        let (geni, rest) = match (line.strip_prefix("GEN "), line.strip_prefix("GENI ")) {
+            (Some(r), _) => (false, r),
+            (_, Some(r)) => (true, r),
+            _ => {
+                out(&format!("ERR unsupported command: {}", line.split_whitespace().next().unwrap_or("")));
+                continue;
+            }
         };
         let parts: Vec<&str> = rest.split_whitespace().collect();
-        if parts.len() < 2 {
-            out("ERR GEN needs: GEN <max_new> [key=value ...] <id,id,...>");
+        if parts.len() < if geni { 3 } else { 2 } {
+            out(if geni { "ERR GENI needs: GENI <max_new> [key=value ...] <embeddings file> <id,id,...>" }
+                else { "ERR GEN needs: GEN <max_new> [key=value ...] <id,id,...>" });
             continue;
         }
+        let keys_end = parts.len() - if geni { 2 } else { 1 };
         let max_new: usize = parts.first().and_then(|v| v.parse().ok()).unwrap_or(256);
         let ids: Vec<u32> = parts.last().map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect()).unwrap_or_default();
         let mut s = Sampling { temperature: 0.0, top_k: 64, top_p: 1.0, min_p: 0.0, rng: Rng(0x9E3779B97F4A7C15) };
         // drafted tokens per step from prompt lookup (0: off); the CPU path only, where a chunk's logits come back
         let mut lookup: usize = std::env::var("AM2_LOOKUP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-        for kv in &parts[1..parts.len().saturating_sub(1)] {
+        let mut image_pad: Option<u32> = None;
+        for kv in &parts[1..keys_end] {
             if let Some((k, v)) = kv.split_once('=') {
                 match k {
+                    "image_pad" => image_pad = v.parse().ok(),
                     "temperature" => s.temperature = v.parse().unwrap_or(0.0),
                     "top_k" => s.top_k = v.parse().unwrap_or(64),
                     "top_p" => s.top_p = v.parse().unwrap_or(1.0),
@@ -420,8 +431,35 @@ fn main() {
             out(&format!("ERR the prompt ({} tokens) and {max_new} new tokens do not fit the context of {max_ctx}", ids.len()));
             continue;
         }
-        // a conversation that goes on: the recurrent state cannot be rewound, only extended
-        let reused = if ids.len() > history.len() && ids[..history.len()] == history[..] { history.len() } else { 0 };
+        // the pictures' rows: as many as the prompt has image_pad ids, n_embd wide
+        let mut rows: Vec<f32> = Vec::new();
+        if geni {
+            let Some(pad) = image_pad else {
+                out("ERR GENI: no image_pad");
+                continue;
+            };
+            if !m.takes_rows() || on_graph {
+                out(&format!("ERR GENI: {} takes no image rows{}", m.arch, if on_graph { " on the device graph" } else { "" }));
+                continue;
+            }
+            let bytes = match std::fs::read(parts[parts.len() - 2]) {
+                Ok(b) => b,
+                Err(e) => {
+                    out(&format!("ERR GENI: the embeddings file could not be read ({e})"));
+                    continue;
+                }
+            };
+            let pads = ids.iter().filter(|&&t| t == pad).count();
+            if bytes.len() % (4 * m.n_embd) != 0 || bytes.len() / 4 / m.n_embd != pads {
+                out(&format!("ERR GENI: {pads} image token(s) in the prompt but {} bytes of embeddings ({} wide)", bytes.len(), m.n_embd));
+                continue;
+            }
+            rows = bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        }
+        let pad = if geni { image_pad } else { None };
+        // a conversation that goes on: the recurrent state cannot be rewound, only extended (a prompt with pictures
+        // starts afresh: the same ids can carry other pictures)
+        let reused = if !geni && ids.len() > history.len() && ids[..history.len()] == history[..] { history.len() } else { 0 };
         if reused == 0 {
             st = m.new_state();
             history.clear();
@@ -431,7 +469,23 @@ fn main() {
         let tp = Instant::now();
         let mut logits = Vec::new();
         let todo = &ids[reused..];
-        if batch > 1 {
+        if let Some(pad) = pad {
+            // runs of text in chunks as below, each picture row in place of its pad token
+            let (mut i, mut row) = (0usize, 0usize);
+            while i < todo.len() {
+                if todo[i] == pad {
+                    logits = m.forward_embd(&mut st, rows[row * m.n_embd..(row + 1) * m.n_embd].to_vec());
+                    row += 1;
+                    i += 1;
+                } else {
+                    let run = todo[i..].iter().take_while(|&&t| t != pad).count().min(batch.max(1));
+                    logits = if run > 1 { forward_batch(&mut st, &todo[i..i + run]) } else { forward(&mut st, todo[i]) };
+                    i += run;
+                }
+                out(&format!("PP {i} {} {}", ids.len(), tp.elapsed().as_millis()));
+            }
+            history.extend_from_slice(todo);
+        } else if batch > 1 {
             // the prompt in chunks: each weight row read once per chunk, the same values as token by token
             let mut i = 0;
             while i < todo.len() {
@@ -575,6 +629,10 @@ fn main() {
         }
         if model::times::on() {
             out(&format!("INFO times_ms={}", model::times::take()));
+        }
+        if geni {
+            // the state holds pictures the ids do not name: the next request starts afresh
+            history.clear();
         }
         // fields 6 and 7: drafted tokens kept and offered (strata-protocol's drafts_accepted / drafts_offered)
         out(&format!("DONE {n} {} {prompt_ms} {} {finish} {accepted} {drafted} 0 {reused}", ids.len(), td.elapsed().as_millis()));

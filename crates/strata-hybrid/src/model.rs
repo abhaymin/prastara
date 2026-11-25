@@ -1270,6 +1270,21 @@ impl Model {
         }
     }
 
+    /// Whether `forward_embd` takes input rows (GENI's pictures): Inkling 2.
+    pub fn takes_rows(&self) -> bool {
+        self.ink.is_some()
+    }
+
+    /// One input row (an image row from the encoder, `n_embd` wide) through the model in place of a token: it skips
+    /// the token norm, as llama.cpp's inkling2 graph does for embeddings (`if (ubatch.token)`).
+    pub fn forward_embd(&self, st: &mut State, row: Vec<f32>) -> Vec<f32> {
+        let ink = self.ink.as_ref().expect("forward_embd: a model that takes rows");
+        debug_assert_eq!(row.len(), self.n_embd);
+        let logits = ink.forward(self, &mut st.ink, st.pos, row);
+        st.pos += 1;
+        logits
+    }
+
     /// One token through the model: the logits of the next one.
     pub fn forward(&self, st: &mut State, token: u32) -> Vec<f32> {
         if let Some(ink) = &self.ink {
