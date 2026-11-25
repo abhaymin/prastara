@@ -344,7 +344,25 @@ pub struct Report {
     pub filtered: std::collections::BTreeMap<String, usize>,
     pub duplicates: usize,
     pub judged_out: usize,
+    /// requests the model could not answer (after a retry): skipped, not fatal
+    pub failed: usize,
+    /// why the run ended early, when the model stopped answering
+    pub stopped: Option<String>,
     pub kept: usize,
+}
+
+/// Requests that fail one after another before a run gives up (the server is down, not one bad answer).
+const MAX_FAILS_IN_A_ROW: usize = 3;
+
+/// One request, retried once after a pause: a single cut-off answer or dropped connection must not end a run.
+fn ask_retry(model: &Model, system: &str, user: &str, temp: f64, max_tokens: u32, think: bool) -> Result<String> {
+    match model.ask(system, user, temp, max_tokens, think) {
+        Ok(r) => Ok(r),
+        Err(_) => {
+            std::thread::sleep(std::time::Duration::from_millis(if cfg!(test) { 10 } else { 5000 }));
+            model.ask(system, user, temp, max_tokens, think)
+        }
+    }
 }
 
 /// Generate the dataset. `progress(done, total, message)` is called as it goes; `should_stop()` ends it early (the
@@ -424,6 +442,7 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
     let total = units.len();
     // (record, source ref, the text it is grounded in: a chunk, or what a translation translates; its plan)
     let mut records: Vec<(Record, Option<String>, Option<String>, Option<usize>)> = vec![];
+    let (mut fails, mut last_error) = (0usize, None::<String>);
     for (i, (chunk, src)) in units.iter().enumerate() {
         if should_stop() {
             progress(i, total, "stopped: writing what was made so far");
@@ -436,7 +455,20 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
         };
         // code answers carry whole programs: a larger budget
         let budget = if s.recipe == Recipe::Code { 12_288 } else { 6144 };
-        let reply = model.ask(SYSTEM, &request, s.temperature, budget, s.think)?;
+        let reply = match ask_retry(model, SYSTEM, &request, s.temperature, budget, s.think) {
+            Ok(r) => { fails = 0; r }
+            Err(e) => {
+                rep.failed += 1;
+                fails += 1;
+                if fails >= MAX_FAILS_IN_A_ROW {
+                    progress(i + 1, total, &format!("stopping after {fails} failed requests in a row ({e:#}): writing what was made so far"));
+                    last_error = Some(format!("{e:#}"));
+                    break;
+                }
+                progress(i + 1, total, &format!("{} records so far (a request failed and was skipped)", records.len()));
+                continue;
+            }
+        };
         let made: Vec<(Record, Option<String>)> = match (&plans[i], extract_json(&reply)) {
             (Some(plan), Some(v)) => recipes::records_from(plan, &v, &mut draw),
             (None, Some(v)) => records_from(s.recipe, &v).into_iter().map(|r| (r, None)).collect(),
@@ -488,8 +520,19 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
                 Some(_) if src.is_none() => judge_prompt(q, a, None),
                 _ => judge_prompt(q, a, chunk.as_deref()),
             };
-            let reply = model.ask(SYSTEM, &ask, 0.0, 2048, false)?;
-            let sc = judge_score(&reply);
+            // a judge that cannot answer drops the record (unjudged data is not kept when a score is asked for)
+            let sc = match ask_retry(model, SYSTEM, &ask, 0.0, 2048, false) {
+                Ok(reply) => { fails = 0; judge_score(&reply) }
+                Err(e) => {
+                    rep.failed += 1;
+                    fails += 1;
+                    if fails >= MAX_FAILS_IN_A_ROW {
+                        last_error.get_or_insert(format!("{e:#}"));
+                        break;
+                    }
+                    continue;
+                }
+            };
             if sc < s.min_score {
                 rep.judged_out += 1;
                 continue;
@@ -500,6 +543,7 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
         if kept.len() >= s.count { break; }
     }
     rep.kept = kept.len();
+    rep.stopped = last_error;
 
     // write the dataset and its card
     if let Some(d) = s.out.parent() { std::fs::create_dir_all(d)?; }
@@ -541,6 +585,7 @@ Made by Prastara's Workshop with the **{recipe}** recipe, using the model **{mod
 | Dropped by the filters | {filtered} |
 | Near-duplicates dropped | {dups} |
 | Dropped by the judge (score below {min}) | {judged} |
+| Requests the model did not answer (skipped after a retry) | {failed} |
 | Chunks of the documents | {chunks} (chunk size {cs} characters, overlap {ov}) |
 | Temperature | {temp} |
 
@@ -563,6 +608,7 @@ Made by Prastara's Workshop with the **{recipe}** recipe, using the model **{mod
         kept = r.kept, gen = r.generated, asked = r.asked, unparsable = r.unparsable,
         filtered = if filtered.is_empty() { "none".into() } else { filtered.join(", ") }, dups = r.duplicates,
         min = if s.min_score > 0 { s.min_score.to_string() } else { "off".into() }, judged = r.judged_out,
+        failed = match &r.stopped { Some(e) => format!("{} (the run ended early: {e})", r.failed), None => r.failed.to_string() },
         chunks = r.chunks, cs = s.chunk_chars, ov = s.overlap, temp = s.temperature,
         sources = r.sources.iter().map(|x| format!("- `{x}`")).collect::<Vec<_>>().join("\n"))
 }
@@ -570,6 +616,81 @@ Made by Prastara's Workshop with the **{recipe}** recipe, using the model **{mod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that answers `/v1/chat/completions` with `reply(n)` (n counts requests from 0): `None` is an HTTP 500.
+    fn fake_server(reply: impl Fn(usize) -> Option<String> + Send + 'static) -> String {
+        use std::io::{BufRead, BufReader, Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", l.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let mut n = 0;
+            for c in l.incoming() {
+                let Ok(mut c) = c else { continue };
+                let mut r = BufReader::new(c.try_clone().unwrap());
+                let mut len = 0;
+                loop {
+                    let mut line = String::new();
+                    if r.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
+                    if let Some(v) = line.to_lowercase().strip_prefix("content-length:") { len = v.trim().parse().unwrap_or(0); }
+                }
+                let mut body = vec![0; len];
+                let _ = r.read_exact(&mut body);
+                let (status, out) = match reply(n) {
+                    Some(text) => ("200 OK", json!({"choices": [{"message": {"content": text}}]}).to_string()),
+                    None => ("500 Internal Server Error", json!({"error": {"message": "the provider's answer stopped before its end"}}).to_string()),
+                };
+                n += 1;
+                let _ = write!(c, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{out}", out.len());
+            }
+        });
+        url
+    }
+
+    fn qa_settings(dir: &std::path::Path) -> Settings {
+        let doc = dir.join("doc.txt");
+        std::fs::write(&doc, (0..40).map(|i| format!("Sentence number {i} tells a different small fact about rivers and hills. ")).collect::<String>()).unwrap();
+        Settings { recipe: Recipe::Qa, sources: vec![doc], seeds: None, count: 3, per_chunk: 1, chunk_chars: 500, overlap: 0,
+                   temperature: 0.5, min_score: 0, topic: None, language: None, out: dir.join("out.jsonl"), seed: 0,
+                   check_code: false, think: false }
+    }
+
+    #[test]
+    fn a_failed_request_is_skipped_not_fatal() {
+        const ANSWERS: [&str; 4] = ["Rivers carry water from the hills down to the sea over many years.",
+            "A hill is land that rises above its surroundings, lower than a mountain.",
+            "Erosion slowly wears rock away where water runs fast over it.",
+            "Deltas form where a river drops its silt as it meets still water."];
+        // the first request fails twice (it and its retry), the rest answer
+        let url = fake_server(|n| (n >= 2).then(|| json!([{"question": format!("Question {n}?"), "answer": ANSWERS[n % 4]}]).to_string()));
+        let dir = std::env::temp_dir().join(format!("dg-skip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = qa_settings(&dir);
+        let model = Model { url, key: None, client: reqwest::blocking::Client::new(), name: "fake".into() };
+        let r = run(&s, &model, |_, _, _| {}, || false).unwrap();
+        assert_eq!(r.failed, 1);
+        assert!(r.stopped.is_none());
+        assert!(r.kept >= 2, "the other requests still made records: {r:?}");
+        assert_eq!(std::fs::read_to_string(&s.out).unwrap().lines().count(), r.kept);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_server_that_stops_answering_ends_the_run_and_keeps_its_records() {
+        // two good answers, then every request fails
+        const TWO: [&str; 2] = ["Rivers carry water from the hills down to the sea.", "A hill rises above the land around it."];
+        let url = fake_server(|n| (n < 2).then(|| json!([{"question": format!("Question {n}?"), "answer": TWO[n]}]).to_string()));
+        let dir = std::env::temp_dir().join(format!("dg-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = qa_settings(&dir);
+        s.count = 10;
+        let model = Model { url, key: None, client: reqwest::blocking::Client::new(), name: "fake".into() };
+        let r = run(&s, &model, |_, _, _| {}, || false).unwrap();
+        assert_eq!(r.failed, MAX_FAILS_IN_A_ROW);
+        assert!(r.stopped.as_deref().is_some_and(|e| e.contains("stopped before its end")), "{r:?}");
+        assert_eq!(r.kept, 2, "the records made before it stopped are written");
+        assert!(std::fs::read_to_string(card_path(&s.out)).unwrap().contains("the run ended early"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn json_is_found_after_thinking_and_fences() {

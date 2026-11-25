@@ -829,10 +829,15 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             let r = datagen::run(&settings, &model,
                 |done, total, msg| out.event(json!({"event": "progress", "done": done, "total": total, "message": msg})),
                 || TERM.load(std::sync::atomic::Ordering::SeqCst)).map_err(|e| e.to_string())?;
-            out.event(json!({"event": "log", "message": format!("kept {} of {} written ({} filtered, {} duplicates, {} judged out)",
-                r.kept, r.generated, r.filtered.values().sum::<usize>(), r.duplicates, r.judged_out)}));
+            out.event(json!({"event": "log", "message": format!("kept {} of {} written ({} filtered, {} duplicates, {} judged out, {} requests failed)",
+                r.kept, r.generated, r.filtered.values().sum::<usize>(), r.duplicates, r.judged_out, r.failed)}));
+            if let Some(e) = &r.stopped {
+                out.event(json!({"event": "log", "message": format!("the model stopped answering ({e}); the records so far were kept")}));
+            }
             if r.kept == 0 && !TERM.load(std::sync::atomic::Ordering::SeqCst) {
-                let why = if r.generated == 0 {
+                let why = if let Some(e) = &r.stopped {
+                    format!("the model stopped answering before any record was kept: {e}")
+                } else if r.generated == 0 {
                     format!("{} of {} replies from {} held no records in the asked-for JSON: try a larger or instruction-tuned model",
                             r.unparsable, r.asked, model.name)
                 } else {
