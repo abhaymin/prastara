@@ -271,7 +271,7 @@ fn lang_label(l: &Lang) -> String { format!("{} ({})", l.name, l.native) }
 pub fn judge_translation(source: &str, translation: &str, to: &str) -> String {
     format!(
         "Score this translation into {to} from 1 (wrong, missing parts, or not in {to}) to 5 (faithful, complete and \
-         natural). Answer as JSON: {{\"score\": N, \"why\": \"...\"}}\n\nSOURCE:\n{source}\n\nTRANSLATION:\n{translation}")
+         natural). Answer as JSON: {{\"score\": N, \"why\": \"...\"}} with the reason in English, at most 15 words.\n\nSOURCE:\n{source}\n\nTRANSLATION:\n{translation}")
 }
 
 // ------------------------------------------------------------------------------------------------------ records

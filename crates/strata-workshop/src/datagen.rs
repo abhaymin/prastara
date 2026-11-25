@@ -193,12 +193,23 @@ pub fn judge_prompt(question: &str, answer: &str, source: Option<&str>) -> Strin
     match source {
         Some(src) => format!(
             "Score how well the SOURCE supports the ANSWER to the QUESTION, from 1 (not at all, or wrong) to 5 (fully \
-             supported and correct). Answer as JSON: {{\"score\": N, \"why\": \"...\"}}\n\nSOURCE:\n{src}\n\nQUESTION:\n\
+             supported and correct). Answer as JSON: {{\"score\": N, \"why\": \"...\"}} with the reason in English, at most 15 words.\n\nSOURCE:\n{src}\n\nQUESTION:\n\
              {question}\n\nANSWER:\n{answer}"),
         None => format!(
             "Score this ANSWER to the QUESTION from 1 (wrong, unhelpful) to 5 (correct, complete, helpful). Answer as \
-             JSON: {{\"score\": N, \"why\": \"...\"}}\n\nQUESTION:\n{question}\n\nANSWER:\n{answer}"),
+             JSON: {{\"score\": N, \"why\": \"...\"}} with the reason in English, at most 15 words.\n\nQUESTION:\n{question}\n\nANSWER:\n{answer}"),
     }
+}
+
+/// The judge's score in its reply: from its JSON, or — when the reply was cut off before the JSON closed — from the
+/// `"score": N` it began with; 0 when there is none.
+pub fn judge_score(reply: &str) -> u8 {
+    if let Some(n) = extract_json(reply).and_then(|v| v["score"].as_u64()) {
+        return n.min(5) as u8;
+    }
+    let r = match reply.rfind("</think>") { Some(i) => &reply[i + 8..], None => reply };
+    regex::Regex::new(r#""score"\s*:\s*"?([1-5])\b"#).ok()
+        .and_then(|re| re.captures(r).and_then(|c| c[1].parse().ok())).unwrap_or(0)
 }
 
 /// The first JSON value in a model's reply (after any thinking or Markdown fence), or None.
@@ -468,8 +479,8 @@ pub fn run(s: &Settings, model: &Model, mut progress: impl FnMut(usize, usize, &
                 Some(_) if src.is_none() => judge_prompt(q, a, None),
                 _ => judge_prompt(q, a, chunk.as_deref()),
             };
-            let reply = model.ask(SYSTEM, &ask, 0.0, 512, false)?;
-            let sc = extract_json(&reply).and_then(|v| v["score"].as_u64()).unwrap_or(0) as u8;
+            let reply = model.ask(SYSTEM, &ask, 0.0, 2048, false)?;
+            let sc = judge_score(&reply);
             if sc < s.min_score {
                 rep.judged_out += 1;
                 continue;
@@ -557,6 +568,9 @@ mod tests {
         assert_eq!(v[0]["question"], "a]", "a bracket inside a string does not end the array");
         assert!(extract_json("no json here").is_none());
         assert_eq!(extract_json("{\"score\": 4, \"why\": \"ok\"} trailing").unwrap()["score"], 4);
+        assert_eq!(judge_score("```json\n{\"score\": 4, \"why\": \"a long reason that was cut o"), 4, "a cut-off reply still scores");
+        assert_eq!(judge_score("{\"score\": 5}"), 5);
+        assert_eq!(judge_score("no score here"), 0);
     }
 
     #[test]
