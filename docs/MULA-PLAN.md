@@ -152,3 +152,11 @@ contexts, and Mula refining itself on Prastara's own tasks.
     - L5 is the engine: YaRN, sliding windows, the loop and an 8-bit tiered cache in `am2strata-hybrid` for
       qwen3.
     - L6, the needle tests, runs on the engine.
+- **What long training still needs (profile of the 1M copy over two cards, checkpointing on):**
+  - **Estimates:** 31 GB on the busier card at 4K tokens, 98 GB at 16K, 186 GB at 32K.
+  - **Where it goes:** the attention table is gone. The output head's logits for every position remain, 15 GB
+    at 4K. So does one block's working set while it is recomputed, and the saved block inputs (19 GB at 32K).
+  - **Three pieces before L4 can run at 16K to 64K:**
+    - the loss computed a chunk of rows at a time, with the head's recomputation in the backward pass;
+    - token-chunked recomputation inside a block (everything but attention works token by token);
+    - the checkpointed block inputs kept in RAM, not on the cards.
