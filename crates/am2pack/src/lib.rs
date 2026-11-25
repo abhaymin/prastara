@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-//! The `.am2aipac` model pack (format version 1; the format is written down in docs/PACK-FORMAT.md).
+//! Kosha, the `.kosha` model pack (first named `.am2aipac`, still read; format version 1; the format is written down in docs/PACK-FORMAT.md).
 //!
 //! One file holds a model, its image projector and optional extras, laid out for a mixture-of-experts engine:
 //! the tensors every token uses are one sequential run (`core`), and each (layer, expert) is one record holding all
@@ -23,6 +23,17 @@ use serde::{Deserialize, Serialize};
 
 /// The first 8 bytes of a pack.
 pub const MAGIC: &[u8; 8] = b"AM2AIPAC";
+
+/// A Kosha file's extension. Version 1 is the `.am2aipac` layout byte for byte, under its new name; files named
+/// `.am2aipac` are read too ([`is_pack_path`]).
+pub const EXTENSION: &str = "kosha";
+/// The first name of the format, still read.
+pub const OLD_EXTENSION: &str = "am2aipac";
+
+/// Whether a path names a model pack: `.kosha`, or the older `.am2aipac`.
+pub fn is_pack_path(p: &std::path::Path) -> bool {
+    p.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case(EXTENSION) || e.eq_ignore_ascii_case(OLD_EXTENSION))
+}
 /// The format version this crate writes and reads.
 pub const VERSION: u32 = 1;
 /// The fixed header's length; the first section starts at or after it.

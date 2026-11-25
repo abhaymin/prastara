@@ -101,8 +101,8 @@ enum Cmd {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
     },
-    /// model packs (.am2aipac): one file holding a model, its image projector and its experts laid out for a fast
-    /// load: `pack build --model m.gguf --mmproj mmproj.gguf --out m.am2aipac`, `pack inspect|verify|unpack`
+    /// model packs (Kosha, .kosha; older .am2aipac files are read too): one file holding a model, its image projector and its experts laid out for a fast
+    /// load: `pack build --model m.gguf --mmproj mmproj.gguf --out m.kosha`, `pack inspect|verify|unpack`
     #[cfg(feature = "pack")]
     Pack {
         #[command(subcommand)]
@@ -1127,7 +1127,7 @@ enum PackCmd {
         /// run defaults, a JSON object (context length, device split, sampling)
         #[arg(long)]
         defaults: Option<PathBuf>,
-        /// the pack to write: <name>.am2aipac
+        /// the pack to write: <name>.kosha
         #[arg(long)]
         out: PathBuf,
         /// the pack's name (default: the output file's name)

@@ -14,7 +14,7 @@ strata-frontend.workspace = true
 strata-gguf.workspace = true
 strata-hub.workspace = true
 strata-pack.workspace = true
-# the .am2aipac model pack (AGPL-3.0, its own licence): `am2strata-run pack`. Build with --no-default-features to leave it out.
+# the Kosha (.kosha) model pack (AGPL-3.0, its own licence): `am2strata-run pack`. Build with --no-default-features to leave it out.
 am2pack = { path = "../am2pack", optional = true }
 anyhow.workspace = true
 serde.workspace = true

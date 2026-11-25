@@ -157,8 +157,8 @@ fn copy_tensors(w: &mut Writer, ix: &mut Index, m: &Mapped, which: &[usize]) -> 
 }
 
 pub fn build(o: &BuildOptions, say: &mut dyn FnMut(&str)) -> Result<Summary> {
-    if o.out.extension().and_then(|e| e.to_str()) != Some("am2aipac") {
-        return Err(format!("{}: a pack's name ends in .am2aipac", o.out.display()));
+    if o.out.extension().and_then(|e| e.to_str()) != Some(crate::EXTENSION) {
+        return Err(format!("{}: a pack's name ends in .{}", o.out.display(), crate::EXTENSION));
     }
     if o.out.exists() {
         return Err(format!("{} exists already", o.out.display()));

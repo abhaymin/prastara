@@ -80,7 +80,7 @@ mathematics. Arranging the parts of a model across any hardware, in order, is wh
 |---|---|---|---|
 | **Prastara** | प्रस्तर (*prastara*) | stone; a layer spread out | the platform |
 | **Triveni** | त्रिवेणी (*triveṇī*) | the confluence of three rivers | the layer that makes GPU, CPU and NPU work as one: which chip runs which part of each layer |
-| **Kosha** | कोश (*kośa*) | treasury, container | the model file, `.kosha`: one file holding a model laid out for a fast load and fast experts (today's `.am2aipac` packs are its first version) |
+| **Kosha** | कोश (*kośa*) | treasury, container | the model file, `.kosha`: one file holding a model laid out for a fast load and fast experts (packs first written as `.am2aipac` are read too) |
 | **Anu** | अणु (*aṇu*) | atom, the smallest particle | the kernels: one Rust source for NVIDIA, AMD, any Vulkan or Metal GPU and the CPU |
 | **Stara** | स्तर (*stara*) | layer, level | the model and expert manager: places each part across VRAM, RAM, disk and other machines |
 | **Gati** | गति (*gati*) | motion, speed | the runtime engine |
@@ -403,6 +403,6 @@ quantizers, ACE-Step, Chatterbox, Parler-TTS and more) is listed with its licenc
 
 MIT, see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-One part has its own licence: the model pack format (`crates/am2pack`, the `.am2aipac` files) is AGPL-3.0-only, see
+One part has its own licence: the model pack format (`crates/am2pack`, the Kosha `.kosha` files) is AGPL-3.0-only, see
 [crates/am2pack/LICENSE](crates/am2pack/LICENSE). It is a cargo feature that is on by default, and a binary built with
 it is distributed under the AGPL's terms. Build with `--no-default-features` for an MIT-only binary without packs.

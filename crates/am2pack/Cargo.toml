@@ -1,6 +1,6 @@
 [package]
 name = "am2pack"
-description = "The .am2aipac model pack: one file holding a model, its image projector and its expert layout, laid out for a fast load"
+description = "Kosha, the .kosha model pack (first named .am2aipac): one file holding a model, its image projector and its expert layout, laid out for a fast load"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0-only"

@@ -888,12 +888,12 @@ fn ensure_tokenizer(cfg: &strata_engine::RunConfig) -> Result<()> {
         .with_context(|| format!("{} does not exist, and the config names no model file to make it from", dir.display()))?;
     let pack = dir.parent().unwrap_or(std::path::Path::new("."));
     tracing::info!("writing the tokenizer from {} into {}", gguf.display(), dir.display());
-    let g = if gguf.extension().is_some_and(|e| e == "am2aipac") { pack_header(&gguf)? } else { strata_gguf::Gguf::open(&gguf).with_context(|| format!("reading {}", gguf.display()))? };
+    let g = if gguf.extension().is_some_and(|e| e == "kosha" || e == "am2aipac") { pack_header(&gguf)? } else { strata_gguf::Gguf::open(&gguf).with_context(|| format!("reading {}", gguf.display()))? };
     strata_gguf::extract_tokenizer(&g, pack).map_err(|e| anyhow::anyhow!("{e}"))?;
     Ok(())
 }
 
-/// The model's GGUF header as a model pack (`.am2aipac`) keeps it: the vocabulary and chat template come from there.
+/// The model's GGUF header as a model pack (`.kosha`, or the older `.am2aipac`) keeps it: the vocabulary and chat template come from there.
 #[cfg(feature = "pack")]
 fn pack_header(path: &Path) -> Result<strata_gguf::Gguf> {
     let pk = am2pack::Pack::open(path).map_err(|e| anyhow!("{e}"))?;
@@ -926,7 +926,7 @@ mod split_tests {
 
 #[cfg(all(test, feature = "pack"))]
 mod pack_tokenizer_tests {
-    /// AM2_TEST_PACK=<file>.am2aipac AM2_TEST_TOKENIZER=<the tokenizer folder written from that model's GGUF>: the
+    /// AM2_TEST_PACK=<file>.kosha AM2_TEST_TOKENIZER=<the tokenizer folder written from that model's GGUF>: the
     /// folder written from the pack's header holds the same files.
     #[test]
     #[ignore]

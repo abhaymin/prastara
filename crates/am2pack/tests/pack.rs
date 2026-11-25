@@ -86,7 +86,7 @@ impl Drop for Dir {
 }
 
 fn pack(d: &Dir, o: BuildOptions) -> PathBuf {
-    let out = d.0.join("toy.am2aipac");
+    let out = d.0.join("toy.kosha");
     build(&BuildOptions { out: out.clone(), ..o }, &mut |_| {}).unwrap();
     out
 }
@@ -193,23 +193,23 @@ fn refuses_what_it_cannot_pack_faithfully() {
     let m = d.put("toy.gguf", &model(false));
     // the wrong extension, and an existing file
     assert!(run(BuildOptions { model: m.clone(), out: d.0.join("toy.pack"), ..Default::default() }).is_err());
-    let out = d.put("there.am2aipac", b"");
+    let out = d.put("there.kosha", b"");
     assert!(run(BuildOptions { model: m.clone(), out, ..Default::default() }).unwrap_err().contains("exists"));
     // two tensors on the same bytes
     let mut over = gguf_file("toy", 0, &[("a.weight", vec![8], 0, noise(32, 1)), ("b.weight", vec![8], 0, noise(32, 2))], false);
     let at = over.windows(8).rposition(|w| w == 32u64.to_le_bytes()).unwrap();
     over[at..at + 8].copy_from_slice(&16u64.to_le_bytes());
-    let e = run(BuildOptions { model: d.put("over.gguf", &over), out: d.0.join("over.am2aipac"), ..Default::default() }).unwrap_err();
+    let e = run(BuildOptions { model: d.put("over.gguf", &over), out: d.0.join("over.kosha"), ..Default::default() }).unwrap_err();
     assert!(e.contains("overlaps"), "{e}");
-    assert!(!Path::new(&d.0.join("over.am2aipac.part")).exists(), "a failed build leaves no partial file");
+    assert!(!Path::new(&d.0.join("over.kosha.part")).exists(), "a failed build leaves no partial file");
     // a tensor past the end of the file
     let cut = &model(false)[..model(false).len() - 40];
-    assert!(run(BuildOptions { model: d.put("cut.gguf", cut), out: d.0.join("cut.am2aipac"), ..Default::default() }).is_err());
+    assert!(run(BuildOptions { model: d.put("cut.gguf", cut), out: d.0.join("cut.kosha"), ..Default::default() }).is_err());
     // a profile for another model
     let mut prof = b"STRP".to_vec();
     for v in [1u32, 9, 3, 1, 1] { prof.extend_from_slice(&v.to_le_bytes()); }
     prof.extend_from_slice(&[7, 0, 0, 0]);
-    let e = run(BuildOptions { model: m, profile: Some(d.put("p", &prof)), out: d.0.join("p.am2aipac"), ..Default::default() }).unwrap_err();
+    let e = run(BuildOptions { model: m, profile: Some(d.put("p", &prof)), out: d.0.join("p.kosha"), ..Default::default() }).unwrap_err();
     assert!(e.contains("different model"), "{e}");
 }
 

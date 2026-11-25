@@ -1,4 +1,7 @@
-# The `.am2aipac` pack format, version 1
+# Kosha, the `.kosha` pack format, version 1
+
+Kosha files were first named `.am2aipac`; version 1 is the same layout byte for byte under either name, and both
+are read. New packs are written as `.kosha`.
 
 One file that holds a model, its image projector and optional extras, laid out for a mixture-of-experts engine. The
 reference reader and writer are the `am2pack` crate (`crates/am2pack`, AGPL-3.0). All integers are little-endian.

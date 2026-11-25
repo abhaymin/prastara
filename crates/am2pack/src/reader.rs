@@ -29,7 +29,7 @@ impl Pack {
         let f = std::fs::File::open(path).map_err(|e| format!("{p}: {e}"))?;
         let mm = unsafe { memmap2::Mmap::map(&f) }.map_err(|e| format!("{p}: {e}"))?;
         if mm.len() < HEADER_LEN as usize || &mm[..8] != MAGIC {
-            return Err(format!("{p}: not an am2aipac pack"));
+            return Err(format!("{p}: not a Kosha model pack"));
         }
         let u32_at = |a: usize| u32::from_le_bytes(mm[a..a + 4].try_into().unwrap());
         let u64_at = |a: usize| u64::from_le_bytes(mm[a..a + 8].try_into().unwrap());

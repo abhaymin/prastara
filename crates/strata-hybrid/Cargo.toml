@@ -7,7 +7,7 @@ license = "MIT"
 
 [features]
 default = ["gpu", "vendor-gpus", "aipac"]
-# --model takes a .am2aipac model pack (the am2pack crate, AGPL-3.0)
+# --model takes a Kosha model pack (.kosha, or the older .am2aipac) (the am2pack crate, AGPL-3.0)
 aipac = ["dep:am2pack"]
 # weights on GPUs: NVIDIA (CUDA), AMD (ROCm), any Vulkan GPU - strata-gpu's CubeCL kernels (tools/build-hybrid.sh)
 gpu = ["dep:strata-gpu", "strata-gpu/wgpu"]

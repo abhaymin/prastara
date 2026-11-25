@@ -188,7 +188,7 @@ pub fn fingerprint(path: &std::path::Path) -> Result<String, String> {
     use sha2::Digest;
     // a model pack answers as the GGUF it was built from, so a node running the pack pairs with one running the GGUF
     #[cfg(feature = "aipac")]
-    if path.extension().and_then(|e| e.to_str()) == Some("am2aipac") {
+    if matches!(path.extension().and_then(|e| e.to_str()), Some("kosha" | "am2aipac")) {
         let pk = am2pack::Pack::open(path)?;
         let src = pk.source("model").ok_or_else(|| format!("{}: the pack holds no model", path.display()))?;
         let len = pk.index.sources[src].size;

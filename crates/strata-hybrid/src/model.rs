@@ -927,9 +927,9 @@ impl Model {
     /// Loads the GGUF (memory-mapped); with a pack, its float tensors replace the GGUF's. Also returns how many
     /// tensors came from the pack.
     pub fn load(first: &Path, pack: Option<&crate::pack::Pack>) -> Result<(Model, usize), String> {
-        let aipac = first.extension().and_then(|e| e.to_str()) == Some("am2aipac");
+        let aipac = matches!(first.extension().and_then(|e| e.to_str()), Some("kosha" | "am2aipac"));
         if aipac && pack.is_some() {
-            return Err("--pack (a strata pack folder) goes with a GGUF, not with a .am2aipac model pack".into());
+            return Err("--pack (a strata pack folder) goes with a GGUF, not with a Kosha model pack".into());
         }
         let (g, mut tensors, offsets, file_order, file_map) = if aipac { open_aipac(first)? } else { open_gguf(first)? };
         if g.metadata.contains_key("prism.hadamard.version") {
@@ -2388,7 +2388,7 @@ fn open_gguf(first: &Path) -> Result<Opened, String> {
     Ok((meta.ok_or("no shards")?, tensors, offsets, vec![], None))
 }
 
-/// A model pack (.am2aipac, docs/PACK-FORMAT.md): the header is the GGUF's, kept verbatim; the tensors are mapped in
+/// A Kosha model pack (.kosha or .am2aipac, docs/PACK-FORMAT.md): the header is the GGUF's, kept verbatim; the tensors are mapped in
 /// place from the pack. A stacked expert tensor is not one run of bytes there: each expert's slice sits in that
 /// expert's record, and is named `<tensor>#<expert>` here (Experts::named puts them together).
 #[cfg(feature = "aipac")]
