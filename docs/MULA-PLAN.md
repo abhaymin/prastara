@@ -99,6 +99,11 @@ contexts, and Mula refining itself on Prastara's own tasks.
   the split. Its estimate for the looped 8B over two cards (rank 16 on all seven projections, top 24 blocks) is
   12.2 GB on the busier card at 512 tokens, 15.2 GB at 1,024 and 21.8 GB at 2,048. These are estimates; the run
   below measures.
-- **Next:** the first run on the cards (owner's yes needed). Load the looped 8B over both GPUs with
-  checkpointing, train a few steps at 512 and 1,024 tokens, and report the peak memory per card and the time per
-  step. Then M3, the data.
+- **First run on the cards (owner's yes, 2026-11-25 06:41):**
+  - **Setup:** the looped 8B over both GPUs, BF16 base, rank 16 on all seven projections in the top 24 blocks, the
+    loop gate, checkpointing.
+  - **Result:** 4 steps trained. Peak 9.5 GB on GPU 0 and 8.1 GB on GPU 1. 4 steps plus loading took 14 s. Loss 3.53
+    to 1.89, held-out 2.84.
+  - **Live model:** Cyber-Tiel was off the server for about 1.5 minutes and reloaded in 30 s.
+  - **Not measured yet:** long examples. The smoke set's conversations are about 40 tokens, so the 512 and 1,024
+    limits were never reached. Long examples need a second run.
