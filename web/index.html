@@ -497,30 +497,42 @@
 
   <!-- ============================ Settings ============================ -->
   <section class="view view--workshop" id="view-workshop" role="tabpanel" aria-labelledby="tab-btn-workshop" hidden>
-    <div class="ws">
-      <header class="ws-head">
-        <div>
-          <h2>Workshop</h2>
-          <p class="muted small">Make your own models on this PC, in order: training data, a LoRA adapter, merged into its
-            base, converted to GGUF, quantized, installed. Jobs run one at a time and keep going if you leave this tab.</p>
+    <div class="ws" id="ws">
+      <nav class="ws-rail" aria-label="Workshop steps">
+        <div class="ws-rail__title"><h2>Workshop</h2>
+          <p class="muted small">Make your own models on this PC. Jobs run one at a time and keep going if you leave this tab.</p></div>
+        <div class="ws-rail__list" id="ws-steps" role="tablist" aria-orientation="vertical">
+          <button type="button" role="tab" data-ws-step="overview" aria-selected="false"><span>Overview</span><i class="ws-dot" data-ws-dot="overview" aria-hidden="true"></i></button>
+          <p class="ws-rail__group">Data</p>
+          <button type="button" role="tab" data-ws-step="data" aria-selected="false"><span>Generate data</span><i class="ws-dot" data-ws-dot="data" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="review" aria-selected="false"><span>Review data</span><i class="ws-dot" data-ws-dot="review" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="library" aria-selected="false"><span>Model library</span><i class="ws-dot" data-ws-dot="library" aria-hidden="true"></i></button>
+          <p class="ws-rail__group">Build</p>
+          <button type="button" role="tab" data-ws-step="loop" aria-selected="false"><span>Loop a model</span><i class="ws-dot" data-ws-dot="loop" aria-hidden="true"></i></button>
+          <p class="ws-rail__group">Train</p>
+          <button type="button" role="tab" data-ws-step="train" aria-selected="false"><span>Train an adapter</span><i class="ws-dot" data-ws-dot="train" aria-hidden="true"></i></button>
+          <p class="ws-rail__group">Package</p>
+          <button type="button" role="tab" data-ws-step="merge" aria-selected="false"><span>Merge an adapter</span><i class="ws-dot" data-ws-dot="merge" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="convert" aria-selected="false"><span>Convert to GGUF</span><i class="ws-dot" data-ws-dot="convert" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="quantize" aria-selected="false"><span>Quantize</span><i class="ws-dot" data-ws-dot="quantize" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="install" aria-selected="false"><span>Install</span><i class="ws-dot" data-ws-dot="install" aria-hidden="true"></i></button>
         </div>
         <details class="ws-folders small"><summary>Folders</summary><p class="muted small" id="ws-folders"></p></details>
-      </header>
-      <nav class="ws-steps" id="ws-steps" role="tablist" aria-label="Workshop steps">
-        <button type="button" role="tab" data-ws-step="data" aria-selected="true"><b>1</b><span>Training data</span></button>
-        <button type="button" role="tab" data-ws-step="train"><b>2</b><span>Train</span></button>
-        <button type="button" role="tab" data-ws-step="merge"><b>3</b><span>Merge adapter</span></button>
-        <button type="button" role="tab" data-ws-step="convert"><b>4</b><span>Convert to GGUF</span></button>
-        <button type="button" role="tab" data-ws-step="quantize"><b>5</b><span>Quantize</span></button>
-        <button type="button" role="tab" data-ws-step="install"><b>6</b><span>Install</span></button>
+        <p class="ws-rail__cli muted small">From a terminal: <code>am2strata-run workshop …</code> through this server, or
+          <code>am2strata-workshop</code> on its own.</p>
       </nav>
-      <div class="ws-layout">
-        <div class="ws-main">
-          <div class="st-card ws-panel ws-data" id="ws-data" data-ws-panel="data">
-            <div class="ws-panel__head"><span class="card-title">Training data</span>
-              <p class="muted small">Turn documents into a chat dataset (JSONL with <code>messages</code>, as Unsloth and the
-                trainer read it), written by the model you have loaded. A judge pass can check each answer against its source,
-                and a dataset card beside the file says what it was made from and what was dropped.</p></div>
+      <main class="ws-work" id="ws-work">
+        <div class="msg-error" id="ws-error" hidden></div>
+        <section class="ws-panel" data-ws-panel="overview" hidden>
+          <header class="ws-panel__head"><h3>Your models</h3><p class="muted">Everything the Workshop has made or can use, newest first, with what it came from and what to do next.</p></header>
+          <div class="ws-panel__body">
+            <div class="ws-ov" id="ws-ov"><p class="muted small">Loading…</p></div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="data" hidden>
+          <header class="ws-panel__head"><h3>Generate training data</h3><p class="muted">Turn documents into a chat dataset (JSONL with <code>messages</code>, as Unsloth and the trainer read it), written by a model the server runs. A judge pass can check each answer, and a dataset card beside the file says what it was made from and what was dropped.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block ws-data">
             <div class="ws-form">
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-d-recipe">Recipe</label>
                 <select class="st-input" id="ws-d-recipe">
@@ -546,7 +558,7 @@
               </div>
               <div class="ws-field ws-field--wide" id="ws-d-seed-box" hidden>
                 <label class="st-label" for="ws-d-seeds">Seed examples (JSONL of chats)</label>
-                <input class="st-input mono" id="ws-d-seeds" list="ws-datasets" placeholder="~/data/examples.jsonl">
+                <input class="st-input mono" id="ws-d-seeds" data-ws-pick="datasets" autocomplete="off" placeholder="~/data/examples.jsonl">
               </div>
               <div class="ws-field"><label class="st-label" for="ws-d-count">Records</label>
                 <input class="st-input" id="ws-d-count" type="number" min="1" max="100000" value="100"></div>
@@ -574,8 +586,13 @@
               </details>
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-datagen">Generate dataset</button></div>
-            <div class="ws-review">
-              <span class="card-title">Review a dataset</span>
+          </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="review" hidden>
+          <header class="ws-panel__head"><h3>Review a dataset</h3><p class="muted">Read, edit and delete records before you train on them.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block ws-review">
               <div class="ws-data__row">
                 <select class="st-input mono" id="ws-r-pick" aria-label="Dataset to review"><option value="">(none yet)</option></select>
                 <button type="button" class="st-btn st-btn--secondary" id="ws-r-open">Open</button>
@@ -591,39 +608,13 @@
                   <button type="button" class="st-btn st-btn--danger" id="ws-r-del" disabled>Delete selected</button>
                 </div>
               </div>
-            </div>
           </div>
-          <div class="st-card ws-panel" data-ws-panel="train" hidden>
-            <div class="ws-panel__head"><span class="card-title">Train a LoRA adapter</span>
-              <p class="muted small">Training runs on this PC's CPU for Llama, Mistral and Qwen models, from a terminal for now
-                (training from this tab comes next). <code>profile</code> and <code>autopilot</code> say what fits this PC.</p></div>
-            <pre class="ws-cmd">am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt;</pre>
-            <p class="muted small">Use a dataset from step 1, then merge the adapter in step 3.</p>
-            <div class="ws-sub">
-              <span class="card-title">Loop a model (Avarta)</span>
-              <p class="muted small">A copy of a Llama or Qwen3 model whose middle blocks run more than once with the same
-                weights: it thinks deeper at the same size on disk. Each extra pass enters through a gate that starts
-                closed, so the copy answers exactly as its base until you train it here (the gates train with the
-                adapter). Convert carries the loop into the GGUF, and the Rust engine runs it.</p>
-              <div class="ws-form">
-                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-lp-in">Model (HF folder)</label>
-                  <input class="st-input mono" id="ws-lp-in" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
-                <div class="ws-field"><label class="st-label" for="ws-lp-start">First block</label>
-                  <input class="st-input mono" id="ws-lp-start" type="number" min="0" value="12"></div>
-                <div class="ws-field"><label class="st-label" for="ws-lp-end">After the last block</label>
-                  <input class="st-input mono" id="ws-lp-end" type="number" min="1" value="24"></div>
-                <div class="ws-field"><label class="st-label" for="ws-lp-passes">Passes</label>
-                  <input class="st-input mono" id="ws-lp-passes" type="number" min="2" max="16" value="2"></div>
-                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-lp-out">Output folder <output>optional</output></label>
-                  <input class="st-input mono" id="ws-lp-out" placeholder="in the Workshop folder"></div>
-              </div>
-              <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-loop">Make the looped copy</button></div>
-            </div>
-            <div class="ws-lib">
-              <span class="card-title">Model library</span>
-              <p class="muted small">Ready-made recipes for text, code, tools, vision, OCR, image, speech, music and video
-                models: Soup's recipe catalogue, ported to Rust, and Prastara's own (the Mula series and the media models
-                Prastara runs). Each says what the model does and whether this Workshop trains it yet.</p>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="library" hidden>
+          <header class="ws-panel__head"><h3>Model library</h3><p class="muted">Ready-made recipes for text, code, tools, vision, OCR, image, speech, music and video models: Soup's recipe catalogue, ported to Rust, and Prastara's own (the Mula series and the media models Prastara runs). Each says what the model does and whether this Workshop trains it.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block ws-lib">
               <div class="ws-data__row">
                 <select class="st-input" id="ws-l-ability" aria-label="Ability"><option value="">Every ability</option></select>
                 <input class="st-input" id="ws-l-q" placeholder="Search: qwen, whisper, ocr…" aria-label="Search the library">
@@ -639,29 +630,61 @@
                 <div class="ws-data__row"><button type="button" class="st-btn st-btn--secondary" id="ws-l-init">Set up this recipe</button>
                   <span class="muted small" id="ws-l-done"></span></div>
               </div>
-            </div>
           </div>
-          <div class="st-card ws-panel" data-ws-panel="merge" hidden>
-            <div class="ws-panel__head"><span class="card-title">Merge an adapter</span>
-              <p class="muted small">A LoRA adapter folder (<code>adapter_model.safetensors</code> + <code>adapter_config.json</code>,
-                from Unsloth or PEFT) into the Hugging Face model it was trained on. rsLoRA and MoE expert adapters are handled.</p></div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="loop" hidden>
+          <header class="ws-panel__head"><h3>Loop a model (Avarta)</h3><p class="muted">A copy of a Llama or Qwen3 model whose middle blocks run more than once with the same weights: it thinks deeper at the same size on disk. Each extra pass enters through a gate that starts closed, so the copy answers exactly as its base until it is trained (the gates train with the adapter). Convert carries the loop into the GGUF, and the Rust engine runs it.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+              <div class="ws-form">
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-lp-in">Model (HF folder)</label>
+                  <input class="st-input mono" id="ws-lp-in" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+                <div class="ws-field"><label class="st-label" for="ws-lp-start">First block</label>
+                  <input class="st-input mono" id="ws-lp-start" type="number" min="0" value="12"></div>
+                <div class="ws-field"><label class="st-label" for="ws-lp-end">After the last block</label>
+                  <input class="st-input mono" id="ws-lp-end" type="number" min="1" value="24"></div>
+                <div class="ws-field"><label class="st-label" for="ws-lp-passes">Passes</label>
+                  <input class="st-input mono" id="ws-lp-passes" type="number" min="2" max="16" value="2"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-lp-out">Output folder <output>optional</output></label>
+                  <input class="st-input mono" id="ws-lp-out" placeholder="in the Workshop folder"></div>
+              </div>
+              <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-loop">Make the looped copy</button></div>
+          </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="train" hidden>
+          <header class="ws-panel__head"><h3>Train a LoRA adapter</h3><p class="muted">Llama, Mistral and Qwen models, on this PC's CPU or GPUs. <code>profile</code> and <code>autopilot</code> say what fits this PC.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+            <pre class="ws-cmd">am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt; --devices cuda:0,cuda:1</pre>
+            <p class="muted small">From a terminal for now; starting a run from this page comes next. Use a dataset from Generate data, then merge the adapter.</p>
+          </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="merge" hidden>
+          <header class="ws-panel__head"><h3>Merge an adapter</h3><p class="muted">A LoRA adapter folder (<code>adapter_model.safetensors</code> + <code>adapter_config.json</code>, from Unsloth, PEFT or this Workshop) into the Hugging Face model it was trained on. rsLoRA, MoE expert adapters and loop gates are handled.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
             <div class="ws-form">
               <div class="ws-field"><label class="st-label" for="ws-m-base">Base model (HF folder)</label>
-                <input class="st-input mono" id="ws-m-base" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
+                <input class="st-input mono" id="ws-m-base" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
               <div class="ws-field"><label class="st-label" for="ws-m-adapter">Adapter folder</label>
-                <input class="st-input mono" id="ws-m-adapter" list="ws-adapters" placeholder="~/outputs/my-lora"></div>
+                <input class="st-input mono" id="ws-m-adapter" data-ws-pick="adapters" autocomplete="off" placeholder="~/outputs/my-lora"></div>
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-m-out">Output folder <output>optional</output></label>
                 <input class="st-input mono" id="ws-m-out" placeholder="in the Workshop folder"></div>
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-merge">Merge</button></div>
           </div>
-          <div class="st-card ws-panel" data-ws-panel="convert" hidden>
-            <div class="ws-panel__head"><span class="card-title">Convert to GGUF</span>
-              <p class="muted small">A Hugging Face model folder (safetensors, config.json, tokenizer) to one GGUF file, byte for
-                byte as llama.cpp's converter writes it. Llama and Qwen3 models; a looped copy keeps its loop.</p></div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="convert" hidden>
+          <header class="ws-panel__head"><h3>Convert to GGUF</h3><p class="muted">A Hugging Face model folder (safetensors, config.json, tokenizer) to one GGUF file, as llama.cpp's converter writes it. Llama and Qwen3 models; a looped copy keeps its loop.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
             <div class="ws-form">
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-in">Model (HF folder)</label>
-                <input class="st-input mono" id="ws-c-in" list="ws-hf" placeholder="~/models/Qwen3-8B"></div>
+                <input class="st-input mono" id="ws-c-in" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
               <div class="ws-field"><label class="st-label" for="ws-c-type">Precision</label>
                 <select class="st-input" id="ws-c-type"><option value="f16">F16 (half the size)</option><option value="f32">F32</option></select></div>
               <div class="ws-field"><label class="st-label" for="ws-c-pre">Pre-tokenizer <output>only if asked for</output></label>
@@ -671,12 +694,15 @@
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-convert">Convert</button></div>
           </div>
-          <div class="st-card ws-panel" data-ws-panel="quantize" hidden>
-            <div class="ws-panel__head"><span class="card-title">Quantize</span>
-              <p class="muted small">A GGUF to a smaller type, matching <code>llama-quantize --pure</code> byte for byte.</p></div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="quantize" hidden>
+          <header class="ws-panel__head"><h3>Quantize</h3><p class="muted">A GGUF to a smaller type, matching <code>llama-quantize --pure</code> byte for byte.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
             <div class="ws-form">
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-q-in">GGUF</label>
-                <input class="st-input mono" id="ws-q-in" list="ws-gguf" placeholder="~/models/model-f16.gguf"></div>
+                <input class="st-input mono" id="ws-q-in" data-ws-pick="gguf" autocomplete="off" placeholder="~/models/model-f16.gguf"></div>
               <div class="ws-field"><label class="st-label" for="ws-q-type">Type</label>
                 <select class="st-input" id="ws-q-type">
                   <option value="q8_0">Q8_0 (best quality, 8.5 bits)</option><option value="q6_k">Q6_K (6.6 bits)</option>
@@ -687,13 +713,15 @@
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-quantize">Quantize</button></div>
           </div>
-          <div class="st-card ws-panel" data-ws-panel="install" hidden>
-            <div class="ws-panel__head"><span class="card-title">Install as a model Prastara runs</span>
-              <p class="muted small">Writes its run config and tokenizer folder, as a downloaded model gets, with the engine for
-                its architecture (refused, with the reason, if no engine runs it). It then shows in the model list.</p></div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="install" hidden>
+          <header class="ws-panel__head"><h3>Install as a model Prastara runs</h3><p class="muted">Writes its run config and tokenizer folder, as a downloaded model gets, with the engine for its architecture (refused, with the reason, if no engine runs it). It then shows in the model list.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
             <div class="ws-form">
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-s-in">GGUF</label>
-                <input class="st-input mono" id="ws-s-in" list="ws-gguf" placeholder="~/models/model-Q4_K.gguf"></div>
+                <input class="st-input mono" id="ws-s-in" data-ws-pick="gguf" autocomplete="off" placeholder="~/models/model-Q4_K.gguf"></div>
               <div class="ws-field"><label class="st-label" for="ws-s-name">Name <output>optional</output></label>
                 <input class="st-input mono" id="ws-s-name" placeholder="from the file name"></div>
               <div class="ws-field"><label class="st-label" for="ws-s-display">Display name <output>optional</output></label>
@@ -702,16 +730,23 @@
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-strata">Install</button></div>
           </div>
-          <div class="msg-error" id="ws-error" hidden></div>
+          </div>
+        </section>
+      </main>
+      <aside class="ws-side" id="ws-side" aria-label="Workshop jobs">
+        <div class="ws-side__head">
+          <div class="ws-side__title"><h3>Jobs</h3><span class="muted small" id="ws-jobs-sum"></span>
+            <button type="button" class="st-btn st-btn--icon ws-side__close" id="ws-jobs-close" aria-label="Close jobs">×</button></div>
+          <div class="seg seg--4 ws-filter" id="ws-filter" role="radiogroup" aria-label="Show jobs">
+            <button type="button" role="radio" data-f="all" aria-checked="true">All</button>
+            <button type="button" role="radio" data-f="running" aria-checked="false">Running</button>
+            <button type="button" role="radio" data-f="done" aria-checked="false">Done</button>
+            <button type="button" role="radio" data-f="failed" aria-checked="false">Failed</button></div>
         </div>
-        <aside class="ws-side">
-          <div class="st-card ws-jobs"><span class="card-title">Jobs</span>
-            <div id="ws-jobs"><p class="muted small">No jobs yet.</p></div></div>
-          <p class="muted small">From a terminal: <code>am2strata-run workshop convert|quantize|merge|loop|strata|datagen|upload|dataset|jobs|cancel</code>
-            (through this server), or <code>am2strata-workshop</code> on its own.</p>
-        </aside>
-      </div>
-      <datalist id="ws-hf"></datalist><datalist id="ws-adapters"></datalist><datalist id="ws-gguf"></datalist><datalist id="ws-datasets"></datalist>
+        <div class="ws-jobs" id="ws-jobs"><p class="muted small">No jobs yet.</p></div>
+      </aside>
+      <button type="button" class="st-btn st-btn--secondary ws-jobs-toggle" id="ws-jobs-toggle" aria-controls="ws-side" aria-expanded="false">Jobs</button>
+      <div class="ws-pick" id="ws-pick" role="listbox" hidden></div>
     </div>
   </section>
 

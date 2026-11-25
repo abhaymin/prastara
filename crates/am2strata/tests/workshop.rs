@@ -64,7 +64,7 @@ fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
     assert_eq!(s.get("/v1/workshop/jobs", false).0, 401, "needs the key");
     let (code, f) = s.get("/v1/workshop/files", true);
     assert_eq!(code, 200);
-    assert!(f["hf_models"].as_array().unwrap().iter().any(|p| p.as_str().unwrap().ends_with("hf-model")), "{f}");
+    assert!(f["hf_models"].as_array().unwrap().iter().any(|p| p["path"].as_str().unwrap().ends_with("hf-model")), "{f}");
 
     // a convert job runs and reports its output, in the Workshop folder by default
     let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": model}));

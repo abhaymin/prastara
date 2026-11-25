@@ -558,11 +558,16 @@ impl Workshop {
             for e in rd.flatten() {
                 let p = e.path();
                 if p.is_dir() {
+                    let modified = |p: &Path| p.metadata().ok().and_then(|m| m.modified().ok())
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
                     if p.join("adapter_config.json").exists() {
-                        adapters.push(json!(p.display().to_string()));
+                        adapters.push(json!({"path": p.display().to_string(), "modified": modified(&p.join("adapter_config.json"))}));
                     } else if p.join("config.json").exists() && std::fs::read_dir(&p).into_iter().flatten().flatten()
                         .any(|f| f.path().extension().and_then(|x| x.to_str()) == Some("safetensors")) {
-                        hf.push(json!(p.display().to_string()));
+                        // what the overview shows of a model folder: its architecture, a loop, a private mark
+                        let c: Value = std::fs::read_to_string(p.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                        hf.push(json!({"path": p.display().to_string(), "modified": modified(&p.join("config.json")),
+                                       "arch": c["model_type"], "loop": c["prastara_loop"], "private": c["prastara_private"] == true}));
                     } else if depth > 0 {
                         walk(&p, depth - 1, gguf, hf, adapters);
                     }
@@ -570,7 +575,9 @@ impl Workshop {
                     let n = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
                     // shard 2+ of a split model is not a model of its own
                     if !n.contains("-of-") || n.contains("-00001-of-") {
-                        gguf.push(json!({"path": p.display().to_string(), "bytes": e.metadata().map(|m| m.len()).unwrap_or(0)}));
+                        let m = e.metadata().ok();
+                        gguf.push(json!({"path": p.display().to_string(), "bytes": m.as_ref().map_or(0, |m| m.len()),
+                                         "modified": m.and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs())}));
                     }
                 }
             }

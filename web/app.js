@@ -4648,8 +4648,9 @@ if (tab === "settings" && section === "connect") { renderAppSetup(); renderAgent
   window.addEventListener("resize", () => { if (!box.hidden) fit(); });
 })();
 
-// ------------------------------------------------------------------ Workshop: convert, quantize, merge (workshop.rs)
+// ------------------------------------------------------------------ Workshop: the rail, the jobs, your models (workshop.rs)
 let wsTimer = null;
+const ws = {files: {hf: [], adapters: [], gguf: [], datasets: []}, jobs: [], filter: "all"};
 async function wsFetch(path, opts = {}) {
   const r = await fetch(path, {...opts, headers: {...headers(), ...(opts.body ? {"Content-Type": "application/json"} : {})}});
   const j = await r.json().catch(() => ({}));
@@ -4661,44 +4662,95 @@ async function loadWorkshop() {
   refreshJobs();
 }
 let wsKnownDatasets = "";
+const wsBase = (p) => String(p || "").replace(/\/+$/, "").split("/").pop();
+const wsDir = (p) => String(p || "").replace(/\/+$/, "").split("/").slice(0, -1).join("/");
+const wsItem = (x) => typeof x === "string" ? {path: x} : x;
+function wsDur(s) {
+  s = Math.max(0, Math.round(s));
+  return s < 60 ? `${s} s` : s < 3600 ? `${Math.floor(s / 60)} min ${s % 60} s` : `${Math.floor(s / 3600)} h ${Math.round((s % 3600) / 60)} min`;
+}
+function wsAgo(t) {
+  if (!t) return "";
+  const s = Math.max(0, Date.now() / 1000 - t);
+  return s < 90 ? "just now" : s < 3600 ? `${Math.round(s / 60)} min ago` : s < 86400 ? `${Math.round(s / 3600)} h ago` : `${Math.round(s / 86400)} d ago`;
+}
 async function wsFiles() {
   try {
     const f = await wsFetch("v1/workshop/files");
-    const ds = (f.datasets || []).map((x) => x.path);
-    $("ws-datasets").innerHTML = ds.map((p) => `<option value="${esc(p)}">`).join("");
+    ws.files = {hf: (f.hf_models || []).map(wsItem), adapters: (f.adapters || []).map(wsItem), gguf: (f.gguf || []).map(wsItem),
+                datasets: (f.datasets || []).map(wsItem)};
+    const ds = ws.files.datasets.map((x) => x.path);
     wsKnownDatasets = ds.join("\n");
     const pick = $("ws-r-pick"), was = pick.value;
-    pick.innerHTML = ds.length ? ds.map((p) => `<option value="${esc(p)}">${esc(p.split("/").pop())}</option>`).join("") : '<option value="">(none yet)</option>';
+    pick.innerHTML = ds.length ? ds.map((p) => `<option value="${esc(p)}">${esc(wsBase(p))}</option>`).join("") : '<option value="">(none yet)</option>';
     if (ds.includes(was)) pick.value = was;
-    const opts = (list) => list.map((x) => `<option value="${esc(typeof x === "string" ? x : x.path)}">`).join("");
-    $("ws-hf").innerHTML = opts(f.hf_models || []);
-    $("ws-adapters").innerHTML = opts(f.adapters || []);
-    $("ws-gguf").innerHTML = opts(f.gguf || []);
     $("ws-folders").textContent = `It works in ${(f.folders || []).join(", ")}; results go to ${f.output_folder}.` +
       (f.installed ? "" : " (The am2strata-workshop command is not installed beside the server.)");
+    wsOverview();
   } catch (e) { wsError(e.message); }
 }
-function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; }
+function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
+
+// which rail step a job belongs to, and what a job read and wrote
+const WS_STEP_OF = {datagen: "data", loop: "loop", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install"};
+const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.seeds || (r.sources || [])[0] || ""; };
+const wsJobOut = (x) => x.result?.output || x.output || "";
+function wsJobCard(x) {
+  const now = Date.now() / 1000, p = x.progress, running = x.state === "running";
+  const badge = {queued: "st-badge--queued", running: "st-badge--generating", failed: "st-badge--error"}[x.state] || "";
+  const time = running && x.started_at ? wsDur(now - x.started_at)
+    : x.started_at && x.finished_at ? wsDur(x.finished_at - x.started_at) : x.state === "queued" ? "waiting" : "";
+  // a log line names files by their full paths: the names are enough here (the details keep the paths)
+  const short = (t) => String(t || "").replace(/(?:~|\/)?(?:[^\s/]+\/)+([^\s/]+)/g, "$1");
+  let bar = "", line = short(x.last);
+  if (running && p && p.total) {
+    const pct = Math.min(100, (100 * p.done) / p.total);
+    const eta = p.done > 0 && x.started_at ? ((now - x.started_at) * (p.total - p.done)) / p.done : null;
+    bar = `<div class="st-progress" role="progressbar" aria-label="job ${x.id}" aria-valuemin="0" aria-valuemax="${p.total}" aria-valuenow="${p.done}">` +
+      `<div class="st-progress__bar" style="width:${pct.toFixed(1)}%"></div></div>`;
+    line = `${p.done} of ${p.total}${p.message ? ` · ${p.message}` : ""}${eta != null && p.done < p.total ? ` · about ${wsDur(eta)} left` : ""}`;
+  }
+  const out = wsJobOut(x), inp = wsJobIn(x);
+  const name = x.kind === "strata" && x.result?.model ? x.result.model : wsBase(out) || wsBase(inp) || x.kind;
+  const size = x.result?.bytes ? fmtBytes(x.result.bytes) : "";
+  const acts = [];
+  if (x.state === "queued" || running) acts.push(`<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>`);
+  if (x.state === "done" && ["merge", "convert", "quantize", "loop"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
+  if (x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
+  if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
+  const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
+  return `<article class="ws-job" data-state="${esc(x.state)}">
+    <div class="ws-job__top"><span class="ws-job__kind">${esc(x.kind)}</span><span class="ws-job__id">#${x.id}</span>
+      <span class="st-badge ${badge}">${esc(x.state)}</span><span class="ws-job__time">${esc(time)}</span></div>
+    <div class="ws-job__name" title="${esc(out || inp)}"><span>${esc(name)}</span><span class="muted">${esc(size)}</span></div>
+    ${bar}${line && !x.error ? `<div class="ws-job__line" title="${esc(line)}">${esc(line)}</div>` : ""}
+    ${x.error ? `<div class="ws-job__err" title="${esc(x.error)}">${esc(x.error)}</div>` : ""}
+    ${acts.length ? `<div class="ws-job__actions">${acts.join("")}</div>` : ""}
+    ${rows.length ? `<details><summary>Details</summary><dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` +
+      (x.last ? `<pre>${esc(x.last)}</pre>` : "") + `</details>` : ""}
+  </article>`;
+}
 // (`pushed`: the jobs as the live channel just sent them; without it they are fetched)
 async function refreshJobs(pushed = null) {
   clearTimeout(wsTimer);
   try {
     const j = pushed || await wsFetch("v1/workshop/jobs");
-    const jobs = j.jobs || [];
-    $("ws-jobs").innerHTML = jobs.length ? jobs.map((x) => {
-      const badge = {queued: "st-badge--reading", running: "st-badge--generating", done: "", failed: "", cancelled: ""}[x.state] ?? "";
-      const took = x.started_at && x.finished_at ? ` · ${fmt(x.finished_at - x.started_at)} s` : "";
-      const res = x.result ? ` · ${esc(x.result.output)} (${fmtBytes(x.result.bytes || 0)})` : "";
-      const p = x.progress, live = x.state === "running" && p && p.total;
-      const bar = live ? `<progress class="ws-progress" max="${p.total}" value="${p.done}" aria-label="job ${x.id} progress"></progress>` : "";
-      return `<div class="mcp-server"><div class="mcp-server__head"><strong>#${x.id} ${esc(x.kind)}</strong>` +
-        `<span class="st-badge ${badge}">${esc(x.state)}</span><span class="muted small">${esc(x.last || "")}${took}${res}</span>` +
-        ((x.state === "queued" || x.state === "running") ? `<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>` : "") +
-        (x.state === "done" && !["strata", "datagen"].includes(x.kind) && x.result ? `<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>` : "") +
-        (x.kind === "datagen" && ["done", "cancelled"].includes(x.state) ? `<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>` : "") +
-        (x.state === "done" && x.kind === "strata" ? `<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>` : "") +
-        `</div>${bar}${x.error ? `<div class="msg-error">${esc(x.error)}</div>` : ""}</div>`;
-    }).join("") : '<p class="muted small">No jobs yet.</p>';
+    const jobs = ws.jobs = j.jobs || [];
+    const active = jobs.filter((x) => x.state === "queued" || x.state === "running").length;
+    const failed = jobs.filter((x) => x.state === "failed").length;
+    $("ws-jobs-sum").textContent = jobs.length ? [active && `${active} active`, `${jobs.length - active - failed} done`, failed && `${failed} failed`].filter(Boolean).join(" · ") : "";
+    $("ws-jobs-toggle").textContent = active ? `Jobs · ${active} active` : `Jobs (${jobs.length})`;
+    const want = {all: () => true, running: (x) => x.state === "queued" || x.state === "running", done: (x) => x.state === "done",
+                  failed: (x) => x.state === "failed" || x.state === "cancelled"}[ws.filter];
+    const shown = jobs.filter(want);
+    $("ws-jobs").innerHTML = shown.length ? shown.map(wsJobCard).join("")
+      : `<p class="muted small">${jobs.length ? "No jobs here." : "No jobs yet. They show here as they run, newest first."}</p>`;
+    // the rail: a dot on each step with a job running, finished or failed
+    for (const d of document.querySelectorAll("[data-ws-dot]")) {
+      const mine = jobs.filter((x) => WS_STEP_OF[x.kind] === d.dataset.wsDot);
+      d.dataset.s = mine.some((x) => x.state === "queued" || x.state === "running") ? "running"
+        : mine[0]?.state === "failed" ? "failed" : mine.some((x) => x.state === "done") ? "done" : "";
+    }
     for (const b of document.querySelectorAll("[data-ws-cancel]")) b.onclick = async () => {
       try { await wsFetch(`v1/workshop/jobs/${b.dataset.wsCancel}`, {method: "DELETE"}); } catch (e) { wsError(e.message); }
       refreshJobs();
@@ -4706,27 +4758,40 @@ async function refreshJobs(pushed = null) {
     for (const b of document.querySelectorAll("[data-ws-next]")) b.onclick = () => {
       const x = jobs.find((y) => String(y.id) === b.dataset.wsNext);
       if (!x) return;
-      if (x.kind === "merge") { $("ws-c-in").value = x.result.output; wsStep("convert"); }    // merged model → convert
-      if (x.kind === "convert") { $("ws-q-in").value = x.result.output; wsStep("quantize"); } // GGUF → quantize
-      if (x.kind === "quantize") { $("ws-s-in").value = x.result.output; wsStep("install"); } // quantized GGUF → install
+      const o = x.result.output;
+      if (x.kind === "loop" || x.kind === "merge") wsUse("convert", "ws-c-in", o);   // a model folder → convert
+      if (x.kind === "convert") wsUse("quantize", "ws-q-in", o);                    // GGUF → quantize
+      if (x.kind === "quantize") wsUse("install", "ws-s-in", o);                    // quantized GGUF → install
     };
     for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
     for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
-    // a dataset that a job just finished appears in the pickers
-    const made = jobs.filter((x) => x.kind === "datagen" && x.state !== "queued").map((x) => x.output);
-    if (made.some((o) => !wsKnownDatasets.split("\n").includes(o))) wsFiles();
+    // something a job just made appears in the pickers and the overview
+    const made = jobs.filter((x) => x.state === "done").map(wsJobOut).join("\n");
+    if (made !== ws.made) { const first = ws.made === undefined; ws.made = made; if (!first) wsFiles(); else wsOverview(); }
     // while jobs run: pushed by the live channel, else asked for again
-    if (tab === "workshop" && !live.has("workshop") && jobs.some((x) => x.state === "queued" || x.state === "running")) wsTimer = setTimeout(refreshJobs, 1500);
+    if (tab === "workshop" && !live.has("workshop") && active) wsTimer = setTimeout(refreshJobs, 1500);
   } catch (e) { wsError(e.message); }
 }
 live.on("workshop", (d) => { if (tab === "workshop") refreshJobs(d); });
 function fmtBytes(b) { return b >= 1e9 ? `${(b / 1e9).toFixed(2)} GB` : b >= 1e6 ? `${(b / 1e6).toFixed(1)} MB` : `${Math.round(b / 1e3)} KB`; }
+$("ws-filter").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-f]");
+  if (!b) return;
+  ws.filter = b.dataset.f;
+  for (const x of $("ws-filter").children) x.setAttribute("aria-checked", String(x === b));
+  refreshJobs({jobs: ws.jobs});
+});
+const wsJobsOpen = (open) => { $("ws").dataset.jobsOpen = String(open); $("ws-jobs-toggle").setAttribute("aria-expanded", String(open)); };
+$("ws-jobs-toggle").onclick = () => wsJobsOpen(true);
+$("ws-jobs-close").onclick = () => wsJobsOpen(false);
+
 async function wsSubmit(body, btn) {
   wsError("");
   const label = btn.textContent; btn.disabled = true;
   try {
     for (const k of Object.keys(body)) if (body[k] === "") delete body[k];
-    await wsFetch("v1/workshop/jobs", {method: "POST", body: JSON.stringify(body)});
+    const j = await wsFetch("v1/workshop/jobs", {method: "POST", body: JSON.stringify(body)});
+    toast("success", `Job #${j.id} queued`, `${body.kind}: it shows under Jobs`);
     refreshJobs();
   } catch (e) { wsError(e.message); }
   finally { btn.disabled = false; btn.textContent = label; }
@@ -4738,14 +4803,103 @@ $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
 $("ws-quantize").onclick = (e) => wsSubmit({kind: "quantize", input: $("ws-q-in").value.trim(), type: $("ws-q-type").value, output: $("ws-q-out").value.trim()}, e.currentTarget);
 
-// the step bar: one step's form at a time (the last one chosen is remembered)
+// the rail: one step at a time (the last one chosen is remembered)
 function wsStep(id) {
+  if (!document.querySelector(`[data-ws-panel="${id}"]`)) id = "overview";
   for (const b of document.querySelectorAll("[data-ws-step]")) b.setAttribute("aria-selected", String(b.dataset.wsStep === id));
   for (const p of document.querySelectorAll("[data-ws-panel]")) p.hidden = p.dataset.wsPanel !== id;
   store.set("ws-step", id);
+  $("ws-work").scrollTop = 0;
+  if (id === "library") wsLibLoad();
+  if (id === "overview") wsOverview();
 }
+function wsUse(step, inputId, path) { wsStep(step); $(inputId).value = path; wsPick.quiet = true; $(inputId).focus(); wsPick.quiet = false; }
 $("ws-steps").addEventListener("click", (e) => { const b = e.target.closest("[data-ws-step]"); if (b) wsStep(b.dataset.wsStep); });
-wsStep(store.get("ws-step", "data"));
+$("ws-steps").addEventListener("keydown", (e) => {
+  if (!["ArrowDown", "ArrowUp"].includes(e.key)) return;
+  const all = [...document.querySelectorAll("[data-ws-step]")], i = all.indexOf(document.activeElement);
+  if (i < 0) return;
+  e.preventDefault();
+  const b = all[(i + (e.key === "ArrowDown" ? 1 : all.length - 1)) % all.length];
+  b.focus(); wsStep(b.dataset.wsStep);
+});
+
+// the overview: what the Workshop has made or can use, with where each came from and what comes next
+function wsOverview() {
+  const box = $("ws-ov");
+  if (!box || box.closest("[data-ws-panel]").hidden) return;
+  const byOut = new Map();
+  for (const x of ws.jobs) if (x.state === "done" && wsJobOut(x) && !byOut.has(wsJobOut(x))) byOut.set(wsJobOut(x), x);
+  const from = (path) => { const x = byOut.get(path); return x ? `made by #${x.id} ${x.kind}${wsJobIn(x) ? ` from ${wsBase(wsJobIn(x))}` : ""}` : ""; };
+  const btn = (label, step, input, path) => `<button class="st-btn st-btn--secondary" data-ws-use="${step}|${input}|${esc(path)}">${label}</button>`;
+  const card = (x, tags, actions) => `<article class="st-card ws-art">
+      <div class="ws-art__name" title="${esc(x.path)}">${esc(wsBase(x.path))}</div>
+      <div class="ws-art__meta">${tags.join("")}${x.bytes ? `<span>${fmtBytes(x.bytes)}</span>` : ""}${x.modified ? `<span>${wsAgo(x.modified)}</span>` : ""}</div>
+      ${from(x.path) ? `<div class="ws-art__from">${esc(from(x.path))}</div>` : ""}
+      <div class="ws-art__actions">${actions}</div></article>`;
+  const tag = (t, cls = "") => `<span class="ws-tag${cls}">${esc(t)}</span>`;
+  const installed = ws.jobs.filter((x) => x.kind === "strata" && x.state === "done" && x.result?.model);
+  const groups = [
+    ["Installed models", installed.map((x) => `<article class="st-card ws-art"><div class="ws-art__name">${esc(x.result.display_name || x.result.model)}</div>
+      <div class="ws-art__meta">${tag(x.result.architecture || "model")}<span>${esc(x.result.model)}</span></div>
+      <div class="ws-art__from">${esc(from(x.result.output) || `installed by #${x.id} from ${wsBase(wsJobIn(x))}`)}</div>
+      <div class="ws-art__actions"><button class="st-btn st-btn--secondary" data-ws-load>Load it</button></div></article>`)],
+    ["Model folders", ws.files.hf.map((x) => card(x, [x.arch ? tag(x.arch) : "", x.loop ? tag(`loop ${x.loop.start}–${x.loop.end - 1} ×${x.loop.passes}`, " ws-tag--loop") : "",
+        x.private ? tag("private", " ws-tag--private") : ""],
+      btn("Convert", "convert", "ws-c-in", x.path) + (x.loop ? "" : btn("Loop", "loop", "ws-lp-in", x.path)) + btn("Merge into", "merge", "ws-m-base", x.path)))],
+    ["Adapters", ws.files.adapters.map((x) => card(x, [tag("LoRA")], btn("Merge", "merge", "ws-m-adapter", x.path)))],
+    ["GGUF files", ws.files.gguf.map((x) => card(x, [tag("GGUF")], btn("Quantize", "quantize", "ws-q-in", x.path) + btn("Install", "install", "ws-s-in", x.path)))],
+    ["Datasets", ws.files.datasets.map((x) => card(x, [tag("JSONL")], `<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.path)}">Review</button>`))],
+  ].filter(([, items]) => items.length);
+  box.innerHTML = groups.length ? groups.map(([h, items]) => `<section class="ws-ov__group"><h4>${h} · ${items.length}</h4><div class="ws-ov__grid">${items.join("")}</div></section>`).join("")
+    : '<p class="muted small">Nothing yet. Start with Generate data, or point a step at a Hugging Face model folder.</p>';
+  for (const b of box.querySelectorAll("[data-ws-use]")) b.onclick = () => { const [step, input, ...p] = b.dataset.wsUse.split("|"); wsUse(step, input, p.join("|")); };
+  for (const b of box.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
+  for (const b of box.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
+}
+
+// the path picker: every path field lists what the Workshop knows of that kind, and still takes a typed path
+const wsPick = {input: null, items: [], i: -1};
+function wsPickShow(input) {
+  const kind = input.dataset.wsPick, q = input.value.trim().toLowerCase();
+  wsPick.input = input;
+  wsPick.items = (ws.files[kind] || []).filter((x) => !q || x.path.toLowerCase().includes(q)).slice(0, 60);
+  wsPick.i = -1;
+  const box = $("ws-pick"), r = input.getBoundingClientRect();
+  box.innerHTML = wsPick.items.length ? wsPick.items.map((x, i) => `<button type="button" role="option" data-i="${i}" aria-selected="false">` +
+      `<b>${esc(wsBase(x.path))}</b><i>${x.bytes ? fmtBytes(x.bytes) : ""}</i><small>${esc(wsDir(x.path))}</small></button>`).join("")
+    : `<p>${(ws.files[kind] || []).length ? "No match: a full path works too." : "Nothing of this kind yet: type a full path."}</p>`;
+  Object.assign(box.style, {left: `${r.left}px`, top: `${r.bottom + 4}px`, width: `${r.width}px`});
+  box.hidden = false;
+  const below = innerHeight - r.bottom;
+  if (below < 220 && r.top > below) Object.assign(box.style, {top: "", bottom: `${innerHeight - r.top + 4}px`});
+  else box.style.bottom = "";
+}
+const wsPickHide = () => { $("ws-pick").hidden = true; wsPick.input = null; };
+function wsPickChoose(i) {
+  const x = wsPick.items[i];
+  if (!x || !wsPick.input) return;
+  wsPick.input.value = x.path;
+  wsPick.input.dispatchEvent(new Event("change", {bubbles: true}));
+  wsPickHide();
+}
+document.addEventListener("focusin", (e) => { if (e.target.matches?.("[data-ws-pick]") && !wsPick.quiet) wsPickShow(e.target); });
+document.addEventListener("input", (e) => { if (e.target.matches?.("[data-ws-pick]")) wsPickShow(e.target); });
+document.addEventListener("focusout", (e) => { if (e.target.matches?.("[data-ws-pick]")) setTimeout(() => { if (document.activeElement !== wsPick.input) wsPickHide(); }, 120); });
+document.addEventListener("keydown", (e) => {
+  if (!wsPick.input || e.target !== wsPick.input || $("ws-pick").hidden) return;
+  const n = wsPick.items.length;
+  if (e.key === "Escape") { wsPickHide(); return; }
+  if (e.key === "Enter" && wsPick.i >= 0) { e.preventDefault(); wsPickChoose(wsPick.i); return; }
+  if (!n || !["ArrowDown", "ArrowUp"].includes(e.key)) return;
+  e.preventDefault();
+  wsPick.i = (wsPick.i + (e.key === "ArrowDown" ? 1 : n - 1) + (wsPick.i < 0 && e.key === "ArrowUp" ? 1 : 0)) % n;
+  for (const b of $("ws-pick").children) b.setAttribute?.("aria-selected", String(Number(b.dataset.i) === wsPick.i));
+  $("ws-pick").children[wsPick.i]?.scrollIntoView({block: "nearest"});
+});
+$("ws-pick").addEventListener("mousedown", (e) => { const b = e.target.closest("[data-i]"); if (b) { e.preventDefault(); wsPickChoose(Number(b.dataset.i)); } });
+$("ws-work").addEventListener("scroll", wsPickHide, {passive: true});
+window.addEventListener("resize", wsPickHide);
 
 // ------------------------------------------------------------------ Workshop: training data (datagen) and its review
 const wsRecipe = () => {
@@ -4838,8 +4992,6 @@ $("ws-l-init").onclick = async () => {
       ? `Ready: am2strata-workshop train --soup ${j.config} --model <the base folder>` : `Written to ${j.folder} (soup.yaml and DATA.md).`;
   } catch (err) { $("ws-l-done").textContent = err.message; }
 };
-document.querySelector('[data-ws-step="train"]').addEventListener("click", wsLibLoad);
-if (store.get("ws-step", "data") === "train") wsLibLoad();
 
 const wsRev = {path: "", offset: 0, limit: 20, total: 0, records: [], selected: new Set()};
 function wsReviewOpen(path) {
@@ -4848,8 +5000,7 @@ function wsReviewOpen(path) {
   $("ws-r-pick").value = path;
   Object.assign(wsRev, {path, offset: 0});
   wsReviewLoad();
-  wsStep("data");
-  $("ws-data").scrollIntoView({behavior: "smooth", block: "start"});
+  wsStep("review");
 }
 $("ws-r-open").onclick = () => wsReviewOpen($("ws-r-pick").value);
 $("ws-r-prev").onclick = () => { wsRev.offset = Math.max(0, wsRev.offset - wsRev.limit); wsReviewLoad(); };
@@ -4921,6 +5072,9 @@ $("ws-r-del").onclick = async () => {
     wsReviewLoad();
   } catch (e) { wsError(e.message); }
 };
+// the step chosen last time (after the library and review code above, which it may call)
+wsStep(store.get("ws-step", "overview"));
+
 // ------------------------------------------------------------------ Computer: the sandbox desktop live (computer/live.rs)
 let cvWs = null, cvState = null, cvMoveAt = 0;
 const cvCanvas = $("cv-canvas");
