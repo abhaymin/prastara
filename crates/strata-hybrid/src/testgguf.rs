@@ -27,12 +27,16 @@ pub struct Spec {
     /// the loop: blocks start..end, passes
     pub loop_: Option<(usize, usize, usize)>,
     pub seed: u64,
+    /// the matrices quantized to `ty` and written back as F32: the same model without the quantized products, the
+    /// reference the device's quantized kernels are checked against
+    pub dequantized: bool,
 }
 
 impl Spec {
     pub fn tiny_qwen3() -> Spec {
         Spec { arch: "qwen3", n_embd: 64, n_head: 4, n_kv: 2, head_dim: 32, n_layer: 4, vocab: 256, ffn: 96, n_expert: 0, top_k: 0,
-               expert_ffn: 0, ty: "F32", loop_: None, seed: 0x5EED_0001 }
+               expert_ffn: 0, ty: "F32", loop_: None, seed: 0x5EED_0001,
+               dequantized: false }
     }
 
     pub fn tiny_qwen3moe() -> Spec {
@@ -122,7 +126,7 @@ pub fn write(s: &Spec, path: &Path) {
     }
     let bytes = |shape: &[usize], f32_: bool| -> (u32, u64) {
         let n: usize = shape.iter().product();
-        let ty = if f32_ { "F32" } else { s.ty };
+        let ty = if f32_ || s.dequantized { "F32" } else { s.ty };
         let (be, bb) = strata_gguf::block_geometry(ty).unwrap();
         (ggml_type(ty), (n as u64 / be) * bb)
     };
@@ -144,6 +148,11 @@ pub fn write(s: &Spec, path: &Path) {
         } else {
             let mut out = Vec::new();
             strata_pack::quantize::quantize(s.ty, &vals, &mut out).unwrap();
+            if s.dequantized {
+                let mut back = vec![0f32; n];
+                strata_pack::quants::dequantize_into(s.ty, &out, &mut back).unwrap();
+                out = back.iter().flat_map(|v| v.to_le_bytes()).collect();
+            }
             w.tensor_data(&out).unwrap();
         }
         w.end_tensor().unwrap();
@@ -170,7 +179,7 @@ fn write_speed_fixtures() {
     let dir = std::path::PathBuf::from(std::env::var("AM2_WRITE_FIXTURES").expect("AM2_WRITE_FIXTURES=<dir>"));
     std::fs::create_dir_all(&dir).unwrap();
     let dense = Spec { arch: "qwen3", n_embd: 1024, n_head: 16, n_kv: 8, head_dim: 128, n_layer: 16, vocab: 32768, ffn: 3072,
-                       n_expert: 0, top_k: 0, expert_ffn: 0, ty: "Q4_K", loop_: None, seed: 0xD1 };
+                       n_expert: 0, top_k: 0, expert_ffn: 0, ty: "Q4_K", loop_: None, seed: 0xD1, dequantized: false };
     let looped = Spec { loop_: Some((4, 12, 2)), seed: 0xD2, ..dense.clone() };
     let moe = Spec { arch: "qwen3moe", n_expert: 32, top_k: 4, expert_ffn: 512, seed: 0xD3, ..dense.clone() };
     let moe_q8 = Spec { ty: "Q8_0", seed: 0xD4, ..moe.clone() };
@@ -181,5 +190,28 @@ fn write_speed_fixtures() {
         let p = dir.join(format!("{n}.gguf"));
         write(s, &p);
         eprintln!("{} {:.1} MB", p.display(), std::fs::metadata(&p).unwrap().len() as f64 / 1e6);
+    }
+}
+
+/// The kernel speed runs' models (docs/MULA-PLAN.md M8, the kernels): Qwen3-8B's shapes (4096 wide, 32 heads of 128, 8
+/// KV heads, 12288 in the feed-forward, a 151936-token vocabulary) with 8 layers, in Q8_0 (2.3 GB on the card) and Q4_K
+/// (1.2 GB), and the Q8_0 one looped (blocks 2..6, 2 passes: 12 layer passes per token), small enough for a card that
+/// already holds another model, large enough that a token's weights are read at the card's bandwidth.
+///   AM2_WRITE_FIXTURES=<dir> cargo test --release write_kernel_bench_models -- --ignored
+#[test]
+#[ignore]
+fn write_kernel_bench_models() {
+    let dir = std::path::PathBuf::from(std::env::var("AM2_WRITE_FIXTURES").expect("AM2_WRITE_FIXTURES=<dir>"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let q8 = Spec { arch: "qwen3", n_embd: 4096, n_head: 32, n_kv: 8, head_dim: 128, n_layer: 8, vocab: 151936, ffn: 12288,
+                    n_expert: 0, top_k: 0, expert_ffn: 0, ty: "Q8_0", loop_: None, seed: 0xB1, dequantized: false };
+    let q4 = Spec { ty: "Q4_K", seed: 0xB2, ..q8.clone() };
+    let looped = Spec { loop_: Some((2, 6, 2)), seed: 0xB3, ..q8.clone() };
+    for (n, s) in [("bench-qwen3-4096-q8_0", &q8), ("bench-qwen3-4096-q4_k", &q4), ("bench-qwen3-4096-loop-q8_0", &looped)] {
+        let p = dir.join(format!("{n}.gguf"));
+        if !p.exists() {
+            write(s, &p);
+        }
+        eprintln!("{} {:.2} GB", p.display(), std::fs::metadata(&p).unwrap().len() as f64 / 1e9);
     }
 }

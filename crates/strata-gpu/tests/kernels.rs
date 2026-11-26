@@ -2,7 +2,7 @@
 //! (docs/GPU-PLAN.md) - within 1e-3 of the sum of |w x|, so only the order of the sums differs.
 
 use std::sync::atomic::Ordering;
-use strata_gpu::{list, Gpu, WIDE_ROWS};
+use strata_gpu::{list, Gpu, FAST_Q4K, MM_TOKENS, WIDE_ROWS};
 
 /// A tiny deterministic generator (no rand dependency).
 struct Rng(u64);
@@ -48,9 +48,14 @@ fn weights(ty: &str, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
 #[test]
 fn every_kernel_matches_the_cpu_on_every_device() {
     // CubeCL's own CPU runtime compiles slowly (minutes per kernel): STRATA_GPU_TEST_CPU=1 includes it
-    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some()).collect();
+    // STRATA_GPU_TEST_ONLY=<device> checks one device
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| (d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some())
+        && only.as_deref().is_none_or(|o| o == d.name)).collect();
     eprintln!("devices: {:?}", devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>());
-    let (rows, cols, tokens) = (70, 512, 3); // 70 rows: not a multiple of the cube; 3 vectors at once
+    // 70 rows: not a multiple of any cube's rows; 67 vectors at once: more than one of the tiled kernel's token tiles,
+    // and not a multiple of them
+    let (rows, cols, tokens) = (70, 512, 67);
     let mut rng = Rng(0x9e3779b97f4a7c15);
     let x: Vec<f32> = (0..cols * tokens).map(|_| rng.unit()).collect();
     for ty in ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS"] {
@@ -71,14 +76,20 @@ fn every_kernel_matches_the_cpu_on_every_device() {
         for d in &devices {
             let g = Gpu::open(&d.name).unwrap();
             let wt = g.upload(ty, &w, rows, cols).unwrap();
-            for (kernel, limit) in [("plain", u32::MAX), ("wide", 0)] {
+            // the older kernels (plain, wide), the fast decode kernels (one product per vector), and the tiled one
+            for (kernel, limit, fast, mm) in [("plain", u32::MAX, false, u32::MAX), ("wide", 0, false, u32::MAX), ("fast", u32::MAX, true, u32::MAX),
+                                             ("tiled", u32::MAX, true, 1)] {
                 WIDE_ROWS.store(limit, Ordering::Relaxed);
+                FAST_Q4K.store(fast, Ordering::Relaxed);
+                MM_TOKENS.store(mm, Ordering::Relaxed);
                 let got = g.matvec(&wt, &x);
                 assert_eq!(got.len(), rows * tokens);
                 let worst = got.iter().zip(&want).zip(&scale).map(|((g, w), s)| ((*g - *w).abs() as f64) / s.max(1e-12)).fold(0f64, f64::max);
                 eprintln!("{ty:5} on {:18} {kernel:6} worst relative error {worst:.2e}", d.name);
                 assert!(worst < 1e-3, "{ty} on {} ({kernel}): {worst}", d.name);
             }
+            FAST_Q4K.store(true, Ordering::Relaxed);
+            MM_TOKENS.store(8, Ordering::Relaxed);
         }
     }
 }
@@ -86,7 +97,9 @@ fn every_kernel_matches_the_cpu_on_every_device() {
 /// A token's chain of kernels against the same arithmetic on the CPU (docs/ENGINE-PLAN.md phase 1).
 #[test]
 fn the_chain_of_kernels_matches_the_cpu() {
-    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some()).collect();
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| (d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some())
+        && only.as_deref().is_none_or(|o| o == d.name)).collect();
     let mut rng = Rng(42);
     let (hd, n_head, n_kv, n) = (128usize, 8usize, 2usize, 37usize);
     let q: Vec<f32> = (0..n_head * hd).map(|_| rng.unit()).collect();
@@ -324,5 +337,86 @@ fn the_computed_sign_table_is_the_cpus() {
     for i in 0..128u32 {
         let parity = (i.count_ones() & 1) << 7;
         assert_eq!(i | parity, strata_pack::grids::KSIGNS_IQ2XS[i as usize] as u32, "entry {i}");
+    }
+}
+
+/// The graph's fused kernels (strata-gpu lib.rs: mv_add, mv_into, glu, qkv, qk_rope) against the kernels they replace,
+/// for Q8_0 and Q4_K, one vector and a few at once: the same values within float rounding.
+#[test]
+fn the_fused_kernels_match_the_unfused_ones() {
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let mut rng = Rng(0x5151_7777_aaaa_0001);
+    let (cols, ffn, hd, n_head, n_kv) = (512usize, 768usize, 64usize, 8usize, 2usize);
+    let close = |got: &[f32], want: &[f32], what: &str| {
+        let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("{what}: worst {worst:.2e} (values up to {scale:.2})");
+        assert!(got.len() == want.len() && worst <= 1e-5 * scale.max(1.0), "{what}: worst {worst}");
+    };
+    for d in &devices {
+        let g = Gpu::open(&d.name).unwrap();
+        for ty in ["Q8_0", "Q4_K"] {
+            let up = |rows: usize, c: usize, rng: &mut Rng| g.upload(ty, &weights(ty, rows, c, rng), rows, c).unwrap();
+            let (wg, wu, wd) = (up(ffn, cols, &mut rng), up(ffn, cols, &mut rng), up(cols, ffn, &mut rng));
+            let (wq, wk, wv) = (up(n_head * hd, cols, &mut rng), up(n_kv * hd, cols, &mut rng), up(n_kv * hd, cols, &mut rng));
+            // 67: a chunk, which takes the tiled kernel (its residual and its offset into the cache)
+            for tokens in [1u32, 3, 67] {
+                let t = tokens as usize;
+                let xv: Vec<f32> = (0..cols * t).map(|_| rng.unit()).collect();
+                let x = g.buffer(&xv);
+                let what = |k: &str| format!("{} {ty} tokens={tokens} {k}", d.name);
+                // the gated feed-forward
+                let (gv, uv) = (g.read(&g.mv_tokens(&wg, &x, tokens)), g.read(&g.mv_tokens(&wu, &x, tokens)));
+                let want: Vec<f32> = gv.iter().zip(&uv).map(|(g, u)| u * (g / (1.0 + (-g).exp()))).collect();
+                let h = g.glu(&wg, &wu, &x, tokens);
+                close(&g.read(&h), &want, &what("glu"));
+                // the residual added in the product
+                let res: Vec<f32> = (0..cols * t).map(|_| rng.unit()).collect();
+                let y = g.buffer(&res);
+                let dv = g.read(&g.mv_tokens(&wd, &h, tokens));
+                g.mv_add(&wd, &h, &y, tokens);
+                close(&g.read(&y), &res.iter().zip(&dv).map(|(a, b)| a + b).collect::<Vec<_>>(), &what("mv_add"));
+                // q, k and v in one kernel, v into its cache at an offset
+                let row = n_kv * hd;
+                let at = 5 * row;
+                let vc = g.buffer(&vec![0f32; (8 + t) * row]);
+                let (q, k) = g.qkv(&wq, &wk, &wv, &x, tokens, &vc, at);
+                close(&g.read(&q), &g.read(&g.mv_tokens(&wq, &x, tokens)), &what("qkv q"));
+                close(&g.read(&k), &g.read(&g.mv_tokens(&wk, &x, tokens)), &what("qkv k"));
+                let mut want = vec![0f32; (8 + t) * row];
+                want[at..at + t * row].copy_from_slice(&g.read(&g.mv_tokens(&wv, &x, tokens)));
+                close(&g.read(&vc), &want, &what("qkv v in its cache"));
+                // q/k norms, RoPE (both layouts, part of the head rotated) and k into its cache, against the kernels in turn
+                for (neox, n_rot) in [(false, hd as u32), (true, hd as u32), (true, 32)] {
+                    let tab: Vec<f32> = (0..t).flat_map(|p| (0..n_rot as usize / 2).flat_map(move |i| {
+                        let a = (p + 3) as f32 * 0.37 / (1.0 + i as f32); [a.cos(), a.sin()] })).collect();
+                    let tab = g.buffer(&tab);
+                    let (qn, kn) = (g.buffer(&(0..hd).map(|_| 1.0 + 0.2 * rng.unit()).collect::<Vec<_>>()),
+                                    g.buffer(&(0..hd).map(|_| 1.0 + 0.2 * rng.unit()).collect::<Vec<_>>()));
+                    for norm in [false, true] {
+                        let (n1, n2) = if norm { (Some(&qn), Some(&kn)) } else { (None, None) };
+                        let (q0, k0) = (g.read(&q), g.read(&k));
+                        // the kernels in turn
+                        let (mut qa, mut ka) = (g.buffer(&q0), g.buffer(&k0));
+                        if norm {
+                            qa = g.rms_norm(&qa, &qn, 1e-6);
+                            ka = g.rms_norm(&ka, &kn, 1e-6);
+                        }
+                        g.rope_tokens(&tab, &qa, hd as u32, n_rot, neox, tokens);
+                        g.rope_tokens(&tab, &ka, hd as u32, n_rot, neox, tokens);
+                        let kc_want = g.buffer(&vec![0f32; (8 + t) * row]);
+                        g.kv_append(&ka, &kc_want, at);
+                        // the one kernel
+                        let (qb, kb) = (g.buffer(&q0), g.buffer(&k0));
+                        let kc = g.buffer(&vec![0f32; (8 + t) * row]);
+                        let qo = g.qk_rope(&qb, &kb, n1, n2, &tab, &kc, at, hd as u32, n_rot, neox, tokens, 1e-6);
+                        let tag = what(&format!("qk_rope neox={neox} n_rot={n_rot} norm={norm}"));
+                        close(&g.read(&qo), &g.read(&qa), &format!("{tag} q"));
+                        close(&g.read(&kc), &g.read(&kc_want), &format!("{tag} k in its cache"));
+                    }
+                }
+            }
+        }
     }
 }

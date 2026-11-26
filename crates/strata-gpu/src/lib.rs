@@ -126,6 +126,34 @@ pub struct Weights {
     /// whether matvec_q4k's shared memory (x, its group sums and the cube's partial sums) fits this device: Metal
     /// allows 32 KiB, so a 9216-column Q4_K matrix (a 3B model's ffn_down) must take the plain kernel there
     wide_fits: bool,
+    /// a Q8_0 matrix on CubeCL is repacked (kernels.rs, the fast products): `handle` holds its values, rows * cols
+    /// bytes, and this its f16 scales
+    scales: Option<Mem>,
+    /// whether the device's planes are 32 units wide, so the fast kernels sum a row's warp with a plane reduction
+    plane: bool,
+}
+
+impl Weights {
+    /// Whether the fast kernels take this matrix (kernels.rs, the fast products): Q8_0 (repacked) and Q4_K on CubeCL.
+    pub fn fast(&self) -> bool {
+        self.scales.is_some() || (self.geometry.2 == kernels::kind::Q4_K && matches!(self.handle, Mem::Cube(_))
+                                  && FAST_Q4K.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The values as 16-byte loads, for the fast kernels.
+    fn v4<R: Runtime>(&self) -> ArrayArg<R> {
+        unsafe { ArrayArg::from_raw_parts(self.handle.cube(), self.value_words() / 4) }
+    }
+
+    /// A repacked Q8_0 matrix's scales (anything for the other kinds: the kernels do not read it).
+    fn sc<R: Runtime>(&self) -> ArrayArg<R> {
+        unsafe { ArrayArg::from_raw_parts(self.scales.as_ref().unwrap_or(&self.handle).cube(), 1) }
+    }
+
+    /// The words of `handle`: a repacked Q8_0 matrix's values, or the whole matrix.
+    fn value_words(&self) -> usize {
+        if self.scales.is_some() { self.rows as usize * self.cols as usize / 4 } else { self.bytes.div_ceil(4) }
+    }
 }
 
 /// Values on the device, so that a chain of kernels needs no trip through the CPU.
@@ -175,11 +203,53 @@ macro_rules! native {
 /// From this many rows a Q4_K or Q6_K product takes `matvec_q4k` / `matvec_q6k` (a variable so a test can force either kernel).
 pub static WIDE_ROWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(kernels::WIDE_ROWS);
 
+/// From this many tokens a Q8_0 or Q4_K product of a chunk takes the tiled kernel (`kernels::mm`), below it the decode
+/// kernel once per token (a variable so a test can force either kernel).
+pub static MM_TOKENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
+/// Whether Q4_K products take the fast decode kernel (`kernels::mv_q4_k`); off, the older kernels (for comparisons).
+pub static FAST_Q4K: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Queues y[y_off..] (+)= W x for `tokens` vectors with a fast kernel (Weights::fast): the tiled one for a chunk, else
+/// the decode one (once per vector). `ylen`: the values in y's buffer.
+macro_rules! fast {
+    ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $ylen:expr, $tokens:expr, $y_off:expr, $add:expr) => {{
+        let w: &Weights = $w;
+        let k = w.geometry.2;
+        stats::launch(1);
+        let tiled = $tokens >= MM_TOKENS.load(std::sync::atomic::Ordering::Relaxed) && w.cols % kernels::MM_K == 0;
+        let words = w.value_words();
+        unsafe {
+            let y = ArrayArg::from_raw_parts($hy, $ylen);
+            let x4 = ArrayArg::from_raw_parts($hx, $n / 4);
+            let wd = ArrayArg::from_raw_parts(w.scales.as_ref().unwrap_or(&w.handle).cube(), 1);
+            if tiled {
+                let count = CubeCount::Static(w.rows.div_ceil(kernels::MM_M), ($tokens as u32).div_ceil(kernels::MM_N), 1);
+                kernels::mm::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::MM_CUBE), ArrayArg::from_raw_parts(w.handle.cube(), words),
+                    ArrayArg::from_raw_parts(w.handle.cube(), words / 4), wd, x4, y, w.rows, w.cols, $tokens as u32, $y_off, k, $add);
+            } else {
+                kernels::mv_fast::launch_unchecked::<$R>($c, mv_count(w.rows, 0, 0, $tokens as u32), CubeDim::new_1d(kernels::MV_ROWS * 32),
+                    ArrayArg::from_raw_parts(w.handle.cube(), words / 4), wd, x4, y, w.rows, w.cols, $y_off, k, w.plane, $add);
+            }
+        }
+    }};
+}
+
+/// The grid of the fast decode kernels for these rows (of up to three matrices) and tokens: x and y (each axis has a
+/// limit of 65535 on some backends), z the tokens.
+fn mv_count(r0: u32, r1: u32, r2: u32, tokens: u32) -> CubeCount {
+    let cubes = r0.div_ceil(kernels::MV_ROWS) + r1.div_ceil(kernels::MV_ROWS) + r2.div_ceil(kernels::MV_ROWS);
+    let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
+    CubeCount::Static(cx, cy, tokens)
+}
+
 /// Queues y = W x for `tokens` vectors with the kernel that suits the matrix.
 macro_rules! product {
     ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $tokens:expr) => {{
         let w = $w;
         let (be, bb, k) = w.geometry;
+        if w.fast() {
+            fast!($c, $R, w, $hx, $n, $hy, $tokens as usize * w.rows as usize, $tokens, 0u32, false);
+        } else {
         let wide = (k == kernels::kind::Q4_K || k == kernels::kind::Q6_K) && w.wide_fits
             && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
         // cubes over x and y of the grid (each axis has a limit of 65535 on some backends)
@@ -197,6 +267,7 @@ macro_rules! product {
             } else {
                 kernels::matvec::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::CUBE), wa, xa, y, w.rows, w.cols, w.row_bytes, be, bb, k);
             }
+        }
         }
     }};
 }
@@ -281,6 +352,7 @@ impl Gpu {
             "metal" if native::wanted() => {
                 return native::Native::open().map(|n| Gpu { client: Client::Metal(n), name: name.to_string() });
             }
+            #[cfg(feature = "wgpu")]
             "metal" | "vulkan" | "wgpu" => {
                 use cubecl::wgpu::WgpuDevice;
                 let d = match idx {
@@ -312,12 +384,31 @@ impl Gpu {
             let t = kernels::table_for(ty);
             let all: Vec<u8> = t.iter().chain(data).copied().collect();
             Ok(Weights { handle: Mem::Mtl(n.upload(&all)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
-                         geometry, bytes: all.len(), wide_fits: false })
+                         geometry, bytes: all.len(), wide_fits: false, scales: None, plane: false })
         });
         // whole u32 words: the kind's lookup table first (IQ3_XXS's grid), then the rows, the tail padded with zeros.
         // A matrix with no table and whole words (every K-quant and float one) goes as it is: the client makes the
         // one copy the device thread uploads from, so the mapped file is read once and nothing is rebuilt here.
         let table = kernels::table_for(ty);
+        let (plane, shared) = with_client!(self, c, R, {
+            let p = c.properties();
+            (p.hardware.plane_size_min == 32 && p.hardware.plane_size_max == 32 && p.features.plane.contains(cubecl::ir::features::Plane::Ops),
+             p.hardware.max_shared_memory_size)
+        });
+        if geometry.2 == kernels::kind::Q8_0 {
+            // the values first, then the scales (kernels.rs): 16-byte rows the fast kernels read in 16-byte loads
+            let blocks = data.len() / 34;
+            let mut qs = Vec::with_capacity(blocks * 32);
+            let mut ds = Vec::with_capacity(blocks * 2 + 2);
+            for b in data.chunks_exact(34) {
+                ds.extend_from_slice(&b[..2]);
+                qs.extend_from_slice(&b[2..]);
+            }
+            ds.resize(ds.len().div_ceil(4) * 4, 0);
+            let (hq, hd) = with_client!(self, c, R, (c.create_from_slice(&qs), c.create_from_slice(&ds)));
+            return Ok(Weights { handle: Mem::Cube(hq), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry,
+                                bytes: data.len(), wide_fits: false, scales: Some(Mem::Cube(hd)), plane });
+        }
         let handle = if table.is_empty() && data.len() % 4 == 0 {
             Mem::Cube(with_client!(self, c, R, c.create_from_slice(data)))
         } else {
@@ -329,13 +420,12 @@ impl Gpu {
             Mem::Cube(with_client!(self, c, R, c.create_from_slice(&all)))
         };
         let data_len = table.len() + data.len();
-        let shared = with_client!(self, c, R, c.properties().hardware.max_shared_memory_size);
         let need = match geometry.2 {
             kernels::kind::Q6_K => kernels::wide_q6k_shared_bytes(cols as u32),
             _ => kernels::wide_shared_bytes(cols as u32),
         };
         let wide_fits = need <= shared;
-        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data_len, wide_fits })
+        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data_len, wide_fits, scales: None, plane })
     }
 
     /// Let go of the host copies of uploads the device has finished reading. The runtime keeps each upload's bytes
@@ -438,6 +528,101 @@ impl Gpu {
         })
     }
 
+    /// Whether a decode kernel (not the tiled one) takes `tokens` vectors of these fast matrices of one kind and width:
+    /// the fused kernels below are decode kernels.
+    fn fused(&self, ws: &[&Weights], tokens: u32) -> bool {
+        tokens < MM_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
+            && ws.iter().all(|w| w.fast() && w.geometry.2 == ws[0].geometry.2 && w.cols == ws[0].cols)
+    }
+
+    /// y += W x for `tokens` vectors, queued: the residual added in the product's own kernel when it is a fast one.
+    pub fn mv_add(&self, w: &Weights, x: &Buf, y: &Buf, tokens: u32) {
+        if w.fast() {
+            with_client!(self, c, R, fast!(c, R, w, x.handle.cube(), x.len, y.handle.cube(), y.len, tokens, 0u32, true));
+            return;
+        }
+        self.add_into(&self.mv_tokens(w, x, tokens), y);
+    }
+
+    /// W x for `tokens` vectors written at y[off..], queued (V straight into its cache).
+    pub fn mv_into(&self, w: &Weights, x: &Buf, y: &Buf, off: usize, tokens: u32) {
+        if w.fast() {
+            with_client!(self, c, R, fast!(c, R, w, x.handle.cube(), x.len, y.handle.cube(), y.len, tokens, off as u32, false));
+            return;
+        }
+        self.kv_append(&self.mv_tokens(w, x, tokens), y, off);
+    }
+
+    /// silu(G x) * (U x) for `tokens` vectors, queued: one kernel for both products and the gate when it can.
+    pub fn glu(&self, gate: &Weights, up: &Weights, x: &Buf, tokens: u32) -> Buf {
+        if !self.fused(&[gate, up], tokens) || gate.rows != up.rows {
+            let (u, g) = (self.mv_tokens(up, x, tokens), self.mv_tokens(gate, x, tokens));
+            self.silu_gate(&g, &u);
+            return u;
+        }
+        stats::launch(1);
+        let y = self.scratch(tokens as usize * up.rows as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::mv_glu::launch_unchecked::<R>(c, mv_count(up.rows, 0, 0, tokens), CubeDim::new_1d(kernels::MV_ROWS * 32), gate.v4(), gate.sc(),
+                up.v4(), up.sc(), ArrayArg::from_raw_parts(x.handle.cube(), x.len / 4), y.arg(), up.rows, up.cols, up.geometry.2, up.plane);
+        });
+        y
+    }
+
+    /// Attention's three products of x for `tokens` vectors, queued: -> (q, k); v is written into `vc` at `v_off`. One
+    /// kernel for the three when it can.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv(&self, q: &Weights, k: &Weights, v: &Weights, x: &Buf, tokens: u32, vc: &Buf, v_off: usize) -> (Buf, Buf) {
+        if !self.fused(&[q, k, v], tokens) {
+            let (qy, ky) = (self.mv_tokens(q, x, tokens), self.mv_tokens(k, x, tokens));
+            self.mv_into(v, x, vc, v_off, tokens);
+            return (qy, ky);
+        }
+        stats::launch(1);
+        let (qy, ky) = (self.scratch(tokens as usize * q.rows as usize), self.scratch(tokens as usize * k.rows as usize));
+        with_client!(self, c, R, unsafe {
+            kernels::mv3::launch_unchecked::<R>(c, mv_count(q.rows, k.rows, v.rows, tokens), CubeDim::new_1d(kernels::MV_ROWS * 32), q.v4(), q.sc(),
+                k.v4(), k.sc(), v.v4(), v.sc(), ArrayArg::from_raw_parts(x.handle.cube(), x.len / 4), qy.arg(), ky.arg(), vc.arg(), q.rows, k.rows,
+                v.rows, v_off as u32, q.cols, q.geometry.2, q.plane);
+        });
+        (qy, ky)
+    }
+
+    /// Attention's q and k after their products, for `tokens` tokens, queued: each head RMS-normed by `qn` / `kn` when
+    /// given, rotated by `tab` (each token's (cos, sin) pairs), and k written into its cache `kc` at `k_off`. -> q. One
+    /// kernel on CubeCL (heads of at most 512 values); the norm, rope and append kernels in turn elsewhere.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_rope(&self, q: &Buf, k: &Buf, qn: Option<&Buf>, kn: Option<&Buf>, tab: &Buf, kc: &Buf, k_off: usize, hd: u32, n_rot: u32,
+                   neox: bool, tokens: u32, eps: f32) -> Buf {
+        if self.is_native() || hd > 512 || qn.is_some() != kn.is_some() {
+            let (mut q, mut k) = (q.clone(), k.clone());
+            if let Some(w) = qn {
+                q = self.rms_norm(&q, w, eps);
+            }
+            if let Some(w) = kn {
+                k = self.rms_norm(&k, w, eps);
+            }
+            if tokens == 1 {
+                self.rope(tab, &q, hd, n_rot, neox);
+                self.rope(tab, &k, hd, n_rot, neox);
+            } else {
+                self.rope_tokens(tab, &q, hd, n_rot, neox, tokens);
+                self.rope_tokens(tab, &k, hd, n_rot, neox, tokens);
+            }
+            self.kv_append(&k, kc, k_off);
+            return q;
+        }
+        stats::launch(1);
+        let (n_head, n_kv) = (q.len as u32 / hd / tokens, k.len as u32 / hd / tokens);
+        let norm = qn.is_some();
+        let (qn, kn) = (qn.unwrap_or(tab), kn.unwrap_or(tab));
+        with_client!(self, c, R, unsafe {
+            kernels::qk_rope::launch_unchecked::<R>(c, CubeCount::Static(n_head + n_kv, tokens, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(),
+                qn.arg(), kn.arg(), tab.arg(), kc.arg(), hd, n_rot, neox as u32, n_head, n_kv, k_off as u32, eps, norm);
+        });
+        q.clone()
+    }
+
     /// y = x * w / sqrt(mean(x^2) + eps), queued.
     /// The norm of each row of `w.len` values: one vector, a chunk's tokens, or each head (q/k norms).
     pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
@@ -500,6 +685,23 @@ impl Gpu {
     /// values. `s` is scratch for n_head * n scores.
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
+        if let Some(per) = self.flash(hd) {
+            // flash decoding: runs of positions per KV head, then their merge
+            stats::launch(2);
+            // about 32 runs (at least 32 positions each), so that a short context and a long one both fill the card
+            let len = n.div_ceil(32).div_ceil(32).max(1) * 32;
+            let splits = n.div_ceil(len);
+            let part = self.scratch((n_head * splits * (hd + 2)) as usize);
+            let o = self.scratch((n_head * hd) as usize);
+            let warps = (n_head / n_kv).clamp(1, 8);
+            with_client!(self, c, R, unsafe {
+                kernels::attend_split::launch_unchecked::<R>(c, CubeCount::Static(n_kv, splits, 1), CubeDim::new_1d(32 * warps), q.arg(), k.arg(), v.arg(),
+                    part.arg(), n, n_kv, n_head / n_kv, scale, len, per);
+                kernels::attend_merge::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), part.arg(), o.arg(),
+                    splits, hd);
+            });
+            return o;
+        }
         stats::launch(3);
         native!(self, m, Buf { handle: Mem::Mtl(m.attend(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), s.handle.mtl(), n, n_head, n_kv, hd, scale)),
                                len: (n_head * hd) as usize });
@@ -509,6 +711,32 @@ impl Gpu {
             kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(), n, n_kv, group, hd, scale);
             kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
             kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
+        });
+        o
+    }
+
+    /// Whether attention takes kernels::attend_rows (heads of 32, 64, 128 or 256 values, a device with 32-wide planes,
+    /// AM2_FLASH not 0): -> the values per unit.
+    fn flash(&self, hd: u32) -> Option<u32> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("AM2_FLASH").is_ok_and(|v| v == "0")) || self.is_native() || !matches!(hd, 32 | 64 | 128 | 256) {
+            return None;
+        }
+        let plane = with_client!(self, c, R, {
+            let p = c.properties();
+            p.hardware.plane_size_min == 32 && p.hardware.plane_size_max == 32 && p.features.plane.contains(cubecl::ir::features::Plane::Ops)
+        });
+        plane.then_some(hd / 32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attend_rows(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, per: u32, scale: f32,
+                   chunk: bool) -> Buf {
+        stats::launch(1);
+        let o = self.scratch((tokens * n_head * per * 32) as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::attend_rows::launch_unchecked::<R>(c, CubeCount::Static(n_head, tokens, 1), CubeDim::new_1d(128), q.arg(), k.arg(), v.arg(), o.arg(),
+                scales.arg(), base, n_kv, n_head / n_kv, n_head, scale, per, chunk);
         });
         o
     }
@@ -545,6 +773,9 @@ impl Gpu {
     pub fn attend_tokens(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Buf {
         native!(self, m, { stats::launch(1); Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
                                                                 n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize } });
+        if let Some(per) = self.flash(hd) {
+            return self.attend_rows(q, k, v, scales, base, tokens, n_head, n_kv, per, 0.0, true);
+        }
         stats::launch(3);
         let n = base + tokens;
         let rows = tokens * n_head;
