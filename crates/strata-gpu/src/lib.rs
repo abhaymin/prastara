@@ -281,6 +281,7 @@ impl Gpu {
             "metal" if native::wanted() => {
                 return native::Native::open().map(|n| Gpu { client: Client::Metal(n), name: name.to_string() });
             }
+            #[cfg(feature = "wgpu")]
             "metal" | "vulkan" | "wgpu" => {
                 use cubecl::wgpu::WgpuDevice;
                 let d = match idx {

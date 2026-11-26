@@ -183,3 +183,26 @@ fn write_speed_fixtures() {
         eprintln!("{} {:.1} MB", p.display(), std::fs::metadata(&p).unwrap().len() as f64 / 1e6);
     }
 }
+
+/// The kernel speed runs' models (docs/MULA-PLAN.md M8, the kernels): Qwen3-8B's shapes (4096 wide, 32 heads of 128, 8
+/// KV heads, 12288 in the feed-forward, a 151936-token vocabulary) with 8 layers, in Q8_0 (2.3 GB on the card) and Q4_K
+/// (1.2 GB), and the Q8_0 one looped (blocks 2..6, 2 passes: 12 layer passes per token), small enough for a card that
+/// already holds another model, large enough that a token's weights are read at the card's bandwidth.
+///   AM2_WRITE_FIXTURES=<dir> cargo test --release write_kernel_bench_models -- --ignored
+#[test]
+#[ignore]
+fn write_kernel_bench_models() {
+    let dir = std::path::PathBuf::from(std::env::var("AM2_WRITE_FIXTURES").expect("AM2_WRITE_FIXTURES=<dir>"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let q8 = Spec { arch: "qwen3", n_embd: 4096, n_head: 32, n_kv: 8, head_dim: 128, n_layer: 8, vocab: 151936, ffn: 12288,
+                    n_expert: 0, top_k: 0, expert_ffn: 0, ty: "Q8_0", loop_: None, seed: 0xB1 };
+    let q4 = Spec { ty: "Q4_K", seed: 0xB2, ..q8.clone() };
+    let looped = Spec { loop_: Some((2, 6, 2)), seed: 0xB3, ..q8.clone() };
+    for (n, s) in [("bench-qwen3-4096-q8_0", &q8), ("bench-qwen3-4096-q4_k", &q4), ("bench-qwen3-4096-loop-q8_0", &looped)] {
+        let p = dir.join(format!("{n}.gguf"));
+        if !p.exists() {
+            write(s, &p);
+        }
+        eprintln!("{} {:.2} GB", p.display(), std::fs::metadata(&p).unwrap().len() as f64 / 1e9);
+    }
+}

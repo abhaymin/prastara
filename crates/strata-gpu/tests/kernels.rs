@@ -48,7 +48,10 @@ fn weights(ty: &str, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
 #[test]
 fn every_kernel_matches_the_cpu_on_every_device() {
     // CubeCL's own CPU runtime compiles slowly (minutes per kernel): STRATA_GPU_TEST_CPU=1 includes it
-    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some()).collect();
+    // STRATA_GPU_TEST_ONLY=<device> checks one device (another may be busy with a running model)
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| (d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some())
+        && only.as_deref().is_none_or(|o| o == d.name)).collect();
     eprintln!("devices: {:?}", devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>());
     let (rows, cols, tokens) = (70, 512, 3); // 70 rows: not a multiple of the cube; 3 vectors at once
     let mut rng = Rng(0x9e3779b97f4a7c15);
@@ -86,7 +89,10 @@ fn every_kernel_matches_the_cpu_on_every_device() {
 /// A token's chain of kernels against the same arithmetic on the CPU (docs/ENGINE-PLAN.md phase 1).
 #[test]
 fn the_chain_of_kernels_matches_the_cpu() {
-    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some()).collect();
+    // STRATA_GPU_TEST_ONLY=<device> checks one device (another may be busy with a running model)
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| (d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some())
+        && only.as_deref().is_none_or(|o| o == d.name)).collect();
     let mut rng = Rng(42);
     let (hd, n_head, n_kv, n) = (128usize, 8usize, 2usize, 37usize);
     let q: Vec<f32> = (0..n_head * hd).map(|_| rng.unit()).collect();
