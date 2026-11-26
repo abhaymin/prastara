@@ -316,3 +316,46 @@ fn the_commands_report_as_json_events() {
     assert_eq!(done["promoted"], serde_json::Value::Null);
     assert!(std::fs::read_to_string(root.join("gt/rounds.md")).unwrap().contains("no answer was good enough"));
 }
+
+/// Inference records nothing for a backward pass, even through a loop gate (a trained variable): the first GPU run of
+/// the looped Qwen3-8B kept every later block's graph, attention tables included, and ran out of memory. The values
+/// are the plain evaluation's, and the chunked attention (above one chunk under inference) gives the same loss.
+#[test]
+fn inference_keeps_no_graph_through_the_loop_and_gives_the_same_numbers() {
+    use strata_workshop::model::{BaseDtype, Ctx, LlamaModel, LoopSpec};
+    let root = temp_dir("regress-nograd");
+    let (base, looped) = (root.join("model"), root.join("looped"));
+    chat_model(&base);
+    strata_workshop::model::make_looped(&base, &looped, LoopSpec { start: 1, end: 2, passes: 2 }).unwrap();
+    let m = LlamaModel::load(&looped, BaseDtype::F32, &candle_core::Device::Cpu).unwrap();
+    let tokens: Vec<u32> = (0..40u32).map(|i| (i * 7 + 3) % 30).collect();
+    let h = m.lower(&tokens).unwrap();
+    assert!(m.upper_hidden(&h, &Ctx::eval()).unwrap().track_op(), "the plain evaluation records the gate's graph");
+    let inf = m.upper_hidden(&h, &Ctx::inference()).unwrap();
+    assert!(!inf.track_op(), "inference records nothing");
+    let sup: Vec<bool> = (0..tokens.len()).map(|i| i > 10).collect();
+    let a = m.loss(&tokens, &sup, &Ctx::eval()).unwrap().to_scalar::<f32>().unwrap();
+    let b = m.loss(&tokens, &sup, &Ctx::inference()).unwrap().to_scalar::<f32>().unwrap();
+    assert!((a - b).abs() < 1e-5, "{a} vs {b}");
+    // 700 tokens: inference attends in chunks (above 512), the evaluation with a whole table (up to 2,048)
+    let long: Vec<u32> = (0..700u32).map(|i| (i * 7 + 3) % 30).collect();
+    let sup: Vec<bool> = (0..long.len()).map(|i| i > 10).collect();
+    let (a, c) = (m.loss(&long, &sup, &Ctx::eval()).unwrap().to_scalar::<f32>().unwrap(), m.loss(&long, &sup, &Ctx::inference()).unwrap().to_scalar::<f32>().unwrap());
+    assert!((a - c).abs() < 1e-4, "chunked {c} vs a table {a}");
+}
+
+/// The memory estimate of an inference run: the looped Qwen3-8B in bf16 over two 16 GB cards fits with room at 4,096
+/// tokens, and a single card is refused before anything loads.
+#[test]
+fn the_inference_estimate_splits_the_weights_and_refuses_what_cannot_fit() {
+    use strata_workshop::model::{BaseDtype, ModelConfig};
+    let cfg = ModelConfig::from_json(&json!({"architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": 4096, "intermediate_size": 12288,
+        "num_hidden_layers": 36, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "vocab_size": 151936, "rms_norm_eps": 1e-6,
+        "rope_theta": 1000000, "max_position_embeddings": 40960, "tie_word_embeddings": false, "prastara_loop": {"start": 12, "end": 24, "passes": 2}})).unwrap();
+    let two = strata_workshop::profile::inference_bytes(&cfg, BaseDtype::BF16, 2, 4096 + 48, 0);
+    eprintln!("per card: {:?} GB", two.iter().map(|b| *b as f64 / 1e9).collect::<Vec<_>>());
+    assert_eq!(two.len(), 2);
+    assert!(two.iter().all(|b| *b > 8_000_000_000 && *b < 12_500_000_000), "{two:?}");
+    let one = strata_workshop::profile::inference_bytes(&cfg, BaseDtype::BF16, 1, 4096, 0);
+    assert!(one[0] > 16_500_000_000, "{one:?}");
+}

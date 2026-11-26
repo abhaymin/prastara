@@ -577,7 +577,7 @@ impl Runner {
         for i in 0..self.data.eval.len() {
             let ex = self.data.eval[i].clone();
             let h = self.hidden(&ex)?;
-            sum += self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &Ctx::eval())?.to_scalar::<f32>()? as f64;
+            sum += self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &Ctx::inference())?.to_scalar::<f32>()? as f64;
         }
         Ok(Some(sum / self.data.eval.len() as f64))
     }

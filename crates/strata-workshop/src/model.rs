@@ -900,6 +900,11 @@ pub struct Linear {
 pub struct Ctx {
     pub train: bool,
     pub seed: u64,
+    /// plain inference (regression runs, sampling, validation): the trained variables (adapters, routers, loop gates)
+    /// are read detached, so nothing is recorded for a backward pass, and attention goes a chunk of queries at a time
+    /// above [`ATTENTION_CHUNK`] tokens. Without it a loop gate (a `Var`) made every block after the loop record its
+    /// graph, attention tables included: the first GPU regression run of the looped Qwen3-8B ran out of memory on it.
+    pub no_grad: bool,
     calls: Cell<u64>,
     /// each MoE block's load-balancing loss of this pass (training only), summed into the loss by `loss_from_hidden`
     aux: RefCell<Vec<Tensor>>,
@@ -910,6 +915,14 @@ pub struct Ctx {
 impl Ctx {
     pub fn eval() -> Self {
         Self::default()
+    }
+    /// Inference with nothing recorded for a backward pass (see [`Ctx::no_grad`]).
+    pub fn inference() -> Self {
+        Self { no_grad: true, ..Self::default() }
+    }
+    /// A trained variable as this pass reads it: detached under [`Ctx::no_grad`].
+    fn var(&self, v: &Var) -> Tensor {
+        if self.no_grad { v.as_tensor().detach() } else { v.as_tensor().clone() }
     }
     pub fn train(seed: u64) -> Self {
         Self { train: true, seed, ..Self::default() }
@@ -985,7 +998,7 @@ fn lora_delta(l: &Lora, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
     } else {
         x.clone()
     };
-    Ok((x.matmul(&l.a.as_tensor().t()?)?.matmul(&l.b.as_tensor().t()?)? * l.scaling)?)
+    Ok((x.matmul(&ctx.var(&l.a).t()?)?.matmul(&ctx.var(&l.b).t()?)? * l.scaling)?)
 }
 
 /// An upcycled block's feed-forward: the router and each expert's adapters on gate, up and down; the experts share
@@ -1018,7 +1031,7 @@ fn top_k_rows(probs: &[Vec<f32>], k: usize) -> Vec<Vec<usize>> {
 fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result<Tensor> {
     let (seq, hid) = h.dims2()?;
     let (n_exp, k, dev) = (m.experts.len(), m.top_k, h.device().clone());
-    let probs = candle_nn::ops::softmax(&h.matmul(&m.router.as_tensor().t()?)?, D::Minus1)?;
+    let probs = candle_nn::ops::softmax(&h.matmul(&ctx.var(&m.router).t()?)?, D::Minus1)?;
     let chosen = top_k_rows(&probs.detach().to_device(&Device::Cpu)?.to_vec2::<f32>()?, k);
     let (base_g, base_u) = (block.lin[4].forward(h, ctx)?, block.lin[5].forward(h, ctx)?);
     let mut outs = Vec::new();
@@ -1208,6 +1221,16 @@ pub struct LlamaModel {
 type CkptGrads = std::sync::Arc<Mutex<Vec<(Var, Tensor)>>>;
 
 /// The weight files of a model folder, in order: `model.safetensors`, or the `model-0000i-of-0000n` shards.
+/// Which of `devices` each block goes on: the first device holds the embeddings and the last the output head (its
+/// loss is sliced, so no full logits). With an untied head the two ends weigh the same and the blocks split evenly; a
+/// tied head is the embedding matrix on the first device, so the first device takes that many blocks' worth fewer.
+pub fn block_devices(cfg: &ModelConfig, devices: usize) -> Vec<usize> {
+    let (n, d) = (cfg.num_hidden_layers.max(1), devices.max(1));
+    let block = (cfg.block_params() - cfg.block_small_params()).max(1) as f64;
+    let extra = if d > 1 && cfg.tie_word_embeddings { ((cfg.vocab_size * cfg.hidden_size) as f64 / block).round() as usize } else { 0 };
+    (0..n).map(|i| ((i + extra) * d / (n + extra)).min(d - 1)).collect()
+}
+
 pub fn weight_files(dir: &Path) -> Result<Vec<PathBuf>> {
     let single = dir.join("model.safetensors");
     if single.exists() {
@@ -1280,12 +1303,7 @@ impl LlamaModel {
         // the first device holds the embeddings and the last the output head (its loss is sliced, so no full logits):
         // with an untied head the two ends weigh the same and the blocks split evenly; a tied head is the embedding
         // matrix on the first device, so the first device takes that many blocks' worth fewer
-        let block_dev: Vec<usize> = {
-            let (n, d) = (cfg.num_hidden_layers.max(1), devs.len());
-            let block = (cfg.block_params() - cfg.block_small_params()).max(1) as f64;
-            let extra = if d > 1 && cfg.tie_word_embeddings { ((cfg.vocab_size * cfg.hidden_size) as f64 / block).round() as usize } else { 0 };
-            (0..n).map(|i| ((i + extra) * d / (n + extra)).min(d - 1)).collect()
-        };
+        let block_dev = block_devices(&cfg, devs.len());
         let files = weight_files(dir)?;
         // mapped, not read: each tensor is copied out (and narrowed to the base dtype) one at a time
         let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files) }.with_context(|| format!("{}", dir.display()))?;
@@ -1660,7 +1678,7 @@ impl LlamaModel {
     }
 
     fn block_forward(&self, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
-        if self.checkpoint && x.track_op() || self.checkpoint && block.has_lora() {
+        if !ctx.no_grad && (self.checkpoint && x.track_op() || self.checkpoint && block.has_lora()) {
             return checkpointed(&self.cfg, block, x, rope, mask, ctx, &self.ckpt_grads);
         }
         block_forward(&self.cfg, block, x, rope, mask, ctx)
@@ -1740,7 +1758,10 @@ impl LlamaModel {
         }
         // the rotary tables and the mask, once per device the blocks sit on
         // (rope, the causal mask, the sliding layers' mask when there are any) per device
-        let long = seq > CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed);
+        // inference has no backward pass to keep a table for: chunks of queries above one chunk's length, so a
+        // 4,096-token prompt holds [heads, 512, keys] at a time instead of [heads, seq, seq] (2 GB on Qwen3-8B)
+        let above = if ctx.no_grad { ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed) } else { CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed) };
+        let long = seq > above;
         let mut per_dev: Vec<Option<((Tensor, Tensor), Mask, Option<Mask>)>> = vec![None; self.devs.len()];
         for i in range.clone() {
             let d = self.block_dev[i];
@@ -1790,7 +1811,7 @@ impl LlamaModel {
                             }
                         }
                         let y = move_to(&y, x.device())?;
-                        x = (&x + (y - &x)?.broadcast_mul(g.as_tensor())?)?;
+                        x = (&x + (y - &x)?.broadcast_mul(&ctx.var(g))?)?;
                     }
                 }
                 _ => {}
@@ -1817,7 +1838,7 @@ impl LlamaModel {
 
     /// Run `h` through the blocks in `range` as plain inference (they must carry no adapter); the result is detached.
     pub fn frozen_blocks(&self, h: &Tensor, range: std::ops::Range<usize>) -> Result<Tensor> {
-        Ok(self.run_blocks(h.clone(), range, &Ctx::eval())?.detach())
+        Ok(self.run_blocks(h.clone(), range, &Ctx::inference())?.detach())
     }
 
     /// The residual stream at the last token after every block, and after every block of each extra loop pass, in the
@@ -1830,7 +1851,7 @@ impl LlamaModel {
             out.push((b, p, x.get(last)?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.detach()));
             Ok(())
         };
-        self.run_blocks_seen(self.embed_tokens(tokens)?, 0..self.cfg.num_hidden_layers, &Ctx::eval(), Some(&mut keep))?;
+        self.run_blocks_seen(self.embed_tokens(tokens)?, 0..self.cfg.num_hidden_layers, &Ctx::inference(), Some(&mut keep))?;
         Ok(out)
     }
 
@@ -1844,7 +1865,7 @@ impl LlamaModel {
     pub fn head(&self, h: &Tensor) -> Result<Tensor> {
         let w = self.lm_head.as_ref().or(self.embed.as_ref()).ok_or_else(|| anyhow!("no output head in memory"))?.clone();
         let h = move_to(h, w.device())?;
-        Linear { w, bias: None, lora: None }.forward(&h, &Ctx::eval())
+        Linear { w, bias: None, lora: None }.forward(&h, &Ctx::inference())
     }
 
     /// From the cached hidden state to logits `[seq, vocab]`.

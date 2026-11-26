@@ -343,7 +343,7 @@ pub fn greedy(model: &LlamaModel, prompt: &[u32], max_new: usize, stop: &[u32]) 
     let mut seq = prompt.to_vec();
     let mut out = Vec::new();
     for _ in 0..max_new {
-        let h = model.upper_hidden(&model.lower(&seq)?, &Ctx::eval())?;
+        let h = model.upper_hidden(&model.lower(&seq)?, &Ctx::inference())?;
         let last = h.narrow(0, seq.len() - 1, 1)?;
         let logits = model.head(&last)?.squeeze(0)?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
         let next = logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).map(|(i, _)| i as u32).unwrap_or(0);
@@ -364,7 +364,7 @@ pub fn answer_loss(model: &LlamaModel, prompt: &[u32], answer: &[u32]) -> Result
     let mut tokens = prompt.to_vec();
     tokens.extend_from_slice(answer);
     let supervised: Vec<bool> = (0..tokens.len()).map(|i| i >= prompt.len()).collect();
-    Ok(Some(model.loss(&tokens, &supervised, &Ctx::eval())?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64))
+    Ok(Some(model.loss(&tokens, &supervised, &Ctx::inference())?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64))
 }
 
 /// The prompts of a file: one per line, blank lines skipped.

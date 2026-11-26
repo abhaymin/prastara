@@ -286,6 +286,9 @@ enum Cmd {
         /// the model that judges (any the server lists); default the suite's judge_model, else the loaded one
         #[arg(long)]
         judge_model: Option<String>,
+        /// run even when the memory estimate says a device is too small
+        #[arg(long)]
+        force: bool,
     },
     /// training by grading, in rounds: N sampled answers per prompt, graded (code: run with its tests; judge: 1-5
     /// through the server's API), the best of each prompt fine-tuned on, the suite run, and the adapter promoted only
@@ -1004,7 +1007,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             Ok((r.out, "gguf".into(), json!({"experts": r.moe.experts, "top_k": r.moe.top_k, "total_parameters": r.total_params,
                                               "active_parameters": r.active_params, "trained_blocks": r.trained_blocks})))
         }
-        Cmd::Regress { model, adapter, passes, suite, out: dst, against, devices, base_dtype, max_prompt_tokens, judge_model } => {
+        Cmd::Regress { model, adapter, passes, suite, out: dst, against, devices, base_dtype, max_prompt_tokens, judge_model, force } => {
             use strata_workshop::regress;
             out.event(json!({"event": "start", "what": format!("the suite {} on {}{} into {}", suite.display(), model.display(),
                 adapter.as_ref().map_or(String::new(), |a| format!(" with {}", a.display())), dst.display())}));
@@ -1015,6 +1018,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             o.devices = devices.clone();
             o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
             o.max_prompt_tokens = *max_prompt_tokens;
+            o.force = *force;
             let s = regress::Suite::load(suite).map_err(|e| format!("{e:#}"))?;
             let judge = judge_for(&s, judge_model.as_deref(), out);
             install_term_handler();
