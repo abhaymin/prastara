@@ -510,11 +510,15 @@ fn every_route_answers_each_caller_as_its_row_says() {
 fn every_workshop_job_kind_answers_each_caller_as_its_row_says() {
     let s = Server::start(&[client_model(json!({}))], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": "/nonexistent/am2strata-workshop"}}));
     // (kind, the owner's minimal body, what it is refused for)
-    let rows: [(&str, &str, &str); 4] = [
+    let rows: [(&str, &str, &str); 8] = [
         ("upcycle", r#"{"kind": "upcycle", "input": "/nope/model"}"#, "no such folder"),
         ("upcycle", r#"{"kind": "upcycle", "input": "/nope/model", "experts": "ten", "top_k": []}"#, "wrongly typed shape"),
         ("export-moe", r#"{"kind": "export-moe", "input": "/nope/upcycled"}"#, "no such folder"),
         ("export-moe", r#"{"kind": "export-moe", "input": 5, "adapter": {}, "type": 3}"#, "wrongly typed fields"),
+        ("regress", r#"{"kind": "regress", "model": "/nope/model", "suite": "/nope/suite.json"}"#, "no such model or suite"),
+        ("regress", r#"{"kind": "regress", "model": 5, "suite": [], "passes": {}, "against": 3, "adapter": 1}"#, "wrongly typed fields"),
+        ("grade-train", r#"{"kind": "grade-train", "model": "/nope/model", "suite": "/nope/suite.json", "data": "/nope/p.jsonl"}"#, "no such model, suite or prompts"),
+        ("grade-train", r#"{"kind": "grade-train", "model": [], "data": 4, "samples": "many", "rounds": -1, "grader": 2}"#, "wrongly typed fields"),
     ];
     let mut wrong = vec![];
     for (kind, body, why) in rows {

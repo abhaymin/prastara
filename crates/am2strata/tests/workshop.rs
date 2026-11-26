@@ -250,6 +250,24 @@ if [ "$1" = "--json" ] && { [ "$2" = "upcycle" ] || [ "$2" = "export-moe" ]; }; 
   fi
   exit 0
 fi
+if [ "$1" = "--json" ] && { [ "$2" = "regress" ] || [ "$2" = "grade-train" ]; }; then
+  echo "$@" > "$here/$2-args.txt"
+  printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/$2-env.txt"
+  out=""; prev=""
+  for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
+  mkdir -p "$out"
+  echo "{\"event\":\"start\",\"what\":\"$2\"}"
+  if [ "$2" = "regress" ]; then
+    echo '{"results":[],"regressions":[]}' > "$out/report.json"
+    echo '{"event":"progress","done":1,"total":2,"message":"humaneval at 1 pass"}'
+    echo "{\"event\":\"done\",\"output\":\"$out/report.json\",\"kind\":\"report\",\"regressions\":[{\"test\":\"humaneval\",\"passes\":2,\"delta\":-0.2}],\"report\":{\"results\":[{\"test\":\"humaneval\",\"passes\":2,\"metric\":\"pass@1\",\"value\":0.3}],\"regressions\":[{\"test\":\"humaneval\",\"passes\":2}]},\"bytes\":10,\"seconds\":0.1}"
+  else
+    echo '{"round":1,"promoted":true}' > "$out/rounds.jsonl"
+    echo '{"event":"progress","done":1,"total":2,"step":1,"loss":2.5,"message":"round 1: training, loss 2.5"}'
+    echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"grade-train\",\"promoted\":\"$out/round-1/adapter\",\"rounds\":[{\"round\":1,\"kept\":3,\"regressions\":0,\"promoted\":true}],\"bytes\":10,\"seconds\":0.1}"
+  fi
+  exit 0
+fi
 if [ "$1" = "--json" ] && [ "$2" = "abliterate" ]; then
   echo "$@" > "$here/abliterate-args.txt"
   out=""; prev=""
@@ -670,5 +688,100 @@ fn upcycle_and_export_moe_jobs_check_their_inputs() {
     assert_eq!(u["moe"], json!({"experts": 4, "top_k": 2}));
     let d = hf.iter().find(|x| x["path"].as_str().unwrap().ends_with("tiny-dense")).unwrap();
     assert_eq!((d["dims"]["hidden"].as_u64(), d["dims"]["layers"].as_u64()), (Some(32), Some(4)));
+    let _ = std::fs::remove_dir_all(&tools);
+}
+
+/// Regression runs and grade-and-train from the Workshop (plan Part G): the model, adapter, suite (and every data file
+/// it names), earlier reports and prompts must be inside the Workshop's folders; passes, devices and the numbers are
+/// checked; the command gets the server's address and key in its environment (for the judge); the report card and the
+/// rounds come back as the job's result.
+#[cfg(unix)]
+#[test]
+fn regress_and_grade_train_jobs_check_their_inputs_and_carry_their_report() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-regress-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let ws = s.dir.join("workshop");
+    let model = ws.join("tiny-model");
+    std::fs::create_dir_all(&model).unwrap();
+    for f in ["config.json", "tokenizer.json"] {
+        std::fs::write(model.join(f), "{}").unwrap();
+    }
+    std::fs::write(model.join("model.safetensors"), "x").unwrap();
+    let ad = ws.join("tiny-adapter");
+    std::fs::create_dir_all(&ad).unwrap();
+    std::fs::write(ad.join("adapter_config.json"), r#"{"r": 8}"#).unwrap();
+    let suites = ws.join("suites");
+    std::fs::create_dir_all(&suites).unwrap();
+    std::fs::write(suites.join("heldout.jsonl"), "{}\n").unwrap();
+    let suite = suites.join("core.json");
+    std::fs::write(&suite, r#"{"tests": [{"name": "held-out", "kind": "loss", "data": "heldout.jsonl"}]}"#).unwrap();
+    let leaky = suites.join("leaky.json");
+    std::fs::write(&leaky, r#"{"tests": [{"name": "x", "kind": "loss", "data": "/etc/passwd"}]}"#).unwrap();
+    let missing = suites.join("missing.json");
+    std::fs::write(&missing, r#"{"tests": [{"name": "x", "kind": "loss", "data": "nope.jsonl"}]}"#).unwrap();
+    let empty = suites.join("empty.json");
+    std::fs::write(&empty, r#"{"tests": []}"#).unwrap();
+    let prompts = ws.join("datasets").join("prompts.jsonl");
+    std::fs::create_dir_all(prompts.parent().unwrap()).unwrap();
+    std::fs::write(&prompts, "{\"prompt\": \"x\"}\n").unwrap();
+    for (bad, why) in [
+        (json!({"kind": "regress", "suite": suite}), "no model"),
+        (json!({"kind": "regress", "model": model}), "no suite"),
+        (json!({"kind": "regress", "model": "/etc", "suite": suite}), "a model outside"),
+        (json!({"kind": "regress", "model": model, "suite": leaky}), "a suite that reads outside the Workshop"),
+        (json!({"kind": "regress", "model": model, "suite": missing}), "a suite whose data is missing"),
+        (json!({"kind": "regress", "model": model, "suite": empty}), "a suite without tests"),
+        (json!({"kind": "regress", "model": model, "suite": prompts}), "a suite that is not .json"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "adapter": model}), "an adapter that is no adapter"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "passes": [0]}), "0 passes"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "passes": "1,x"}), "passes that are no numbers"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "passes": {}}), "passes of the wrong type"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "devices": "gpu"}), "bad devices"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "against": "/etc/passwd"}), "a report outside"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "against": [5]}), "a report that is no path"),
+        (json!({"kind": "regress", "model": model, "suite": suite, "output": "/tmp/r"}), "an output outside"),
+        (json!({"kind": "grade-train", "model": model, "suite": suite}), "no prompts"),
+        (json!({"kind": "grade-train", "model": model, "suite": suite, "data": prompts, "grader": "vibes"}), "an unknown grader"),
+        (json!({"kind": "grade-train", "model": model, "suite": suite, "data": prompts, "samples": 0}), "no samples"),
+        (json!({"kind": "grade-train", "model": model, "suite": suite, "data": prompts, "rounds": 100}), "too many rounds"),
+        (json!({"kind": "grade-train", "model": model, "suite": suite, "data": prompts, "temperature": "hot"}), "a temperature that is no number"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+        assert!(e["error"]["message"].is_string(), "{why}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "regress", "model": model, "adapter": ad, "suite": suite, "passes": [1, 2]}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let out = done["result"]["output"].as_str().unwrap().to_string();
+    assert!(out.ends_with("/workshop/reports/tiny-model-tiny-adapter/report.json"), "{out}");
+    assert_eq!(done["result"]["regressions"][0]["test"], "humaneval", "the regressions come back: {done}");
+    assert_eq!(done["result"]["report"]["results"][0]["metric"], "pass@1");
+    let args = std::fs::read_to_string(tools.join("regress-args.txt")).unwrap();
+    assert!(args.contains(&format!("--adapter {}", ad.display())) && args.contains("--passes 1,2") && args.contains(&format!("--suite {}", suite.display())), "{args}");
+    let env = std::fs::read_to_string(tools.join("regress-env.txt")).unwrap();
+    assert!(env.starts_with("http://127.0.0.1:"), "the judge's server comes in the environment: {env}");
+    // a second run against the first, from its folder
+    let first = std::path::Path::new(&out).parent().unwrap().to_path_buf();
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "regress", "model": model, "suite": suite, "against": first, "passes": "2"}));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("regress-args.txt")).unwrap();
+    assert!(args.contains(&format!("--against {}", first.join("report.json").display())) && args.contains("--passes 2"), "{args}");
+    let (_, f) = s.get("/v1/workshop/files", true);
+    assert!(f["suites"].as_array().unwrap().iter().any(|x| x["path"].as_str().unwrap().ends_with("core.json")), "{f}");
+    assert!(f["reports"].as_array().unwrap().iter().any(|x| x["path"].as_str().unwrap().ends_with("tiny-model-tiny-adapter")), "{f}");
+
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "grade-train", "model": model, "suite": suite, "data": prompts, "samples": 4, "rounds": 2,
+                                                         "grader": "judge", "temperature": 0.7, "max_steps": 10}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(done["result"]["output"].as_str().unwrap().ends_with("/workshop/grade-train/tiny-model-prompts"), "{done}");
+    assert_eq!(done["result"]["rounds"][0]["promoted"], true);
+    assert!(done["points"].as_array().unwrap().iter().any(|p| p["loss"] == 2.5), "the training loss is kept for the curve");
+    let args = std::fs::read_to_string(tools.join("grade-train-args.txt")).unwrap();
+    assert!(args.contains("--samples 4") && args.contains("--rounds 2") && args.contains("--grader judge") && args.contains("--temperature 0.7")
+            && args.contains("--max-steps 10") && args.contains(&format!("--data {}", prompts.display())), "{args}");
     let _ = std::fs::remove_dir_all(&tools);
 }

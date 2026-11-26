@@ -1016,7 +1016,12 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             if !out.json {
                 print!("{}", regress::report_markdown(&r.json));
             }
-            Ok((dst.join("report.json"), "report".into(), json!({"regressions": r.json["regressions"], "results": r.results.len(),
+            // the report card without its per-item scores (those stay in report.json), for the job's result
+            let mut card = r.json.clone();
+            for t in card["results"].as_array_mut().into_iter().flatten() {
+                if let Some(o) = t.as_object_mut() { o.remove("items"); }
+            }
+            Ok((dst.join("report.json"), "report".into(), json!({"regressions": r.json["regressions"], "results": r.results.len(), "report": card,
                 "summary": r.results.iter().map(|t| json!({"test": t.test, "passes": t.passes, "metric": t.metric, "value": t.value, "n": t.items.len(), "error": t.error})).collect::<Vec<_>>()})))
         }
         Cmd::GradeTrain { model, adapter, data, samples, grader, rounds, suite, out: dst, temperature, top_p, max_tokens, min_score, seed, passes, devices, base_dtype,

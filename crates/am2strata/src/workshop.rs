@@ -28,6 +28,15 @@
 //!     `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?, `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`?, `"model"`? (the one to write with; default the loaded one) — training data written by the
 //!     loaded model, through this server's own chat API (its address and key reach the command in its environment,
 //!     never on its command line)
+//!   - regress: `"model"` (an HF model folder), `"adapter"`? (an adapter folder), `"suite"` (a suite .json whose data
+//!     files must be inside the Workshop's folders too), `"passes"`? ([1, 2] or "1,2": a looped model at each),
+//!     `"against"`? (earlier reports, paths or a list), `"devices"`?, `"max_prompt_tokens"`?, `"judge_model"`?,
+//!     `"output"`? (a folder; default `reports/<model>[-<adapter>]`) — the regression suite: report.json, report.md and
+//!     a regressions list (a GPU run takes the GPUs as training does)
+//!   - grade-train: `"model"`, `"adapter"`?, `"data"` (prompts, .jsonl), `"grader"`? (code | judge), `"samples"`?,
+//!     `"rounds"`?, `"suite"`, `"temperature"`?, `"max_tokens"`?, `"min_score"`?, `"lr"`?, `"epochs"`?, `"max_steps"`?,
+//!     `"rank"`?, `"passes"`?, `"devices"`?, `"output"`? (a folder; default `grade-train/<model>-<data>`) — rounds of
+//!     sampling, grading, best-of-N fine-tuning and the suite, promoting an adapter only when nothing regressed
 //! - `POST /v1/workshop/uploads?name=notes.pdf` (the file as the body) saves a document into `<data>/workshop/uploads`.
 //! - `GET /v1/workshop/dataset?path=…&offset=&limit=` pages through a dataset's records (with its card);
 //!   `POST /v1/workshop/dataset` `{"path", "remove": [i, …], "replace": {"i": record}}` edits it in place.
@@ -53,7 +62,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 10] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen"];
+const KINDS: [&str; 12] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen", "regress", "grade-train"];
 
 /// What `export-moe` writes as: the converter's two float types and the quantizer's.
 const EXPORT_TYPES: [&str; 7] = ["q4_k", "q8_0", "q6_k", "q5_k", "q4_0", "f16", "f32"];
@@ -634,6 +643,114 @@ impl Workshop {
                 }
                 Ok((kind.into(), args, output))
             }
+            "regress" | "grade-train" => {
+                let model = self.allowed(s("model").ok_or_else(|| format!("{kind} needs \"model\": a Hugging Face model folder"))?, true)?;
+                if !model.join("config.json").exists() || !model.join("tokenizer.json").exists() {
+                    return Err(format!("{} needs config.json and tokenizer.json: {kind} takes a Hugging Face model folder", model.display()));
+                }
+                let suite = self.suite_path(s("suite").ok_or_else(|| format!("{kind} needs \"suite\": a suite .json listing the tests"))?)?;
+                let mut args = vec![kind.to_string(), "--model".into(), model.display().to_string(), "--suite".into(), suite.display().to_string()];
+                let adapter = match &req["adapter"] {
+                    Value::Null => None,
+                    Value::String(a) if a.is_empty() => None,
+                    Value::String(a) => {
+                        let a = self.allowed(a, true)?;
+                        if !a.join("adapter_config.json").exists() {
+                            return Err(format!("{} has no adapter_config.json: \"adapter\" is a LoRA adapter folder", a.display()));
+                        }
+                        args.extend(["--adapter".into(), a.display().to_string()]);
+                        Some(a)
+                    }
+                    _ => return Err("\"adapter\" is the path of an adapter folder".into()),
+                };
+                let passes: Vec<u64> = match &req["passes"] {
+                    Value::Null => vec![],
+                    Value::String(t) if t.trim().is_empty() => vec![],
+                    Value::String(t) => t.split(',').map(|x| x.trim().parse::<u64>().map_err(|_| "\"passes\" is a list of pass counts, e.g. [1, 2] or \"1,2\"".to_string())).collect::<Result<_, _>>()?,
+                    Value::Array(a) => a.iter().map(|x| x.as_u64().ok_or("\"passes\" is a list of pass counts, e.g. [1, 2]".to_string())).collect::<Result<_, _>>()?,
+                    _ => return Err("\"passes\" is a list of pass counts, e.g. [1, 2]".into()),
+                };
+                if passes.iter().any(|p| !(1..=16).contains(p)) || passes.len() > 16 {
+                    return Err("\"passes\": each pass count is 1 to 16".into());
+                }
+                if !passes.is_empty() {
+                    args.extend(["--passes".into(), passes.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(",")]);
+                }
+                let devices = s("devices").unwrap_or("cpu");
+                let ok = devices == "cpu" || devices.split(',').all(|d| d.strip_prefix("cuda:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())));
+                if !ok {
+                    return Err(format!("\"devices\" is cpu, cuda:0 or cuda:0,cuda:1 (got {devices:?})"));
+                }
+                if devices != "cpu" {
+                    args.extend(["--devices".into(), devices.into()]);
+                }
+                let num = |k: &str, lo: f64, hi: f64| -> Result<Option<f64>, String> {
+                    match &req[k] {
+                        Value::Null => Ok(None),
+                        v => v.as_f64().filter(|n| (lo..=hi).contains(n)).map(Some).ok_or_else(|| format!("\"{k}\" is a number from {lo} to {hi}")),
+                    }
+                };
+                if let Some(n) = num("max_prompt_tokens", 16.0, 1_048_576.0)? {
+                    args.extend(["--max-prompt-tokens".into(), (n as u64).to_string()]);
+                }
+                if let Some(m) = s("judge_model") {
+                    if m.len() > 200 || m.chars().any(|c| c.is_control()) {
+                        return Err("\"judge_model\" is a model name".into());
+                    }
+                    args.extend(["--judge-model".into(), m.into()]);
+                }
+                let stem = |p: &Path| p.file_name().and_then(|x| x.to_str()).unwrap_or("model").to_string();
+                if kind == "regress" {
+                    let against: Vec<&str> = match &req["against"] {
+                        Value::Null => vec![],
+                        Value::String(a) if a.is_empty() => vec![],
+                        Value::String(a) => vec![a.as_str()],
+                        Value::Array(a) => a.iter().map(|x| x.as_str().ok_or("\"against\" is a report path or a list of them")).collect::<Result<_, _>>()?,
+                        _ => return Err("\"against\" is a report path or a list of them".into()),
+                    };
+                    for a in against {
+                        let p = self.allowed(a, true)?;
+                        let f = if p.is_dir() { p.join("report.json") } else { p.clone() };
+                        if !f.is_file() {
+                            return Err(format!("{}: \"against\" is an earlier report (report.json or its folder)", p.display()));
+                        }
+                        args.extend(["--against".into(), f.display().to_string()]);
+                    }
+                    let output = match s("output") {
+                        Some(o) => self.allowed(o, false)?,
+                        None => Self::fresh(&self.out_dir.join("reports"), &format!("{}{}", stem(&model), adapter.as_ref().map_or(String::new(), |a| format!("-{}", stem(a)))), ""),
+                    };
+                    if output.join("report.json").exists() {
+                        return Err(format!("{} already holds a report", output.display()));
+                    }
+                    args.extend(["--out".into(), output.display().to_string()]);
+                    return Ok((kind.into(), args, output));
+                }
+                let data = self.dataset_path(s("data").ok_or("grade-train needs \"data\": the prompts, a .jsonl")?)?;
+                args.extend(["--data".into(), data.display().to_string()]);
+                let grader = s("grader").unwrap_or("code");
+                if !["code", "judge"].contains(&grader) {
+                    return Err("\"grader\" is code or judge".into());
+                }
+                args.extend(["--grader".into(), grader.into()]);
+                for (k, flag, lo, hi, int) in [("samples", "--samples", 1.0, 64.0, true), ("rounds", "--rounds", 1.0, 20.0, true), ("temperature", "--temperature", 0.0, 2.0, false),
+                                               ("max_tokens", "--max-tokens", 1.0, 32768.0, true), ("min_score", "--min-score", 1.0, 5.0, true), ("lr", "--lr", 1e-8, 1.0, false),
+                                               ("epochs", "--epochs", 0.01, 100.0, false), ("max_steps", "--max-steps", 1.0, 10_000_000.0, true), ("rank", "--rank", 1.0, 512.0, true),
+                                               ("train_layers", "--train-layers", 1.0, 1024.0, true), ("max_len", "--max-len", 16.0, 1_048_576.0, true)] {
+                    if let Some(n) = num(k, lo, hi)? {
+                        args.extend([flag.into(), if int { (n as u64).to_string() } else { n.to_string() }]);
+                    }
+                }
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => Self::fresh(&self.out_dir.join("grade-train"), &format!("{}-{}", stem(&model), data.file_stem().and_then(|x| x.to_str()).unwrap_or("prompts")), ""),
+                };
+                if output.join("rounds.jsonl").exists() {
+                    return Err(format!("{} already holds a grade-and-train run", output.display()));
+                }
+                args.extend(["--out".into(), output.display().to_string()]);
+                Ok((kind.into(), args, output))
+            }
             other => Err(format!("unknown kind {other:?}: {}", KINDS.join(", "))),
         }
     }
@@ -696,7 +813,7 @@ impl Workshop {
         // a training run on the GPUs takes them from the chat model, the way a media job does: it waits its turn in the
         // queue, the model is unloaded, chats wait until the run ends, and the model that was loaded comes back after
         let mut lease = None;
-        if matches!(job.kind.as_str(), "train" | "abliterate") && Self::train_on_gpu(&job.request) {
+        if matches!(job.kind.as_str(), "train" | "abliterate" | "regress" | "grade-train") && Self::train_on_gpu(&job.request) {
             let mgr = self.mgr.lock().unwrap().clone();
             if let Some(m) = mgr {
                 let before = m.queue.resident();
@@ -719,7 +836,8 @@ impl Workshop {
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
         // the server's address and key for a job that uses its API: in the environment, never on the command line
         cmd.env_remove("AM2STRATA_URL").env_remove("AM2STRATA_API_KEY");
-        if job.kind == "datagen" {
+        // datagen writes through the server's model; regress and grade-train ask it to judge
+        if matches!(job.kind.as_str(), "datagen" | "regress" | "grade-train") {
             if let Some((url, key)) = self.server.lock().unwrap().clone() {
                 cmd.env("AM2STRATA_URL", url);
                 if let Some(k) = key {
@@ -935,7 +1053,20 @@ impl Workshop {
         let mut prompts = listing(&self.out_dir.join("abliterate"), &txt);
         prompts.extend(listing(&self.out_dir.join("datasets"), &txt));
         prompts.extend(listing(&self.uploads_dir(), &txt));
-        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "datasets": datasets, "prompts": prompts, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+        // regression suites (the Workshop's suites folder, then datasets and uploads) and the reports written
+        let js = |p: &Path| p.extension().and_then(|x| x.to_str()) == Some("json");
+        let mut suites = listing(&self.out_dir.join("suites"), &js);
+        suites.extend(listing(&self.out_dir.join("datasets"), &js));
+        suites.extend(listing(&self.uploads_dir(), &js));
+        let mut reports: Vec<(u64, Value)> = std::fs::read_dir(self.out_dir.join("reports")).into_iter().flatten().flatten()
+            .filter(|e| e.path().join("report.json").is_file())
+            .map(|e| {
+                let t = e.path().join("report.json").metadata().ok().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
+                (t, json!({"path": e.path().display().to_string(), "modified": t}))
+            }).collect();
+        reports.sort_by(|a, b| b.0.cmp(&a.0));
+        let reports: Vec<Value> = reports.into_iter().map(|x| x.1).collect();
+        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "datasets": datasets, "prompts": prompts, "suites": suites, "reports": reports, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
                "output_folder": self.out_dir.display().to_string(), "installed": exe().is_some()})
     }
 }
@@ -1288,6 +1419,25 @@ pub async fn browse_get(State(s): State<AppState>, headers: HeaderMap,
 
 impl Workshop {
     /// A dataset the Workshop may read: a .jsonl inside its folders.
+    /// A regression suite: a .json inside the Workshop's folders whose tests' data files are inside them too (the
+    /// command reads them; the API must not let a suite reach anywhere else).
+    fn suite_path(&self, p: &str) -> Result<PathBuf, String> {
+        if !p.ends_with(".json") {
+            return Err("a suite is a .json file".into());
+        }
+        let path = self.allowed(p, true)?;
+        let v: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok())
+            .ok_or_else(|| format!("{}: not a JSON suite", path.display()))?;
+        let tests = v["tests"].as_array().filter(|t| !t.is_empty()).ok_or_else(|| format!("{}: the suite lists no \"tests\"", path.display()))?;
+        let base = path.parent().unwrap_or(Path::new("/"));
+        for t in tests {
+            let d = t["data"].as_str().filter(|d| !d.is_empty()).ok_or_else(|| format!("{}: a test without a \"data\" file", path.display()))?;
+            let full = if Path::new(d).is_absolute() { PathBuf::from(d) } else { base.join(d) };
+            self.allowed(&full.display().to_string(), true).map_err(|e| format!("the suite's test {}: {e}", t["name"].as_str().unwrap_or("?")))?;
+        }
+        Ok(path)
+    }
+
     fn dataset_path(&self, p: &str) -> Result<PathBuf, String> {
         if !p.ends_with(".jsonl") {
             return Err("a dataset is a .jsonl file".into());
