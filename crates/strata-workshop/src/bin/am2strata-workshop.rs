@@ -522,7 +522,12 @@ impl Out {
                 println!("  {}", v["message"].as_str().unwrap_or(""));
                 println!("{}", serde_json::to_string(&v["layers"]).unwrap_or_default());
             }
-            Some("check") => println!("  {} : {}", v["which"].as_str().unwrap_or(""), v["result"]),
+            Some("check") => {
+                let r = &v["result"];
+                let pct = |k: &str| format!("{:.0}%", r[k].as_f64().unwrap_or(0.0) * 100.0);
+                println!("  {}: refused {} of {} held-out harmful prompts and {} of the harmless; answer loss {}", v["which"].as_str().unwrap_or(""),
+                         pct("harmful_refusal_rate"), r["n"], pct("harmless_refusal_rate"), r["harmless_loss"].as_f64().map_or("-".into(), |l| format!("{l:.3}")));
+            }
             Some("profile") | Some("plan") | Some("find-lr") | Some("library") => {
                 for l in v["lines"].as_array().into_iter().flatten() {
                     println!("{}", l.as_str().unwrap_or(""));

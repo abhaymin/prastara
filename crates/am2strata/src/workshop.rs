@@ -9,6 +9,10 @@
 //!   - loop: `"input"` (an HF model folder), `"start"`, `"end"` (its blocks start..end), `"passes"`? (2-16, default 2),
 //!     `"output"`? (a folder) — a looped copy (Avarta): the core runs again behind gates that start closed, so the copy
 //!     is exactly its base until trained; convert carries the loop into the GGUF and the Rust engine runs it
+//!   - abliterate: `"input"` (an HF model folder), `"harmful"` and `"harmless"` (text files in Workshop folders, one
+//!     prompt per line), `"layer"`? (auto | N | "N:P"), `"scale"`? (0-2, default 1), `"check"`? (held-out prompts to
+//!     answer before and after), `"devices"`?, `"output"`? (a folder; default `<stem>-abliterated`) — the refusal
+//!     direction removed from every matrix that writes the residual stream; the copy is marked `prastara_private`
 //!   - strata: `"input"` (a .gguf), `"name"`?, `"display_name"`?, `"overwrite"`? — make it a model the server runs: the
 //!     same run config and tokenizer folder a downloaded model gets (strata-hub's config writer, which picks the engine
 //!     for the architecture and refuses one no engine runs), so it appears in the model list
@@ -43,7 +47,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 7] = ["convert", "quantize", "merge", "loop", "train", "strata", "datagen"];
+const KINDS: [&str; 8] = ["convert", "quantize", "merge", "loop", "abliterate", "train", "strata", "datagen"];
 
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -408,6 +412,58 @@ impl Workshop {
                 Ok((kind.into(), vec!["loop".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
                                       "--start".into(), start.to_string(), "--end".into(), end.to_string(), "--passes".into(), passes.to_string()], output))
             }
+            "abliterate" => {
+                let input = self.allowed(s("input").ok_or("abliterate needs \"input\": a Hugging Face model folder")?, true)?;
+                if !input.join("config.json").exists() || !input.join("tokenizer.json").exists() {
+                    return Err(format!("{} needs config.json and tokenizer.json: abliterate takes a Hugging Face model folder", input.display()));
+                }
+                let list = |k: &str, what: &str| -> Result<PathBuf, String> {
+                    let p = self.allowed(s(k).ok_or_else(|| format!("abliterate needs \"{k}\": a text file of {what} prompts, one per line"))?, true)?;
+                    if !p.is_file() {
+                        return Err(format!("{}: \"{k}\" is a text file, one prompt per line", p.display()));
+                    }
+                    Ok(p)
+                };
+                let (harmful, harmless) = (list("harmful", "refused")?, list("harmless", "ordinary")?);
+                let layer = match &req["layer"] {
+                    Value::Null => "auto".to_string(),
+                    Value::Number(n) => n.as_u64().ok_or("\"layer\" is auto, a block number, or N:P")?.to_string(),
+                    Value::String(t) if t.is_empty() || t == "auto" => "auto".to_string(),
+                    Value::String(t) => {
+                        let ok = t.split(':').count() <= 2 && t.split(':').all(|x| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit()));
+                        if !ok { return Err("\"layer\" is auto, a block number, or N:P (block N in loop pass P)".into()); }
+                        t.clone()
+                    }
+                    _ => return Err("\"layer\" is auto, a block number, or N:P".into()),
+                };
+                let scale = match &req["scale"] {
+                    Value::Null => 1.0,
+                    v => v.as_f64().filter(|x| *x > 0.0 && *x <= 2.0).ok_or("\"scale\" is a number above 0, at most 2 (1 removes the direction)")?,
+                };
+                let check = match &req["check"] {
+                    Value::Null => 0,
+                    v => v.as_u64().filter(|n| *n <= 256).ok_or("\"check\" is a whole number of held-out prompts, 0 to 256")?,
+                };
+                let devices = s("devices").unwrap_or("cpu");
+                let ok = devices == "cpu" || devices.split(',').all(|d| d.strip_prefix("cuda:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())));
+                if !ok {
+                    return Err(format!("\"devices\" is cpu, cuda:0 or cuda:0,cuda:1 (got {devices:?})"));
+                }
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => Self::fresh(&self.out_dir, &format!("{}-abliterated", input.file_name().and_then(|x| x.to_str()).unwrap_or("model")), ""),
+                };
+                if output.exists() {
+                    return Err(format!("{} already exists", output.display()));
+                }
+                let mut args = vec!["abliterate".into(), input.display().to_string(), "--harmful".into(), harmful.display().to_string(),
+                                    "--harmless".into(), harmless.display().to_string(), "--layer".into(), layer, "--scale".into(), scale.to_string(),
+                                    "--check".into(), check.to_string(), "--out".into(), output.display().to_string()];
+                if devices != "cpu" {
+                    args.extend(["--devices".into(), devices.into()]);
+                }
+                Ok((kind.into(), args, output))
+            }
             "train" => {
                 let mut args = vec!["train".to_string()];
                 args.extend(self.train_args(req)?);
@@ -562,12 +618,12 @@ impl Workshop {
         // a training run on the GPUs takes them from the chat model, the way a media job does: it waits its turn in the
         // queue, the model is unloaded, chats wait until the run ends, and the model that was loaded comes back after
         let mut lease = None;
-        if job.kind == "train" && Self::train_on_gpu(&job.request) {
+        if matches!(job.kind.as_str(), "train" | "abliterate") && Self::train_on_gpu(&job.request) {
             let mgr = self.mgr.lock().unwrap().clone();
             if let Some(m) = mgr {
                 let before = m.queue.resident();
                 self.update(id, |j| j.log.push("waiting for the GPUs: the chat model is unloaded for the run and loaded again after".into()));
-                match m.gpu_exclusive_needing(true, "train", &format!("training #{id}"), 4.0).await {
+                match m.gpu_exclusive_needing(true, "train", &format!("{} #{id}", job.kind), 4.0).await {
                     Ok(pass) => lease = Some((m, pass, before)),
                     Err(e) => {
                         self.update(id, |j| { j.state = "failed"; j.error = Some(format!("{e:#}")); j.finished_at = Some(now()); });
@@ -633,6 +689,19 @@ impl Workshop {
                         }
                     }
                     Some("done") => j.result = Some(ev.clone()),
+                    // abliterate: the layer score table (kept in full for the form) and the refusal checks
+                    Some("layers") => {
+                        j.log.push(ev["message"].as_str().unwrap_or("").to_string());
+                        j.points.push(json!({"layers": ev["layers"], "chosen": ev["chosen"]}));
+                    }
+                    Some("check") => {
+                        let r = &ev["result"];
+                        let pct = |k: &str| r[k].as_f64().map_or("?".to_string(), |x| format!("{:.0}%", x * 100.0));
+                        j.log.push(format!("{} model: refused {} of the held-out harmful prompts, {} of the harmless{}", ev["which"].as_str().unwrap_or(""),
+                                           pct("harmful_refusal_rate"), pct("harmless_refusal_rate"),
+                                           r["harmless_loss"].as_f64().map(|l| format!(" (answer loss {l:.3})")).unwrap_or_default()));
+                        j.points.push(json!({"check": ev["which"], "result": r}));
+                    }
                     Some("progress") => {
                         if ev["loss"].is_number() {
                             j.points.push(json!({"step": ev["step"], "loss": ev["loss"], "lr": ev["lr"]}));
@@ -778,7 +847,12 @@ impl Workshop {
         };
         let datasets = listing(&self.out_dir.join("datasets"), &|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"));
         let uploads = listing(&self.uploads_dir(), &|_| true);
-        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "datasets": datasets, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+        // prompt lists for abliteration: text files, one prompt per line (the Workshop's abliterate folder first)
+        let txt = |p: &Path| p.extension().and_then(|x| x.to_str()) == Some("txt");
+        let mut prompts = listing(&self.out_dir.join("abliterate"), &txt);
+        prompts.extend(listing(&self.out_dir.join("datasets"), &txt));
+        prompts.extend(listing(&self.uploads_dir(), &txt));
+        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "datasets": datasets, "prompts": prompts, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
                "output_folder": self.out_dir.display().to_string(), "installed": exe().is_some()})
     }
 }

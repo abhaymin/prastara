@@ -4761,7 +4761,7 @@ if (tab === "settings" && section === "connect") { renderAppSetup(); renderAgent
 
 // ------------------------------------------------------------------ Workshop: the rail, the jobs, your models (workshop.rs)
 let wsTimer = null;
-const ws = {files: {hf: [], adapters: [], gguf: [], datasets: []}, jobs: [], filter: "all"};
+const ws = {files: {hf: [], adapters: [], gguf: [], datasets: [], prompts: []}, jobs: [], filter: "all"};
 async function wsFetch(path, opts = {}) {
   const r = await fetch(path, {...opts, headers: {...headers(), ...(opts.body ? {"Content-Type": "application/json"} : {})}});
   const j = await r.json().catch(() => ({}));
@@ -4790,7 +4790,7 @@ async function wsFiles() {
   try {
     const f = await wsFetch("v1/workshop/files");
     ws.files = {hf: (f.hf_models || []).map(wsItem), adapters: (f.adapters || []).map(wsItem), gguf: (f.gguf || []).map(wsItem),
-                datasets: (f.datasets || []).map(wsItem)};
+                datasets: (f.datasets || []).map(wsItem), prompts: (f.prompts || []).map(wsItem)};
     const ds = ws.files.datasets.map((x) => x.path);
     wsKnownDatasets = ds.join("\n");
     const pick = $("ws-r-pick"), was = pick.value;
@@ -4804,7 +4804,7 @@ async function wsFiles() {
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", loop: "loop", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install"};
+const WS_STEP_OF = {datagen: "data", loop: "loop", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install"};
 const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.seeds || (r.sources || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
@@ -4827,7 +4827,7 @@ function wsJobCard(x) {
   const size = x.result?.bytes ? fmtBytes(x.result.bytes) : "";
   const acts = [];
   if (x.state === "queued" || running) acts.push(`<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>`);
-  if (x.state === "done" && ["merge", "convert", "quantize", "loop", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
+  if (x.state === "done" && ["merge", "convert", "quantize", "loop", "abliterate", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
   if (x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
   if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
   const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
@@ -4881,7 +4881,7 @@ async function refreshJobs(pushed = null) {
       const x = jobs.find((y) => String(y.id) === b.dataset.wsNext);
       if (!x) return;
       const o = x.result.output;
-      if (x.kind === "loop" || x.kind === "merge") wsUse("convert", "ws-c-in", o);   // a model folder → convert
+      if (["loop", "merge", "abliterate"].includes(x.kind)) wsUse("convert", "ws-c-in", o); // a model folder → convert
       if (x.kind === "convert") wsUse("quantize", "ws-q-in", o);                    // GGUF → quantize
       if (x.kind === "train") { $("ws-m-base").value = x.request?.model || ""; wsUse("merge", "ws-m-adapter", x.output || o); } // adapter → merge
       if (x.kind === "quantize") wsUse("install", "ws-s-in", o);                    // quantized GGUF → install
@@ -4889,6 +4889,7 @@ async function refreshJobs(pushed = null) {
     for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
     for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
     wsCurveRefresh(jobs);
+    wsAblitRefresh(jobs);
     // something a job just made appears in the pickers and the overview
     const made = jobs.filter((x) => x.state === "done").map(wsJobOut).join("\n");
     if (made !== ws.made) { const first = ws.made === undefined; ws.made = made; if (!first) wsFiles(); else wsOverview(); }
@@ -4922,6 +4923,9 @@ async function wsSubmit(body, btn) {
 }
 $("ws-loop").onclick = (e) => wsSubmit({kind: "loop", input: $("ws-lp-in").value.trim(), start: Number($("ws-lp-start").value),
   end: Number($("ws-lp-end").value), passes: Number($("ws-lp-passes").value), output: $("ws-lp-out").value.trim()}, e.currentTarget);
+$("ws-abliterate").onclick = (e) => wsSubmit({kind: "abliterate", input: $("ws-a-in").value.trim(), harmful: $("ws-a-harmful").value.trim(),
+  harmless: $("ws-a-harmless").value.trim(), layer: $("ws-a-layer").value.trim() || "auto", scale: Number($("ws-a-scale").value) || 1,
+  check: Number($("ws-a-check").value) || 0, output: $("ws-a-out").value.trim()}, e.currentTarget);
 $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").value.trim(), adapter: $("ws-m-adapter").value.trim(), output: $("ws-m-out").value.trim()}, e.currentTarget);
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
@@ -4936,6 +4940,7 @@ function wsStep(id) {
   $("ws-work").scrollTop = 0;
   if (id === "library") wsLibLoad();
   if (id === "train") { wsCurveId = null; wsCurveRefresh(); }
+  if (id === "abliterate") { wsAblitId = null; wsAblitRefresh(); }
   if (id === "overview") wsOverview();
 }
 function wsUse(step, inputId, path) { wsStep(step); $(inputId).value = path; wsPick.quiet = true; $(inputId).focus(); wsPick.quiet = false; }
@@ -4971,7 +4976,8 @@ function wsOverview() {
       <div class="ws-art__actions"><button class="st-btn st-btn--secondary" data-ws-load>Load it</button></div></article>`)],
     ["Model folders", ws.files.hf.map((x) => card(x, [x.arch ? tag(x.arch) : "", x.loop ? tag(`loop ${x.loop.start}–${x.loop.end - 1} ×${x.loop.passes}`, " ws-tag--loop") : "",
         x.private ? tag("private", " ws-tag--private") : ""],
-      btn("Convert", "convert", "ws-c-in", x.path) + (x.loop ? "" : btn("Loop", "loop", "ws-lp-in", x.path)) + btn("Merge into", "merge", "ws-m-base", x.path)))],
+      btn("Convert", "convert", "ws-c-in", x.path) + (x.loop ? "" : btn("Loop", "loop", "ws-lp-in", x.path)) + btn("Merge into", "merge", "ws-m-base", x.path)
+        + (x.private ? "" : btn("Abliterate", "abliterate", "ws-a-in", x.path))))],
     ["Adapters", ws.files.adapters.map((x) => card(x, [tag("LoRA")], btn("Merge", "merge", "ws-m-adapter", x.path)))],
     ["GGUF files", ws.files.gguf.map((x) => card(x, [tag("GGUF")], btn("Quantize", "quantize", "ws-q-in", x.path) + btn("Install", "install", "ws-s-in", x.path)))],
     ["Datasets", ws.files.datasets.map((x) => card(x, [tag("JSONL")], `<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.path)}">Review</button>`))],
@@ -5201,8 +5207,8 @@ $("ws-r-del").onclick = async () => {
 // Paths are the server's: jobs run there. From another device, Upload sends a file or a whole folder into the
 // server's uploads folder (streamed, any size) and fills the field with its server path.
 const WS_PICK_FOLDER = {hf: true, adapters: true};
-const WS_PICK_EXT = {gguf: ".gguf", datasets: ".jsonl"};
-const WS_PICK_KIND = {hf: "hf-model", adapters: "adapter", gguf: "gguf", datasets: "dataset"};
+const WS_PICK_EXT = {gguf: ".gguf", datasets: ".jsonl", prompts: ".txt"};
+const WS_PICK_KIND = {hf: "hf-model", adapters: "adapter", gguf: "gguf", datasets: "dataset", prompts: "prompts"};
 for (const input of document.querySelectorAll("[data-ws-pick]")) {
   const row = document.createElement("div");
   row.className = "ws-pathrow";
@@ -5407,6 +5413,37 @@ async function wsCurveRefresh(jobs) {
     $("ws-t-curve-note").textContent = `${t.state}${d.progress?.total ? ` · step ${d.progress.done} of ${d.progress.total}` : ""}`;
     $("ws-t-chart").innerHTML = wsChart(d.points || []);
   } catch (e) { /* the chart stays as it was */ }
+}
+
+// ------------------------------------------------------------------ Workshop: Refine › Abliterate's result
+// The newest abliterate job: the layer table (each block's separation of the two prompt sets; the chosen one marked)
+// and, with a check, how often the model refused before and after.
+let wsAblitId = null, wsAblitAt = 0;
+async function wsAblitRefresh(jobs) {
+  const panel = document.querySelector('[data-ws-panel="abliterate"]');
+  if (!panel || panel.hidden) return;
+  const t = (jobs || ws.jobs).find((x) => x.kind === "abliterate");
+  if (!t) { $("ws-a-result").hidden = true; return; }
+  const live = t.state === "running" || t.state === "queued";
+  if (t.id === wsAblitId && !live && Date.now() - wsAblitAt < 60000) return;
+  wsAblitId = t.id; wsAblitAt = Date.now();
+  try {
+    const d = await wsFetch(`v1/workshop/jobs/${t.id}`);
+    const pts = d.points || [], tbl = pts.find((p) => p.layers), checks = pts.filter((p) => p.check);
+    $("ws-a-result").hidden = false;
+    $("ws-a-result-title").textContent = `Result · abliterate #${t.id}`;
+    $("ws-a-result-note").textContent = `${t.state}${d.progress?.total && live ? ` · ${d.progress.done} of ${d.progress.total}` : ""}`;
+    const pct = (v) => v == null ? "–" : `${Math.round(v * 100)}%`;
+    const rate = checks.length ? `<table class="ws-ab__check"><thead><tr><th></th><th>Refused (held-out refused prompts)</th><th>Refused (ordinary)</th><th>Answer loss</th></tr></thead><tbody>` +
+      checks.map((c) => `<tr><th>${c.check === "before" ? "Before" : "After"}</th><td>${pct(c.result?.harmful_refusal_rate)}</td><td>${pct(c.result?.harmless_refusal_rate)}</td>` +
+        `<td class="mono">${c.result?.harmless_loss == null ? "–" : c.result.harmless_loss.toFixed(3)}</td></tr>`).join("") + "</tbody></table>" : "";
+    const layers = tbl?.layers || [], best = Math.max(1e-9, ...layers.map((l) => l.separation || 0));
+    const rows = layers.map((l, i) => `<li${i === tbl.chosen ? ' aria-current="true"' : ""}><span class="mono">${l.block}${l.pass ? `:${l.pass}` : ""}</span>` +
+      `<span class="ws-ab__bar${l.eligible ? "" : " ws-ab__bar--out"}"><i style="width:${(100 * (l.separation || 0) / best).toFixed(1)}%"></i></span>` +
+      `<span class="mono">${(l.separation || 0).toFixed(2)}</span></li>`).join("");
+    $("ws-a-result-body").innerHTML = `<div class="ws-est">${rate}${layers.length ? `<p class="muted small">Separation of the two sets after each block (block:pass in a loop); auto picks the best between 30 and 70 % deep, marked.</p><ol class="ws-ab__layers">${rows}</ol>` : ""}` +
+      (t.state === "done" ? `<p class="small"><span class="ws-tag ws-tag--private">private</span> ${esc(wsJobOut(t))}</p>` : "") + "</div>";
+  } catch (e) { /* the card stays as it was */ }
 }
 
 // ------------------------------------------------------------------ Workshop: the context column (wide screens only)

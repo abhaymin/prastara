@@ -513,6 +513,8 @@
           <button type="button" role="tab" data-ws-step="loop" aria-selected="false"><span>Loop a model</span><i class="ws-dot" data-ws-dot="loop" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Train</p>
           <button type="button" role="tab" data-ws-step="train" aria-selected="false"><span>Train an adapter</span><i class="ws-dot" data-ws-dot="train" aria-hidden="true"></i></button>
+          <p class="ws-rail__group">Refine</p>
+          <button type="button" role="tab" data-ws-step="abliterate" aria-selected="false"><span>Abliterate</span><i class="ws-dot" data-ws-dot="abliterate" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Package</p>
           <button type="button" role="tab" data-ws-step="merge" aria-selected="false"><span>Merge an adapter</span><i class="ws-dot" data-ws-dot="merge" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="convert" aria-selected="false"><span>Convert to GGUF</span><i class="ws-dot" data-ws-dot="convert" aria-hidden="true"></i></button>
@@ -692,6 +694,35 @@
           <div class="st-card ws-block" id="ws-t-curve" hidden><div class="ws-curve__head"><span class="card-title" id="ws-t-curve-title">Loss</span><span class="muted small" id="ws-t-curve-note"></span></div>
             <div id="ws-t-chart"></div></div>
           <p class="muted small">From a terminal: <code>am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt; --devices cuda:0,cuda:1</code>. Then merge the adapter (Package › Merge).</p>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="abliterate" hidden>
+          <header class="ws-panel__head"><h3>Abliterate a model</h3><p class="muted">Finds the direction a model's hidden state takes before it refuses (from prompts it refuses and ordinary ones, one per line) and removes it from every matrix that writes that state. The copy answers instead of refusing; check its answers before you use it. Works on Llama and Qwen models, looped ones too.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+              <div class="ws-form">
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-in">Model (HF folder)</label>
+                  <input class="st-input mono" id="ws-a-in" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-harmful">Prompts it refuses <output>a .txt file, one per line</output></label>
+                  <input class="st-input mono" id="ws-a-harmful" data-ws-pick="prompts" autocomplete="off" placeholder="~/data/refused.txt"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-harmless">Ordinary prompts <output>a .txt file, one per line</output></label>
+                  <input class="st-input mono" id="ws-a-harmless" data-ws-pick="prompts" autocomplete="off" placeholder="~/data/ordinary.txt"></div>
+                <div class="ws-field"><label class="st-label" for="ws-a-layer">Layer <output>auto, N or N:pass</output></label>
+                  <input class="st-input mono" id="ws-a-layer" autocomplete="off" value="auto"></div>
+                <div class="ws-field"><label class="st-label" for="ws-a-scale">Strength</label>
+                  <input class="st-input" id="ws-a-scale" type="number" min="0.1" max="2" step="0.1" value="1"></div>
+                <div class="ws-field"><label class="st-label" for="ws-a-check">Check answers <output>prompts of each list</output></label>
+                  <input class="st-input" id="ws-a-check" type="number" min="0" max="256" value="8"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-out">Output folder <output>optional</output></label>
+                  <input class="st-input mono" id="ws-a-out" placeholder="in the Workshop folder, as …-abliterated"></div>
+              </div>
+              <p class="small ws-private"><span class="ws-tag ws-tag--private">private</span> Abliterated models stay on this PC; they are marked private.</p>
+              <div class="ws-actions"><span class="muted small ws-actions__note">The check answers each held-out prompt before and after, a few words each; on a large model that takes a while.</span>
+                <button type="button" class="st-btn st-btn--primary" id="ws-abliterate">Make the abliterated copy</button></div>
+          </div>
+          <div class="st-card ws-block" id="ws-a-result" hidden><div class="ws-curve__head"><span class="card-title" id="ws-a-result-title">Result</span><span class="muted small" id="ws-a-result-note"></span></div>
+            <div id="ws-a-result-body"></div></div>
+          <p class="muted small">From a terminal: <code>am2strata-workshop abliterate &lt;hf-folder&gt; --harmful refused.txt --harmless ordinary.txt --check 8 --out &lt;folder&gt;</code>. Then convert it (Package › Convert).</p>
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="merge" hidden>

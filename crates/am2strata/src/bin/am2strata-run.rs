@@ -156,6 +156,7 @@ enum Cmd {
     /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
     /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
     /// | loop <hf-folder> 12..24x2 (a looped copy: blocks 12-23 run twice, behind gates that start closed)
+    /// | abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto] [--check 8] (a private copy)
     /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
     /// | jobs | job <id> | cancel <id> | files
@@ -1395,6 +1396,20 @@ struct DatagenOpts {
     /// datagen: the model to write with (any the server lists; default the loaded one)
     #[arg(long = "writer")]
     writer: Option<String>,
+    /// abliterate: the prompts the model refuses, and ordinary ones (text files, one prompt per line, in Workshop folders)
+    #[arg(long)]
+    harmful: Option<String>,
+    #[arg(long)]
+    harmless: Option<String>,
+    /// abliterate: auto, a block number, or N:P (block N in loop pass P)
+    #[arg(long)]
+    layer: Option<String>,
+    /// abliterate: how much of the direction to remove (1: all)
+    #[arg(long)]
+    scale: Option<f64>,
+    /// abliterate: held-out prompts of each list to answer before and after
+    #[arg(long)]
+    check: Option<u64>,
     /// dataset: the first record to show, and how many
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -1447,6 +1462,12 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 let num = |v: &str| v.trim().parse::<u64>().map_err(|_| USE.to_string());
                 serde_json::json!({"kind": "loop", "input": abs(first.clone().ok_or(USE)?), "start": num(a)?, "end": num(b)?,
                                    "passes": num(passes)?, "output": out.clone().map(abs)})
+            }
+            "abliterate" => {
+                const USE: &str = "abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N] [--scale 1] [--check N]";
+                serde_json::json!({"kind": "abliterate", "input": abs(first.clone().ok_or(USE)?), "harmful": abs(dg.harmful.clone().ok_or(USE)?),
+                                   "harmless": abs(dg.harmless.clone().ok_or(USE)?), "layer": dg.layer.clone(), "scale": dg.scale,
+                                   "check": dg.check, "output": out.clone().map(abs)})
             }
             "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
                                            "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),

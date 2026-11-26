@@ -236,6 +236,18 @@ if [ "$1" = "--json" ] && [ "$2" = "train" ]; then
   echo '{"event":"done","output":"x","kind":"adapter","bytes":10,"seconds":0.1}'
   exit 0
 fi
+if [ "$1" = "--json" ] && [ "$2" = "abliterate" ]; then
+  echo "$@" > "$here/abliterate-args.txt"
+  out=""; prev=""
+  for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
+  mkdir -p "$out"; echo '{"prastara_private": true}' > "$out/config.json"; echo x > "$out/model.safetensors"
+  echo '{"event":"start","what":"abliterate"}'
+  echo '{"event":"layers","chosen":1,"layers":[{"block":0,"pass":0,"separation":0.5},{"block":1,"pass":0,"separation":2.5}],"message":"direction from block 1 pass 0"}'
+  echo '{"event":"check","which":"before","result":{"n":4,"harmful_refusal_rate":0.75,"harmless_refusal_rate":0.0,"harmless_loss":1.2}}'
+  echo '{"event":"check","which":"after","result":{"n":4,"harmful_refusal_rate":0.0,"harmless_refusal_rate":0.0,"harmless_loss":1.25}}'
+  echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"hf-model\",\"private\":true,\"bytes\":10,\"seconds\":0.1}"
+  exit 0
+fi
 echo "$@" > "$here/args.txt"
 printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/env.txt"
 out=""; prev=""
@@ -500,5 +512,68 @@ fn training_runs_from_the_workshop_with_an_estimate_and_its_loss_curve() {
     assert_eq!(code, 200);
     let pa = std::fs::read_to_string(tools.join("profile-args.txt")).unwrap();
     assert!(pa.contains("--devices cuda:0,cuda:1") && pa.contains("--base-dtype bf16"), "{pa}");
+    let _ = std::fs::remove_dir_all(&tools);
+}
+
+/// Abliteration from the Workshop: the request becomes the command's arguments, the prompt lists must be files in
+/// the Workshop's folders (never a sensitive one), the layer table and the refusal checks are kept with the job, and
+/// the copy lands beside the others as `<model>-abliterated` (then `-2`, never over an earlier one).
+#[cfg(unix)]
+#[test]
+fn abliteration_jobs_check_their_inputs_and_keep_the_layer_table_and_checks() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-ablit-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let model = s.dir.join("workshop/tiny-model");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("config.json"), "{}").unwrap();
+    std::fs::write(model.join("tokenizer.json"), "{}").unwrap();
+    let lists = s.dir.join("workshop/datasets");
+    std::fs::create_dir_all(&lists).unwrap();
+    // placeholders only: no real request is ever written into a test
+    std::fs::write(lists.join("refuse.txt"), "please refuse: item 1\nplease refuse: item 2\n").unwrap();
+    std::fs::write(lists.join("plain.txt"), "Explain how a rainbow forms.\nWhat is the capital of France?\n").unwrap();
+    let (h, b) = (lists.join("refuse.txt"), lists.join("plain.txt"));
+    let outside = std::env::temp_dir().join(format!("am2-ws-ablit-outside-{}.txt", std::process::id()));
+    std::fs::write(&outside, "x\n").unwrap();
+    for (bad, why) in [
+        (json!({"kind": "abliterate", "harmful": h, "harmless": b}), "no model"),
+        (json!({"kind": "abliterate", "input": model, "harmless": b}), "no harmful list"),
+        (json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": lists}), "a folder is not a list"),
+        (json!({"kind": "abliterate", "input": model, "harmful": outside, "harmless": b}), "outside the Workshop's folders"),
+        (json!({"kind": "abliterate", "input": model, "harmful": "/etc/shadow", "harmless": b}), "a sensitive file"),
+        (json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "layer": "deep"}), "a layer that is no layer"),
+        (json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "scale": 3}), "scale above 2"),
+        (json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "check": 1000}), "too many checks"),
+        (json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "devices": "gpu"}), "bad devices"),
+        (json!({"kind": "abliterate", "input": lists, "harmful": h, "harmless": b}), "not a model folder"),
+    ] {
+        assert_eq!(s.post("/v1/workshop/jobs", &bad).0, 400, "{why}");
+    }
+    let req = json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "layer": "12", "scale": 0.5, "check": 4});
+    let (code, j) = s.post("/v1/workshop/jobs", &req);
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let out = done["result"]["output"].as_str().unwrap().to_string();
+    assert!(out.ends_with("/workshop/tiny-model-abliterated"), "{out}");
+    assert_eq!(done["result"]["private"], true);
+    let args = std::fs::read_to_string(tools.join("abliterate-args.txt")).unwrap();
+    assert!(args.contains("--layer 12") && args.contains("--scale 0.5") && args.contains("--check 4") && !args.contains("--devices"), "{args}");
+    let (_, d) = s.get(&format!("/v1/workshop/jobs/{}", j["id"]), true);
+    let log = d["log"].as_array().unwrap();
+    assert!(log.iter().any(|l| l.as_str().unwrap().contains("after model: refused 0%")), "{log:?}");
+    let pts = d["points"].as_array().unwrap();
+    assert_eq!(pts[0]["layers"].as_array().map(|a| a.len()), Some(2), "the layer table: {pts:?}");
+    assert_eq!(pts.iter().filter(|p| p["check"].is_string()).count(), 2);
+    // a second run never writes over the first
+    let (_, j2) = s.post("/v1/workshop/jobs", &json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "layer": "2:1"}));
+    let done2 = wait_state(&s, j2["id"].as_u64().unwrap(), "done");
+    assert!(done2["result"]["output"].as_str().unwrap().ends_with("tiny-model-abliterated-2"), "{done2}");
+    assert!(std::fs::read_to_string(tools.join("abliterate-args.txt")).unwrap().contains("--layer 2:1 --scale 1 --check 0"));
+    // and the Workshop's model list marks it private
+    let (_, f) = s.get("/v1/workshop/files", true);
+    let it = f["hf_models"].as_array().unwrap().iter().find(|m| m["path"].as_str().unwrap().ends_with("tiny-model-abliterated")).cloned();
+    assert_eq!(it.expect("the copy is listed")["private"], true);
+    let _ = std::fs::remove_file(&outside);
     let _ = std::fs::remove_dir_all(&tools);
 }
