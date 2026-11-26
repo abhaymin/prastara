@@ -122,9 +122,12 @@ impl QMat {
         if n == 0 {
             return Vec::new();
         }
+        // on a device: every token's rounded input in one product (one upload, one wait), not one round trip per token;
+        // each token's row is computed as matvec computes it alone, so the values are the same
         #[cfg(feature = "gpu")]
-        if self.gpu.is_some() {
-            return xs.iter().map(|x| self.mul(x)).collect();
+        if let Some(g) = &self.gpu {
+            let flat: Vec<f32> = xs.iter().flat_map(|x| self.vdt.round_trip(x)).collect();
+            return g.matvec(&flat).chunks_exact(self.rows).map(|c| c.to_vec()).collect();
         }
         let Some(fast) = self.fast() else {
             return self.matmul_dequant(xs);
@@ -632,22 +635,22 @@ fn act(a: Act, x: f32) -> f32 {
 pub struct Moe {
     /// the layer's index in the expert profile
     pub layer: usize,
-    router: Vec<f32>,
-    bias: Option<Vec<f32>>,
-    gating: Gating,
+    pub(crate) router: Vec<f32>,
+    pub(crate) bias: Option<Vec<f32>>,
+    pub(crate) gating: Gating,
     pub n_expert: usize,
-    top_k: usize,
-    w_norm: bool,
-    w_scale: f32,
+    pub(crate) top_k: usize,
+    pub(crate) w_norm: bool,
+    pub(crate) w_scale: f32,
     /// Nemotron's latent MoE: experts work in a smaller space between these two projections
-    latent: Option<(QMat, QMat)>,
+    pub(crate) latent: Option<(QMat, QMat)>,
     pub gate_exps: Option<Experts>,
     pub up_exps: Experts,
     pub down_exps: Experts,
-    act: Act,
-    shared: Option<Dense>,
+    pub(crate) act: Act,
+    pub(crate) shared: Option<Dense>,
     /// the shared expert's output is multiplied by the sigmoid of this row's product with the input (Qwen3.5)
-    shared_gate: Option<Vec<f32>>,
+    pub(crate) shared_gate: Option<Vec<f32>>,
 }
 
 impl Moe {
@@ -669,6 +672,34 @@ impl Moe {
 
     fn expert_local(&self, e: usize, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
         self.expert_forward(&self.up_exps.0[e], self.gate_exps.as_ref().map(|g| &g.0[e]), &self.down_exps.0[e], xs)
+    }
+
+    /// Experts computed here, each on its own inputs (`jobs`: an expert and the inputs of the tokens that chose it):
+    /// in two parallel passes (`QMat::matmul_set`: every expert's up and gate, then every down) when all their matrices
+    /// are in RAM, else one expert at a time. -> each job's outputs. The prompt path (`moe_batch`) and the device graph
+    /// (the experts not on its device) both run this, so an expert's outputs are the same bits on either path.
+    pub(crate) fn experts_here(&self, jobs: &[(usize, &[Vec<f32>])]) -> Vec<Vec<Vec<f32>>> {
+        let fused = (|| {
+            let mut first_jobs: Vec<(&QMat, &[Vec<f32>])> = Vec::new();
+            for &(e, x) in jobs {
+                first_jobs.push((&self.up_exps.0[e], x));
+                if let Some(g) = &self.gate_exps {
+                    first_jobs.push((&g.0[e], x));
+                }
+            }
+            let mut first = QMat::matmul_set(&first_jobs)?.into_iter();
+            let mids: Vec<Vec<Vec<f32>>> = jobs.iter().map(|_| {
+                let mut up = first.next().unwrap();
+                match self.gate_exps.as_ref().map(|_| first.next().unwrap()) {
+                    Some(gv) => for (u, g) in up.iter_mut().zip(&gv) { u.iter_mut().zip(g).for_each(|(u, g)| *u *= act(self.act, *g)); },
+                    None => up.iter_mut().for_each(|u| u.iter_mut().for_each(|v| *v = act(self.act, *v))),
+                }
+                up
+            }).collect();
+            let second: Vec<(&QMat, &[Vec<f32>])> = jobs.iter().zip(&mids).map(|(&(e, _), mid)| (&self.down_exps.0[e], &mid[..])).collect();
+            QMat::matmul_set(&second)
+        })();
+        fused.unwrap_or_else(|| jobs.iter().map(|&(e, x)| self.expert_local(e, x)).collect())
     }
 }
 
@@ -815,8 +846,8 @@ pub enum Block {
 pub struct Layer {
     pub parts: Vec<(Vec<f32>, Block)>,
     /// hyper-connections' mixers before the two blocks: `parts`' norms are then empty
-    hc: Option<[HcMix; 2]>,
-    ple: Option<Ple>,
+    pub(crate) hc: Option<[HcMix; 2]>,
+    pub(crate) ple: Option<Ple>,
 }
 
 pub struct Model {
@@ -873,7 +904,7 @@ pub(crate) struct Loop {
 
 /// One step of a forward pass: a layer in a pass of the loop (0 is the base's pass), or the mixing after an extra pass.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Step {
+pub(crate) enum Step {
     Layer(usize, usize),
     /// before an extra pass: keep the hidden state it starts from
     Save,
@@ -1203,8 +1234,8 @@ impl Model {
         let loop_ = match u("loop.count") {
             Ok(passes) => {
                 let (start, end, passes) = (u("loop.start")? as usize, u("loop.end")? as usize, passes as usize);
-                if !matches!(arch.as_str(), "qwen3" | "llama") {
-                    return Err(format!("{arch}: a loop runs on qwen3 and llama models here"));
+                if !matches!(arch.as_str(), "qwen3" | "qwen3moe" | "llama") {
+                    return Err(format!("{arch}: a loop runs on qwen3, qwen3moe and llama models here"));
                 }
                 if start >= end || end > n_layer || !(2..=16).contains(&passes) {
                     return Err(format!("{arch}: invalid loop: blocks {start}..{end} of {n_layer}, {passes} passes"));
@@ -1247,7 +1278,7 @@ impl Model {
 
     /// The order a token goes through the layers: every layer once, and after the loop's last block the core again
     /// for each extra pass, between a save and a mix.
-    fn schedule(&self) -> Vec<Step> {
+    pub(crate) fn schedule(&self) -> Vec<Step> {
         let mut s = Vec::with_capacity(self.layers.len());
         for l in 0..self.layers.len() {
             s.push(Step::Layer(l, 0));
@@ -2065,7 +2096,7 @@ impl Model {
     }
 
     /// Asks for these experts' pages all at once (when `prefetch` is on), so the ones on disk load in parallel.
-    fn prefetch_experts(&self, m: &Moe, experts: impl Iterator<Item = usize>) {
+    pub(crate) fn prefetch_experts(&self, m: &Moe, experts: impl Iterator<Item = usize>) {
         if self.prefetch.load(Ordering::Relaxed) {
             experts.for_each(|e| crate::pack::prefetch_expert(m, e));
         }
@@ -2101,41 +2132,16 @@ impl Model {
             let jobs: Vec<(usize, Vec<&[f32]>)> = far.iter().map(|&e| (e, users[e].iter().map(|&(t, _)| &xs[t][..]).collect())).collect();
             r.start(m.layer, &jobs)
         });
-        // the local experts in two parallel passes (matmul_set): every expert's up and gate on its tokens, then every down;
-        // with many experts and few tokens each (Tiel: 256, 8 chosen) one pass per matrix would mostly wait on joins
+        // the local experts in two parallel passes (experts_here: matmul_set): every expert's up and gate on its tokens,
+        // then every down; with many experts and few tokens each (Tiel: 256, 8 chosen) one pass per matrix would mostly
+        // wait on joins
         let local: Vec<usize> = (0..m.n_expert).filter(|&e| !users[e].is_empty() && !(pending.is_some() && far.contains(&e))).collect();
         let ins: Vec<Vec<Vec<f32>>> = local.iter().map(|&e| users[e].iter().map(|&(t, _)| xs[t].clone()).collect()).collect();
-        let fused = (|| {
-            let mut jobs: Vec<(&QMat, &[Vec<f32>])> = Vec::new();
-            for (&e, x) in local.iter().zip(&ins) {
-                jobs.push((&m.up_exps.0[e], x));
-                if let Some(g) = &m.gate_exps {
-                    jobs.push((&g.0[e], x));
-                }
+        let jobs: Vec<(usize, &[Vec<f32>])> = local.iter().zip(&ins).map(|(&e, x)| (e, &x[..])).collect();
+        for (&e, os) in local.iter().zip(m.experts_here(&jobs)) {
+            for (o, &(t, slot)) in os.into_iter().zip(&users[e]) {
+                outs[t][slot] = o;
             }
-            let mut first = QMat::matmul_set(&jobs)?.into_iter();
-            let mids: Vec<Vec<Vec<f32>>> = local.iter().map(|_| {
-                let mut up = first.next().unwrap();
-                match m.gate_exps.as_ref().map(|_| first.next().unwrap()) {
-                    Some(gv) => for (u, g) in up.iter_mut().zip(&gv) { u.iter_mut().zip(g).for_each(|(u, g)| *u *= act(m.act, *g)); },
-                    None => up.iter_mut().for_each(|u| u.iter_mut().for_each(|v| *v = act(m.act, *v))),
-                }
-                up
-            }).collect();
-            let jobs: Vec<(&QMat, &[Vec<f32>])> = local.iter().zip(&mids).map(|(&e, mid)| (&m.down_exps.0[e], &mid[..])).collect();
-            QMat::matmul_set(&jobs)
-        })();
-        match fused {
-            Some(downs) => for (&e, os) in local.iter().zip(downs) {
-                for (o, &(t, slot)) in os.into_iter().zip(&users[e]) {
-                    outs[t][slot] = o;
-                }
-            },
-            None => for (&e, x) in local.iter().zip(&ins) {
-                for (o, &(t, slot)) in m.expert_local(e, x).into_iter().zip(&users[e]) {
-                    outs[t][slot] = o;
-                }
-            },
         }
         if let (Some(r), Some(p)) = (remote, pending) {
             match r.finish(p, rows) {
@@ -2582,6 +2588,24 @@ mod tests {
         assert_eq!(h, EXP_SWEEP_HASH, "exp_f32's bits changed on this machine: {h:#x}");
     }
     const EXP_SWEEP_HASH: u64 = 0xcf06_e9bd_8437_6dda; // measured on x86-64 Linux; must hold on every machine
+
+    /// A prompt chunk of a MoE model (tokens grouped per expert, each chosen expert's matrices applied once to all the
+    /// tokens that chose it) gives every token's logits exactly as token by token does, with and without the loop.
+    #[test]
+    fn moe_chunk_equals_token_by_token_exactly() {
+        use crate::testgguf::{tmp, Spec};
+        let toks: Vec<u32> = (0..23).map(|i| (i * 37 + 5) % 256).collect();
+        for (name, spec) in [("tiny-qwen3moe", Spec::tiny_qwen3moe()),
+                             ("tiny-qwen3moe-loop", Spec { loop_: Some((1, 3, 2)), seed: 0x5EED_0005, ..Spec::tiny_qwen3moe() })] {
+            let (m, _) = Model::load(&tmp(name, &spec), None).unwrap();
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            let mut st = m.new_state();
+            let mut chunk = m.forward_batch_all(&mut st, &toks[..16]);
+            chunk.extend(m.forward_batch_all(&mut st, &toks[16..]));
+            assert!(one == chunk, "{name}: a chunk's logits are token by token's, bit for bit");
+        }
+    }
 
     /// A rows x cols matrix of `ty` with random bytes and finite f16 scales where the type keeps them.
     fn random_qmat(ty: &str, rows: usize, cols: usize, next: &mut dyn FnMut() -> u64) -> QMat {

@@ -126,7 +126,10 @@ pub fn nothing_placed(dense_on_device: usize, experts_on_device: usize) -> bool 
 /// copies to its card while the loader reads the next matrix for another, and the loader waits for a device only
 /// when it has QUEUE_BYTES queued. From a model pack the experts go in the file's order unless a profile is given,
 /// so each device's share is one run of the file, asked from the disk ahead of the uploads.
-pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>) -> Result<(String, usize, usize), String> {
+///
+/// `reserve` bytes of the first device's budget are kept out of the plan and left in ROOM for the device graph's KV
+/// cache (graph::kv_need), so a model's experts do not take the room the graph needs.
+pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>, reserve: u64) -> Result<(String, usize, usize), String> {
     let t0 = std::time::Instant::now();
     let gpus: Vec<strata_gpu::Gpu> = devices.iter().map(|(n, _)| strata_gpu::Gpu::open(n)).collect::<Result<_, _>>()?;
     let open_ms = t0.elapsed().as_millis();
@@ -147,8 +150,15 @@ pub fn place(m: &mut Model, devices: &[(String, u64)], profile: Option<&Profile>
         }
     }
     let items: Vec<Item> = qs.iter().map(|q| Item::of(q)).collect();
-    let budgets: Vec<u64> = devices.iter().map(|(_, b)| *b).collect();
-    let (to, left) = plan(&items, &budgets);
+    let mut budgets: Vec<u64> = devices.iter().map(|(_, b)| *b).collect();
+    let reserve = reserve.min(budgets.first().copied().unwrap_or(0));
+    if let Some(b) = budgets.first_mut() {
+        *b -= reserve;
+    }
+    let (to, mut left) = plan(&items, &budgets);
+    if let Some(l) = left.first_mut() {
+        *l += reserve;
+    }
 
     // read-ahead: from a pack each device's matrices are one run of the file (the core, then a run of the experts),
     // read from the disk by several threads ahead of the uploads

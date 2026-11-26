@@ -170,4 +170,41 @@ contexts, and Mula refining itself on Prastara's own tasks.
     of France is" with " Paris", the same 8 tokens with one pass or two. On the CPU in F16: 18.0 s with one pass,
     23.5 s with two.
   - **Open:** the GPU graph path for qwen3 and the loop (M8's second half); a per-request pass count.
+- **M8's second half, the GPU graph (2026-11-26, branch `engine/moe-graph`, the plan's Part D):**
+  - **Profile first:** `AM2_PROFILE=1` prints, per request, the prompt's and the decode's cost per token: time, time
+    waiting on the device, host syncs, kernel launches, bytes each way. Matrix by matrix, a small qwen3moe made 257
+    syncs per decoded token and waited on the device 6.4 of its 11 ms; the dense qwen3 113, its looped copy 169.
+  - **The graph runs qwen3** (per-head q/k norms, NEOX RoPE, `key_length`), **the loop** (each extra pass with its
+    own KV cache on the card, the gate mix on the card) **and softmax-routed experts** (`qwen3moe`, Mixtral-style
+    `llama`; the loop allowed on `qwen3moe`). The router and its top-k run on the card; one wait per MoE layer reads the
+    choice. Experts on the card run there; the others on the CPU, with only the activations crossing. Prompts go
+    through it a chunk at a time on CUDA/HIP/Vulkan too, each chosen expert once per chunk.
+  - **Gates:** the tiny looped Qwen3 on the graph equals the Workshop's own logits within 9.5e-7 (one token at a time
+    and as a chunk). Against the CPU path (f16 KV there): 5.9e-4 to 1.5e-3 on qwen3, llama, the loop at 1, 2 and 3
+    passes, and qwen3moe with all, half or none of its experts on the card. The best token is the same at every step.
+    A chunk equals token by token, exactly on the graph and on the CPU path.
+  - **Speed** on cuda:1 (synthetic models from `testgguf.rs`, 128-token prompt, 32 new tokens, the median of 3 runs;
+    the machine was under load, load average 4-9). "Before" is the commit before this work, matrix by matrix:
+
+    | Model | Before: prefill / decode tok/s | After: prefill / decode tok/s | CPU alone |
+    |---|---|---|---|
+    | small qwen3, 16 layers, 1024 wide, Q4_K | 146 / 116 | 1402 / 561 | 148 / 62 |
+    | the same looped (blocks 4..12, 2 passes) | 82 / 55 | 928 / 381 | 87 / 37 |
+    | small qwen3moe, 32 experts, top-4, Q4_K | 97 / 75 | 1303 / 248 | 151 / 70 |
+    | the same in Q8_0 | 71 / 55 | 396 / 176 | 143 / 62 |
+    | Q4_K, 0.55 GiB budget (276 of 512 experts on the card) | 94 / 84 | 592 / 140 | |
+    | tiny looped qwen3 (64 wide) | 768 / 744 | 25800 / 1600 | 2867 / 842 |
+
+    Syncs per decoded token went from 113-257 to 1 (dense, loop) and 17 (MoE: one per layer and the logits).
+    On these small models, decode is now limited by the host queueing kernels: 340-630 launches per token, at
+    about 2-4 µs each through CubeCL. The next step is fewer, larger kernels: fused norm and RoPE, and one launch for
+    all experts per layer.
+  - **For Mula on one card:** the looped 8B must be a Q8_0 or Q4_K GGUF to fit one 16 GB card with its two passes' KV
+    cache. The F16 file (16.4 GB) does not fit. The owner runs the 8B benchmarks.
+  - **Not yet on the graph:** Inkling 2 (`inkling2_loop`, model/inkling.rs). It needs attention without RoPE, with a
+    learned relative-position bias, a sink and clipped q/k; short causal convolutions with recurrent state; depth-mixed
+    residual streams; fused gate/up SiTU experts; and the loop controllers. That is a separate port, not an extension
+    of this graph. Also not yet: sigmoid-routed and shared or latent experts (deepseek2, qwen35moe, nemotron), the
+    loop and experts on the native Metal backend (refused there with a message), and a device-side expert dispatch
+    (an indexed product) that would drop the one wait per MoE layer when all experts are on the card.
 

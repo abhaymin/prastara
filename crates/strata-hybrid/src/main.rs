@@ -20,6 +20,8 @@ mod gpu;
 mod graph;
 mod pack;
 mod remote;
+#[cfg(test)]
+mod testgguf;
 
 use std::io::{BufRead, Write};
 use std::sync::mpsc;
@@ -115,6 +117,48 @@ fn sample(logits: &[f32], s: &mut Sampling) -> u32 {
     }
     idx[p.len() - 1] as u32
 }
+
+/// AM2_PROFILE=1: per request, for the prompt and for the decode, what each token cost on average: wall time, the time
+/// the host waited for a device (reads back; the rest is the CPU's, or the host queueing kernels), host syncs, kernel
+/// launches and bytes each way over the bus. One INFO line per phase:
+///   INFO profile=decode tokens=31 ms_per_token=1.92 wait_ms_per_token=0.80 cpu_ms_per_token=1.12 syncs_per_token=57.0
+///        launches_per_token=210.0 h2d_bytes_per_token=12288 d2h_bytes_per_token=6144
+#[derive(Clone, Copy)]
+struct Prof {
+    t: Instant,
+    #[cfg(feature = "gpu")]
+    g: strata_gpu::stats::Stats,
+}
+
+impl Prof {
+    fn on() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("AM2_PROFILE").is_some())
+    }
+
+    fn now() -> Prof {
+        Prof { t: Instant::now(), #[cfg(feature = "gpu")] g: strata_gpu::stats::snapshot() }
+    }
+
+    /// The INFO line for `tokens` tokens since `self`.
+    fn line(&self, phase: &str, tokens: usize) -> String {
+        let wall = self.t.elapsed().as_secs_f64() * 1e3;
+        let n = tokens.max(1) as f64;
+        #[cfg(feature = "gpu")]
+        let d = strata_gpu::stats::snapshot() - self.g;
+        #[cfg(not(feature = "gpu"))]
+        let d = Stats0::default();
+        let wait = d.wait_ns as f64 / 1e6;
+        format!("INFO profile={phase} tokens={tokens} ms_per_token={:.3} wait_ms_per_token={:.3} cpu_ms_per_token={:.3} syncs_per_token={:.1} \
+                 launches_per_token={:.1} h2d_bytes_per_token={:.0} h2d_copies_per_token={:.1} d2h_bytes_per_token={:.0}",
+                wall / n, wait / n, (wall - wait) / n, d.syncs as f64 / n, d.launches as f64 / n, d.h2d_bytes as f64 / n,
+                d.h2d_copies as f64 / n, d.d2h_bytes as f64 / n)
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+#[derive(Default)]
+struct Stats0 { wait_ns: u64, syncs: u64, launches: u64, h2d_bytes: u64, h2d_copies: u64, d2h_bytes: u64 }
 
 /// Free RAM in bytes (0 when unknown), on Linux, macOS and Windows (strata_pack::sysmem).
 fn mem_available() -> u64 {
@@ -241,7 +285,10 @@ fn main() {
     #[cfg(feature = "gpu")]
     if let Some(spec) = arg("--devices") {
         let devs = gpu::parse(&spec).unwrap_or_else(|e| fail(e));
-        let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref()).unwrap_or_else(|e| fail(e));
+        // the device graph's KV cache is kept free on the first device when the graph can run this model (its experts
+        // would otherwise fill the budget first and leave the graph no room)
+        let reserve = if !args.iter().any(|a| a == "--no-graph") && graph::refusal(&m).is_none() { graph::kv_need(&m, max_ctx, 4) } else { 0 };
+        let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref(), reserve).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} {summary}");
         // findings item 2: --devices asked the GPU to take weights but nothing landed on it (the device opened and its
         // self-check passed, yet no matrix fit or a kernel was absent). A chat then only keep-alives for minutes. So
@@ -322,7 +369,11 @@ fn main() {
         None
     } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") {
         match graph::Graph::new(&m, max_ctx) {
-            Ok(g) => { placement = format!("{placement} graph=auto"); Some(g) }
+            Ok(g) => {
+                let (on, all) = g.experts_on();
+                placement = format!("{placement} graph=auto{}", if all > 0 { format!(" graph_experts_on_device={on}/{all}") } else { String::new() });
+                Some(g)
+            }
             Err(why) => { eprintln!("matrix by matrix on the device ({why})"); None }
         }
     } else {
@@ -467,6 +518,7 @@ fn main() {
             out(&format!("RESUME {reused}"));
         }
         let tp = Instant::now();
+        let prof_prompt = Prof::now();
         let mut logits = Vec::new();
         let todo = &ids[reused..];
         // a STOP while the prompt is read ends the request there (a long prompt can take minutes on a slow path):
@@ -514,6 +566,10 @@ fn main() {
         let prompt_ms = tp.elapsed().as_millis();
         let force: Option<Vec<u32>> = std::env::var("AM2_DEBUG_FORCE").ok().map(|v| v.split(',').filter_map(|t| t.parse().ok()).collect());
         let td = Instant::now();
+        if Prof::on() {
+            out(&prof_prompt.line("prompt", todo.len()));
+        }
+        let prof_decode = Prof::now();
         let (mut n, mut finish) = (0usize, if stopped { "stop" } else { "length" });
         let max_new = if stopped { 0 } else { max_new };
         if on_graph || batch <= 1 || force.is_some() {
@@ -616,6 +672,10 @@ fn main() {
             if stopped {
                 break;
             }
+        }
+        if Prof::on() {
+            // the first token comes from the prompt's logits: n tokens sampled, n - 1 (or n, after a stop) passes
+            out(&prof_decode.line("decode", n));
         }
         if lookup > 0 {
             out(&format!("INFO lookup_checks={checks} lookup_drafted={drafted} lookup_accepted={accepted}"));

@@ -11,6 +11,58 @@ pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod native;
 
+/// What the devices were asked to do, counted for every device since the process started (AM2_PROFILE in the engine
+/// reads it per token): kernel launches, host syncs (a read that waits for the device), bytes each way, and the time
+/// the host spent waiting in those reads. Relaxed atomics: a few nanoseconds against a kernel launch's microseconds.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+    static SYNCS: AtomicU64 = AtomicU64::new(0);
+    static D2H: AtomicU64 = AtomicU64::new(0);
+    static H2D: AtomicU64 = AtomicU64::new(0);
+    static H2D_COPIES: AtomicU64 = AtomicU64::new(0);
+    static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    pub struct Stats {
+        pub launches: u64,
+        pub syncs: u64,
+        pub d2h_bytes: u64,
+        pub h2d_bytes: u64,
+        pub h2d_copies: u64,
+        pub wait_ns: u64,
+    }
+
+    impl std::ops::Sub for Stats {
+        type Output = Stats;
+        fn sub(self, o: Stats) -> Stats {
+            Stats { launches: self.launches - o.launches, syncs: self.syncs - o.syncs, d2h_bytes: self.d2h_bytes - o.d2h_bytes,
+                    h2d_bytes: self.h2d_bytes - o.h2d_bytes, h2d_copies: self.h2d_copies - o.h2d_copies, wait_ns: self.wait_ns - o.wait_ns }
+        }
+    }
+
+    pub fn snapshot() -> Stats {
+        Stats { launches: LAUNCHES.load(Relaxed), syncs: SYNCS.load(Relaxed), d2h_bytes: D2H.load(Relaxed), h2d_bytes: H2D.load(Relaxed),
+                h2d_copies: H2D_COPIES.load(Relaxed), wait_ns: WAIT_NS.load(Relaxed) }
+    }
+
+    pub(crate) fn launch(n: u64) {
+        LAUNCHES.fetch_add(n, Relaxed);
+    }
+
+    pub(crate) fn h2d(bytes: usize) {
+        H2D.fetch_add(bytes as u64, Relaxed);
+        H2D_COPIES.fetch_add(1, Relaxed);
+    }
+
+    /// A read back: it waited `t0.elapsed()` (the device's queue, then the copy).
+    pub(crate) fn d2h(bytes: usize, t0: std::time::Instant) {
+        SYNCS.fetch_add(1, Relaxed);
+        D2H.fetch_add(bytes as u64, Relaxed);
+        WAIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -134,6 +186,7 @@ macro_rules! product {
         let cubes = w.rows.div_ceil(if wide { 32 } else { kernels::ROWS_PER_CUBE });
         let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
         let count = CubeCount::Static(cx, cy, $tokens);
+        stats::launch(1);
         unsafe {
             let y = ArrayArg::from_raw_parts($hy, $tokens as usize * w.rows as usize);
             let (wa, xa) = (ArrayArg::from_raw_parts(w.handle.cube(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts($hx, $n));
@@ -254,6 +307,7 @@ impl Gpu {
         if data.len() != rows * row_bytes {
             return Err(format!("{} bytes for a {rows}x{cols} {ty} matrix (want {})", data.len(), rows * row_bytes));
         }
+        stats::h2d(data.len());
         native!(self, n, {
             let t = kernels::table_for(ty);
             let all: Vec<u8> = t.iter().chain(data).copied().collect();
@@ -314,18 +368,25 @@ impl Gpu {
             outs.iter().map(|b| self.read(b)).collect()
         });
         with_client!(self, c, R, {
+            stats::h2d(x.len() * 4);
             let hx = c.create_from_slice(f32::as_bytes(x));
             let outs: Vec<_> = ws.iter().map(|w| {
                 let hy = c.empty(tokens as usize * w.rows as usize * 4);
                 product!(c, R, *w, hx.clone(), x.len(), hy.clone(), tokens);
                 hy
             }).collect();
-            outs.into_iter().map(|hy| f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()).collect()
+            outs.into_iter().map(|hy| {
+                let t0 = std::time::Instant::now();
+                let v = f32::from_bytes(&c.read_one_unchecked(hy)).to_vec();
+                stats::d2h(v.len() * 4, t0);
+                v
+            }).collect()
         })
     }
 
     /// A buffer of f32 on the device.
     pub fn buffer(&self, v: &[f32]) -> Buf {
+        stats::h2d(v.len() * 4);
         native!(self, n, Buf { handle: Mem::Mtl(n.upload(f32::as_bytes(v))), len: v.len() });
         Buf { handle: Mem::Cube(with_client!(self, c, R, c.create_from_slice(f32::as_bytes(v)))), len: v.len() }
     }
@@ -350,8 +411,13 @@ impl Gpu {
 
     /// Waits for the device and reads a buffer back. Only this waits: every call below just queues its kernel.
     pub fn read(&self, b: &Buf) -> Vec<f32> {
-        native!(self, n, n.read(b.handle.mtl(), b.len));
-        with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.cube())).to_vec())
+        let t0 = std::time::Instant::now();
+        let v = (|| {
+            native!(self, n, n.read(b.handle.mtl(), b.len));
+            with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.cube())).to_vec())
+        })();
+        stats::d2h(b.len * 4, t0);
+        v
     }
 
     /// y = W x, queued; y stays on the device.
@@ -361,6 +427,8 @@ impl Gpu {
 
     /// y = W x for `tokens` vectors of `w.cols` values in x, queued; y (tokens * rows) stays on the device.
     pub fn mv_tokens(&self, w: &Weights, x: &Buf, tokens: u32) -> Buf {
+        #[cfg(target_os = "macos")]
+        if self.is_native() { stats::launch(1); }
         native!(self, n, Buf { handle: Mem::Mtl(n.mv(w.handle.mtl(), w.rows, w.cols, w.row_bytes, w.geometry.2, x.handle.mtl(), tokens)),
                                len: tokens as usize * w.rows as usize });
         with_client!(self, c, R, {
@@ -371,17 +439,21 @@ impl Gpu {
     }
 
     /// y = x * w / sqrt(mean(x^2) + eps), queued.
+    /// The norm of each row of `w.len` values: one vector, a chunk's tokens, or each head (q/k norms).
     pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
+        stats::launch(1);
         native!(self, n, Buf { handle: Mem::Mtl(n.rms_norm(x.handle.mtl(), w.handle.mtl(), w.len as u32, (x.len / w.len) as u32, eps)), len: x.len });
         let y = self.scratch(x.len);
+        let rows = (x.len / w.len) as u32;
         with_client!(self, c, R, unsafe {
-            kernels::rms_norm::launch_unchecked::<R>(c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), w.arg(), y.arg(), x.len as u32, eps);
+            kernels::rms_norm::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), w.arg(), y.arg(), w.len as u32, eps);
         });
         y
     }
 
     /// y += x, queued.
     pub fn add_into(&self, x: &Buf, y: &Buf) {
+        stats::launch(1);
         native!(self, m, m.add_into(x.handle.mtl(), y.handle.mtl(), x.len as u32));
         let n = x.len as u32;
         with_client!(self, c, R, unsafe {
@@ -391,6 +463,7 @@ impl Gpu {
 
     /// up *= silu(gate), queued.
     pub fn silu_gate(&self, gate: &Buf, up: &Buf) {
+        stats::launch(1);
         native!(self, m, m.silu_gate(gate.handle.mtl(), up.handle.mtl(), up.len as u32));
         let n = up.len as u32;
         with_client!(self, c, R, unsafe {
@@ -400,15 +473,22 @@ impl Gpu {
 
     /// Rotates x, `hd` values per head, by a (cos, sin) table of `n_rot / 2` pairs, queued.
     pub fn rope(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool) {
+        stats::launch(1);
         let heads = x.len as u32 / hd;
         native!(self, m, m.rope(tab.handle.mtl(), x.handle.mtl(), heads, hd, n_rot, neox));
+        self.rope_cube(tab, x, hd, n_rot, neox, heads, 1);
+    }
+
+    fn rope_cube(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool, heads: u32, tokens: u32) {
         with_client!(self, c, R, unsafe {
-            kernels::rope::launch_unchecked::<R>(c, CubeCount::Static(heads, 1, 1), CubeDim::new_1d(kernels::CUBE), tab.arg(), x.arg(), hd, n_rot, neox as u32);
+            kernels::rope::launch_unchecked::<R>(c, CubeCount::Static(heads, tokens, 1), CubeDim::new_1d(kernels::CUBE), tab.arg(), x.arg(), hd, n_rot,
+                                                 neox as u32, heads);
         });
     }
 
     /// cache[at..] = x, queued.
     pub fn kv_append(&self, x: &Buf, cache: &Buf, at: usize) {
+        stats::launch(1);
         native!(self, m, m.kv_append(x.handle.mtl(), cache.handle.mtl(), x.len as u32, at as u32));
         let n = x.len as u32;
         with_client!(self, c, R, unsafe {
@@ -420,6 +500,7 @@ impl Gpu {
     /// values. `s` is scratch for n_head * n scores.
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
+        stats::launch(3);
         native!(self, m, Buf { handle: Mem::Mtl(m.attend(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), s.handle.mtl(), n, n_head, n_kv, hd, scale)),
                                len: (n_head * hd) as usize });
         let o = self.scratch((n_head * hd) as usize);
@@ -427,7 +508,7 @@ impl Gpu {
         with_client!(self, c, R, unsafe {
             kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(), n, n_kv, group, hd, scale);
             kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
-            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
         });
         o
     }
@@ -444,24 +525,108 @@ impl Gpu {
     /// RoPE over a chunk of `tokens` tokens (native Metal only): `tab` holds each token's (cos, sin) pairs in turn.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn rope_tokens(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool, tokens: u32) {
+        stats::launch(1);
         native!(self, m, m.rope_tokens(tab.handle.mtl(), x.handle.mtl(), x.len as u32 / hd / tokens, tokens, hd, n_rot, neox));
-        panic!("rope_tokens needs the native Metal backend")
+        self.rope_cube(tab, x, hd, n_rot, neox, x.len as u32 / hd / tokens, tokens);
     }
 
     /// x[at .. at + n] as a buffer of its own (native Metal only).
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn row(&self, x: &Buf, at: usize, n: usize) -> Buf {
-        native!(self, m, Buf { handle: Mem::Mtl(m.copy_from(x.handle.mtl(), at as u32, n as u32)), len: n });
-        panic!("row needs the native Metal backend")
+        native!(self, m, { stats::launch(1); Buf { handle: Mem::Mtl(m.copy_from(x.handle.mtl(), at as u32, n as u32)), len: n } });
+        let y = self.scratch(n);
+        self.copy(x, &y, at, 0, n);
+        y
     }
 
     /// Causal attention for a chunk (native Metal only): `tokens` queries at positions base.., K and V already appended.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn attend_tokens(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Buf {
-        native!(self, m, Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
-                                                                n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize });
-        panic!("attend_tokens needs the native Metal backend")
+        native!(self, m, { stats::launch(1); Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
+                                                                n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize } });
+        stats::launch(3);
+        let n = base + tokens;
+        let rows = tokens * n_head;
+        let s = self.scratch((rows * n) as usize);
+        let o = self.scratch((rows * hd) as usize);
+        let group = n_head / n_kv;
+        with_client!(self, c, R, unsafe {
+            kernels::attn_scores_tokens::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, tokens), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(),
+                                                               scales.arg(), n, n_kv, group, hd, n_head, base);
+            kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
+        });
+        o
+    }
+
+    /// Whether this device has the kernels of the loop and of the experts below (CubeCL; not yet the native Metal backend).
+    pub fn has_moe_kernels(&self) -> bool {
+        !self.is_native()
+    }
+
+    /// y[dst .. dst + n] = x[src .. src + n], queued.
+    pub fn copy(&self, x: &Buf, y: &Buf, src: usize, dst: usize, n: usize) {
+        stats::launch(1);
+        let n = n as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::copy_range::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), y.arg(),
+                                                       src as u32, dst as u32, n);
+        });
+    }
+
+    /// x = saved + g * (x - saved), `g` one value per channel, queued (the loop's gate mix).
+    pub fn loop_mix(&self, saved: &Buf, x: &Buf, g: &Buf) {
+        stats::launch(1);
+        let n = x.len as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::loop_mix::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), saved.arg(), x.arg(),
+                                                     g.arg(), n, g.len as u32);
+        });
+    }
+
+    /// The router's top `k` of `n_e` experts per token from its logits (`tokens` rows of n_e), softmax gating, queued.
+    /// -> per token k indices (f32), then k weights (kernels::route_topk).
+    pub fn route_topk(&self, logits: &Buf, n_e: u32, k: u32, norm: bool, scale: f32) -> Buf {
+        stats::launch(1);
+        let tokens = logits.len as u32 / n_e;
+        let out = self.scratch((tokens * 2 * k) as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::route_topk::launch_unchecked::<R>(c, CubeCount::Static(tokens, 1, 1), CubeDim::new_1d(32), logits.arg(), out.arg(), n_e, k, norm as u32, scale);
+        });
+        out
+    }
+
+    /// The rows `idx` (f32 row numbers) of x, `dim` wide, queued.
+    pub fn gather_rows(&self, x: &Buf, idx: &Buf, dim: usize) -> Buf {
+        stats::launch(1);
+        let y = self.scratch(idx.len * dim);
+        with_client!(self, c, R, unsafe {
+            kernels::gather_rows::launch_unchecked::<R>(c, CubeCount::Static((dim as u32).div_ceil(kernels::CUBE), idx.len as u32, 1), CubeDim::new_1d(kernels::CUBE),
+                                                        x.arg(), idx.arg(), y.arg(), dim as u32);
+        });
+        y
+    }
+
+    /// Row r of x to row idx[r] of y, `dim` wide, queued.
+    pub fn scatter_rows(&self, x: &Buf, idx: &Buf, y: &Buf, dim: usize) {
+        stats::launch(1);
+        with_client!(self, c, R, unsafe {
+            kernels::scatter_rows::launch_unchecked::<R>(c, CubeCount::Static((dim as u32).div_ceil(kernels::CUBE), idx.len as u32, 1), CubeDim::new_1d(kernels::CUBE),
+                                                         x.arg(), idx.arg(), y.arg(), dim as u32);
+        });
+    }
+
+    /// x += the chosen experts' outputs (`slots`: tokens * k rows of x's width), weighted by `routes` and added in
+    /// routing order, queued.
+    pub fn moe_combine(&self, slots: &Buf, routes: &Buf, x: &Buf, k: u32) {
+        stats::launch(1);
+        let n = x.len as u32;
+        let dim = (slots.len / (routes.len / 2)) as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::moe_combine::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), slots.arg(),
+                                                        routes.arg(), x.arg(), k, dim, n);
+        });
     }
 
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).
@@ -469,10 +634,14 @@ impl Gpu {
         let tokens = (x.len() / w.cols as usize).max(1) as u32;
         native!(self, m, { let _ = m; let hx = self.buffer(x); let y = self.mv_tokens(w, &hx, tokens); self.read(&y) });
         with_client!(self, c, R, {
+            stats::h2d(x.len() * 4);
             let hx = c.create_from_slice(f32::as_bytes(x));
             let hy = c.empty(tokens as usize * w.rows as usize * 4);
             product!(c, R, w, hx, x.len(), hy.clone(), tokens);
-            f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()
+            let t0 = std::time::Instant::now();
+            let v = f32::from_bytes(&c.read_one_unchecked(hy)).to_vec();
+            stats::d2h(v.len() * 4, t0);
+            v
         })
     }
 }
