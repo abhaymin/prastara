@@ -10,8 +10,14 @@
 //!     `"output"`? (a folder) — a looped copy (Avarta): the core runs again behind gates that start closed, so the copy
 //!     is exactly its base until trained; convert carries the loop into the GGUF and the Rust engine runs it
 //!   - upcycle: `"input"` (a dense HF model folder, looped or not), `"experts"`? (2-256, default 10), `"top_k"`? (1 to
-//!     experts, default 1), `"output"`? (a folder; default `<stem>-moe<E>x<K>`) — a linked copy marked as a mixture of
-//!     experts (LoRA upcycling): `train` on it trains a router and each expert's LoRA, and it starts as its base
+//!     experts, default 1), `"output"`? (a folder; default `<stem>-moe<E>x<K>`, fine-grained `<stem>-moe<E>f<FF>x<K>`) —
+//!     a linked copy marked as a mixture of experts (LoRA upcycling): `train` on it trains a router and each expert's
+//!     LoRA, and at full width it starts as its base. Fine-grained (the 56B-A5B design): `"expert_ff"`? (neurons per
+//!     expert, dividing the intermediate size; experts a multiple of the groups, top_k at most the groups), `"split"`?
+//!     (cluster | contiguous, default cluster), `"calib"`? (a JSONL of conversations in the Workshop's folders; needed
+//!     for cluster), `"calib_tokens"`? (64-65,536, default 4,096), `"expert_rank"`? (0-64; default the largest scheme
+//!     that fits the cards), `"shared_a"`? (bool), `"dense_start_check"`? (bool: the held-out loss of the dense model
+//!     and of the upcycled one at its start). The calibration runs on the CPU
 //!   - export-moe: `"input"` (an upcycled folder), `"adapter"`? (the adapter trained on it), `"type"`? (q4_k | q8_0 |
 //!     q6_k | q5_k | q4_0 | f16 | f32, default q4_k), `"pre_tokenizer"`?, `"output"`? (a .gguf) — the real qwen3moe
 //!     model, each expert's LoRA folded into its own copy of the feed-forward, quantized as it is written
@@ -604,15 +610,104 @@ impl Workshop {
                 if top_k == 0 || top_k > experts {
                     return Err(format!("\"top_k\" is 1 to the number of experts, {experts} (got {top_k})"));
                 }
+                let flag = |k: &str| -> Result<bool, String> {
+                    match &req[k] { Value::Null => Ok(false), v => v.as_bool().ok_or_else(|| format!("\"{k}\" is true or false")) }
+                };
+                let mut extra: Vec<String> = Vec::new();
+                // fine-grained experts: a slice of the dense feed-forward each
+                let ff = cfg["intermediate_size"].as_u64();
+                let expert_ff = match &req["expert_ff"] {
+                    Value::Null => None,
+                    v => Some(v.as_u64().ok_or("\"expert_ff\" is a whole number (neurons per expert)")?),
+                };
+                let fine = match (expert_ff, ff) {
+                    (Some(fe), Some(ff)) if fe > 0 && fe < ff => {
+                        if ff % fe != 0 {
+                            return Err(format!("\"expert_ff\" {fe} must divide the model's intermediate size {ff}"));
+                        }
+                        let groups = ff / fe;
+                        if experts % groups != 0 {
+                            return Err(format!("{experts} experts are not whole copies of the {groups} neuron groups of {fe}: use a multiple of {groups}"));
+                        }
+                        if top_k > groups {
+                            return Err(format!("\"top_k\" {top_k} is more than the {groups} neuron groups"));
+                        }
+                        Some(fe)
+                    }
+                    (Some(fe), Some(ff)) if fe == ff => None,
+                    (Some(fe), Some(ff)) => return Err(format!("\"expert_ff\" {fe} must be 1 to the model's intermediate size {ff}")),
+                    (Some(_), None) => return Err("the model's config.json has no intermediate_size: \"expert_ff\" cannot be checked".into()),
+                    (None, _) => None,
+                };
+                let fine_only = ["split", "calib", "calib_tokens", "expert_rank", "shared_a", "dense_start_check"];
+                if fine.is_none() {
+                    if let Some(k) = fine_only.iter().find(|k| !req[**k].is_null()) {
+                        return Err(format!("\"{k}\" is for fine-grained experts: give \"expert_ff\" below the intermediate size"));
+                    }
+                }
+                if let Some(fe) = fine {
+                    extra.extend(["--expert-ff".into(), fe.to_string()]);
+                    let split = s("split").unwrap_or("cluster");
+                    if !["cluster", "contiguous"].contains(&split) {
+                        return Err(format!("\"split\" is cluster or contiguous (got {split:?})"));
+                    }
+                    extra.extend(["--split".into(), split.into()]);
+                    let calib = match s("calib") {
+                        Some(c) => {
+                            let c = self.allowed(c, true)?;
+                            if !c.is_file() {
+                                return Err(format!("{} is not a file: \"calib\" is a JSONL of conversations", c.display()));
+                            }
+                            Some(c)
+                        }
+                        None if !req["calib"].is_null() => return Err("\"calib\" is a path".into()),
+                        None => None,
+                    };
+                    if split == "cluster" && calib.is_none() {
+                        return Err("\"split\": \"cluster\" groups the neurons by how they fire on calibration text: give \"calib\" (a JSONL of conversations), or use \"split\": \"contiguous\"".into());
+                    }
+                    let check = flag("dense_start_check")?;
+                    if check && calib.is_none() {
+                        return Err("\"dense_start_check\" needs \"calib\" (its held-out conversations come from that file)".into());
+                    }
+                    if let Some(c) = calib {
+                        extra.extend(["--calib".into(), c.display().to_string()]);
+                    }
+                    if !req["calib_tokens"].is_null() {
+                        let t = num("calib_tokens", 4096)?;
+                        if !(64..=65_536).contains(&t) {
+                            return Err(format!("\"calib_tokens\" is 64 to 65,536 (got {t})"));
+                        }
+                        extra.extend(["--calib-tokens".into(), t.to_string()]);
+                    }
+                    if !req["expert_rank"].is_null() {
+                        let r = num("expert_rank", 4)?;
+                        if r > 64 {
+                            return Err(format!("\"expert_rank\" is 0 (the router only) to 64 (got {r})"));
+                        }
+                        extra.extend(["--expert-rank".into(), r.to_string()]);
+                    }
+                    if flag("shared_a")? {
+                        if req["expert_rank"].is_null() {
+                            return Err("\"shared_a\" goes with \"expert_rank\" (without one the scheme that fits is chosen, sharing included)".into());
+                        }
+                        extra.push("--shared-a".into());
+                    }
+                    if check {
+                        extra.push("--dense-start-check".into());
+                    }
+                }
                 let output = match s("output") {
                     Some(o) => self.allowed(o, false)?,
-                    None => self.default_output(&input, &format!("-moe{experts}x{top_k}")),
+                    None => self.default_output(&input, &match fine { Some(fe) => format!("-moe{experts}f{fe}x{top_k}"), None => format!("-moe{experts}x{top_k}") }),
                 };
                 if output.exists() {
                     return Err(format!("{} already exists", output.display()));
                 }
-                Ok((kind.into(), vec!["upcycle".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
-                                      "--experts".into(), experts.to_string(), "--top-k".into(), top_k.to_string()], output))
+                let mut args = vec!["upcycle".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
+                                    "--experts".into(), experts.to_string(), "--top-k".into(), top_k.to_string()];
+                args.extend(extra);
+                Ok((kind.into(), args, output))
             }
             "export-moe" => {
                 let input = self.allowed(s("input").ok_or("export-moe needs \"input\": an upcycled model folder")?, true)?;
@@ -631,7 +726,8 @@ impl Workshop {
                     let a = self.allowed(a, true)?;
                     let ac: Value = std::fs::read_to_string(a.join("adapter_config.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
                         .ok_or_else(|| format!("{} has no adapter_config.json: \"adapter\" is the folder train wrote", a.display()))?;
-                    if ac["prastara_moe"]["experts"] != moe["experts"] || ac["prastara_moe"]["top_k"] != moe["top_k"] {
+                    let same = |k: &str| ac["prastara_moe"][k] == moe[k];
+                    if !["experts", "top_k", "expert_ff", "expert_rank", "shared_a"].iter().all(|k| same(k)) {
                         return Err(format!("{} was not trained on this upcycled model (its prastara_moe is {}, the model's {moe})", a.display(), ac["prastara_moe"]));
                     }
                     args.extend(["--adapter".into(), a.display().to_string()]);

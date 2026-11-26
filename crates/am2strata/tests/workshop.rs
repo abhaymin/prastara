@@ -688,6 +688,43 @@ fn upcycle_and_export_moe_jobs_check_their_inputs() {
     let wrong = ws.join("other-adapter");
     std::fs::create_dir_all(&wrong).unwrap();
     std::fs::write(wrong.join("adapter_config.json"), r#"{"r": 16}"#).unwrap();
+    let calib = ws.join("calib.jsonl");
+    std::fs::write(&calib, "{\"messages\": []}\n").unwrap();
+    // a fine-grained upcycled folder and adapters: the expert width and rank are part of the shape
+    let fine_up = ws.join("tiny-fine");
+    std::fs::create_dir_all(&fine_up).unwrap();
+    std::fs::write(fine_up.join("config.json"), r#"{"model_type": "qwen3", "prastara_moe": {"experts": 8, "top_k": 2, "expert_ff": 16, "split": "cluster", "expert_rank": 4, "shared_a": true}}"#).unwrap();
+    std::fs::write(fine_up.join("model.safetensors"), "x").unwrap();
+    let fine_ad = ws.join("tiny-fine-adapter");
+    std::fs::create_dir_all(&fine_ad).unwrap();
+    std::fs::write(fine_ad.join("adapter_config.json"), r#"{"r": 16, "prastara_moe": {"experts": 8, "top_k": 2, "expert_ff": 16, "split": "cluster", "expert_rank": 4, "shared_a": true, "rank": 16}}"#).unwrap();
+    let full_ad = ws.join("tiny-full-adapter");
+    std::fs::create_dir_all(&full_ad).unwrap();
+    std::fs::write(full_ad.join("adapter_config.json"), r#"{"r": 16, "prastara_moe": {"experts": 8, "top_k": 2, "rank": 16}}"#).unwrap();
+    let fine = |extra: serde_json::Value| { let mut v = json!({"kind": "upcycle", "input": dense, "experts": 8, "top_k": 2, "expert_ff": 16}); for (k, x) in extra.as_object().unwrap() { v[k] = x.clone(); } v };
+    for (bad, why) in [
+        (fine(json!({"expert_ff": 24})), "an expert width that does not divide the feed-forward"),
+        (fine(json!({"expert_ff": 100})), "an expert width above the feed-forward"),
+        (fine(json!({"expert_ff": "wide"})), "an expert width not a number"),
+        (fine(json!({"experts": 10})), "experts not whole copies of the 4 groups"),
+        (fine(json!({"top_k": 5, "experts": 8})), "top-k above the groups"),
+        (fine(json!({})), "a cluster split without calibration text"),
+        (fine(json!({"split": "random", "calib": calib})), "an unknown split"),
+        (fine(json!({"calib": "/etc/passwd"})), "calibration text outside the Workshop"),
+        (fine(json!({"calib": ws})), "calibration text that is a folder"),
+        (fine(json!({"split": "contiguous", "dense_start_check": true})), "the dense-start check without calibration text"),
+        (fine(json!({"split": "contiguous", "expert_rank": 100})), "an expert rank too large"),
+        (fine(json!({"split": "contiguous", "shared_a": true})), "a shared A without an expert rank"),
+        (fine(json!({"split": "contiguous", "shared_a": "yes", "expert_rank": 4})), "shared_a not a bool"),
+        (fine(json!({"calib": calib, "calib_tokens": 10})), "too few calibration tokens"),
+        (json!({"kind": "upcycle", "input": dense, "split": "contiguous"}), "a fine-grained field without an expert width"),
+        (json!({"kind": "upcycle", "input": dense, "expert_rank": 4}), "an expert rank at full width"),
+        (json!({"kind": "export-moe", "input": fine_up, "adapter": full_ad}), "a full-width adapter on a fine-grained model"),
+        (json!({"kind": "export-moe", "input": up, "adapter": fine_ad}), "a fine-grained adapter on another shape"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+    }
     for (bad, why) in [
         (json!({"kind": "upcycle"}), "no model"),
         (json!({"kind": "upcycle", "input": mixtral}), "a mixture of experts already"),
@@ -721,6 +758,25 @@ fn upcycle_and_export_moe_jobs_check_their_inputs() {
     let (_, j) = s.post("/v1/workshop/jobs", &json!({"kind": "upcycle", "input": dense, "experts": 8, "top_k": 2}));
     let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
     assert!(done["result"]["output"].as_str().unwrap().ends_with("tiny-dense-moe8x2"));
+    // fine-grained (the 56B-A5B design in miniature): 8 experts of 16 neurons, top-2, clustered on the calibration text
+    let (code, j) = s.post("/v1/workshop/jobs", &fine(json!({"calib": calib, "calib_tokens": 512, "expert_rank": 4, "shared_a": true, "dense_start_check": true})));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(done["result"]["output"].as_str().unwrap().ends_with("tiny-dense-moe8f16x2"), "{done}");
+    let args = std::fs::read_to_string(tools.join("upcycle-args.txt")).unwrap();
+    assert!(args.contains(&format!("--experts 8 --top-k 2 --expert-ff 16 --split cluster --calib {} --calib-tokens 512 --expert-rank 4 --shared-a --dense-start-check", calib.display())), "{args}");
+    let (_, j) = s.post("/v1/workshop/jobs", &fine(json!({"split": "contiguous", "output": ws.join("tiny-contig").display().to_string()})));
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("upcycle-args.txt")).unwrap();
+    assert!(args.contains("--expert-ff 16 --split contiguous") && !args.contains("--calib") && !args.contains("--expert-rank"), "{args}");
+    // an expert width equal to the feed-forward is the full-width design
+    let (_, j) = s.post("/v1/workshop/jobs", &json!({"kind": "upcycle", "input": dense, "experts": 6, "top_k": 1, "expert_ff": 64}));
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("upcycle-args.txt")).unwrap();
+    assert!(args.contains("--experts 6 --top-k 1") && !args.contains("--expert-ff"), "{args}");
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "export-moe", "input": fine_up, "adapter": fine_ad}));
+    assert_eq!(code, 202, "a fine-grained adapter on its own model: {j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
 
     let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "export-moe", "input": up, "adapter": ad, "pre_tokenizer": "qwen2"}));
     assert_eq!(code, 202, "{j}");
@@ -744,6 +800,10 @@ fn upcycle_and_export_moe_jobs_check_their_inputs() {
     assert_eq!((code, e["kind"].as_str()), (200, Some("upcycle")), "{e}");
     let ea = std::fs::read_to_string(tools.join("estimate-args.txt")).unwrap();
     assert!(ea.contains("upcycle") && ea.contains("--experts 10 --top-k 1") && ea.contains("--estimate"), "{ea}");
+    let (code, e) = s.post("/v1/workshop/estimate", &fine(json!({"calib": calib, "dense_start_check": true})));
+    assert_eq!((code, e["kind"].as_str()), (200, Some("upcycle")), "{e}");
+    let ea = std::fs::read_to_string(tools.join("estimate-args.txt")).unwrap();
+    assert!(ea.contains("--expert-ff 16 --split cluster") && ea.contains("--dense-start-check") && ea.contains("--estimate"), "{ea}");
     let (code, e) = s.post("/v1/workshop/estimate", &json!({"kind": "export-moe", "input": up, "type": "q4_k"}));
     assert_eq!((code, e["kind"].as_str(), e["gpu"].as_bool()), (200, Some("export-moe"), Some(false)), "{e}");
     let (code, _) = s.post("/v1/workshop/estimate", &json!({"kind": "export-moe", "input": dense}));

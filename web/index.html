@@ -708,7 +708,7 @@
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="upcycle" hidden>
-          <header class="ws-panel__head"><h3>Upcycle to a mixture of experts</h3><p class="muted">Turns a dense Llama or Qwen3 model (looped or not) into a real mixture of experts. Each block's feed-forward becomes several experts with a router that picks the best ones for each token. In training the experts share the base weights, and each one learns its own LoRA. At the start the copy answers exactly like its base. When it is trained, export writes a <code>qwen3moe</code> GGUF that gives every expert its own weights, quantized as it is written.</p></header>
+          <header class="ws-panel__head"><h3>Upcycle to a mixture of experts</h3><p class="muted">Turns a dense Llama or Qwen3 model (looped or not) into a real mixture of experts. Each block's feed-forward becomes several experts with a router that picks the best ones for each token. In training the experts share the base weights, and each one learns its own LoRA. At full width the copy starts out answering exactly like its base. With fine-grained experts (a neuron width, e.g. 120 experts of 1,024 neurons, top-5: 56B with 5B active) each expert is a slice of the feed-forward. A token then uses only some of the slices, so the copy starts close to its base but not equal to it. The dense-start check measures how close. When it is trained, export writes a <code>qwen3moe</code> GGUF that gives every expert its own weights, quantized as it is written.</p></header>
           <div class="ws-panel__body">
           <div class="st-card ws-block">
               <h4 class="ws-block__title">1 · Make the upcycled copy</h4>
@@ -719,6 +719,16 @@
                   <input class="st-input mono" id="ws-u-experts" type="number" min="2" max="256" value="10"></div>
                 <div class="ws-field"><label class="st-label" for="ws-u-topk">Experts per token (top-k)</label>
                   <input class="st-input mono" id="ws-u-topk" type="number" min="1" max="256" value="1"></div>
+                <div class="ws-field"><label class="st-label" for="ws-u-ff">Expert width (neurons) <output>optional</output></label>
+                  <input class="st-input mono" id="ws-u-ff" type="number" min="1" placeholder="full width"></div>
+                <div class="ws-field" data-ws-fine hidden><label class="st-label" for="ws-u-split">Neuron groups</label>
+                  <select class="st-input" id="ws-u-split"><option value="cluster">Clustered by co-activation</option><option value="contiguous">Contiguous</option></select></div>
+                <div class="ws-field" data-ws-fine hidden><label class="st-label" for="ws-u-rank">Expert LoRA rank <output>optional</output></label>
+                  <input class="st-input mono" id="ws-u-rank" type="number" min="0" max="64" placeholder="what fits the cards"></div>
+                <div class="ws-field ws-field--wide" data-ws-fine hidden><label class="st-label" for="ws-u-calib">Calibration conversations</label>
+                  <input class="st-input mono" id="ws-u-calib" data-ws-pick="datasets" autocomplete="off" placeholder="~/data/train.jsonl"></div>
+                <label class="ws-field--wide small ws-check" data-ws-fine hidden><input type="checkbox" id="ws-u-shared"> Share each group's LoRA A across its copies (less memory; with a rank)</label>
+                <label class="ws-field--wide small ws-check" data-ws-fine hidden><input type="checkbox" id="ws-u-check" checked> Dense-start check: measure the held-out loss of the base and of the copy at its start</label>
                 <div class="ws-field ws-field--wide"><label class="st-label" for="ws-u-out">Output folder <output>optional</output></label>
                   <input class="st-input mono" id="ws-u-out" placeholder="in the Workshop folder"></div>
               </div>

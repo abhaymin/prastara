@@ -4929,8 +4929,7 @@ async function wsSubmit(body, btn) {
 }
 $("ws-loop").onclick = (e) => wsSubmit({kind: "loop", input: $("ws-lp-in").value.trim(), start: Number($("ws-lp-start").value),
   end: Number($("ws-lp-end").value), passes: Number($("ws-lp-passes").value), output: $("ws-lp-out").value.trim()}, e.currentTarget);
-$("ws-upcycle").onclick = (e) => wsSubmit({kind: "upcycle", input: $("ws-u-in").value.trim(), experts: Number($("ws-u-experts").value),
-  top_k: Number($("ws-u-topk").value), output: $("ws-u-out").value.trim()}, e.currentTarget);
+$("ws-upcycle").onclick = (e) => wsSubmit({...wsUpReq(), output: $("ws-u-out").value.trim()}, e.currentTarget);
 $("ws-u-train").onclick = () => {
   const done = ws.jobs.find((x) => x.kind === "upcycle" && x.state === "done");
   const up = ws.files.hf.find((x) => x.moe);
@@ -4940,8 +4939,9 @@ $("ws-export-moe").onclick = (e) => wsSubmit({kind: "export-moe", input: $("ws-x
   type: $("ws-x-type").value, pre_tokenizer: $("ws-x-pre").value.trim(), output: $("ws-x-out").value.trim()}, e.currentTarget);
 
 // LoRA upcycling: a model's size as a mixture, counted as the Workshop counts it (model.rs MoeSpec::params): each
-// block's feed-forward `experts` times in all and `top_k` times per token, plus a router per block
-function wsMoeCount(d, experts, topK) {
+// block's feed-forward becomes `experts` experts of `ffE` neurons (the whole feed-forward at full width), `top_k` of
+// them per token, plus a router per block
+function wsMoeCount(d, experts, topK, ffE) {
   const n = (v) => Number(v) || 0;
   const [h, ff, layers, vocab, heads] = [n(d.hidden), n(d.intermediate), n(d.layers), n(d.vocab), n(d.heads)];
   if (!h || !ff || !layers || !vocab || !heads) return null;
@@ -4949,37 +4949,46 @@ function wsMoeCount(d, experts, topK) {
   const extra = d.family === "qwen2" ? heads * hd + 2 * kv * hd : d.family === "qwen3" ? 2 * hd : 0;
   const block = 2 * h * heads * hd + 2 * h * kv * hd + 3 * h * ff + 2 * h + extra;
   const dense = vocab * h * (d.tied ? 1 : 2) + layers * block + h;
-  const ffn = 3 * h * ff, router = experts * h;
-  return {dense, total: dense + layers * ((experts - 1) * ffn + router), active: dense + layers * ((topK - 1) * ffn + router),
+  const ffn = 3 * h * ff, expert = 3 * h * (ffE > 0 && ffE < ff ? ffE : ff), router = experts * h;
+  return {dense, total: dense + layers * (experts * expert - ffn + router), active: dense + layers * (topK * expert - ffn + router),
+          groups: ffE > 0 && ffE < ff ? ff / ffE : 1, ff,
           // the export at about 4.5, 8.5 and 16 bits a weight (the routers and norms stay f32)
-          bytes: (bits) => (dense + layers * ((experts - 1) * ffn)) * bits / 8};
+          bytes: (bits) => (dense + layers * (experts * expert - ffn)) * bits / 8};
 }
 const wsParams = (p) => p >= 1e9 ? `${(p / 1e9).toFixed(2)} B` : p >= 1e6 ? `${(p / 1e6).toFixed(1)} M` : `${Math.round(p / 1e3)} K`;
 function wsUpcycleEst() {
   const box = $("ws-u-est");
   const path = $("ws-u-in").value.trim();
   const experts = Math.max(2, Number($("ws-u-experts").value) || 10), topK = Math.min(experts, Math.max(1, Number($("ws-u-topk").value) || 1));
+  const ffE = Number($("ws-u-ff").value) || 0;
   const m = (ws.files?.hf || []).find((x) => x.path === path);
+  // the fine-grained fields show when the width is below the model's feed-forward
+  const fineShown = ffE > 0 && (!m?.dims?.intermediate || ffE < Number(m.dims.intermediate));
+  for (const el of document.querySelectorAll("[data-ws-fine]")) el.hidden = !fineShown;
   if (!m) { box.innerHTML = `<p class="muted small">${path ? "Not a model folder the Workshop has listed, so its size is not known here; the job says it when it runs." : "Choose a model to see its size as a mixture."}</p>`; return; }
-  if (m.moe) { box.innerHTML = `<p class="muted small">This folder is upcycled already (${m.moe.experts} experts, top-${m.moe.top_k}). Train it, or export it below.</p>`; return; }
-  const c = m.dims && wsMoeCount(m.dims, experts, topK);
+  if (m.moe) { box.innerHTML = `<p class="muted small">This folder is upcycled already (${m.moe.experts} experts${m.moe.expert_ff ? ` of ${m.moe.expert_ff} neurons` : ""}, top-${m.moe.top_k}). Train it, or export it below.</p>`; return; }
+  const c = m.dims && wsMoeCount(m.dims, experts, topK, ffE);
   if (!c) { box.innerHTML = '<p class="muted small">Its config.json does not give the sizes needed to count the parameters.</p>'; return; }
   const q4 = m.dims.vocab ? c.bytes(4.5) : 0;
   box.innerHTML = `<dl class="ws-moe-nums"><div><dt>Dense now</dt><dd>${wsParams(c.dense)}</dd></div><div><dt>Total as a mixture</dt><dd>${wsParams(c.total)}</dd></div>` +
     `<div><dt>Active per token</dt><dd>${wsParams(c.active)}</dd></div><div><dt>Export, Q4_K</dt><dd>about ${fmtBytes(q4)}</dd></div>` +
     `<div><dt>Q8_0</dt><dd>about ${fmtBytes(c.bytes(8.5))}</dd></div><div><dt>F16</dt><dd>about ${fmtBytes(c.bytes(16))}</dd></div></dl>` +
-    `<p class="muted small">${topK === 1 ? "One expert per token: each token costs what it does on the dense model." : `${topK} experts per token: each token costs about ${(c.active / c.dense).toFixed(1)}× the dense model.`} The copy links the weights, so it takes no extra disk until it is exported.</p>`;
+    (c.groups > 1
+      ? `<p class="muted small">${c.groups} neuron groups of ${ffE}, ${experts / c.groups} copies each${experts % c.groups ? ` <strong class="msg-error">(the experts must be a multiple of ${c.groups})</strong>` : ""}. ` +
+        `Each token uses ${topK} × ${ffE} of the ${c.ff} neurons, so it costs about ${(c.active / c.dense).toFixed(2)}× the dense model, and the copy is <strong>not</strong> the dense model at the start: the dense-start check measures the gap that training wins back.</p>`
+      : `<p class="muted small">${topK === 1 ? "One expert per token: each token costs what it does on the dense model." : `${topK} experts per token: each token costs about ${(c.active / c.dense).toFixed(1)}× the dense model.`}</p>`) +
+    `<p class="muted small">The copy links the weights, so it takes no extra disk until it is exported.</p>`;
 }
 function wsExportEst() {
   const box = $("ws-x-est");
   const m = (ws.files?.hf || []).find((x) => x.path === $("ws-x-in").value.trim());
   if (!m?.moe || !m.dims) { box.innerHTML = m && !m.moe ? '<p class="muted small">This folder is not upcycled: make the upcycled copy first.</p>' : ""; return; }
-  const c = wsMoeCount(m.dims, m.moe.experts, m.moe.top_k);
+  const c = wsMoeCount(m.dims, m.moe.experts, m.moe.top_k, Number(m.moe.expert_ff) || 0);
   const bits = {q4_k: 4.5, q8_0: 8.5, q6_k: 6.6, q5_k: 5.5, f16: 16, f32: 32}[$("ws-x-type").value] || 4.5;
   box.innerHTML = c ? `<p class="muted small">${m.moe.experts} experts, top-${m.moe.top_k}: ${wsParams(c.total)} parameters, ${wsParams(c.active)} active per token. ` +
     `The file is about ${fmtBytes(c.bytes(bits))}, written one tensor at a time, so it needs that much free disk and no more.</p>` : "";
 }
-for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk"]) $(id).addEventListener("input", wsUpcycleEst);
+for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk", "ws-u-ff"]) $(id).addEventListener("input", wsUpcycleEst);
 $("ws-u-in").addEventListener("change", wsUpcycleEst);
 for (const id of ["ws-x-in", "ws-x-type"]) { $(id).addEventListener("input", wsExportEst); $(id).addEventListener("change", wsExportEst); }
 // abliterate, upcycle and export-moe: the server's estimate (the job's own command with --estimate), shown under the form
@@ -5015,9 +5024,21 @@ $("ws-abliterate").onclick = (e) => {
   // on the GPUs it takes them from the chat model, as training does: the owner's yes first
   if (wsGpuYes(req.devices, "This abliteration")) wsSubmit(req, e.currentTarget);
 };
-const wsUpReq = () => ({kind: "upcycle", input: $("ws-u-in").value.trim(), experts: Number($("ws-u-experts").value) || 10, top_k: Number($("ws-u-topk").value) || 1});
+function wsUpReq() {
+  const r = {kind: "upcycle", input: $("ws-u-in").value.trim(), experts: Number($("ws-u-experts").value) || 10, top_k: Number($("ws-u-topk").value) || 1};
+  const m = (ws.files?.hf || []).find((x) => x.path === r.input);
+  const ffE = Number($("ws-u-ff").value) || 0;
+  if (ffE > 0 && (!m?.dims?.intermediate || ffE < Number(m.dims.intermediate))) {
+    const rank = $("ws-u-rank").value.trim(), calib = $("ws-u-calib").value.trim();
+    Object.assign(r, {expert_ff: ffE, split: $("ws-u-split").value});
+    if (calib) r.calib = calib;
+    if (rank !== "") { r.expert_rank = Number(rank); if ($("ws-u-shared").checked) r.shared_a = true; }
+    if (calib && $("ws-u-check").checked) r.dense_start_check = true;
+  }
+  return r;
+}
 const wsUpEstSoon = () => wsJobEstimateSoon("ws-u-train-est", wsUpReq, () => { const m = (ws.files?.hf || []).find((x) => x.path === $("ws-u-in").value.trim()); return !!m && !m.moe; });
-for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk"]) $(id).addEventListener("change", wsUpEstSoon);
+for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk", "ws-u-ff", "ws-u-split", "ws-u-rank", "ws-u-calib", "ws-u-shared", "ws-u-check"]) $(id).addEventListener("change", wsUpEstSoon);
 const wsXReq = () => ({kind: "export-moe", input: $("ws-x-in").value.trim(), adapter: $("ws-x-adapter").value.trim() || undefined, type: $("ws-x-type").value,
   output: $("ws-x-out").value.trim() || undefined});
 const wsXEstSoon = () => wsJobEstimateSoon("ws-x-srv-est", wsXReq, () => !!(ws.files?.hf || []).find((x) => x.path === $("ws-x-in").value.trim() && x.moe));
