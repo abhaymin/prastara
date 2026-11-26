@@ -161,6 +161,8 @@ enum Cmd {
     /// | abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto] [--check 8] (a private copy)
     /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
+    /// | regress <hf-folder> [<adapter>] --suite suite.json [--passes 1,2] [--against <report>] (the regression report card)
+    /// | grade-train <hf-folder> --data prompts.jsonl --suite suite.json [--grader code|judge] [--samples 4] [--rounds 1]
     /// | jobs | job <id> | cancel <id> | files
     Workshop {
         action: String,
@@ -1413,6 +1415,29 @@ struct DatagenOpts {
     /// abliterate: held-out prompts of each list to answer before and after
     #[arg(long)]
     check: Option<u64>,
+    /// regress, grade-train: the suite (.json) of tests
+    #[arg(long)]
+    suite: Option<String>,
+    /// regress, grade-train: pass counts of a loop to run at, e.g. 1,2
+    #[arg(long)]
+    passes: Option<String>,
+    /// regress: an earlier report to compare with (repeat it)
+    #[arg(long)]
+    against: Vec<String>,
+    /// grade-train: the prompts (.jsonl)
+    #[arg(long = "prompts", alias = "data")]
+    prompts: Option<String>,
+    /// grade-train: code or judge
+    #[arg(long)]
+    grader: Option<String>,
+    /// grade-train: answers sampled per prompt, and rounds
+    #[arg(long)]
+    samples: Option<u64>,
+    #[arg(long)]
+    rounds: Option<u64>,
+    /// regress, grade-train: cpu (default), cuda:0 or cuda:0,cuda:1 (a GPU run takes the GPUs from the chat model)
+    #[arg(long)]
+    devices: Option<String>,
     /// dataset: the first record to show, and how many
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -1484,6 +1509,20 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 serde_json::json!({"kind": "abliterate", "input": abs(first.clone().ok_or(USE)?), "harmful": abs(dg.harmful.clone().ok_or(USE)?),
                                    "harmless": abs(dg.harmless.clone().ok_or(USE)?), "layer": dg.layer.clone(), "scale": dg.scale,
                                    "check": dg.check, "output": out.clone().map(abs)})
+            }
+            "regress" => {
+                const USE: &str = "regress <hf-folder> [<adapter-folder>] --suite suite.json [--passes 1,2] [--against <report>]";
+                serde_json::json!({"kind": "regress", "model": abs(first.clone().ok_or(USE)?), "adapter": second.clone().map(abs),
+                                   "suite": abs(dg.suite.clone().ok_or(USE)?), "passes": dg.passes.clone(),
+                                   "against": dg.against.iter().cloned().map(abs).collect::<Vec<_>>(), "devices": dg.devices.clone(),
+                                   "output": out.clone().map(abs)})
+            }
+            "grade-train" => {
+                const USE: &str = "grade-train <hf-folder> [<adapter-folder>] --data prompts.jsonl --suite suite.json [--grader code|judge] [--samples 4] [--rounds 1]";
+                serde_json::json!({"kind": "grade-train", "model": abs(first.clone().ok_or(USE)?), "adapter": second.clone().map(abs),
+                                   "data": abs(dg.prompts.clone().ok_or(USE)?), "suite": abs(dg.suite.clone().ok_or(USE)?), "grader": dg.grader.clone(),
+                                   "samples": dg.samples, "rounds": dg.rounds, "passes": dg.passes.clone(), "temperature": dg.temperature,
+                                   "devices": dg.devices.clone(), "output": out.clone().map(abs)})
             }
             "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
                                            "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),

@@ -514,6 +514,8 @@
           <button type="button" role="tab" data-ws-step="upcycle" aria-selected="false"><span>Upcycle to MoE</span><i class="ws-dot" data-ws-dot="upcycle" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Train</p>
           <button type="button" role="tab" data-ws-step="train" aria-selected="false"><span>Train an adapter</span><i class="ws-dot" data-ws-dot="train" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="test" aria-selected="false"><span>Test</span><i class="ws-dot" data-ws-dot="test" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="grade" aria-selected="false"><span>Grade and train</span><i class="ws-dot" data-ws-dot="grade" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Refine</p>
           <button type="button" role="tab" data-ws-step="abliterate" aria-selected="false"><span>Abliterate</span><i class="ws-dot" data-ws-dot="abliterate" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Package</p>
@@ -740,6 +742,73 @@
           <div class="st-card ws-block" id="ws-t-curve" hidden><div class="ws-curve__head"><span class="card-title" id="ws-t-curve-title">Loss</span><span class="muted small" id="ws-t-curve-note"></span></div>
             <div id="ws-t-chart"></div></div>
           <p class="muted small">From a terminal: <code>am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt; --devices cuda:0,cuda:1</code>. Then merge the adapter (Package › Merge).</p>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="test" hidden>
+          <header class="ws-panel__head"><h3>Test a model</h3><p class="muted">Runs the same fixed tests on each version of a model: the base, a looped copy at each pass count, every trained adapter. Code answers really run, with their tests, in a sandbox with time and memory limits and no network. Compare with an earlier report to see what got worse: a test is marked when the drop is larger than its noise.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-model">Model (HF folder)</label>
+                <input class="st-input mono" id="ws-g-model" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-adapter">Adapter <output>optional</output></label>
+                <input class="st-input mono" id="ws-g-adapter" data-ws-pick="adapters" autocomplete="off" placeholder="without one, the model as it is"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-suite">Suite</label>
+                <input class="st-input mono" id="ws-g-suite" data-ws-pick="suites" autocomplete="off" placeholder="~/workshop/suites/core.json"></div>
+              <div class="ws-field"><label class="st-label" for="ws-g-passes">Passes <output>looped models</output></label>
+                <input class="st-input mono" id="ws-g-passes" autocomplete="off" placeholder="its own, or 1,2"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-against">Compare with <output>an earlier report, optional</output></label>
+                <input class="st-input mono" id="ws-g-against" data-ws-pick="reports" autocomplete="off" placeholder="none: the first report"></div>
+              <fieldset class="ws-field ws-field--wide ws-fieldset"><legend class="st-label">Devices</legend>
+                <div class="seg ws-devs" id="ws-g-devs" role="radiogroup" aria-label="Devices">
+                  <button type="button" role="radio" data-dev="cpu" aria-checked="true">CPU</button>
+                  <button type="button" role="radio" data-dev="cuda:0" aria-checked="false">GPU 0</button>
+                  <button type="button" role="radio" data-dev="cuda:0,cuda:1" aria-checked="false">GPU 0 + 1</button></div></fieldset>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-out">Report folder <output>optional</output></label>
+                <input class="st-input mono" id="ws-g-out" placeholder="in the Workshop's reports folder"></div>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-g-start">Run the tests</button></div>
+          </div>
+          <div class="st-card ws-block" id="ws-g-result" hidden><div class="ws-curve__head"><span class="card-title" id="ws-g-result-title">Report</span><span class="muted small" id="ws-g-result-note"></span></div>
+            <div id="ws-g-result-body"></div></div>
+          <p class="muted small">A suite is a JSON list of tests: held-out loss, code (HumanEval, MBPP, LiveCodeBench, Codeforces, Strandset-Rust), IndicQA-style questions and judge-scored answers. From a terminal: <code>am2strata-workshop regress --model &lt;hf-folder&gt; --suite suite.json --passes 1,2 --out &lt;report-dir&gt;</code>.</p>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="grade" hidden>
+          <header class="ws-panel__head"><h3>Grade and train</h3><p class="muted">In rounds: the model answers each prompt several times, every answer is graded (its code is run with the prompt's tests, or a judge model scores it), the best answer of each prompt is trained on, and the test suite runs on the new adapter. The adapter is kept only if no test got worse.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-gt-model">Model (HF folder)</label>
+                <input class="st-input mono" id="ws-gt-model" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-gt-adapter">Start from an adapter <output>optional</output></label>
+                <input class="st-input mono" id="ws-gt-adapter" data-ws-pick="adapters" autocomplete="off" placeholder="without one, the base"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-gt-data">Prompts (.jsonl)</label>
+                <input class="st-input mono" id="ws-gt-data" data-ws-pick="datasets" autocomplete="off" placeholder="~/data/prompts.jsonl"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-gt-suite">Suite</label>
+                <input class="st-input mono" id="ws-gt-suite" data-ws-pick="suites" autocomplete="off" placeholder="~/workshop/suites/core.json"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-grader">Grader</label>
+                <select class="st-input" id="ws-gt-grader"><option value="code" selected>Run the code</option><option value="judge">The judge model</option></select></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-samples">Answers per prompt</label><input class="st-input" id="ws-gt-samples" type="number" min="1" max="64" value="4"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-rounds">Rounds</label><input class="st-input" id="ws-gt-rounds" type="number" min="1" max="20" value="1"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-temp">Temperature</label><input class="st-input" id="ws-gt-temp" type="number" min="0" max="2" step="0.1" value="0.8"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-tokens">Longest answer <output>tokens</output></label><input class="st-input" id="ws-gt-tokens" type="number" min="1" value="512"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-lr">Learning rate</label><input class="st-input" id="ws-gt-lr" value="2e-4"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-epochs">Epochs</label><input class="st-input" id="ws-gt-epochs" type="number" min="0.1" max="100" step="0.1" value="2"></div>
+              <div class="ws-field"><label class="st-label" for="ws-gt-passes">Passes <output>looped models</output></label><input class="st-input mono" id="ws-gt-passes" placeholder="its own"></div>
+              <fieldset class="ws-field ws-field--wide ws-fieldset"><legend class="st-label">Devices</legend>
+                <div class="seg ws-devs" id="ws-gt-devs" role="radiogroup" aria-label="Devices">
+                  <button type="button" role="radio" data-dev="cpu" aria-checked="true">CPU</button>
+                  <button type="button" role="radio" data-dev="cuda:0" aria-checked="false">GPU 0</button>
+                  <button type="button" role="radio" data-dev="cuda:0,cuda:1" aria-checked="false">GPU 0 + 1</button></div></fieldset>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-gt-out">Output folder <output>optional</output></label>
+                <input class="st-input mono" id="ws-gt-out" placeholder="in the Workshop's grade-train folder"></div>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-gt-start">Start the rounds</button></div>
+          </div>
+          <div class="st-card ws-block" id="ws-gt-result" hidden><div class="ws-curve__head"><span class="card-title" id="ws-gt-result-title">Rounds</span><span class="muted small" id="ws-gt-result-note"></span></div>
+            <div id="ws-gt-result-body"></div></div>
+          <p class="muted small">Code prompts: <code>{"prompt", "test"}</code> (Python appended after the answer) or <code>{"prompt", "cases": [{"input", "output"}]}</code>; judge prompts: <code>{"prompt", "reference"}</code>. Training on pairs of best and worst answers (DPO) is not here yet.</p>
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="abliterate" hidden>

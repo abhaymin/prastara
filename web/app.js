@@ -3127,7 +3127,7 @@ function renderTls(j) {
       `<dt>SHA-256</dt><dd class="mono small" style="word-break:break-all">${esc(c.sha256 || "")}</dd></dl>`;
     $("tls-port").value = j.https_port; $("tls-http").value = j.http;
   }
-  if (j.tailscale) html += `<p class="muted small">Tailscale: ${esc(j.tailscale.name || "no MagicDNS name")} · ${(j.tailscale.ips || []).map(esc).join(", ")}</p>`;
+  if (j.tailscale) html += `<p class="muted small">Tailscale: ${esc(j.tailscale.name || "no MagicDNS name")} · ${(j.tailscale.ips || []).join(", ")}</p>`;
   else html += `<p class="muted small">Tailscale is not running on this PC (or not logged in).</p>`;
   if (j.last_error) html += `<div class="msg-error">${esc(j.last_error)}</div>`;
   $("tls-status").innerHTML = html;
@@ -4790,7 +4790,8 @@ async function wsFiles() {
   try {
     const f = await wsFetch("v1/workshop/files");
     ws.files = {hf: (f.hf_models || []).map(wsItem), adapters: (f.adapters || []).map(wsItem), gguf: (f.gguf || []).map(wsItem),
-                datasets: (f.datasets || []).map(wsItem), prompts: (f.prompts || []).map(wsItem)};
+                datasets: (f.datasets || []).map(wsItem), prompts: (f.prompts || []).map(wsItem),
+                suites: (f.suites || []).map(wsItem), reports: (f.reports || []).map(wsItem)};
     const ds = ws.files.datasets.map((x) => x.path);
     wsKnownDatasets = ds.join("\n");
     const pick = $("ws-r-pick"), was = pick.value;
@@ -4805,8 +4806,8 @@ async function wsFiles() {
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install"};
-const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.seeds || (r.sources || [])[0] || ""; };
+const WS_STEP_OF = {datagen: "data", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", regress: "test", "grade-train": "grade"};
+const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.model || r.seeds || (r.sources || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
   const now = Date.now() / 1000, p = x.progress, running = x.state === "running";
@@ -4893,6 +4894,8 @@ async function refreshJobs(pushed = null) {
     for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
     wsCurveRefresh(jobs);
     wsAblitRefresh(jobs);
+    wsTestRefresh(jobs);
+    wsGradeRefresh(jobs);
     // something a job just made appears in the pickers and the overview
     const made = jobs.filter((x) => x.state === "done").map(wsJobOut).join("\n");
     if (made !== ws.made) { const first = ws.made === undefined; ws.made = made; if (!first) wsFiles(); else wsOverview(); }
@@ -4997,6 +5000,8 @@ function wsStep(id) {
   if (id === "library") wsLibLoad();
   if (id === "train") { wsCurveId = null; wsCurveRefresh(); }
   if (id === "abliterate") { wsAblitId = null; wsAblitRefresh(); }
+  if (id === "test") { wsTestId = null; wsTestRefresh(); }
+  if (id === "grade") { wsGradeId = null; wsGradeRefresh(); }
   if (id === "upcycle") { wsUpcycleEst(); wsExportEst(); }
   if (id === "overview") wsOverview();
 }
@@ -5505,6 +5510,98 @@ async function wsAblitRefresh(jobs) {
       `<span class="mono">${(l.separation || 0).toFixed(2)}</span></li>`).join("");
     $("ws-a-result-body").innerHTML = `<div class="ws-est">${rate}${layers.length ? `<p class="muted small">Separation of the two sets after each block (block:pass in a loop); auto picks the best between 30 and 70 % deep, marked.</p><ol class="ws-ab__layers">${rows}</ol>` : ""}` +
       (t.state === "done" ? `<p class="small"><span class="ws-tag ws-tag--private">private</span> ${esc(wsJobOut(t))}</p>` : "") + "</div>";
+  } catch (e) { /* the card stays as it was */ }
+}
+
+// ------------------------------------------------------------------ Workshop: Train › Test and Train › Grade and train
+// Both run the regression suite (plan Part G). A run on the GPUs takes them from the chat model, as training does: the
+// confirm dialog is the owner's yes for it (each grade-and-train round's training and tests run in that one job).
+const wsSegDev = (id) => $(id).querySelector('[aria-checked="true"]')?.dataset.dev || "cpu";
+for (const id of ["ws-g-devs", "ws-gt-devs"]) $(id).addEventListener("click", (e) => {
+  const b = e.target.closest("[data-dev]");
+  if (b) for (const x of $(id).children) x.setAttribute("aria-checked", String(x === b));
+});
+function wsGpuYes(devices, what) {
+  if (devices === "cpu") return true;
+  const cards = devices.split(",").map((d) => `GPU ${d.split(":")[1]}`).join(" and ");
+  const model = $("model-select").selectedOptions[0]?.textContent || "the chat model";
+  return confirm(`${what} uses ${cards}.\n\n${model} is unloaded while it runs, chats wait, and the model is loaded again when it ends.\n\nStart it?`);
+}
+$("ws-g-start").onclick = (e) => {
+  const req = {kind: "regress", model: $("ws-g-model").value.trim(), adapter: $("ws-g-adapter").value.trim(), suite: $("ws-g-suite").value.trim(),
+               passes: $("ws-g-passes").value.trim(), against: $("ws-g-against").value.trim(), devices: wsSegDev("ws-g-devs"), output: $("ws-g-out").value.trim()};
+  if (wsGpuYes(req.devices, "This test run")) wsSubmit(req, e.currentTarget);
+};
+$("ws-gt-start").onclick = (e) => {
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? undefined : Number(v); };
+  const req = {kind: "grade-train", model: $("ws-gt-model").value.trim(), adapter: $("ws-gt-adapter").value.trim(), data: $("ws-gt-data").value.trim(),
+               suite: $("ws-gt-suite").value.trim(), grader: $("ws-gt-grader").value, samples: num("ws-gt-samples"), rounds: num("ws-gt-rounds"),
+               temperature: num("ws-gt-temp"), max_tokens: num("ws-gt-tokens"), lr: num("ws-gt-lr"), epochs: num("ws-gt-epochs"),
+               passes: $("ws-gt-passes").value.trim(), devices: wsSegDev("ws-gt-devs"), output: $("ws-gt-out").value.trim()};
+  const rounds = req.rounds || 1;
+  if (wsGpuYes(req.devices, `Grade and train (${rounds} round${rounds > 1 ? "s" : ""}: sampling, training and the tests in each)`)) wsSubmit(req, e.currentTarget);
+};
+// the report card: one row per test and pass count, a regression marked (and listed above the table)
+function wsReportTable(r) {
+  const f = (v, d = 3) => v == null ? "–" : Number(v).toFixed(d);
+  const regs = r.regressions || [];
+  const head = regs.length
+    ? `<p class="ws-rep__alert" role="status"><b>${regs.length} regression${regs.length > 1 ? "s" : ""}</b>: ${regs.map((g) => `${esc(g.test)} at ${g.passes} pass${g.passes > 1 ? "es" : ""} (${f(g.before)} → ${f(g.after)})`).join(", ")}</p>`
+    : (r.against || []).length ? '<p class="small">No regressions beyond noise.</p>' : '<p class="muted small">No earlier report to compare with: this one is the first.</p>';
+  const rows = (r.results || []).map((t) => {
+    const c = t.compared;
+    const vs = !c ? "" : c.regressed ? `worse ${f(c.delta)}` : c.improved ? `better +${f(c.delta)}` : `same (${c.delta >= 0 ? "+" : ""}${f(c.delta)})`;
+    const cls = c?.regressed ? ' class="ws-rep__bad"' : c?.improved ? ' class="ws-rep__good"' : "";
+    const val = t.error ? `<span class="msg-error small">${esc(String(t.error).slice(0, 120))}</span>` : `<span class="mono">${f(t.value)}</span>`;
+    return `<tr${cls}><th>${esc(t.test)}</th><td class="mono">${t.passes}</td><td>${esc(t.metric || "")}${t.higher_is_better === false ? " ↓" : ""}</td><td>${val}</td>` +
+      `<td class="mono">${t.ci ? `${f(t.ci[0])} – ${f(t.ci[1])}` : "–"}</td><td class="mono">${t.n ?? 0}${t.skipped ? ` <small class="muted">+${t.skipped} left out</small>` : ""}</td><td>${vs}</td></tr>`;
+  }).join("");
+  const net = r.sandbox ? `<p class="muted small">Code ran with CPU and memory limits${r.sandbox.network_isolated ? " and no network" : "; this PC would not give it a network of its own, so it was not cut off from the network"}.</p>` : "";
+  return `<div class="ws-est">${head}<div class="ws-rep__wrap"><table class="ws-ab__check ws-rep"><thead><tr><th>Test</th><th>Passes</th><th>Metric</th><th>Value</th><th>95% interval</th><th>Items</th><th>Against earlier</th></tr></thead>` +
+    `<tbody>${rows}</tbody></table></div>${net}</div>`;
+}
+let wsTestId = null, wsTestAt = 0;
+async function wsTestRefresh(jobs) {
+  const panel = document.querySelector('[data-ws-panel="test"]');
+  if (!panel || panel.hidden) return;
+  const t = (jobs || ws.jobs).find((x) => x.kind === "regress");
+  if (!t) { $("ws-g-result").hidden = true; return; }
+  const live = t.state === "running" || t.state === "queued";
+  if (t.id === wsTestId && !live && Date.now() - wsTestAt < 60000) return;
+  wsTestId = t.id; wsTestAt = Date.now();
+  try {
+    const d = await wsFetch(`v1/workshop/jobs/${t.id}`);
+    $("ws-g-result").hidden = false;
+    $("ws-g-result-title").textContent = `Report · test #${t.id}`;
+    $("ws-g-result-note").textContent = `${t.state}${live && d.progress?.total ? ` · ${d.progress.message || ""} ${d.progress.done} of ${d.progress.total}` : ""}`;
+    const rep = d.result?.report;
+    $("ws-g-result-body").innerHTML = rep ? wsReportTable(rep) + `<p class="muted small mono">${esc(wsJobOut(t))}</p>`
+      : t.state === "failed" ? `<p class="msg-error">${esc(d.error || "failed")}</p>`
+      : `<ul class="muted small">${(d.log || []).slice(-6).map((l) => `<li>${esc(l)}</li>`).join("")}</ul>`;
+  } catch (e) { /* the card stays as it was */ }
+}
+let wsGradeId = null, wsGradeAt = 0;
+async function wsGradeRefresh(jobs) {
+  const panel = document.querySelector('[data-ws-panel="grade"]');
+  if (!panel || panel.hidden) return;
+  const t = (jobs || ws.jobs).find((x) => x.kind === "grade-train");
+  if (!t) { $("ws-gt-result").hidden = true; return; }
+  const live = t.state === "running" || t.state === "queued";
+  if (t.id === wsGradeId && !live && Date.now() - wsGradeAt < 60000) return;
+  wsGradeId = t.id; wsGradeAt = Date.now();
+  try {
+    const d = await wsFetch(`v1/workshop/jobs/${t.id}`);
+    $("ws-gt-result").hidden = false;
+    $("ws-gt-result-title").textContent = `Rounds · grade and train #${t.id}`;
+    $("ws-gt-result-note").textContent = `${t.state}${live && d.progress?.total ? ` · ${d.progress.message || ""}` : ""}`;
+    const rounds = d.result?.rounds || [];
+    const table = rounds.length ? `<table class="ws-ab__check ws-rep"><thead><tr><th>Round</th><th>Answers</th><th>Good</th><th>Prompts kept</th><th>Regressions</th><th>Kept the adapter</th><th></th></tr></thead><tbody>` +
+      rounds.map((r) => `<tr${r.regressions ? ' class="ws-rep__bad"' : r.promoted ? ' class="ws-rep__good"' : ""}><th>${r.round}</th><td class="mono">${r.sampled ?? "–"}</td><td class="mono">${r.passing ?? "–"}</td>` +
+        `<td class="mono">${r.kept}</td><td class="mono">${r.regressions}</td><td>${r.promoted ? "yes" : "no"}</td><td class="small">${esc(r.note || "")}</td></tr>`).join("") + "</tbody></table>" : "";
+    const promoted = t.state === "done" ? `<p class="small">${d.result?.promoted ? `Adapter to use: <span class="mono">${esc(d.result.promoted)}</span>` : "Nothing beat the start: no adapter was kept."}</p>` : "";
+    const curve = (d.points || []).some((p) => p.loss != null) ? wsChart(d.points) : "";
+    $("ws-gt-result-body").innerHTML = t.state === "failed" ? `<p class="msg-error">${esc(d.error || "failed")}</p>`
+      : `<div class="ws-est">${table}${promoted}${curve}${live ? `<ul class="muted small">${(d.log || []).slice(-4).map((l) => `<li>${esc(l)}</li>`).join("")}</ul>` : ""}</div>`;
   } catch (e) { /* the card stays as it was */ }
 }
 

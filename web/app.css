@@ -1046,3 +1046,11 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 /* Monitor: the context card keeps its own height; pager buttons big enough to hit */
 .monitor-row > .ctx-card { align-self: start; }
 .req-pager .st-btn { min-height: 32px; min-width: 32px; }
+/* Workshop › Test: the report card (a regression row stands out; it is also listed above the table) */
+.ws-rep__wrap { overflow-x: auto; }
+.ws-rep td, .ws-rep th { white-space: nowrap; }
+.ws-rep td.small { white-space: normal; }
+.ws-rep tr.ws-rep__bad > * { background: var(--st-danger-tint); color: var(--st-danger-text); }
+.ws-rep tr.ws-rep__bad > th:first-child { box-shadow: inset 3px 0 0 var(--st-danger); }
+.ws-rep tr.ws-rep__good > th:first-child { box-shadow: inset 3px 0 0 var(--st-success, var(--st-accent)); }
+.ws-rep__alert { color: var(--st-danger-text); background: var(--st-danger-tint); border-radius: var(--st-r-md); padding: 8px 12px; font-size: var(--st-fs-sm); }
