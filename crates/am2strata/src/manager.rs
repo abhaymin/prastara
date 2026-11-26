@@ -712,6 +712,10 @@ impl Manager {
                     "default": m.id == self.default_id,
                     "status": if cur.as_deref() == Some(m.id.as_str()) { "loaded" } else { "available" },
                     "tuned": crate::optimizer::view(&m.path),
+                    // the Workshop's marks (an abliterated model): it stays on this PC, and the minor-safety check
+                    // reads every chat with it (crate::minor_safety)
+                    "private": m.cfg.rest.get("private") == Some(&Value::Bool(true)),
+                    "uncensored": crate::minor_safety::applies(&m.id, &m.cfg),
                     // a config `pull` marked unavailable shows its reason here (findings item 3); an empty model list is
                     // not one the server missed, so it stays null and this stays distinguishable from a real problem
                     "engine_available": m.cfg.engine_available.unwrap_or(true),

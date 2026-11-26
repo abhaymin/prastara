@@ -80,6 +80,9 @@ enum Cmd {
         /// experts each token is routed to (1: Switch-style, the active size of the dense base)
         #[arg(long, default_value_t = 1)]
         top_k: usize,
+        /// print the sizes, the export sizes and what training it takes on this machine's GPUs, and stop
+        #[arg(long)]
+        estimate: bool,
     },
     /// an upcycled folder and the adapter trained on it to a qwen3moe GGUF: each expert's LoRA folded into its own
     /// copy of the feed-forward, the router from the adapter; streamed, and quantized as it is written with --type
@@ -96,6 +99,9 @@ enum Cmd {
         /// name the BPE pre-tokenizer when its hash is not a known one (e.g. "qwen2", "llama-bpe", "gpt-2")
         #[arg(long)]
         pre_tokenizer: Option<String>,
+        /// print the disk and memory it needs, and stop
+        #[arg(long)]
+        estimate: bool,
     },
     /// abliteration: remove the direction the model writes into its residual stream before refusing (from the mean
     /// residuals of two prompt lists, one prompt per line) from every o_proj, down_proj and the embeddings; the copy
@@ -126,6 +132,27 @@ enum Cmd {
         base_dtype: Option<String>,
         #[arg(long)]
         out: PathBuf,
+        /// print what the run needs (memory, disk, time) and stop
+        #[arg(long)]
+        estimate: bool,
+    },
+    /// ordinary prompts from chat JSONL files or folders of them (the first user message of each record), one per line:
+    /// the harmless list for `abliterate`, from our own data
+    Prompts {
+        /// .jsonl files or folders holding them
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        /// at most this many prompts
+        #[arg(long, default_value_t = 520)]
+        max: usize,
+        /// skip prompts longer than this many characters
+        #[arg(long, default_value_t = 300)]
+        max_chars: usize,
+        /// only prompts that are almost all ASCII (to match an English harmful list)
+        #[arg(long)]
+        latin: bool,
     },
     /// a long-context copy of a model folder: YaRN positions to --length, every --full-every-th layer full
     /// attention, the rest a --window of the last tokens (weights linked; it still needs long-context training)
@@ -719,7 +746,7 @@ impl Out {
                          pct("harmful_refusal_rate"), r["n"], pct("harmless_refusal_rate"), r["harmless_loss"].as_f64().map_or("-".into(), |l| format!("{l:.3}")));
             }
             Some("rule") => println!("  {}", v["message"].as_str().unwrap_or("")),
-            Some("profile") | Some("plan") | Some("find-lr") | Some("library") => {
+            Some("profile") | Some("plan") | Some("find-lr") | Some("library") | Some("estimate") => {
                 for l in v["lines"].as_array().into_iter().flatten() {
                     println!("{}", l.as_str().unwrap_or(""));
                 }
@@ -727,6 +754,32 @@ impl Out {
             _ => println!("{v}"),
         }
     }
+}
+
+/// What training an upcycled `cfg` takes on this machine's GPUs (all of them, the blocks split), at the settings a
+/// real run starts from (rank 16, all seven targets, 1,024 tokens, gradient checkpointing, a bf16 base), and the
+/// largest settings that fit when those do not: lines, and the same as JSON.
+fn moe_training_plan(cfg: &ModelConfig) -> (Vec<String>, Value) {
+    let machine = Machine { cpu_gflops: 0.0, ..Machine::detect_memory() };
+    let cards = machine.gpus.len().max(1);
+    let p = ProfileInput { cfg: cfg.clone(), lora: strata_workshop::model::LoraSpec { r: 16, alpha: 32.0, targets: Target::ALL.to_vec(), ..Default::default() },
+                           base_dtype: BaseDtype::BF16, max_len: 1024, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: 512,
+                           checkpointing: true, devices: cards };
+    let e = profile::estimate(&p);
+    let card = profile::card_bytes(&e);
+    let mut lines = vec![format!("training (rank 16, all targets, 1,024 tokens, checkpointing, bf16 base, {cards} GPU(s)): about {} on the busiest card, {} trainable",
+                                 human(card), params_label(e.trainable_params))];
+    let fit = profile::suggest_gpu_fit(&p, &machine);
+    if machine.gpus.is_empty() {
+        lines.push("no NVIDIA GPU found here: the training estimate is for one card".into());
+    } else if let Some(l) = profile::gpu_fit_line(&p, &machine) {
+        lines.push(l);
+    } else {
+        lines.push("fits the cards (the chat model is unloaded for a GPU run)".into());
+    }
+    (lines, json!({"card_bytes": card, "devices": cards, "trainable_parameters": e.trainable_params,
+                   "fits": fit.is_none() && !machine.gpus.is_empty() && profile::gpu_fit_line(&p, &machine).is_none(),
+                   "suggested": fit.map(|(r, len, need)| json!({"rank": r, "max_len": len, "card_bytes": need}))}))
 }
 
 fn human(b: u64) -> String {
@@ -983,8 +1036,11 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                 machine.cpu_gflops = *g;
             }
             let mut lines = profile::report_lines(&p, &est, &machine);
+            if s.devices.iter().any(|d| d.starts_with("cuda")) {
+                lines.extend(profile::gpu_fit_line(&p, &machine));
+            }
             lines.extend(notes);
-            lines.push("a 4-bit base (QLoRA), expert adapters of mixture-of-experts models, and vision towers are not done; several GPUs need a cuda build (--devices)".into());
+            lines.push("a 4-bit base (QLoRA) and vision towers are not done; several GPUs need a cuda build (--devices)".into());
             let mut v = profile::estimate_json(&p, &est, &machine);
             v["event"] = json!("profile");
             v["lines"] = json!(lines);
@@ -1038,20 +1094,44 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                              "trainable_parameters": plan.estimate.trainable_params, "cache_disk_bytes": plan.estimate.cache_disk_bytes}}));
             Ok((model.clone(), "info".into(), json!({})))
         }
-        Cmd::Abliterate { model, harmful, harmless, layer, scale, check, devices, base_dtype, out: dst } => {
+        Cmd::Abliterate { model, harmful, harmless, layer, scale, check, devices, base_dtype, out: dst, estimate } => {
             use strata_workshop::abliterate;
-            out.event(json!({"event": "start", "what": format!("abliterate {} into {}", model.display(), dst.display())}));
-            let read = |p: &Path| abliterate::read_prompts(p).map_err(|e| format!("{e:#}"));
+            let read = |p: &Path| abliterate::read_prompt_list(p).map_err(|e| format!("{}: {e:#}", p.display()));
             let mut o = abliterate::Options::new(model, read(harmful)?, read(harmless)?, dst);
             o.layer = abliterate::LayerChoice::parse(layer).map_err(|e| e.to_string())?;
             o.scale = *scale;
             o.check = *check;
             o.devices = devices.clone();
             o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
-            if let Ok(cfg) = ModelConfig::load(model) {
-                // the model while reading, and the largest tensor while writing
-                let held = cfg.total_params() * if o.base_dtype == Some(BaseDtype::F32) { 4 } else { 2 };
-                fits(held + (cfg.vocab_size * cfg.hidden_size) as u64 * 4, "abliteration")?;
+            let cfg = ModelConfig::load(model).map_err(|e| format!("{e:#}"))?;
+            // what it needs, before anything is loaded: the prompts' length through the chat template
+            let gpus = devices.iter().filter(|d| d.as_str() != "cpu").count();
+            let dtype = o.base_dtype.unwrap_or(match profile::source_dtype(model) { Ok(BaseDtype::F32) => BaseDtype::F32, _ => BaseDtype::BF16 });
+            let tokens = strata_workshop::chatdata::ChatTokenizer::load(model, None).ok().map(|t| {
+                let all: Vec<usize> = o.harmful.iter().chain(&o.harmless).take(64).filter_map(|p| t.prompt_ids_answering(p).ok().map(|i| i.len())).collect();
+                all.iter().sum::<usize>() / all.len().max(1)
+            }).unwrap_or(48);
+            let source = strata_workshop::model::weight_files(model).map(|f| f.iter().map(|p| size_of(p)).sum()).unwrap_or(0);
+            let est = abliterate::estimate(&cfg, dtype, gpus, o.harmful.len() + o.harmless.len() - 2 * o.check, tokens, o.check, o.check_tokens, source);
+            let mut lines = vec![format!("{} harmful and {} harmless prompts ({} of each held out for the check), about {tokens} tokens each with the template",
+                                         o.harmful.len(), o.harmless.len(), o.check)];
+            lines.extend(est.lines(gpus, if *estimate || gpus == 0 { Machine::detect().cpu_gflops } else { 0.0 }));
+            if let Some(free) = disk_free(dst) {
+                if free < est.disk_bytes + (1 << 30) {
+                    lines.push(format!("NOT ENOUGH DISK: the output needs about {} and {} is free there", human(est.disk_bytes), human(free)));
+                }
+            }
+            if *estimate {
+                out.event(json!({"event": "estimate", "kind": "abliterate", "estimate": est.to_json(), "lines": lines, "prompt_tokens": tokens}));
+                return Ok((dst.clone(), "info".into(), json!({})));
+            }
+            out.event(json!({"event": "start", "what": format!("abliterate {} into {}", model.display(), dst.display())}));
+            out.event(json!({"event": "estimate", "kind": "abliterate", "estimate": est.to_json(), "lines": lines}));
+            fits(est.ram_bytes, "abliteration")?;
+            if let Some(free) = disk_free(dst) {
+                if free < est.disk_bytes + (1 << 30) {
+                    return Err(format!("the abliterated copy needs about {} on disk and {} is free there", human(est.disk_bytes), human(free)));
+                }
             }
             let r = abliterate::run(&o, &mut |v| out.event(v)).map_err(|e| format!("{e:#}"))?;
             let extra = json!({"layer": r.chosen.site.block, "pass": r.chosen.site.pass, "separation": r.chosen.separation,
@@ -1059,38 +1139,85 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                                "before": r.before.as_ref().map(|c| c.to_json()), "after": r.after.as_ref().map(|c| c.to_json())});
             Ok((dst.clone(), "hf-model".into(), extra))
         }
-        Cmd::Upcycle { model, out: dst, experts, top_k } => {
+        Cmd::Prompts { inputs, out: dst, max, max_chars, latin } => {
+            let got = strata_workshop::abliterate::harvest_prompts(inputs, *max, *max_chars, *latin).map_err(|e| format!("{e:#}"))?;
+            if got.is_empty() {
+                return Err("no prompts matched (first user messages of {\"messages\": [...]} records)".into());
+            }
+            if let Some(p) = dst.parent().filter(|p| !p.as_os_str().is_empty()) {
+                std::fs::create_dir_all(p).map_err(|e| format!("{}: {e}", p.display()))?;
+            }
+            std::fs::write(dst, got.join("\n") + "\n").map_err(|e| format!("{}: {e}", dst.display()))?;
+            out.event(json!({"event": "log", "message": format!("{} prompts written to {}", got.len(), dst.display())}));
+            Ok((dst.clone(), "prompts".into(), json!({"prompts": got.len()})))
+        }
+        Cmd::Upcycle { model, out: dst, experts, top_k, estimate } => {
             use strata_workshop::model::{make_upcycled, MoeSpec};
-            out.event(json!({"event": "start", "what": format!("upcycle {} to {experts} experts, top-{top_k}, as {}", model.display(), dst.display())}));
             let m = MoeSpec { experts: *experts, top_k: *top_k };
-            let (total, active) = make_upcycled(model, dst, m).map_err(|e| format!("{e:#}"))?;
-            let cfg = ModelConfig::load(dst).map_err(|e| format!("{e:#}"))?;
-            out.event(json!({"event": "log", "message": format!("{experts} experts x top-{top_k}: {} parameters in all, {} active per token (the dense base has {})",
-                                                                 params_label(total), params_label(active), params_label(cfg.total_params()))}));
+            m.check().map_err(|e| format!("{e:#}"))?;
+            let dense = ModelConfig::load(model).map_err(|e| format!("{e:#}"))?;
+            if dense.moe.is_some() {
+                return Err(format!("{} is already upcycled", model.display()));
+            }
+            let mut cfg = dense.clone();
+            cfg.moe = Some(m);
+            let (total, active) = m.params(&dense);
             let sizes: serde_json::Map<String, Value> = ["q4_k", "q8_0", "f16"].iter().filter_map(|t| {
                 let ty = strata_workshop::export_moe::ExportType::from_s(t).ok()?;
                 Some((t.to_string(), json!(strata_workshop::export_moe::export_bytes(&cfg, ty).ok()?)))
             }).collect();
-            out.event(json!({"event": "log", "message": format!("export sizes: q4_k {}, q8_0 {}, f16 {}",
-                human(sizes["q4_k"].as_u64().unwrap_or(0)), human(sizes["q8_0"].as_u64().unwrap_or(0)), human(sizes["f16"].as_u64().unwrap_or(0)))}));
+            let mut lines = vec![format!("{experts} experts x top-{top_k}: {} parameters in all, {} active per token (the dense base has {})",
+                                         params_label(total), params_label(active), params_label(dense.total_params())),
+                                 format!("export sizes: q4_k {}, q8_0 {}, f16 {}", human(sizes["q4_k"].as_u64().unwrap_or(0)),
+                                         human(sizes["q8_0"].as_u64().unwrap_or(0)), human(sizes["f16"].as_u64().unwrap_or(0)))];
+            let (train_lines, train) = moe_training_plan(&cfg);
+            lines.extend(train_lines);
+            if *estimate {
+                out.event(json!({"event": "estimate", "kind": "upcycle", "lines": lines, "total_parameters": total, "active_parameters": active,
+                                 "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train}));
+                return Ok((dst.clone(), "info".into(), json!({})));
+            }
+            out.event(json!({"event": "start", "what": format!("upcycle {} to {experts} experts, top-{top_k}, as {}", model.display(), dst.display())}));
+            make_upcycled(model, dst, m).map_err(|e| format!("{e:#}"))?;
+            for l in &lines {
+                out.event(json!({"event": "log", "message": l}));
+            }
             Ok((dst.clone(), "hf-model".into(), json!({"experts": experts, "top_k": top_k, "total_parameters": total, "active_parameters": active,
-                                                         "dense_parameters": cfg.total_params(), "export_bytes": sizes})))
+                                                         "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train})))
         }
-        Cmd::ExportMoe { model, adapter, out: dst, ty, pre_tokenizer } => {
-            use strata_workshop::export_moe::{export_bytes, export_moe, ExportType};
+        Cmd::ExportMoe { model, adapter, out: dst, ty, pre_tokenizer, estimate } => {
+            use strata_workshop::export_moe::{export_moe_with, export_needs, ExportType};
             let t = ExportType::from_s(ty).map_err(|e| e.to_string())?;
             let cfg = ModelConfig::load(model).map_err(|e| format!("{e:#}"))?;
-            let need = export_bytes(&cfg, t).map_err(|e| format!("{}: {e}", model.display()))?;
-            if let Some(free) = disk_free(dst) {
+            let (need, ram) = export_needs(&cfg, t, adapter.as_ref().map_or(0, |a| size_of(a))).map_err(|e| format!("{}: {e}", model.display()))?;
+            let free = disk_free(dst);
+            let mut lines = vec![format!("the file: about {} ({ty}), written one tensor at a time (no larger file first)", human(need)),
+                                 format!("memory: about {} (the embeddings as f32 and encoded, or a feed-forward matrix, an expert's copy and its LoRA product; the adapter)", human(ram))];
+            if let Some(f) = free {
+                lines.push(format!("{} is free on the disk it goes to{}", human(f), if f < need + (1 << 30) { ": NOT ENOUGH" } else { "" }));
+            }
+            if *estimate {
+                out.event(json!({"event": "estimate", "kind": "export-moe", "lines": lines, "disk_bytes": need, "ram_bytes": ram, "disk_free": free}));
+                return Ok((dst.clone(), "info".into(), json!({})));
+            }
+            if let Some(free) = free {
                 if free < need + (1 << 30) {
                     return Err(format!("the export needs about {} on disk and {} is free there", human(need), human(free)));
                 }
             }
-            // one feed-forward matrix as f32, a few copies, and the adapter
-            fits(4 * 4 * (cfg.hidden_size * cfg.intermediate_size.max(cfg.vocab_size)) as u64 + adapter.as_ref().map_or(0, |a| size_of(a)), "exporting this model")?;
+            fits(ram, "exporting this model")?;
             out.event(json!({"event": "start", "what": format!("export {}{} as a qwen3moe GGUF ({ty}, about {}) to {}", model.display(),
                 adapter.as_ref().map_or(String::new(), |a| format!(" with {}", a.display())), human(need), dst.display())}));
-            let r = export_moe(model, adapter.as_deref(), dst, t, pre_tokenizer.as_deref()).map_err(|e| format!("{e:#}"))?;
+            for l in &lines {
+                out.event(json!({"event": "log", "message": l}));
+            }
+            let mut last = Instant::now();
+            let r = export_moe_with(model, adapter.as_deref(), dst, t, pre_tokenizer.as_deref(), &mut |done, all, name| {
+                if last.elapsed().as_secs_f64() >= 2.0 || done == all {
+                    last = Instant::now();
+                    out.event(json!({"event": "progress", "done": done, "total": all, "message": format!("writing {name}")}));
+                }
+            }).map_err(|e| format!("{e:#}"))?;
             out.event(json!({"event": "log", "message": format!("{} experts x top-{}: {} parameters, {} active per token; {} of {} blocks carry trained experts",
                 r.moe.experts, r.moe.top_k, params_label(r.total_params), params_label(r.active_params), r.trained_blocks, cfg.num_hidden_layers)}));
             Ok((r.out, "gguf".into(), json!({"experts": r.moe.experts, "top_k": r.moe.top_k, "total_parameters": r.total_params,
@@ -1233,7 +1360,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))

@@ -38,8 +38,15 @@ pub fn cpu_training_efficiency(dtype: BaseDtype) -> f64 {
         BaseDtype::F16 => 0.3,
     }
 }
-/// A 16 GB-class GPU's training throughput in GFLOP/s. **Assumed, not measured**: no GPU run is part of this trainer yet.
-pub const ASSUMED_GPU_GFLOPS: f64 = 1500.0;
+/// A 16 GB-class GPU's training throughput in GFLOP/s, **measured** on the first real two-card run (the looped
+/// Qwen3-8B "Mula", RTX 5060 Ti ×2, rank 16 on all seven targets, 1,024-token cap, gradient checkpointing, bf16 base:
+/// 672 steps of 4 conversations, 1.31 M tokens, in 5.1 h, where this formula's FLOPs over 1,500 said 19 h). The two
+/// cards run the blocks one after the other, so this is the speed of the pair, not of each.
+pub const ASSUMED_GPU_GFLOPS: f64 = 5600.0;
+/// What a CUDA device holds beyond the estimate's tensors: the context, cuBLAS's workspace and the memory pool's
+/// slack. **Measured** on the same run: its busiest card peaked at 14.7 GiB (15.8 GB; nvidia-smi's MiB) where the
+/// estimate said 13.0 GB.
+pub const CUDA_OVERHEAD_BYTES: u64 = 2_800_000_000;
 /// Room left for the process itself, the tokenizer and the allocator on top of the estimate.
 pub const HEADROOM_BYTES: u64 = 512 << 20;
 
@@ -158,8 +165,11 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     };
     let block_passes = (trained + loop_extra) as f64;
     let per_token = graph_floats_per_token(cfg, &p.lora, seq);
+    // with checkpointing, one block's activations at a time (recomputed in the backward pass): on whichever device that
+    // block sits, so it does not divide when the blocks are split
+    let one_block = if p.checkpointing { 2.0 * 4.0 * seq as f64 * per_token } else { 0.0 };
     let graph = if p.checkpointing {
-        4.0 * (seq * cfg.hidden_size) as f64 * block_passes + 2.0 * 4.0 * seq as f64 * per_token
+        4.0 * (seq * cfg.hidden_size) as f64 * block_passes + one_block
     } else {
         2.0 * 4.0 * seq as f64 * per_token * block_passes
     };
@@ -195,11 +205,11 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let train_factor = if p.checkpointing { 4.0 } else { 3.0 };
     let flops = tokens * (lower_passes * first as f64 * block_fwd + passes * train_factor * (block_passes * block_fwd + head_fwd));
     let total = (weights + 5 * adapter + activations + widening).max(fill);
-    // split over devices: the blocks and their activations divide; the head (last device: its matrix and loss slice)
-    // and one widened matrix do not
+    // split over devices: the blocks and their activations divide; the head (last device: its matrix and loss slice),
+    // one widened matrix and the one block recomputed at a time (checkpointing) do not
     let head_bytes = (cfg.vocab_size * cfg.hidden_size) as u64 * p.base_dtype.bytes() + head as u64;
     let per_device = if p.devices > 1 {
-        (weights + 5 * adapter + activations).saturating_sub(head_bytes) / p.devices as u64 + head_bytes + widening
+        (weights + 5 * adapter + activations).saturating_sub(head_bytes + one_block as u64) / p.devices as u64 + head_bytes + widening + one_block as u64
     } else {
         0
     };
@@ -270,9 +280,14 @@ impl Machine {
     /// This machine: /proc/meminfo for the RAM and `nvidia-smi` for the cards (the server's own two sources), and a
     /// short benchmark for the CPU. Missing sources leave their fields empty.
     pub fn detect() -> Self {
+        Self { cpu_gflops: measure_cpu_gflops(), ..Self::detect_memory() }
+    }
+
+    /// [`detect`](Self::detect) without the CPU benchmark (`cpu_gflops` 0): the RAM and the cards only.
+    pub fn detect_memory() -> Self {
         let (ram_total, ram_available) = std::fs::read_to_string("/proc/meminfo").map(|t| parse_meminfo(&t)).unwrap_or((0, 0));
         let gpus = detect_gpus();
-        Self { ram_total, ram_available, cpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), gpus, cpu_gflops: measure_cpu_gflops() }
+        Self { ram_total, ram_available, cpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), gpus, cpu_gflops: 0.0 }
     }
 }
 
@@ -290,8 +305,12 @@ pub struct Verdict {
     pub need_bytes: u64,
     /// `None` when the free memory is unknown
     pub fits_ram: Option<bool>,
-    /// per GPU: would the same run fit in its free memory (for when GPU runs land)
+    /// what one GPU needs: the busiest device's share (all of it on one card) plus [`CUDA_OVERHEAD_BYTES`]
+    pub card_bytes: u64,
+    /// per GPU: would the run's share fit in its free memory now
     pub fits_gpu: Vec<(u32, bool)>,
+    /// per GPU: would it fit on the card with nothing else on it (the chat model is unloaded for a GPU run)
+    pub fits_gpu_idle: Vec<(u32, bool)>,
     pub cpu_seconds: f64,
     pub gpu_seconds: f64,
 }
@@ -300,16 +319,25 @@ pub fn need_bytes(e: &Estimate) -> u64 {
     e.total_bytes + e.total_bytes / 10 + HEADROOM_BYTES
 }
 
+/// What one GPU needs for the run: the busiest device's share when the blocks are split, else the whole estimate, plus
+/// [`CUDA_OVERHEAD_BYTES`].
+pub fn card_bytes(e: &Estimate) -> u64 {
+    (if e.per_device_bytes > 0 { e.per_device_bytes } else { e.total_bytes }) + CUDA_OVERHEAD_BYTES
+}
+
 pub fn cpu_seconds(e: &Estimate, cpu_gflops: f64) -> f64 {
     e.flops / (cpu_gflops.max(0.01) * cpu_training_efficiency(e.base_dtype) * 1e9)
 }
 
 pub fn verdict(e: &Estimate, m: &Machine) -> Verdict {
     let need = need_bytes(e);
+    let card = card_bytes(e);
     Verdict {
         need_bytes: need,
         fits_ram: (m.ram_available > 0).then_some(need <= m.ram_available),
-        fits_gpu: m.gpus.iter().map(|g| (g.index, need <= g.free_bytes)).collect(),
+        card_bytes: card,
+        fits_gpu: m.gpus.iter().map(|g| (g.index, card <= g.free_bytes)).collect(),
+        fits_gpu_idle: m.gpus.iter().map(|g| (g.index, card <= g.total_bytes)).collect(),
         cpu_seconds: cpu_seconds(e, m.cpu_gflops),
         gpu_seconds: e.flops / (ASSUMED_GPU_GFLOPS * 1e9),
     }
@@ -384,18 +412,66 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
         out.push(format!("activation cache: about {} on disk; the {} frozen blocks run once per conversation, one block in memory at a time (peak {} while filling)",
                          human_bytes(e.cache_disk_bytes), p.cfg.num_hidden_layers - e.trained_blocks, human_bytes(e.fill_bytes)));
     }
-    out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on a 16 GB-class GPU (assumed {:.0} GFLOP/s, not measured; train with --devices cuda:0[,cuda:1] in a cuda build)",
+    out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on 16 GB-class GPUs ({:.0} GFLOP/s, measured on a two-card RTX 5060 Ti run; train with --devices cuda:0[,cuda:1] in a cuda build)",
                      e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * cpu_training_efficiency(e.base_dtype), human_seconds(v.gpu_seconds), ASSUMED_GPU_GFLOPS));
     out.push(match v.fits_ram {
         Some(true) => format!("fits: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         Some(false) => format!("DOES NOT FIT: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         None => format!("needs {} with headroom; this system does not say how much RAM is free", human_bytes(v.need_bytes)),
     });
-    for (g, (_, fits)) in m.gpus.iter().zip(&v.fits_gpu) {
-        out.push(format!("GPU {} ({}): {} free of {} — the same run {} there", g.index, g.name, human_bytes(g.free_bytes), human_bytes(g.total_bytes),
-                         if *fits { "would fit" } else { "would not fit" }));
+    if !m.gpus.is_empty() {
+        out.push(format!("on a GPU: about {} on {} (its share {} + {} measured for CUDA itself)", human_bytes(v.card_bytes),
+                         if e.per_device_bytes > 0 { "the busiest card" } else { "the card" },
+                         human_bytes(v.card_bytes - CUDA_OVERHEAD_BYTES), human_bytes(CUDA_OVERHEAD_BYTES)));
+    }
+    for ((g, (_, fits)), (_, idle)) in m.gpus.iter().zip(&v.fits_gpu).zip(&v.fits_gpu_idle) {
+        out.push(format!("GPU {} ({}): {} free of {} — {}", g.index, g.name, human_bytes(g.free_bytes), human_bytes(g.total_bytes),
+                         match (fits, idle) {
+                             (true, _) => "it would fit there now",
+                             (false, true) => "it would not fit beside what is loaded now, but fits the card once the chat model is unloaded for the run",
+                             (false, false) => "it would not fit on this card even when it is empty",
+                         }));
     }
     out
+}
+
+/// The share of a card's memory a GPU run is planned to: the measured two-card run peaked at 92 % of its cards
+/// (15.8 of 17.1 GB) and ran; above that is untried.
+pub const CARD_PLAN_SHARE: f64 = 0.925;
+
+/// When the run does not fit the smallest GPU (empty) within [`CARD_PLAN_SHARE`]: the largest sequence cap, then the
+/// largest rank, from the usual steps (1,024, 768, 512, 384 tokens; rank 16, 8, 4) that does, with its card need.
+/// `None` when it fits as it is, when there is no GPU, or when nothing on the list fits.
+pub fn suggest_gpu_fit(p: &ProfileInput, m: &Machine) -> Option<(usize, usize, u64)> {
+    let card = m.gpus.iter().map(|g| g.total_bytes).min()?;
+    let limit = (card as f64 * CARD_PLAN_SHARE) as u64;
+    if card_bytes(&estimate(p)) <= limit {
+        return None;
+    }
+    for len in [1024, 768, 512, 384].into_iter().filter(|l| *l <= p.max_len.max(384)) {
+        for r in [16, 8, 4].into_iter().filter(|r| *r <= p.lora.r.max(4)) {
+            let q = ProfileInput { max_len: len, lora: LoraSpec { r, alpha: p.lora.alpha * r as f64 / p.lora.r.max(1) as f64, ..p.lora.clone() }, ..p.clone() };
+            let need = card_bytes(&estimate(&q));
+            if need <= limit {
+                return Some((r, len, need));
+            }
+        }
+    }
+    None
+}
+
+/// For a GPU run: a line when the run is over [`CARD_PLAN_SHARE`] of the smallest card, with the settings that fit.
+pub fn gpu_fit_line(p: &ProfileInput, m: &Machine) -> Option<String> {
+    let card = m.gpus.iter().map(|g| g.total_bytes).min()?;
+    let need = card_bytes(&estimate(p));
+    if need as f64 <= card as f64 * CARD_PLAN_SHARE {
+        return None;
+    }
+    Some(match suggest_gpu_fit(p, m) {
+        Some((r, len, need)) => format!("THIS IS OVER {:.0} % of a {} card (the most a run has been measured to use): --rank {r} --max-len {len} would need about {} a card",
+                                        CARD_PLAN_SHARE * 100.0, human_bytes(card), human_bytes(need)),
+        None => format!("THIS IS OVER {:.0} % of a {} card even at rank 4 and 384 tokens: fewer experts, or more cards", CARD_PLAN_SHARE * 100.0, human_bytes(card)),
+    })
 }
 
 pub fn estimate_json(p: &ProfileInput, e: &Estimate, m: &Machine) -> Value {
@@ -411,6 +487,9 @@ pub fn estimate_json(p: &ProfileInput, e: &Estimate, m: &Machine) -> Value {
         "machine": {"ram_total": m.ram_total, "ram_available": m.ram_available, "cpus": m.cpus, "cpu_gflops": m.cpu_gflops,
                     "gpus": m.gpus.iter().map(|g| json!({"index": g.index, "name": g.name, "total": g.total_bytes, "free": g.free_bytes})).collect::<Vec<_>>()},
         "fits_ram": v.fits_ram, "fits_gpu": v.fits_gpu.iter().map(|(i, f)| json!({"index": i, "fits": f})).collect::<Vec<_>>(),
+        "card_bytes": v.card_bytes, "cuda_overhead_bytes": CUDA_OVERHEAD_BYTES, "per_device_bytes": e.per_device_bytes,
+        "gpu_fit": suggest_gpu_fit(p, m).map(|(r, len, need)| json!({"rank": r, "max_len": len, "card_bytes": need})),
+        "fits_gpu_idle": v.fits_gpu_idle.iter().map(|(i, f)| json!({"index": i, "fits": f})).collect::<Vec<_>>(),
     })
 }
 

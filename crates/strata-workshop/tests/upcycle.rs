@@ -351,12 +351,77 @@ fn write_the_engines_moe_fixture() {
     let lad = scratch("fx-loop-ad");
     save_adapter(&lm, &lspec, &lad);
     export_moe(&lup, Some(&lad), &fx.join("moe-loop.f32.gguf"), ExportType::F32, Some("gpt-2")).unwrap();
+    // long context: YaRN to 512 over 32 and two of three layers sliding over 5 tokens, upcycled to 4 experts top-2
+    let (long, lmoe, lmad) = long_moe("fx-long");
+    let mut mm = load(&lmoe);
+    mm.add_lora(&spec).unwrap();
+    pretend_trained(&mm, 0.05, 2.0);
+    let moe_long = logits(&mm);
+    save_adapter(&mm, &spec, &lmad);
+    export_moe(&lmoe, Some(&lmad), &fx.join("moe-long.f32.gguf"), ExportType::F32, Some("gpt-2")).unwrap();
     let base = logits(&load(&fixture()));
-    assert!(max_diff(&moe, &base) > 0.1 && max_diff(&moe_loop, &base) > 0.1);
-    let json = serde_json::json!({"tokens": TOKENS, "moe": moe, "moe_loop": moe_loop, "base": base,
+    assert!(max_diff(&moe, &base) > 0.1 && max_diff(&moe_loop, &base) > 0.1 && max_diff(&moe_long, &moe) > 1e-3);
+    let json = serde_json::json!({"tokens": TOKENS, "moe": moe, "moe_loop": moe_loop, "moe_long": moe_long, "base": base,
                                   "note": "written by crates/strata-workshop/tests/upcycle.rs write_the_engines_moe_fixture"});
     std::fs::write(fx.join("logits.json"), serde_json::to_string(&json).unwrap()).unwrap();
-    for d in [out, ad, looped, lup, lad] {
+    for d in [out, ad, looped, lup, lad, long, lmoe, lmad] {
         let _ = std::fs::remove_dir_all(d);
     }
+}
+
+/// The long-context copy of the fixture (YaRN 512 over 32, layers 0 and 1 sliding over 5 tokens), upcycled to 4
+/// experts top-2, with a tokenizer: (the long copy, the upcycled one, a scratch folder for its adapter).
+fn long_moe(tag: &str) -> (PathBuf, PathBuf, PathBuf) {
+    let long = scratch(&format!("{tag}-long"));
+    strata_workshop::model::make_long_context(&fixture(), &long, 512, Some(32), 5, 3).unwrap();
+    let up = upcycled(&format!("{tag}-moe"), &long, 4, 2);
+    with_tokenizer(&up);
+    (long, up, scratch(&format!("{tag}-ad")))
+}
+
+#[test]
+fn a_long_context_moe_exports_its_yarn_and_sliding_keys() {
+    let (long, up, ad) = long_moe("long");
+    let cfg = ModelConfig::load(&up).unwrap();
+    assert!(cfg.yarn.is_some() && cfg.layer_sliding == vec![true, true, false]);
+    // at the start the mixture is the long-context dense model, window and positions included
+    let dense = logits(&load(&long));
+    let spec = LoraSpec { targets: vec![Target::Q, Target::V], ..LoraSpec::default() };
+    let mut m = load(&up);
+    m.add_lora(&spec).unwrap();
+    assert!(max_diff(&logits(&m), &dense) < 1e-5);
+    pretend_trained(&m, 0.05, 2.0);
+    save_adapter(&m, &spec, &ad);
+    let gguf = ad.join("long.gguf");
+    export_moe(&up, Some(&ad), &gguf, ExportType::F32, Some("gpt-2")).unwrap();
+    let g = strata_gguf::Gguf::open(&gguf).unwrap();
+    assert_eq!(g.architecture(), Some("qwen3moe"));
+    assert_eq!(g.metadata.get("qwen3moe.rope.scaling.type"), Some(&serde_json::json!("yarn")));
+    assert_eq!(g.u64("qwen3moe.rope.scaling.original_context_length"), Some(32));
+    assert_eq!(g.u64("qwen3moe.context_length"), Some(512));
+    assert_eq!(g.u64("qwen3moe.attention.sliding_window"), Some(5));
+    assert_eq!(g.metadata.get("qwen3moe.attention.sliding_window_pattern"), Some(&serde_json::json!([true, true, false])));
+    for d in [long, up, ad] {
+        let _ = std::fs::remove_dir_all(d);
+    }
+}
+
+#[test]
+fn quantizing_on_several_threads_writes_the_same_bytes() {
+    use strata_workshop::export_moe::encode_par;
+    use strata_workshop::quantize_gguf::encode;
+    let (rows, cols) = (2048usize, 4096usize);
+    let v: Vec<f32> = (0..rows * cols).map(|i| noise("par", i) * 0.05).collect();
+    for ty in ["Q4_K", "Q8_0", "F16"] {
+        let t = std::time::Instant::now();
+        let par = encode_par(&v, ty, cols);
+        let tp = t.elapsed().as_secs_f64();
+        let t = std::time::Instant::now();
+        let one = encode(&v, ty);
+        let t1 = t.elapsed().as_secs_f64();
+        assert_eq!(par, one, "{ty}");
+        println!("{ty}: {:.0} M values/s on one thread, {:.0} M/s split", v.len() as f64 / t1 / 1e6, v.len() as f64 / tp / 1e6);
+    }
+    // a matrix the export cannot split by rows is encoded on one thread
+    assert_eq!(encode_par(&v[..1000], "Q8_0", 0), encode(&v[..1000], "Q8_0"));
 }

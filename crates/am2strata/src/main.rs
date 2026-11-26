@@ -37,6 +37,7 @@ mod production;
 mod queue;
 mod remote;
 mod manager;
+mod minor_safety;
 mod hub_api;
 mod mcp_api;
 mod mem;

@@ -4982,9 +4982,46 @@ function wsExportEst() {
 for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk"]) $(id).addEventListener("input", wsUpcycleEst);
 $("ws-u-in").addEventListener("change", wsUpcycleEst);
 for (const id of ["ws-x-in", "ws-x-type"]) { $(id).addEventListener("input", wsExportEst); $(id).addEventListener("change", wsExportEst); }
-$("ws-abliterate").onclick = (e) => wsSubmit({kind: "abliterate", input: $("ws-a-in").value.trim(), harmful: $("ws-a-harmful").value.trim(),
+// abliterate, upcycle and export-moe: the server's estimate (the job's own command with --estimate), shown under the form
+const wsAblitReq = () => ({kind: "abliterate", input: $("ws-a-in").value.trim(), harmful: $("ws-a-harmful").value.trim(),
   harmless: $("ws-a-harmless").value.trim(), layer: $("ws-a-layer").value.trim() || "auto", scale: Number($("ws-a-scale").value) || 1,
-  check: Number($("ws-a-check").value) || 0, output: $("ws-a-out").value.trim()}, e.currentTarget);
+  check: Number($("ws-a-check").value) || 0, devices: $("ws-a-devs").querySelector('[aria-checked="true"]')?.dataset.dev || "cpu",
+  output: $("ws-a-out").value.trim() || undefined});
+const wsJobEstSeq = {};
+async function wsJobEstimate(req, boxId, ready) {
+  const box = $(boxId);
+  if (!ready) { box.innerHTML = ""; return; }
+  const seq = (wsJobEstSeq[boxId] = (wsJobEstSeq[boxId] || 0) + 1);
+  box.innerHTML = '<p class="muted small">Estimating…</p>';
+  try {
+    const e = await wsFetch("v1/workshop/estimate", {method: "POST", body: JSON.stringify(req)});
+    if (seq !== wsJobEstSeq[boxId]) return;
+    const warn = (l) => /NOT ENOUGH|DOES NOT FIT|THIS IS OVER/.test(l);
+    box.innerHTML = `<ul class="small">${(e.lines || []).map((l) => `<li${warn(l) ? ' class="msg-error"' : ""}>${esc(l)}</li>`).join("")}</ul>`;
+  } catch (err) { if (seq === wsJobEstSeq[boxId]) box.innerHTML = `<p class="msg-error small">${esc(err.message)}</p>`; }
+}
+let wsJobEstTimer = {};
+function wsJobEstimateSoon(boxId, make, ready) { clearTimeout(wsJobEstTimer[boxId]); wsJobEstTimer[boxId] = setTimeout(() => wsJobEstimate(make(), boxId, ready()), 700); }
+const wsAblitEstSoon = () => wsJobEstimateSoon("ws-a-est", wsAblitReq, () => { const r = wsAblitReq(); return !!(r.input && r.harmful && r.harmless); });
+for (const id of ["ws-a-in", "ws-a-harmful", "ws-a-harmless", "ws-a-check"]) $(id).addEventListener("change", wsAblitEstSoon);
+$("ws-a-devs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-dev]");
+  if (!b) return;
+  for (const x of $("ws-a-devs").children) x.setAttribute("aria-checked", String(x === b));
+  wsAblitEstSoon();
+});
+$("ws-abliterate").onclick = (e) => {
+  const req = wsAblitReq();
+  // on the GPUs it takes them from the chat model, as training does: the owner's yes first
+  if (wsGpuYes(req.devices, "This abliteration")) wsSubmit(req, e.currentTarget);
+};
+const wsUpReq = () => ({kind: "upcycle", input: $("ws-u-in").value.trim(), experts: Number($("ws-u-experts").value) || 10, top_k: Number($("ws-u-topk").value) || 1});
+const wsUpEstSoon = () => wsJobEstimateSoon("ws-u-train-est", wsUpReq, () => { const m = (ws.files?.hf || []).find((x) => x.path === $("ws-u-in").value.trim()); return !!m && !m.moe; });
+for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk"]) $(id).addEventListener("change", wsUpEstSoon);
+const wsXReq = () => ({kind: "export-moe", input: $("ws-x-in").value.trim(), adapter: $("ws-x-adapter").value.trim() || undefined, type: $("ws-x-type").value,
+  output: $("ws-x-out").value.trim() || undefined});
+const wsXEstSoon = () => wsJobEstimateSoon("ws-x-srv-est", wsXReq, () => !!(ws.files?.hf || []).find((x) => x.path === $("ws-x-in").value.trim() && x.moe));
+for (const id of ["ws-x-in", "ws-x-adapter", "ws-x-type"]) $(id).addEventListener("change", wsXEstSoon);
 $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").value.trim(), adapter: $("ws-m-adapter").value.trim(), output: $("ws-m-out").value.trim()}, e.currentTarget);
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
 $("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
@@ -4999,15 +5036,15 @@ function wsStep(id) {
   $("ws-work").scrollTop = 0;
   if (id === "library") wsLibLoad();
   if (id === "train") { wsCurveId = null; wsCurveRefresh(); }
-  if (id === "abliterate") { wsAblitId = null; wsAblitRefresh(); }
+  if (id === "abliterate") { wsAblitId = null; wsAblitRefresh(); wsAblitEstSoon(); }
   if (id === "test") { wsTestId = null; wsTestRefresh(); }
   if (id === "grade") { wsGradeId = null; wsGradeRefresh(); }
-  if (id === "upcycle") { wsUpcycleEst(); wsExportEst(); }
+  if (id === "upcycle") { wsUpcycleEst(); wsExportEst(); wsUpEstSoon(); wsXEstSoon(); }
   if (id === "overview") wsOverview();
 }
 function wsUse(step, inputId, path) {
   wsStep(step); $(inputId).value = path; wsPick.quiet = true; $(inputId).focus(); wsPick.quiet = false;
-  if (step === "upcycle") { wsUpcycleEst(); wsExportEst(); }
+  if (step === "upcycle") { wsUpcycleEst(); wsExportEst(); wsUpEstSoon(); wsXEstSoon(); }
 }
 $("ws-steps").addEventListener("click", (e) => { const b = e.target.closest("[data-ws-step]"); if (b) wsStep(b.dataset.wsStep); });
 $("ws-steps").addEventListener("keydown", (e) => {
@@ -5438,11 +5475,17 @@ async function wsTrainEstimate() {
   try {
     const e = await wsFetch("v1/workshop/estimate", {method: "POST", body: JSON.stringify(req)});
     if (seq !== wsEstSeq) return;
-    const gpus = (e.fits_gpu || []).map((g) => `<span class="st-badge ${g.fits ? "" : "st-badge--error"}">GPU ${g.index}: ${g.fits ? "fits" : "does not fit"}</span>`).join("");
+    // per card: fits beside what is loaded now, fits once the chat model is unloaded for the run, or not at all
+    const idle = new Map((e.fits_gpu_idle || []).map((g) => [g.index, g.fits]));
+    const gpus = (e.fits_gpu || []).map((g) => {
+      const empty = idle.get(g.index);
+      const [cls, say] = g.fits ? ["", "fits"] : empty ? ["st-badge--queued", "fits once the chat model is unloaded"] : ["st-badge--error", "does not fit"];
+      return `<span class="st-badge ${cls}">GPU ${g.index}: ${say}</span>`;
+    }).join("");
     const ram = e.fits_ram != null ? `<span class="st-badge ${e.fits_ram ? "" : "st-badge--error"}">RAM: ${e.fits_ram ? "fits" : "does not fit"}</span>` : "";
     // the GPUs are checked against what is free now; the chat model gives its share back for the run
     const chat = $("model-select").selectedOptions[0]?.textContent;
-    const note = req.devices !== "cpu" && (e.fits_gpu || []).some((g) => !g.fits)
+    const note = req.devices !== "cpu" && (e.fits_gpu || []).some((g) => !g.fits && !idle.get(g.index))
       ? `<p class="small">The GPU check is against the memory free now, with ${esc(chat || "the chat model")} loaded. It is unloaded for the run, which frees its share of each card: compare the run's need on the busiest card (the line "split over the devices") with each card's total.</p>` : "";
     body.innerHTML = `<div class="ws-est"><div class="ws-est__fit">${ram}${req.devices !== "cpu" ? gpus : ""}</div>${note}` +
       `<ul>${(e.lines || []).map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`;

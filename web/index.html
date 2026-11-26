@@ -723,6 +723,7 @@
                   <input class="st-input mono" id="ws-u-out" placeholder="in the Workshop folder"></div>
               </div>
               <div class="ws-est" id="ws-u-est" aria-live="polite"><p class="muted small">Choose a model to see its size as a mixture.</p></div>
+              <div class="ws-est" id="ws-u-train-est" aria-live="polite"></div>
               <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-upcycle">Make the upcycled copy</button></div>
           </div>
           <div class="st-card ws-block">
@@ -748,6 +749,7 @@
                   <input class="st-input mono" id="ws-x-out" placeholder="in the Workshop folder"></div>
               </div>
               <div class="ws-est" id="ws-x-est" aria-live="polite"></div>
+              <div class="ws-est" id="ws-x-srv-est" aria-live="polite"></div>
               <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-export-moe">Export the qwen3moe GGUF</button></div>
           </div>
           </div>
@@ -873,7 +875,7 @@
                   <input class="st-input mono" id="ws-a-in" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
                 <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-harmful">Prompts it refuses <output>a .txt file, one per line</output></label>
                   <input class="st-input mono" id="ws-a-harmful" data-ws-pick="prompts" autocomplete="off" placeholder="~/data/refused.txt"></div>
-                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-harmless">Ordinary prompts <output>a .txt file, one per line</output></label>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-harmless">Ordinary prompts <output>a .txt file, one per line, or a chat .jsonl</output></label>
                   <input class="st-input mono" id="ws-a-harmless" data-ws-pick="prompts" autocomplete="off" placeholder="~/data/ordinary.txt"></div>
                 <div class="ws-field"><label class="st-label" for="ws-a-layer">Layer <output>auto, N or N:pass</output></label>
                   <input class="st-input mono" id="ws-a-layer" autocomplete="off" value="auto"></div>
@@ -881,16 +883,22 @@
                   <input class="st-input" id="ws-a-scale" type="number" min="0.1" max="2" step="0.1" value="1"></div>
                 <div class="ws-field"><label class="st-label" for="ws-a-check">Check answers <output>prompts of each list</output></label>
                   <input class="st-input" id="ws-a-check" type="number" min="0" max="256" value="8"></div>
+                <fieldset class="ws-field ws-field--wide ws-fieldset"><legend class="st-label">Devices</legend>
+                  <div class="seg ws-devs" id="ws-a-devs" role="radiogroup" aria-label="Devices">
+                    <button type="button" role="radio" data-dev="cpu" aria-checked="true">CPU</button>
+                    <button type="button" role="radio" data-dev="cuda:0" aria-checked="false">GPU 0</button>
+                    <button type="button" role="radio" data-dev="cuda:0,cuda:1" aria-checked="false">GPU 0 + 1</button></div></fieldset>
                 <div class="ws-field ws-field--wide"><label class="st-label" for="ws-a-out">Output folder <output>optional</output></label>
                   <input class="st-input mono" id="ws-a-out" placeholder="in the Workshop folder, as …-abliterated"></div>
               </div>
+              <div class="ws-est" id="ws-a-est" aria-live="polite"></div>
               <p class="small ws-private"><span class="ws-tag ws-tag--private">private</span> Abliterated models stay on this PC; they are marked private.</p>
               <div class="ws-actions"><span class="muted small ws-actions__note">The check answers each held-out prompt before and after, a few words each; on a large model that takes a while.</span>
                 <button type="button" class="st-btn st-btn--primary" id="ws-abliterate">Make the abliterated copy</button></div>
           </div>
           <div class="st-card ws-block" id="ws-a-result" hidden><div class="ws-curve__head"><span class="card-title" id="ws-a-result-title">Result</span><span class="muted small" id="ws-a-result-note"></span></div>
             <div id="ws-a-result-body"></div></div>
-          <p class="muted small">From a terminal: <code>am2strata-workshop abliterate &lt;hf-folder&gt; --harmful refused.txt --harmless ordinary.txt --check 8 --out &lt;folder&gt;</code>. Then convert it (Package › Convert).</p>
+          <p class="muted small">From a terminal: <code>am2strata-workshop abliterate &lt;hf-folder&gt; --harmful refused.txt --harmless ordinary.txt --check 8 --devices cuda:0,cuda:1 --out &lt;folder&gt;</code> (<code>--estimate</code> first to see what it needs). An ordinary list from your own chat data: <code>am2strata-workshop prompts &lt;folders of .jsonl&gt; --latin --out ordinary.txt</code>. Then convert it (Package › Convert) and make it Strata-ready: it is installed as <code>…-abliterated</code>, private and uncensored, and every chat with it goes through the minor-safety check.</p>
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="merge" hidden>

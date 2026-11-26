@@ -148,7 +148,7 @@ fn read_as_f32(buf: &[u8], g: &Gguf, t: &strata_gguf::TensorInfo) -> Result<Vec<
 }
 
 /// Encode f32 values to the output precision `name`: F32/F16 inline, or a strata-pack block quantizer.
-pub(crate) fn encode(x: &[f32], name: &str) -> Vec<u8> {
+pub fn encode(x: &[f32], name: &str) -> Vec<u8> {
     match name {
         "F32" => x.iter().flat_map(|v| v.to_le_bytes()).collect(),
         "F16" => x.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes()).collect(),

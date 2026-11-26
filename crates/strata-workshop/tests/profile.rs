@@ -134,7 +134,7 @@ fn the_verdict_compares_with_free_memory() {
     // time: operations over (GFLOP/s × the share training reaches)
     assert_eq!(profile::cpu_seconds(&e, 100.0), e.flops / (100.0 * profile::cpu_training_efficiency(BaseDtype::F16) * 1e9));
     let lines = profile::report_lines(&p, &e, &m).join("\n");
-    assert!(lines.contains("524288 adapter parameters") && lines.contains("fits: needs") && lines.contains("would not fit") && lines.contains("not measured"), "{lines}");
+    assert!(lines.contains("524288 adapter parameters") && lines.contains("fits: needs") && lines.contains("would not fit") && lines.contains("measured on a two-card"), "{lines}");
     assert_eq!(profile::parse_meminfo("MemTotal:       61712345 kB\nMemFree: 1 kB\nMemAvailable:   20000000 kB\n"), (61712345 * 1024, 20000000 * 1024));
 }
 

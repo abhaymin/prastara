@@ -264,6 +264,16 @@ impl ChatTokenizer {
         Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.get_ids().to_vec())
     }
 
+    /// [`prompt_ids`](Self::prompt_ids) with the template's `enable_thinking` false: a template that can think (Qwen3)
+    /// opens the answer itself, after an empty thinking block; one that cannot is unchanged. Abliteration reads and
+    /// checks the model here, where the answer (and a refusal) starts.
+    pub fn prompt_ids_answering(&self, user: &str) -> Result<Vec<u32>> {
+        let mut vars = self.vars.clone();
+        vars.insert("enable_thinking".into(), json!(false));
+        let text = self.template.render(&[json!({"role": "user", "content": user})], None, true, &vars).map_err(|e| anyhow!("chat template: {e}"))?;
+        Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.get_ids().to_vec())
+    }
+
     /// The ids that end an answer: the template's `eos_token` and the usual end-of-turn markers the vocabulary has.
     pub fn stop_ids(&self) -> Vec<u32> {
         let mut names: Vec<String> = self.vars.get("eos_token").and_then(Value::as_str).map(str::to_string).into_iter().collect();
