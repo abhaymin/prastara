@@ -18,6 +18,8 @@ serde.workspace = true
 thiserror.workspace = true
 strata-pack.workspace = true
 strata-gguf.workspace = true
+# the Rust engine's line protocol (engine.rs: regress and grade-train answer through am2strata-hybrid --serve)
+strata-protocol.workspace = true
 # the model's own chat template renders the training conversations (the same renderer the server uses)
 strata-template.workspace = true
 # soup.yaml import (Soup configs are YAML); serde_yaml itself is unmaintained, this is its maintained fork

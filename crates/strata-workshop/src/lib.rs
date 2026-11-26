@@ -22,6 +22,7 @@ pub mod finetune;
 pub mod datagen;
 pub mod recipes;
 pub mod regress;
+pub mod engine;
 pub mod gradetrain;
 pub mod sandbox;
 pub mod library;

@@ -24,7 +24,20 @@
 //! - **qa**: a short answer read from a passage, exact match and token F1 (SQuAD files such as IndicQA, or jsonl
 //!   `{"id", "context", "question", "answers": [...]}`); unanswerable questions are left out;
 //! - **judge**: an answer scored 1–5 by a model through the server's API (`AM2STRATA_URL`, `AM2STRATA_API_KEY`, as
-//!   datagen reaches it): jsonl `{"id", "prompt", "reference"?, "source"?, "to"?}` (`to`: a translation into it).
+//!   datagen reaches it): jsonl `{"id", "prompt", "reference"?, "source"?, "to"?}` (`to`: a translation into it). The
+//!   judge is asked a tiny question first and must answer within `AM2STRATA_JUDGE_TIMEOUT` (180 s), or the judge tests
+//!   report why without running. **A GPU run and a judge on the same GPUs conflict**: the server takes the GPUs from
+//!   its chat model for the run, so a local GPU judge cannot answer until the run ends (the server refuses such a job
+//!   at once). Judge with a remote (assist) model, or a model whose run config keeps it on the CPU;
+//! - **repeat**: answers to prompts (jsonl `{"id"?, "prompt"}`) scored by how much they repeat themselves
+//!   ([`repetition`]: distinct-2/3, repeated 4-grams and sentences), lower is better; an answer over `threshold`
+//!   (0.25) is flagged;
+//! - **samples**: answers to prompts, kept to read: report.md shows them beside an earlier report's (`--against`).
+//!
+//! With an engine (`Options::engine`, `--engine-gguf`), the generation tests are answered by Prastara's Rust engine on
+//! a GGUF of the model (attention cache, GPU graph), the prompt rendered here with the model's own chat template; the
+//! loss tests keep the Workshop's model (they need its logits), which runs first and leaves the devices before the
+//! engine loads (once per pass count: `--loop-passes`).
 //!
 //! The report keeps every item's score, so a later report pairs its items with an earlier one's and a **paired
 //! bootstrap** of the difference says whether a drop is real: a test regressed when the whole 95 % interval of the
@@ -52,6 +65,33 @@ pub struct Sampling {
     pub seed: u64,
 }
 
+/// Something that answers a user message with the model's chat template: the Workshop's own model ([`Generator`]) or
+/// Prastara's Rust engine on a GGUF of it ([`crate::engine::EngineGenerator`]). Both tokenize the prompt the same way
+/// (the template training used), so their greedy answers agree.
+pub trait Answer {
+    fn tok(&self) -> &ChatTokenizer;
+    /// prompts longer than this many tokens are left out
+    fn max_prompt(&self) -> usize;
+    /// Up to `max_new` tokens after `prompt`, without the end-of-turn token.
+    fn generate(&self, prompt: &[u32], max_new: usize, sampling: Option<Sampling>) -> Result<Vec<u32>>;
+    /// "workshop" or "engine", for the report
+    fn label(&self) -> String;
+
+    /// The prompt as token ids, or None when it is longer than [`Answer::max_prompt`].
+    fn prompt(&self, user: &str) -> Result<Option<Vec<u32>>> {
+        let ids = self.tok().prompt_ids(user)?;
+        Ok((ids.len() <= self.max_prompt()).then_some(ids))
+    }
+
+    /// One answer to one user message, as text; None when the prompt is too long.
+    fn answer(&self, user: &str, max_new: usize, sampling: Option<Sampling>) -> Result<Option<String>> {
+        match self.prompt(user)? {
+            Some(ids) => Ok(Some(self.tok().decode(&self.generate(&ids, max_new, sampling)?)?)),
+            None => Ok(None),
+        }
+    }
+}
+
 /// Answers from the Workshop's model: no attention cache (each token runs the whole sequence again), bounded by
 /// `max_new` tokens, so it suits short answers and small test sets; prompts longer than `max_prompt` are left out.
 pub struct Generator<'a> {
@@ -65,15 +105,23 @@ impl<'a> Generator<'a> {
     pub fn new(model: &'a LlamaModel, tok: &'a ChatTokenizer, max_prompt: usize) -> Self {
         Self { model, tok, stop: tok.stop_ids(), max_prompt }
     }
+}
 
-    /// The prompt as token ids, or None when it is longer than `max_prompt`.
-    pub fn prompt(&self, user: &str) -> Result<Option<Vec<u32>>> {
-        let ids = self.tok.prompt_ids(user)?;
-        Ok((ids.len() <= self.max_prompt).then_some(ids))
+impl Answer for Generator<'_> {
+    fn tok(&self) -> &ChatTokenizer {
+        self.tok
+    }
+
+    fn max_prompt(&self) -> usize {
+        self.max_prompt
+    }
+
+    fn label(&self) -> String {
+        "workshop".into()
     }
 
     /// Up to `max_new` tokens after `prompt`, stopping at an end-of-turn id.
-    pub fn generate(&self, prompt: &[u32], max_new: usize, sampling: Option<Sampling>) -> Result<Vec<u32>> {
+    fn generate(&self, prompt: &[u32], max_new: usize, sampling: Option<Sampling>) -> Result<Vec<u32>> {
         let mut seq = prompt.to_vec();
         let mut out = Vec::new();
         let mut draw = sampling.map(|s| Draw::new(s.seed));
@@ -100,14 +148,6 @@ impl<'a> Generator<'a> {
             seq.push(next);
         }
         Ok(out)
-    }
-
-    /// One answer to one user message, as text; None when the prompt is too long.
-    pub fn answer(&self, user: &str, max_new: usize, sampling: Option<Sampling>) -> Result<Option<String>> {
-        match self.prompt(user)? {
-            Some(ids) => Ok(Some(self.tok.decode(&self.generate(&ids, max_new, sampling)?)?)),
-            None => Ok(None),
-        }
     }
 }
 
@@ -668,6 +708,16 @@ pub fn judge_request(item: &JudgeItem, answer: &str) -> String {
 pub trait Judge {
     fn score(&self, request: &str) -> Result<u8>;
     fn name(&self) -> String;
+    /// Whether the judge answers at all, asked once before the tests (an error says why it cannot).
+    fn ready(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// How long the judge has to answer the first, tiny request: `AM2STRATA_JUDGE_TIMEOUT` seconds, default 180 (a CPU
+/// or remote model that must load first; a judge on GPUs a run holds would otherwise wait for the run to end).
+pub fn judge_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(std::env::var("AM2STRATA_JUDGE_TIMEOUT").ok().and_then(|v| v.parse().ok()).unwrap_or(180).max(5))
 }
 
 impl Judge for crate::datagen::Model {
@@ -678,7 +728,79 @@ impl Judge for crate::datagen::Model {
     fn name(&self) -> String {
         self.name.clone()
     }
+    fn ready(&self) -> Result<()> {
+        let t = judge_timeout();
+        self.ask_within("You are a grader.", "Reply with the single word OK.", 0.0, 8, false, Some(t))
+            .map(|_| ()).with_context(|| format!("no answer within {} s", t.as_secs()))
+    }
 }
+
+// ------------------------------------------------------------------------------------------- repeat and samples
+
+/// One prompt of a `repeat` or `samples` test.
+#[derive(Debug, Clone)]
+pub struct PromptItem {
+    pub id: String,
+    pub prompt: String,
+}
+
+/// Prompts from a jsonl file: `{"id"?, "prompt"}` (or `question`, `instruction`, or the first user turn of
+/// `messages`); rows without one are left out.
+pub fn load_prompts(path: &Path) -> Result<(Vec<PromptItem>, usize)> {
+    let mut out = Vec::new();
+    let mut left = 0;
+    for (n, r) in read_rows(path)?.iter().enumerate() {
+        let text = ["prompt", "question", "instruction"].iter().find_map(|k| r[*k].as_str().filter(|t| !t.trim().is_empty()).map(str::to_string))
+            .or_else(|| r["messages"].as_array().and_then(|m| m.iter().find(|x| x["role"] == "user")).and_then(|x| x["content"].as_str()).map(str::to_string));
+        match text {
+            Some(t) => out.push(PromptItem { id: if r["id"].is_null() { n.to_string() } else { s(r, "id") }, prompt: t }),
+            None => left += 1,
+        }
+    }
+    Ok((out, left))
+}
+
+/// How much an answer repeats itself. `distinct2`/`distinct3`: the share of its word 2- and 3-grams that are distinct
+/// (1: none repeats); `repeated4`: the share of its 4-grams that repeat an earlier one; `repeated_sentences`: the share
+/// of its sentences (8 characters or more, compared without case and punctuation) that repeat an earlier one. Words are split at white space (lowercased,
+/// punctuation trimmed); a text of fewer than 8 words (a script written without spaces) is read character by character.
+/// `score` = max(repeated4, repeated_sentences): 0 is no repetition, near 1 a loop.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Repetition {
+    pub distinct2: f64,
+    pub distinct3: f64,
+    pub repeated4: f64,
+    pub repeated_sentences: f64,
+    pub score: f64,
+}
+
+fn distinct(units: &[String], n: usize) -> f64 {
+    if units.len() < n {
+        return 1.0;
+    }
+    let grams: Vec<&[String]> = units.windows(n).collect();
+    let set: std::collections::HashSet<&[String]> = grams.iter().copied().collect();
+    set.len() as f64 / grams.len() as f64
+}
+
+pub fn repetition(text: &str) -> Repetition {
+    let words: Vec<String> = text.split_whitespace().map(|w| w.trim_matches(|c: char| c.is_ascii_punctuation() || c == '।').to_lowercase())
+        .filter(|w| !w.is_empty()).collect();
+    let units = if words.len() >= 8 { words } else { text.chars().filter(|c| !c.is_whitespace()).map(|c| c.to_string()).collect() };
+    let repeated4 = if units.len() >= 4 { 1.0 - distinct(&units, 4) } else { 0.0 };
+    let sentences: Vec<String> = text.split(['.', '!', '?', '\n', '।', '。', ';']).map(|x| x.chars().filter(|c| !c.is_ascii_punctuation()).collect::<String>().split_whitespace().collect::<Vec<_>>().join(" ").to_lowercase())
+        .filter(|x| x.chars().count() >= 8).collect();
+    let repeated_sentences = if sentences.len() >= 2 {
+        let set: std::collections::HashSet<&String> = sentences.iter().collect();
+        (sentences.len() - set.len()) as f64 / sentences.len() as f64
+    } else {
+        0.0
+    };
+    Repetition { distinct2: distinct(&units, 2), distinct3: distinct(&units, 3), repeated4, repeated_sentences, score: repeated4.max(repeated_sentences) }
+}
+
+/// The share of 4-grams / sentences above which an answer is flagged as repetitive (a test's `threshold`).
+pub const REPEAT_THRESHOLD: f64 = 0.25;
 
 // ---------------------------------------------------------------------------------------------------------- suite
 
@@ -694,7 +816,12 @@ pub struct TestSpec {
     pub language: Option<String>,
     pub cpu_seconds: Option<u64>,
     pub memory_mb: Option<u64>,
+    /// `repeat`: the score above which an answer is flagged
+    pub threshold: Option<f64>,
 }
+
+/// The kinds a suite's test may be.
+pub const KINDS: [&str; 6] = ["loss", "code", "qa", "judge", "repeat", "samples"];
 
 #[derive(Debug, Clone)]
 pub struct Suite {
@@ -716,9 +843,13 @@ impl Suite {
         let mut tests = Vec::new();
         let mut names = std::collections::BTreeSet::new();
         for (i, t) in v["tests"].as_array().ok_or_else(|| anyhow!("{}: no \"tests\" list", path.display()))?.iter().enumerate() {
-            let kind = t["kind"].as_str().ok_or_else(|| anyhow!("test {}: no \"kind\" (loss, code, qa or judge)", i + 1))?.to_string();
-            if !["loss", "code", "qa", "judge"].contains(&kind.as_str()) {
-                bail!("test {}: kind {kind:?} is not loss, code, qa or judge", i + 1);
+            let kind = t["kind"].as_str().ok_or_else(|| anyhow!("test {}: no \"kind\" ({})", i + 1, KINDS.join(", ")))?.to_string();
+            if !KINDS.contains(&kind.as_str()) {
+                bail!("test {}: kind {kind:?} is not one of {}", i + 1, KINDS.join(", "));
+            }
+            let threshold = t["threshold"].as_f64();
+            if threshold.is_some_and(|x| !(0.0..=1.0).contains(&x)) {
+                bail!("test {}: \"threshold\" is a share from 0 to 1", i + 1);
             }
             let name = t["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("{kind}-{}", i + 1));
             if !names.insert(name.clone()) {
@@ -729,7 +860,7 @@ impl Suite {
             let n = |k: &str| t[k].as_u64();
             tests.push(TestSpec { name, kind, format: t["format"].as_str().unwrap_or("").to_string(), data, limit: n("limit").map(|x| x as usize),
                                   max_tokens: n("max_tokens").map(|x| x as usize), language: t["language"].as_str().map(str::to_string),
-                                  cpu_seconds: n("cpu_seconds"), memory_mb: n("memory_mb") });
+                                  cpu_seconds: n("cpu_seconds"), memory_mb: n("memory_mb"), threshold });
         }
         if tests.is_empty() {
             bail!("{}: the suite has no tests", path.display());
@@ -857,12 +988,15 @@ pub struct Options {
     pub max_prompt_tokens: usize,
     /// run even when the memory estimate says a device is too small
     pub force: bool,
+    /// answer the generation tests (code, qa, judge, repeat, samples) through the Rust engine on this GGUF of the model
+    /// (with the adapter merged in, when there is one); the loss tests still use the Workshop's model
+    pub engine: Option<crate::engine::EngineSpec>,
 }
 
 impl Options {
     pub fn new(model: impl Into<PathBuf>, suite: impl Into<PathBuf>, out: impl Into<PathBuf>) -> Self {
         Options { model: model.into(), adapter: None, passes: vec![], suite: suite.into(), out: out.into(), against: vec![], devices: vec![],
-                  base_dtype: None, max_prompt_tokens: 4096, force: false }
+                  base_dtype: None, max_prompt_tokens: 4096, force: false, engine: None }
     }
 }
 
@@ -890,56 +1024,137 @@ fn report_file(p: &Path) -> PathBuf {
 pub fn run(o: &Options, judge: Option<&dyn Judge>, emit: &mut dyn FnMut(Value), should_stop: &dyn Fn() -> bool) -> Result<Report> {
     let suite = Suite::load(&o.suite)?;
     let tok = ChatTokenizer::load(&o.model, None)?;
-    let on_gpu = o.devices.iter().any(|d| d.trim() != "cpu");
-    let dtype = o.base_dtype.unwrap_or(if on_gpu { BaseDtype::BF16 } else { BaseDtype::F32 });
-    // the estimate first: a run that cannot fit is refused before a device is opened
-    let longest = o.max_prompt_tokens + suite.tests.iter().map(answer_tokens).max().unwrap_or(0);
-    memory_check(o, &crate::model::ModelConfig::load(&o.model)?, dtype, longest, emit)?;
-    let devs = crate::finetune::open_devices(&o.devices)?;
-    let mut model = LlamaModel::load_on(&o.model, dtype, &devs)?;
-    if let Some(a) = &o.adapter {
-        model.load_adapter(a).with_context(|| format!("the adapter {}", a.display()))?;
-    }
-    let own = model.passes();
+    let cfg = crate::model::ModelConfig::load(&o.model)?;
+    let own = cfg.loop_.map_or(1, |l| l.passes);
     let passes = if o.passes.is_empty() { vec![own] } else { o.passes.clone() };
     for p in &passes {
         if *p == 0 || *p > own {
             bail!("--passes {p}: this model runs 1{}", if own > 1 { format!(" to {own}") } else { " (it has no loop)".into() });
         }
     }
+    // the Workshop's model answers what the engine does not: the loss tests always, everything without an engine
+    let by_engine = |t: &TestSpec| o.engine.is_some() && t.kind != "loss";
+    let needs_model = suite.tests.iter().any(|t| !by_engine(t));
+    if let Some(e) = &o.engine {
+        let arch = crate::engine::check_gguf_matches(&e.gguf, &cfg)?;
+        emit(json!({"event": "log", "message": format!("answers through the Rust engine: {} ({arch}) with {}{}", e.gguf.display(), e.exe.display(),
+            if e.args.is_empty() { String::new() } else { format!(" {}", e.args.join(" ")) })}));
+        if o.adapter.is_some() {
+            emit(json!({"event": "log", "message": "the adapter is used by the loss tests; the engine's GGUF must already have it merged in (merge, then convert)"}));
+        }
+    }
+    let on_gpu = o.devices.iter().any(|d| d.trim() != "cpu");
+    let dtype = o.base_dtype.unwrap_or(if on_gpu { BaseDtype::BF16 } else { BaseDtype::F32 });
+    // a judge that cannot answer is found now, not after the first test's answers
+    let judge_error: Option<String> = match judge {
+        Some(j) if suite.tests.iter().any(|t| t.kind == "judge") => {
+            emit(json!({"event": "log", "message": format!("checking that the judge {} answers", j.name())}));
+            j.ready().err().map(|e| format!("the judge {} does not answer ({e:#}). A judge on the GPUs this run holds cannot be served until the run ends: \
+                                             use a remote (assist) model or a CPU model as the judge, or run the model under test on the CPU", j.name()))
+        }
+        _ => None,
+    };
+    if let Some(e) = &judge_error {
+        emit(json!({"event": "log", "message": e}));
+    }
     let runner = CodeRunner::detect();
     std::fs::create_dir_all(&o.out).with_context(|| format!("{}", o.out.display()))?;
     let mut answers = String::new();
-    let mut results = Vec::new();
-    // the items each test reads, loaded once
-    let total_tests = suite.tests.len() * passes.len();
+    let n_tests = suite.tests.len();
+    // in the suite's order: (pass index, test index) -> result
+    let mut slots: Vec<Option<TestResult>> = vec![None; passes.len() * n_tests];
+    let total_tests = slots.len();
     let mut done_tests = 0;
-    for &p in &passes {
-        model.set_passes(p)?;
-        let gen = Generator::new(&model, &tok, o.max_prompt_tokens);
-        for spec in &suite.tests {
+    let mut speeds: Vec<Value> = Vec::new();
+    let mut one = |spec: &TestSpec, p: usize, model: Option<&LlamaModel>, gen: Option<&dyn Answer>, answers: &mut String, emit: &mut dyn FnMut(Value)| -> Result<TestResult> {
+        if should_stop() {
+            bail!("stopped");
+        }
+        done_tests += 1;
+        emit(json!({"event": "log", "message": format!("[{done_tests}/{total_tests}] {} ({}) at {p} pass{}{}", spec.name, spec.kind, if p == 1 { "" } else { "es" },
+                                                       gen.filter(|_| spec.kind != "loss").map_or(String::new(), |g| format!(", answered by the {}", g.label())))}));
+        let mut progress = |i: usize, n: usize| emit(json!({"event": "progress", "done": i, "total": n, "message": format!("{} at {p} pass{}", spec.name, if p == 1 { "" } else { "es" })}));
+        let r = if spec.kind == "judge" && judge_error.is_some() {
+            Err(anyhow!("{}", judge_error.clone().unwrap_or_default()))
+        } else {
+            run_test(spec, p, model, &tok, o.max_prompt_tokens, gen, &runner, judge, &mut progress, answers, should_stop)
+        };
+        let mut r = r.unwrap_or_else(|e| {
+            let mut t = TestResult::new(spec, p, "", true);
+            t.error = Some(format!("{e:#}"));
+            t
+        });
+        if let (Some(g), true) = (gen, spec.kind != "loss" && r.error.is_none()) {
+            r.extra["answered_by"] = json!(g.label());
+        }
+        if r.error.as_deref() == Some("stopped") {
+            bail!("stopped");
+        }
+        if let Some(e) = &r.error {
+            emit(json!({"event": "log", "message": format!("{}: {e}", spec.name)}));
+        } else {
+            emit(json!({"event": "log", "message": format!("{}: {} {} over {} items", spec.name, r.metric, r.value.map_or("-".into(), |v| format!("{v:.4}")), r.items.len())}));
+        }
+        Ok(r)
+    };
+    if needs_model {
+        // the estimate first: a run that cannot fit is refused before a device is opened
+        let longest = o.max_prompt_tokens + suite.tests.iter().filter(|t| !by_engine(t)).map(answer_tokens).max().unwrap_or(0);
+        memory_check(o, &cfg, dtype, longest, emit)?;
+        let devs = crate::finetune::open_devices(&o.devices)?;
+        let mut model = LlamaModel::load_on(&o.model, dtype, &devs)?;
+        if let Some(a) = &o.adapter {
+            model.load_adapter(a).with_context(|| format!("the adapter {}", a.display()))?;
+        }
+        for (pi, &p) in passes.iter().enumerate() {
+            model.set_passes(p)?;
+            let gen = Generator::new(&model, &tok, o.max_prompt_tokens);
+            for (ti, spec) in suite.tests.iter().enumerate() {
+                if by_engine(spec) {
+                    continue;
+                }
+                let r = one(spec, p, Some(&model), Some(&gen as &dyn Answer), &mut answers, emit)?;
+                // whatever the test left (an error midway too) goes back to the pool before the next one
+                model.synchronize()?;
+                slots[pi * n_tests + ti] = Some(r);
+            }
+        }
+        // the Workshop's model leaves the devices before the engine loads
+        drop(model);
+        for d in &devs {
+            let _ = d.synchronize();
+        }
+    }
+    if let Some(spec) = &o.engine {
+        let mut spec = spec.clone();
+        if spec.log.is_none() {
+            spec.log = Some(o.out.join("engine.log"));
+        }
+        for (pi, &p) in passes.iter().enumerate() {
+            if !suite.tests.iter().any(by_engine) {
+                break;
+            }
             if should_stop() {
                 bail!("stopped");
             }
-            done_tests += 1;
-            emit(json!({"event": "log", "message": format!("[{done_tests}/{total_tests}] {} ({}) at {p} pass{}", spec.name, spec.kind, if p == 1 { "" } else { "es" })}));
-            let mut progress = |i: usize, n: usize| emit(json!({"event": "progress", "done": i, "total": n, "message": format!("{} at {p} pass{}", spec.name, if p == 1 { "" } else { "es" })}));
-            let r = run_test(spec, p, &gen, &runner, judge, &mut progress, &mut answers, should_stop);
-            // whatever the test left (an error midway too) goes back to the pool before the next one
-            model.synchronize()?;
-            let r = r.unwrap_or_else(|e| {
-                let mut t = TestResult::new(spec, p, "", true);
-                t.error = Some(format!("{e:#}"));
-                t
-            });
-            if let Some(e) = &r.error {
-                emit(json!({"event": "log", "message": format!("{}: {e}", spec.name)}));
-            } else {
-                emit(json!({"event": "log", "message": format!("{}: {} {} over {} items", spec.name, r.metric, r.value.map_or("-".into(), |v| format!("{v:.4}")), r.items.len())}));
+            emit(json!({"event": "log", "message": format!("starting the engine{}", if own > 1 { format!(" at {p} pass{}", if p == 1 { "" } else { "es" }) } else { String::new() })}));
+            let engine = crate::engine::Engine::start(&spec, (own > 1).then_some(p))?;
+            emit(json!({"event": "log", "message": format!("the engine is ready in {:.1} s ({})", engine.load_seconds, engine.info.join("; ").chars().take(300).collect::<String>())}));
+            let gen = crate::engine::EngineGenerator::new(engine, &tok, o.max_prompt_tokens);
+            for (ti, t) in suite.tests.iter().enumerate() {
+                if by_engine(t) {
+                    let r = one(t, p, None, Some(&gen as &dyn Answer), &mut answers, emit)?;
+                    slots[pi * n_tests + ti] = Some(r);
+                }
             }
-            results.push(r);
+            let sp = gen.into_speed();
+            emit(json!({"event": "log", "message": format!("engine at {p} pass(es): {} answers, {} tokens at {:.1} tokens/s", sp.requests, sp.generated, sp.tokens_per_second())}));
+            let mut v = sp.to_json();
+            v["passes"] = json!(p);
+            speeds.push(v);
         }
     }
+    let mut results: Vec<TestResult> = slots.into_iter().flatten().collect();
     std::fs::write(o.out.join("answers.jsonl"), &answers)?;
     // against the best earlier result of each test
     let mut earlier: Vec<(String, Vec<TestResult>)> = Vec::new();
@@ -963,7 +1178,15 @@ pub fn run(o: &Options, judge: Option<&dyn Judge>, emit: &mut dyn FnMut(Value), 
             }
         }
     }
-    let report_json = report_to_json(o, &suite, &results, &comparisons, runner.can(CodeLang::Python), judge.map(|j| j.name()));
+    // a samples test shows the earlier report's answers beside this one's
+    for r in results.iter_mut().filter(|r| r.kind == "samples" && r.error.is_none()) {
+        if let Some((f, old)) = earlier.iter().find_map(|(f, rs)| rs.iter().find(|x| x.test == r.test && x.passes == r.passes && x.extra["answers"].is_array()).map(|x| (f, x))) {
+            r.extra["before"] = json!({"report": f, "answers": old.extra["answers"]});
+        }
+    }
+    let engine = o.engine.as_ref().map(|e| json!({"gguf": e.gguf.display().to_string(), "exe": e.exe.display().to_string(), "args": e.args, "speed": speeds}));
+    let mut report_json = report_to_json(o, &suite, &results, &comparisons, runner.can(CodeLang::Python), judge.map(|j| j.name()));
+    report_json["engine"] = engine.unwrap_or(Value::Null);
     std::fs::write(o.out.join("report.json"), serde_json::to_string_pretty(&report_json)?)?;
     std::fs::write(o.out.join("report.md"), report_markdown(&report_json))?;
     Ok(Report { results, comparisons, json: report_json })
@@ -1061,6 +1284,32 @@ pub fn report_markdown(r: &Value) -> String {
         m.push_str(&format!("| {} | {} | {} | {} | {} to {} | {} | {} | {} |\n", t["test"].as_str().unwrap_or(""), t["passes"], t["metric"].as_str().unwrap_or(""),
                             value, f(&t["ci"][0]), f(&t["ci"][1]), t["n"], t["skipped"], vs));
     }
+    for t in r["results"].as_array().into_iter().flatten().filter(|t| t["kind"] == "repeat" && t["error"].is_null()) {
+        let e = &t["extra"];
+        m.push_str(&format!("\n{} at {} pass(es): {} of {} answers repetitive (score over {}); distinct-2 {:.3}, distinct-3 {:.3}, repeated 4-grams {:.3}, repeated sentences {:.3}.\n",
+                            t["test"].as_str().unwrap_or(""), t["passes"], e["flagged"], t["n"], e["threshold"], e["distinct_2"].as_f64().unwrap_or(0.0),
+                            e["distinct_3"].as_f64().unwrap_or(0.0), e["repeated_4grams"].as_f64().unwrap_or(0.0), e["repeated_sentences"].as_f64().unwrap_or(0.0)));
+    }
+    if let Some(sp) = r["engine"]["speed"].as_array() {
+        for x in sp {
+            m.push_str(&format!("\nEngine at {} pass(es): {} answers, {} tokens at {:.1} tokens/s (loaded in {:.1} s).\n", x["passes"], x["requests"], x["generated"],
+                                x["tokens_per_second"].as_f64().unwrap_or(0.0), x["load_seconds"].as_f64().unwrap_or(0.0)));
+        }
+    }
+    let fence = |text: &str| format!("````text\n{}\n````\n", text.replace("````", "` ` ` `"));
+    for t in r["results"].as_array().into_iter().flatten().filter(|t| t["kind"] == "samples" && t["error"].is_null()) {
+        let before = &t["extra"]["before"];
+        m.push_str(&format!("\n## Samples: {} at {} pass(es){}\n", t["test"].as_str().unwrap_or(""), t["passes"],
+                            before["report"].as_str().map_or(String::new(), |f| format!(", beside `{f}`"))));
+        for a in t["extra"]["answers"].as_array().into_iter().flatten() {
+            let id = a["id"].as_str().unwrap_or("");
+            m.push_str(&format!("\n### {id}\n\n**Prompt**\n\n{}", fence(a["prompt"].as_str().unwrap_or(""))));
+            if let Some(old) = before["answers"].as_array().and_then(|b| b.iter().find(|x| x["id"] == a["id"])) {
+                m.push_str(&format!("\n**Before**\n\n{}", fence(old["answer"].as_str().unwrap_or(""))));
+            }
+            m.push_str(&format!("\n**Now**\n\n{}", fence(a["answer"].as_str().unwrap_or(""))));
+        }
+    }
     m.push_str(&format!("\nSandbox: network {}; code runs with CPU and memory limits in its own process group.\n",
                         if r["sandbox"]["network_isolated"] == true { "isolated (own namespace)" } else { "NOT isolated (this kernel refuses an unprivileged network namespace)" }));
     m
@@ -1074,8 +1323,9 @@ fn limited<T>(mut v: Vec<T>, limit: Option<usize>) -> Vec<T> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner, judge: Option<&dyn Judge>, progress: &mut dyn FnMut(usize, usize),
-            answers: &mut String, should_stop: &dyn Fn() -> bool) -> Result<TestResult> {
+fn run_test(spec: &TestSpec, passes: usize, model: Option<&LlamaModel>, tok: &ChatTokenizer, max_prompt: usize, gen: Option<&dyn Answer>, runner: &CodeRunner,
+            judge: Option<&dyn Judge>, progress: &mut dyn FnMut(usize, usize), answers: &mut String, should_stop: &dyn Fn() -> bool) -> Result<TestResult> {
+    let need_gen = || gen.ok_or_else(|| anyhow!("no answerer for a {} test", spec.kind));
     let mut log_answer = |id: &str, a: &str, score: f64, note: &str| {
         answers.push_str(&format!("{}\n", json!({"test": spec.name, "passes": passes, "id": id, "answer": a, "score": score, "note": note})));
     };
@@ -1087,11 +1337,12 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
             let records = limited(records, spec.limit);
             for (i, rec) in records.iter().enumerate() {
                 if should_stop() { bail!("stopped"); }
-                match gen.tok.encode(rec, gen.max_prompt, false) {
+                let model = model.ok_or_else(|| anyhow!("a loss test needs the Workshop's model"))?;
+                match tok.encode(rec, max_prompt, false) {
                     Ok(ex) => {
                         // the sliced head loss (HeadLoss) under inference: no graph, no [seq, vocab] logits
-                        let l = gen.model.loss(&ex.tokens, &ex.supervised, &Ctx::inference())?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64;
-                        gen.model.synchronize()?;
+                        let l = model.loss(&ex.tokens, &ex.supervised, &Ctx::inference())?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64;
+                        model.synchronize()?;
                         r.items.push((i.to_string(), l));
                     }
                     Err(_) => r.skipped += 1,
@@ -1120,7 +1371,7 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
                     *endings.entry(format!("no {:?} tool", t.lang)).or_default() += 1;
                     continue;
                 }
-                match gen.answer(&t.prompt, max_new, None)? {
+                match need_gen()?.answer(&t.prompt, max_new, None)? {
                     Some(a) => {
                         let g = run.grade(t, &a);
                         *endings.entry(g.ending.clone()).or_default() += 1;
@@ -1144,7 +1395,7 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
             let mut ems = Vec::new();
             for (i, q) in items.iter().enumerate() {
                 if should_stop() { bail!("stopped"); }
-                match gen.answer(&qa_prompt(q), spec.max_tokens.unwrap_or(48), None)? {
+                match need_gen()?.answer(&qa_prompt(q), spec.max_tokens.unwrap_or(48), None)? {
                     Some(a) => {
                         let (em, f1) = qa_score(&a, &q.answers);
                         ems.push(em);
@@ -1166,7 +1417,7 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
             let mut unscored = 0;
             for (i, it) in items.iter().enumerate() {
                 if should_stop() { bail!("stopped"); }
-                match gen.answer(&it.prompt, spec.max_tokens.unwrap_or(256), None)? {
+                match need_gen()?.answer(&it.prompt, spec.max_tokens.unwrap_or(256), None)? {
                     Some(a) => {
                         let sc = judge.score(&judge_request(it, &a))?;
                         if sc == 0 { unscored += 1; } else { r.items.push((it.id.clone(), sc as f64)); }
@@ -1181,6 +1432,61 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
             r.finish();
             Ok(r)
         }
+        "repeat" => {
+            // lower is better: the share of an answer's 4-grams or sentences that repeat an earlier one
+            let mut r = TestResult::new(spec, passes, "repetition", false);
+            let (items, left) = load_prompts(&spec.data)?;
+            r.skipped = left;
+            let items = limited(items, spec.limit);
+            let threshold = spec.threshold.unwrap_or(REPEAT_THRESHOLD);
+            let (mut d2, mut d3, mut r4, mut rs) = (vec![], vec![], vec![], vec![]);
+            let mut flagged = Vec::new();
+            for (i, it) in items.iter().enumerate() {
+                if should_stop() { bail!("stopped"); }
+                match need_gen()?.answer(&it.prompt, spec.max_tokens.unwrap_or(256), None)? {
+                    Some(a) => {
+                        let rp = repetition(&a);
+                        d2.push(rp.distinct2);
+                        d3.push(rp.distinct3);
+                        r4.push(rp.repeated4);
+                        rs.push(rp.repeated_sentences);
+                        if rp.score > threshold {
+                            flagged.push(it.id.clone());
+                        }
+                        r.items.push((it.id.clone(), rp.score));
+                        log_answer(&it.id, &a, rp.score, if rp.score > threshold { "repetitive" } else { "" });
+                    }
+                    None => r.skipped += 1,
+                }
+                progress(i + 1, items.len());
+            }
+            r.extra = json!({"distinct_2": mean(&d2), "distinct_3": mean(&d3), "repeated_4grams": mean(&r4), "repeated_sentences": mean(&rs),
+                             "threshold": threshold, "flagged": flagged.len(), "flagged_ids": flagged,
+                             "flagged_share": if r.items.is_empty() { 0.0 } else { flagged.len() as f64 / r.items.len() as f64 }});
+            r.finish();
+            Ok(r)
+        }
+        "samples" => {
+            // the answers only, to read (report.md shows them beside an earlier report's)
+            let mut r = TestResult::new(spec, passes, "samples", true);
+            let (items, left) = load_prompts(&spec.data)?;
+            r.skipped = left;
+            let items = limited(items, spec.limit);
+            let mut out = Vec::new();
+            for (i, it) in items.iter().enumerate() {
+                if should_stop() { bail!("stopped"); }
+                match need_gen()?.answer(&it.prompt, spec.max_tokens.unwrap_or(256), None)? {
+                    Some(a) => {
+                        log_answer(&it.id, &a, 0.0, "sample");
+                        out.push(json!({"id": it.id, "prompt": it.prompt, "answer": a}));
+                    }
+                    None => r.skipped += 1,
+                }
+                progress(i + 1, items.len());
+            }
+            r.extra = json!({"answers": out});
+            Ok(r)
+        }
         k => bail!("kind {k:?}"),
     }
 }
@@ -1188,6 +1494,51 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repetition_scores_loops_high_and_plain_text_low() {
+        let plain = repetition("The fox saw a crow holding cheese. It praised her voice, she sang, and the cheese fell into the fox's mouth.");
+        assert!(plain.score < 0.05 && plain.distinct2 > 0.95 && plain.distinct3 == 1.0, "{plain:?}");
+        let looped = repetition(&"I am a helpful assistant. ".repeat(12));
+        assert!(looped.repeated4 > 0.8 && looped.repeated_sentences > 0.85 && looped.score > 0.85, "{looped:?}");
+        assert!(looped.distinct2 < 0.15, "{looped:?}");
+        // a phrase loop inside one long sentence: the 4-grams see it, the sentences do not
+        let phrase = repetition(&format!("well {}", "and then again ".repeat(10)));
+        assert!(phrase.repeated4 > 0.6 && phrase.repeated_sentences == 0.0, "{phrase:?}");
+        // a script without spaces is read by characters
+        let cjk = repetition(&"好好学习天天向上".repeat(5));
+        assert!(cjk.repeated4 > 0.7, "{cjk:?}");
+        let short = repetition("Yes.");
+        assert_eq!((short.repeated4, short.repeated_sentences, short.score), (0.0, 0.0, 0.0));
+        assert_eq!(repetition("").score, 0.0);
+        // punctuation and case do not make a repeated sentence new
+        let r = repetition("Hello there friend. hello there, friend! Something else entirely.");
+        assert!((r.repeated_sentences - 1.0 / 3.0).abs() < 1e-9, "{r:?}");
+    }
+
+    #[test]
+    fn a_repeat_result_regresses_when_answers_loop_more() {
+        let mk = |xs: &[f64]| {
+            let mut t = TestResult::new(&TestSpec { name: "r".into(), kind: "repeat".into(), format: String::new(), data: PathBuf::new(), limit: None, max_tokens: None,
+                                                    language: None, cpu_seconds: None, memory_mb: None, threshold: None }, 1, "repetition", false);
+            t.items = xs.iter().enumerate().map(|(i, x)| (i.to_string(), *x)).collect();
+            t.finish();
+            t
+        };
+        let before = mk(&[0.02, 0.0, 0.05, 0.01, 0.03, 0.0, 0.04, 0.02]);
+        let after = mk(&[0.6, 0.4, 0.7, 0.5, 0.8, 0.3, 0.6, 0.9]);
+        assert!(compare(&after, &before).unwrap().regressed, "more repetition is worse");
+        assert!(compare(&before, &after).unwrap().improved);
+    }
+
+    #[test]
+    fn a_suite_takes_repeat_and_samples_tests() {
+        let v = json!({"tests": [{"kind": "repeat", "data": "p.jsonl", "threshold": 0.3}, {"kind": "samples", "data": "p.jsonl"}]});
+        let s = Suite::from_json(&v, Path::new("/tmp/suite.json")).unwrap();
+        assert_eq!((s.tests[0].threshold, s.tests[1].kind.as_str()), (Some(0.3), "samples"));
+        assert!(Suite::from_json(&json!({"tests": [{"kind": "repeat", "data": "p", "threshold": 2.0}]}), Path::new("/tmp/s.json")).is_err());
+        assert!(Suite::from_json(&json!({"tests": [{"kind": "vibes", "data": "p"}]}), Path::new("/tmp/s.json")).is_err());
+    }
 
     #[test]
     fn python_literals_read_as_json() {
