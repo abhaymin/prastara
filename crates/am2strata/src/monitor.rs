@@ -57,6 +57,8 @@ struct Live {
     max_tokens: usize,
     reasoning: bool,
     progress: Option<(u64, u64)>,
+    /// a video's frames: (encoded, read by the engine, all)
+    frames: Option<(usize, usize, usize)>,
     read_started: f64,
     recent: VecDeque<f64>,
 }
@@ -228,7 +230,7 @@ impl Monitor {
         let id = g.next_id;
         let t = now();
         g.live = Some(Live { id, model: model.to_string(), started: t, first_token: None, prompt_tokens, generated: 0, max_tokens, reasoning: false,
-                             progress: None, read_started: t, recent: VecDeque::new() });
+                             progress: None, frames: None, read_started: t, recent: VecDeque::new() });
         g.last_at = Some(t);
         Record { mon: self.clone(), id, prompt_tokens, done: false, outcome: "disconnect" }
     }
@@ -463,6 +465,7 @@ impl Monitor {
                     "prompt_tokens": l.prompt_tokens,
                     "prompt_read": if reading { l.progress.map(|p| p.0) } else { None },
                     "prompt_total": if reading { l.progress.map(|p| p.1) } else { None },
+                    "frames_encoded": l.frames.map(|f| f.0), "frames_read": l.frames.map(|f| f.1), "frames_total": l.frames.map(|f| f.2),
                     "generated": l.generated, "max_tokens": l.max_tokens, "elapsed_s": r1(t - l.started),
                     "tok_s": if reading { None } else { tok_s.map(r1) },
                     "tok_s_mean": if reading { None } else { mean.map(r1) },
@@ -718,6 +721,11 @@ impl Record {
 
     pub fn progress(&self, done: u64, total: u64) {
         self.mon.with_live(self.id, |l| l.progress = Some((done, total)));
+    }
+
+    /// A video's frames: how many are encoded and how many the engine has read, of all.
+    pub fn frames(&self, encoded: usize, read: usize, total: usize) {
+        self.mon.with_live(self.id, |l| l.frames = Some((encoded, read, total)));
     }
 
     /// What the output parser repaired in this request.

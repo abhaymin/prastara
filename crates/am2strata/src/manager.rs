@@ -296,7 +296,9 @@ pub fn adapt(cfg: &RunConfig, hw: &Hardware) -> Result<(RunConfig, bool, Vec<Str
                            vram_gb.unwrap()));
     }
     let poly = cfg.exe.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("strata-poly"));
-    if !poly && cfg.vision.is_some() && !cfg.args.iter().any(|a| a == "--vision") {
+    // the Rust engine takes picture rows without a flag (GENI); `strata` needs --vision
+    let hybrid = cfg.exe.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.contains("am2strata-hybrid"));
+    if !poly && !hybrid && cfg.vision.is_some() && !cfg.args.iter().any(|a| a == "--vision") {
         cfg.args.push("--vision".into());
         if vision_gpu && !cfg.args.iter().any(|a| a == "--vram-reserve-mib") {
             cfg.args.extend(["--vram-reserve-mib".into(), "700".into()]);

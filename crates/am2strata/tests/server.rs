@@ -3179,6 +3179,131 @@ fn video_frames_come_from_the_media_engine_without_ffmpeg() {
     assert_eq!(c, 200, "a chat video becomes frames without ffmpeg: {r}");
 }
 
+/// The `"[mm:ss]"` timestamps of a GENI prompt in order, and the length of each run of picture pads.
+fn video_segments(geni: &str) -> (Vec<String>, Vec<usize>) {
+    let pad = common::tokenizer().token_id("<|image_pad|>").unwrap();
+    let ids = line_ids(geni);
+    let mut runs = Vec::new();
+    for (j, t) in ids.iter().enumerate() {
+        if *t == pad {
+            if j == 0 || ids[j - 1] != pad { runs.push(0); }
+            *runs.last_mut().unwrap() += 1;
+        }
+    }
+    let text = prompt_text(geni);
+    let stamps = text.split('[').skip(1).filter_map(|p| p.split_once(']').map(|(a, _)| a))
+        .filter(|a| a.len() >= 5 && a.as_bytes()[2] == b':').map(|a| format!("[{a}]")).collect();
+    (stamps, runs)
+}
+
+fn mock_video(seconds: u32) -> String {
+    use base64::Engine as _;
+    format!("data:video/mp4;base64,{}", base64::engine::general_purpose::STANDARD.encode(format!("MOCKVIDEO {seconds}")))
+}
+
+/// Part F2: a chat video is one frame a second, each after its timestamp, in order; the engine gets GENI with
+/// rows=stream and the frames are encoded while it reads (the GENI line goes out before the last frame is encoded); the
+/// cap spreads its frames over the whole clip; an engine without geni_stream gets them all encoded first.
+#[test]
+fn a_video_is_read_frame_by_frame_with_timestamps() {
+    let s = Server::start(&[Model::default()], &[ids("A square moves.")], json!({"env": {"AM2_TEST_NO_FFMPEG": "1", "MOCK_ENCODE_MS": "40"}}));
+    let ask = |extra: Value| {
+        let mut req = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "What happens in this video?"}, {"type": "video_url", "video_url": {"url": mock_video(6)}}]}],
+            "chat_template_kwargs": {"enable_thinking": false}, "max_tokens": 16});
+        req.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        req
+    };
+    let (c, r) = s.post("/v1/chat/completions", &ask(json!({})));
+    assert_eq!(c, 200, "{r}");
+    assert_eq!(r["choices"][0]["message"]["content"], "A square moves.");
+    let geni = s.gen_lines().into_iter().rfind(|l| l.starts_with("GENI")).expect("a GENI line");
+    assert!(geni.contains(" rows=stream "), "the frames stream to the engine: {}", &geni[..80]);
+    let (stamps, runs) = video_segments(&geni);
+    assert_eq!(stamps, ["[00:00]", "[00:01]", "[00:02]", "[00:03]", "[00:04]", "[00:05]"], "one a second, in order");
+    assert_eq!(runs, vec![4; 6], "six pictures of 4 rows (the mock encoder's)");
+    assert!(prompt_text(&geni).contains("[A video of 6.0 s, as 6 frames in order, one a second"), "{}", prompt_text(&geni));
+    let cmds = s.commands();
+    assert!(cmds.iter().any(|c| c == &format!("ROWS {} 24", 24 * 16)), "every row reached the engine: {cmds:?}");
+    let at_geni = cmds.iter().position(|c| c.starts_with("GENI")).unwrap();
+    let last_enc = cmds.iter().rposition(|c| c.starts_with("VISION ENC")).unwrap();
+    assert!(at_geni < last_enc, "frames were still being encoded while the engine read: {cmds:?}");
+    assert_eq!(cmds.iter().filter(|c| c.starts_with("VISION ENC")).count(), 6, "each frame encoded once");
+
+    // a cap: 4 frames over the whole 10 s clip (one each 2.5 s), not its first 4 seconds
+    let mut req = ask(json!({"video_max_frames": 4}));
+    req["messages"][0]["content"][1]["video_url"]["url"] = json!(mock_video(10));
+    let (c, r) = s.post("/v1/chat/completions", &req);
+    assert_eq!(c, 200, "{r}");
+    let geni = s.gen_lines().into_iter().rfind(|l| l.starts_with("GENI")).unwrap();
+    let (stamps, runs) = video_segments(&geni);
+    assert_eq!(stamps, ["[00:00.0]", "[00:02.5]", "[00:05.0]", "[00:07.5]"], "{geni}");
+    assert_eq!(runs.len(), 4);
+    assert!(prompt_text(&geni).contains("as 4 frames in order, one every 2.5 s (spread to the 4-frame cap)"), "{}", prompt_text(&geni));
+
+    // two a second: tenths in the timestamps
+    let mut req = ask(json!({"video_fps": 2}));
+    req["messages"][0]["content"][1]["video_url"]["url"] = json!(mock_video(2));
+    let (c, _) = s.post("/v1/chat/completions", &req);
+    assert_eq!(c, 200);
+    let geni = s.gen_lines().into_iter().rfind(|l| l.starts_with("GENI")).unwrap();
+    assert_eq!(video_segments(&geni).0, ["[00:00.0]", "[00:00.5]", "[00:01.0]", "[00:01.5]"]);
+    assert!(prompt_text(&geni).contains("as 4 frames in order, 2.0 a second,"), "{}", prompt_text(&geni));
+}
+
+/// An engine without geni_stream (strata-poly): the frames are all encoded first and sent as one file, with the same
+/// timestamps.
+#[test]
+fn a_video_without_streaming_is_encoded_first() {
+    let s = Server::start(&[Model::default()], &[ids("ok")], json!({"env": {"AM2_TEST_NO_FFMPEG": "1", "MOCK_NO_GENI_STREAM": "1"}}));
+    let (c, r) = s.post("/v1/chat/completions", &json!({"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "Describe."}, {"type": "video_url", "video_url": {"url": mock_video(3)}}]}],
+        "chat_template_kwargs": {"enable_thinking": false}, "max_tokens": 8}));
+    assert_eq!(c, 200, "{r}");
+    let geni = s.gen_lines().into_iter().find(|l| l.starts_with("GENI")).unwrap();
+    assert!(!geni.contains("rows=stream") && geni.contains(" img_keys="), "{}", &geni[..80]);
+    let (stamps, runs) = video_segments(&geni);
+    assert_eq!((stamps.len(), runs), (3, vec![4; 3]));
+    let cmds = s.commands();
+    let at_geni = cmds.iter().position(|c| c.starts_with("GENI")).unwrap();
+    assert!(cmds[at_geni..].iter().all(|c| !c.starts_with("VISION ENC")), "all encoded before GENI: {cmds:?}");
+}
+
+/// The token budget: frames x tokens per frame + the text must fit the context with room for the answer. Over it, the
+/// frames are thinned evenly (a lower rate, said in the note); with "video_fit": "error", or when one frame a video is
+/// still too many, a clear 400.
+#[test]
+fn video_frames_are_thinned_to_fit_the_context() {
+    let m = Model { context: 600, ..Model::default() };
+    let s = Server::start(&[m], &[ids("ok")], json!({"env": {"AM2_TEST_NO_FFMPEG": "1", "MOCK_IMAGE_TOKENS": "20"}}));
+    let req = |secs: u32, extra: Value| {
+        let mut r = json!({"messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Describe."}, {"type": "video_url", "video_url": {"url": mock_video(secs)}}]}],
+            "chat_template_kwargs": {"enable_thinking": false}, "max_tokens": 32});
+        r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        r
+    };
+    // 20 frames x (20 rows + its timestamp) and the system prompt are far over 600
+    let (c, r) = s.post("/v1/chat/completions", &req(20, json!({})));
+    assert_eq!(c, 200, "{r}");
+    let geni = s.gen_lines().into_iter().find(|l| l.starts_with("GENI")).unwrap();
+    let (stamps, runs) = video_segments(&geni);
+    assert!(runs.len() >= 2 && runs.len() < 20 && runs.iter().all(|r| *r == 20), "thinned: {runs:?}");
+    assert_eq!(stamps.len(), runs.len());
+    assert_eq!(stamps[0], "[00:00]");
+    assert!(line_ids(&geni).len() + 32 + 8 <= 600, "it fits: {} ids", line_ids(&geni).len());
+    let text = prompt_text(&geni);
+    assert!(text.contains(&format!("as {} frames", runs.len())) && text.contains("fewer, to fit"), "{text}");
+    // asked not to thin: a 400 that says what to change
+    let (c, r) = s.post("/v1/chat/completions", &req(20, json!({"video_fit": "error"})));
+    assert_eq!(c, 400, "{r}");
+    let msg = r["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("over the context of 600") && msg.contains("video_fps"), "{msg}");
+    // even one frame cannot fit beside a big max_tokens
+    let (c, r) = s.post("/v1/chat/completions", &req(5, json!({"max_tokens": 560})));
+    assert_eq!(c, 400, "{r}");
+}
+
 /// The media library (media_files.rs): what the server makes and what it is sent is kept once, by its content, and used
 /// again by id; a client key sees only its own files, the main key all; a file goes when deleted.
 #[test]

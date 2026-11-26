@@ -46,6 +46,8 @@ so `1.0` keeps its `.0`):
 | `penalty_last_n=N` | any penalty is set | Default 64. |
 | `seed=N` | N > 0 | |
 | `turn_at=POS` | the prompt has a turn start after position 0 | Position of the last `<|im_start|>`. strata-poly keeps a conversation checkpoint there; strata ignores it. |
+| `image_pad=ID`, `img_keys=K,...` | GENI | The token whose positions take the file's rows; each picture's hash (strata-poly). |
+| `rows=stream` | GENI, an engine whose `INFO` has `geni_stream=1` (am2strata-hybrid) | The embeddings file is still being written (a video's frames, encoded one by one): the engine reads each picture's rows when it reaches them, waiting for them (re-sending its last `PP` each second as a heartbeat), and `STOP` ends the wait. |
 
 Example: `GEN 600 temperature=0.7 top_p=0.8 top_k=20 turn_at=184 248045,8678,198,...`
 

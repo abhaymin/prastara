@@ -77,6 +77,9 @@ pub struct Images {
     pub embeddings: String,
     pub pad: u32,
     pub keys: Vec<String>,
+    /// `rows=stream`: the file is still being written (a video's frames, encoded one by one while the engine reads
+    /// the prompt); the engine waits at each picture for its rows. Only for an engine whose INFO says `geni_stream=1`.
+    pub stream: bool,
 }
 
 /// A generation request: `GEN <max_new>[ key=value ...] <id,id,...>`, or `GENI <max_new>[ keys] <file> <ids>`.
@@ -100,6 +103,9 @@ impl Gen<'_> {
                 img.keys.iter().filter(|k| !k.is_empty() && k.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())).collect();
             if !keys.is_empty() && keys.len() == img.keys.len() {
                 let _ = write!(s, " img_keys={}", keys.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(","));
+            }
+            if img.stream {
+                s.push_str(" rows=stream");
             }
         }
         if let Some(at) = self.turn_at {
@@ -217,9 +223,12 @@ mod tests {
         let g = Gen { max_new: 600, sampling: &s, turn_at: Some(3), ids: &[1, 2, 3, 4], images: None };
         assert_eq!(g.line(),
             "GEN 600 temperature=0.7 top_p=0.8 top_k=20 penalty_present=1.5 penalty_last_n=64 turn_at=3 1,2,3,4\n");
-        let img = Images { embeddings: "/dev/shm/x.sve".into(), pad: 248056, keys: vec!["ab12".into(), "cd34".into()] };
+        let img = Images { embeddings: "/dev/shm/x.sve".into(), pad: 248056, keys: vec!["ab12".into(), "cd34".into()], stream: false };
         let g = Gen { max_new: 10, sampling: &Sampling::default(), turn_at: Some(2), ids: &[7, 8], images: Some(&img) };
         assert_eq!(g.line(), "GENI 10 image_pad=248056 img_keys=ab12,cd34 turn_at=2 /dev/shm/x.sve 7,8\n");
+        let img = Images { embeddings: "/dev/shm/v.sve".into(), pad: 9, keys: Vec::new(), stream: true };
+        let g = Gen { max_new: 4, sampling: &Sampling::default(), turn_at: None, ids: &[9, 1], images: Some(&img) };
+        assert_eq!(g.line(), "GENI 4 image_pad=9 rows=stream /dev/shm/v.sve 9,1\n");
         let greedy = Sampling { temperature: Some(0.0), top_p: Some(1.0), top_k: Some(0), ..Default::default() };
         assert_eq!(greedy.keys(), " top_k=64");
         assert_eq!(Sampling { temperature: Some(1.0), ..Default::default() }.keys(), " temperature=1.0");

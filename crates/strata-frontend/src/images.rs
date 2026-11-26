@@ -14,6 +14,31 @@ pub fn images_of(messages: &[Value]) -> Vec<String> {
         .collect()
 }
 
+/// Where a picture is in a video: the server's media.rs marks each frame (and its timestamp text) with
+/// `"video_frame": {"v": <video>, "i": <frame>, "t": <seconds>}`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameTag {
+    pub video: usize,
+    pub frame: usize,
+    pub t: f64,
+}
+
+pub fn frame_tag(item: &Value) -> Option<FrameTag> {
+    let v = item.get("video_frame")?;
+    Some(FrameTag { video: v.get("v")?.as_u64()? as usize, frame: v.get("i")?.as_u64()? as usize, t: v.get("t").and_then(Value::as_f64).unwrap_or(0.0) })
+}
+
+/// The pictures of the rendered conversation in prompt order, as `images_of`, each with its place in a video.
+pub fn image_items(messages: &[Value]) -> Vec<(String, Option<FrameTag>)> {
+    messages
+        .iter()
+        .filter_map(|m| m.get("content").and_then(Value::as_array))
+        .flatten()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("image"))
+        .map(|item| (item.get("source").and_then(Value::as_str).unwrap_or("").to_string(), frame_tag(item)))
+        .collect()
+}
+
 /// One `pad` per picture -> one per image token. Only a pad right after `start` (the marker the template writes
 /// for an image) is a picture; a pad elsewhere (the text of a message that quotes the marker) becomes the ids of
 /// its text, `literal`. `counts`: each picture's token count, in prompt order.
@@ -64,5 +89,15 @@ mod tests {
             {"role": "user", "content": [{"type": "text", "text": "a"}, {"type": "image", "source": "data:1"}]},
             {"role": "tool", "content": [{"type": "image", "source": "data:2"}]}]);
         assert_eq!(images_of(m.as_array().unwrap()), vec!["data:1", "data:2"]);
+    }
+
+    #[test]
+    fn video_frames_keep_their_place() {
+        let m = serde_json::json!([{"role": "user", "content": [
+            {"type": "image", "source": "data:a"},
+            {"type": "text", "text": "[00:01]", "video_frame": {"v": 0, "i": 1, "t": 1.0}},
+            {"type": "image", "source": "data:b", "video_frame": {"v": 0, "i": 1, "t": 1.0}}]}]);
+        let items = image_items(m.as_array().unwrap());
+        assert_eq!(items, vec![("data:a".to_string(), None), ("data:b".to_string(), Some(FrameTag { video: 0, frame: 1, t: 1.0 }))]);
     }
 }

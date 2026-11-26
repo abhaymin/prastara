@@ -333,4 +333,41 @@ the output on the other is the first split to measure), instead of about a thous
 - **Tests:** preprocessing (padding, normalisation, tokens = (W/40)(H/40), the shrink over the limit), the bilinear
   resize at 32x32 is the identity, the merge order, the products; the two gates above as ignored tests.
 - **Open:** JPEG bit-parity with stb_image; the shrink over 4,096 tokens uses Catmull-Rom, not mtmd's bicubic (not
-  compared); the server's config still names `am2strata-llama-vision` as the encoder (switch it with I9).
+  compared). (The config switch to `am2strata-vision` is done: F2 below.)
+
+## F2: video, frame by frame, on the Rust engine (2026-11-26)
+
+- **Frames:** a chat video (`video_url`, `video`, `input_video` parts) is cut by the media engine's own MP4/H.264
+  decoder (`video_frames`, Rust; ffmpeg only for what it cannot read, when installed): **one a second** by default.
+  Request options: `video_fps` (0.05 to 8), `video_max_frames` (default 64, at most 256), `video_width` (default 640,
+  64 to 1280), `video_fit` (`"error"`: refuse rather than thin); the older `video_frames: N` still means N frames
+  evenly spread. Over the cap, the frames are spread over the whole video (one every duration/cap s: `"fit"` in the
+  op, `pick_every` in am2strata-media), not cut off after the first minute.
+- **In the prompt:** a note (`[A video of 42.0 s, as 42 frames in order, one a second, each after its time:]`), then
+  each frame after its timestamp, `[00:42]` (`[1:02:03]` past an hour; tenths, `[00:02.5]`, when the frames are not on
+  whole seconds). The parts are marked `"video_frame": {"v", "i", "t"}` (strata-frontend keeps the mark; not `"video"`,
+  which Qwen's template renders as `<|video_pad|>`).
+- **Fed incrementally:** the server encodes each video's first frame (its token count is every frame's: one decoder,
+  one size) and the other pictures, builds the prompt, and sends `GENI ... rows=stream <file> <ids>` to an engine whose
+  `INFO` has `geni_stream=1` (am2strata-hybrid). The engine reads the text, and at each picture waits for its rows in
+  the file (re-sending its last `PP` each second, so the stall watchdog sees it alive; `STOP` ends the wait;
+  `AM2_ROWS_WAIT_S`, default 600, is the limit). The server encodes frame 2, 3, ... in order and appends their rows
+  (run.rs `FrameStream`): the attention cache grows frame by frame while the encoder works on the next. An engine
+  without `geni_stream` (strata-poly, strata) gets all frames encoded first and one file, as before.
+- **Progress:** `/metrics` (and the queue) show `frames_encoded`, `frames_read` (from the engine's `PP` against where
+  each frame's rows end) and `frames_total` beside `prompt_read`/`prompt_total`.
+- **Token budget:** frames x (rows + about 8 for the timestamp and markers) + the text must fit the context with
+  `max_tokens` (else 2,048, at most a quarter of the context) left for the answer. Over it, each video is thinned
+  evenly (its first frame kept; the note says `one every 2.5 s (fewer, to fit the context)`), rebuilt and checked
+  again; with `"video_fit": "error"`, or when one frame per video is still too many, a 400 says what to lower.
+- **Config:** `strata-hub` writes a `vision` section for `inkling2`/`inkling2_loop` with an mmproj on the Rust engine:
+  `am2strata-vision` beside the engine (or `${AM2STRATA_HOME}/crates/strata-hybrid/target/release/`), on the CPU;
+  the manager no longer adds `--vision` to am2strata-hybrid. Nothing on this branch names `am2strata-llama-vision`.
+- **Tests:** server (mock engine): `a_video_is_read_frame_by_frame_with_timestamps` (6 frames, 6 GENI picture runs
+  after `[00:00]`..`[00:05]` in order, `rows=stream`, the GENI line sent before the last frame is encoded, every row
+  arrived; the cap spreads 4 frames over 10 s; 2 fps gives tenths), `a_video_without_streaming_is_encoded_first`,
+  `video_frames_are_thinned_to_fit_the_context`; units: `pick_every` (sampling times, the 29.97 fps drift, the cap),
+  timestamps, request options, thinning; strata-hub `inkling_pictures_use_the_rust_encoder`; the real engine:
+  `tests/vision.rs` `geni_streams_a_video` (ignored; a synthetic square moving and turning red to blue).
+- **Open:** pictures on the device graph (`--devices`): GENI is refused there, so a GPU-placed Inkling reads pictures
+  only with `--no-graph`; F3 (the same path for Mula Drishti).

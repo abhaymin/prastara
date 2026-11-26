@@ -2,8 +2,10 @@
 //!
 //! A picture's source is a data: URL, an http(s) URL or a local file path (never a network share), as PolyStrata
 //! reads them. A video is turned into frames before the model sees it: MiniCPM-V and the other models read a video
-//! as an ordered series of pictures, and neither llama.cpp's encoder nor the engines decode video themselves. Frames
-//! are cut with ffmpeg when it is installed; a client can always send the frames as images instead.
+//! as an ordered series of pictures, each after its timestamp ("[00:42]"), one a second by default. Frames come from
+//! the media engine's own MP4/H.264 decoder (Rust); ffmpeg, when installed, only reads what that cannot. On an engine
+//! with `geni_stream=1` the server encodes the frames while the engine reads the prompt (run.rs). A client can always
+//! send the frames as images instead.
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine as _;
@@ -12,8 +14,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const URL_MAX: usize = 64 << 20;
-pub const DEFAULT_FRAMES: usize = 16;
-pub const MAX_FRAMES: usize = 64;
+/// A chat video's frames: one a second by default (`video_fps`), at most 64 (`video_max_frames`, up to 256), each
+/// scaled to 640 pixels wide (`video_width`); a video longer than the cap is sampled more thinly over its whole length.
+pub const DEFAULT_FPS: f64 = 1.0;
+pub const DEFAULT_MAX_FRAMES: usize = 64;
+pub const MAX_FRAMES: usize = 256;
+pub const DEFAULT_FRAME_WIDTH: usize = 640;
 
 /// What a request's media sources may reach (main.rs sets it from the config at start). Local paths: only for a
 /// server that listens on this PC alone, or with "allow_local_files": true. URLs: public addresses only, unless
@@ -131,23 +137,42 @@ pub static ENGINE: std::sync::OnceLock<std::sync::Arc<crate::image_gen::Media>> 
 /// (every_s 0) or one every `every_s` seconds, each scaled to `width`. -> (PNG bytes per frame, fps, duration in s).
 /// Other formats come back as the engine's error, which names them and says they need ffmpeg.
 pub async fn rust_frames(video: &[u8], every_s: f64, max: usize, width: usize) -> Result<(Vec<Vec<u8>>, f64, f64, Option<String>)> {
+    let s = rust_frames_at(video, every_s, max, width, false).await?;
+    Ok((s.frames.into_iter().map(|(_, png)| png).collect(), s.fps, s.duration_s, s.note))
+}
+
+/// Frames of a video with their times (seconds from its start), as PNG (Rust) or JPEG (ffmpeg) bytes.
+pub struct Sampled {
+    pub frames: Vec<(f64, Vec<u8>)>,
+    pub fps: f64,
+    pub duration_s: f64,
+    pub note: Option<String>,
+    pub mime: &'static str,
+    /// only the keyframes could be read (a B-frame MP4 in the Rust decoder)
+    pub keyframes_only: bool,
+}
+
+/// `rust_frames` with each frame's time; `fit`: one frame each `every_s`, spread wider so that `max` cover the
+/// whole video when it is longer.
+pub async fn rust_frames_at(video: &[u8], every_s: f64, max: usize, width: usize, fit: bool) -> Result<Sampled> {
     let Some(engine) = ENGINE.get() else { bail!("this server cannot decode video: no media engine and no ffmpeg") };
     let dir = tempdir()?;
     let input = dir.join("in.mp4");
     std::fs::write(&input, video)?;
-    let r = engine.call(json!({"op": "video_frames", "file": input.to_string_lossy(), "every_s": every_s, "max": max, "width": width}),
+    let r = engine.call(json!({"op": "video_frames", "file": input.to_string_lossy(), "every_s": every_s, "max": max, "width": width, "fit": fit}),
                         |_| {}).await;
     let _ = std::fs::remove_dir_all(&dir);
     let v = r?;
     let mut out = Vec::new();
     for f in v["frames"].as_array().into_iter().flatten() {
         let png = base64::engine::general_purpose::STANDARD.decode(f["png"].as_str().unwrap_or("")).map_err(|e| anyhow::anyhow!("a frame: {e}"))?;
-        out.push(png);
+        out.push((f["t"].as_f64().unwrap_or(0.0), png));
     }
     if out.is_empty() {
         bail!("the video gave no frames");
     }
-    Ok((out, v["fps"].as_f64().unwrap_or(0.0), v["duration_s"].as_f64().unwrap_or(0.0), v["note"].as_str().map(str::to_owned)))
+    Ok(Sampled { frames: out, fps: v["fps"].as_f64().unwrap_or(0.0), duration_s: v["duration_s"].as_f64().unwrap_or(0.0),
+                 note: v["note"].as_str().map(str::to_owned), mime: "image/png", keyframes_only: v["keyframes_only"] == true })
 }
 
 pub fn ffmpeg_available() -> bool {
@@ -215,8 +240,59 @@ fn video_source(part: &Value) -> Option<String> {
     }
 }
 
-/// `n` frames evenly spread over the video, as JPEG bytes.
-async fn frames(video: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
+/// What a request asks of its videos' frames.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VideoAsk {
+    /// one frame each this many seconds; None: `max` frames evenly spread (the older `video_frames: N`)
+    pub every_s: Option<f64>,
+    pub max: usize,
+    pub width: usize,
+}
+
+/// `video_fps` (default 1, 0.05 to 8), `video_max_frames` (default 64, at most 256), `video_width` (default 640, 64
+/// to 1280); `video_frames: N` alone keeps the older meaning, N frames evenly spread.
+pub fn video_ask(req: &Value) -> VideoAsk {
+    let fps = req.get("video_fps").and_then(Value::as_f64).filter(|f| f.is_finite() && *f > 0.0).map(|f| f.clamp(0.05, 8.0));
+    let even = req.get("video_frames").and_then(Value::as_u64).map(|n| (n as usize).clamp(1, MAX_FRAMES));
+    let max = req.get("video_max_frames").and_then(Value::as_u64).map(|n| (n as usize).clamp(1, MAX_FRAMES))
+        .or(even).unwrap_or(DEFAULT_MAX_FRAMES);
+    let width = req.get("video_width").and_then(Value::as_u64).map(|w| (w as usize).clamp(64, 1280)).unwrap_or(DEFAULT_FRAME_WIDTH);
+    let every_s = match (fps, even) {
+        (Some(f), _) => Some(1.0 / f),
+        (None, Some(_)) => None,
+        (None, None) => Some(1.0 / DEFAULT_FPS),
+    };
+    VideoAsk { every_s, max, width }
+}
+
+/// The time a frame is shown at, as the model reads it before the frame: "[00:42]", "[1:02:03]"; tenths when the
+/// frames are less than a second apart ("[00:02.5]").
+pub fn timestamp(t: f64, tenths: bool) -> String {
+    let t = t.max(0.0);
+    let whole = if tenths { (t * 10.0).round() / 10.0 } else { t.floor() };
+    let secs = whole.floor() as u64;
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    let frac = if tenths { format!(".{}", ((whole - whole.floor()) * 10.0).round() as u64 % 10) } else { String::new() };
+    if h > 0 { format!("[{h}:{m:02}:{s:02}{frac}]") } else { format!("[{m:02}:{s:02}{frac}]") }
+}
+
+/// The note before a video's frames: how long it is, how many frames, how far apart.
+pub fn video_note(duration_s: f64, frames: usize, every_s: Option<f64>, lowered: Option<&str>, how: Option<&str>) -> String {
+    let rate = match every_s {
+        Some(e) if (e - 1.0).abs() < 0.01 => ", one a second".to_string(),
+        Some(e) if e < 1.0 => format!(", {:.1} a second", 1.0 / e),
+        Some(e) => format!(", one every {e:.1} s"),
+        None => String::new(),
+    };
+    let lowered = lowered.map(|w| format!(" ({w})")).unwrap_or_default();
+    let len = if duration_s > 0.0 { format!(" of {duration_s:.1} s") } else { String::new() };
+    let how = how.map(|n| format!(" ({n})")).unwrap_or_default();
+    format!("[A video{len}, as {frames} frames in order{rate}{lowered}{how}, each after its time:]\n")
+}
+
+/// Frames with ffmpeg (any format), as JPEG bytes: one each `every_s` (fewer when over `max`: spread over the whole
+/// video), else `max` evenly spread.
+async fn ffmpeg_frames(video: &[u8], ask: VideoAsk) -> Result<Sampled> {
     let dir = tempdir()?;
     let input = dir.join("in.video");
     std::fs::write(&input, video)?;
@@ -225,11 +301,19 @@ async fn frames(video: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
         .arg(&input)
         .output()?;
     let duration: f64 = String::from_utf8_lossy(&probe.stdout).trim().parse().unwrap_or(0.0);
-    let fps = if duration > 0.0 { n as f64 / duration } else { 1.0 };
+    let n = ask.max;
+    let mut fps = match ask.every_s {
+        Some(e) => 1.0 / e,
+        None if duration > 0.0 => n as f64 / duration,
+        None => 1.0,
+    };
+    if duration > 0.0 && duration * fps > n as f64 {
+        fps = n as f64 / duration;
+    }
     let status = Command::new(crate::server_tls::program("ffmpeg"))
         .args(["-v", "error", "-i"])
         .arg(&input)
-        .args(["-vf", &format!("fps={fps:.6},scale='min(1280,iw)':-2"), "-frames:v", &n.to_string(), "-q:v", "3"])
+        .args(["-vf", &format!("fps={fps:.6},scale='min({},iw)':-2", ask.width), "-frames:v", &n.to_string(), "-q:v", "3"])
         .arg(dir.join("f%04d.jpg"))
         .status()?;
     if !status.success() {
@@ -243,7 +327,8 @@ async fn frames(video: &[u8], n: usize) -> Result<Vec<Vec<u8>>> {
     if out.is_empty() {
         bail!("the video gave no frames");
     }
-    Ok(out)
+    Ok(Sampled { frames: out.into_iter().enumerate().map(|(k, b)| (k as f64 / fps, b)).collect(), fps: 0.0, duration_s: duration,
+                 note: None, mime: "image/jpeg", keyframes_only: false })
 }
 
 pub fn tempdir() -> Result<PathBuf> {
@@ -252,10 +337,90 @@ pub fn tempdir() -> Result<PathBuf> {
     Ok(d)
 }
 
-/// Replace every video part in an OpenAI request's messages with its frames as image parts, preceded by a short note
-/// so the model reads them as one video in order. `n`: frames per video (the request's `video_frames`, default 16).
+/// A video's frames: the media engine's own MP4/H.264 decoder (Rust, no ffmpeg) first; ffmpeg only for what it cannot
+/// read (another format, or a B-frame MP4 it reads only the keyframes of) when ffmpeg is installed.
+async fn sample_video(data: &[u8], ask: VideoAsk) -> Result<Sampled> {
+    let rust = rust_frames_at(data, ask.every_s.unwrap_or(0.0), ask.max, ask.width, ask.every_s.is_some()).await;
+    match rust {
+        Ok(s) if !(s.keyframes_only && ffmpeg_available()) => Ok(s),
+        _ if ffmpeg_available() => ffmpeg_frames(data, ask).await,
+        Ok(s) => Ok(s),
+        Err(e) => Err(anyhow!("this server cannot decode this video without ffmpeg: {e:#}. Install ffmpeg ({}), \
+                               or send the video's frames as images in one message",
+                              crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg"))),
+    }
+}
+
+/// The parts that stand for one video: the note, then each frame after its timestamp text, all marked
+/// `"video_frame": {"v", "i", "t"}` (the note: `"note": true`; not "video", which Qwen's template reads as a video) so
+/// the server encodes the frames as the engine reads them and
+/// can thin them to fit the context (`thin_video`).
+pub fn video_parts(v: usize, s: &Sampled, ask: VideoAsk) -> Vec<Value> {
+    // tenths when the frames are not on whole seconds (two a second, or spread to the cap)
+    let tenths = s.frames.iter().any(|(t, _)| (t - t.round()).abs() >= 0.05);
+    // the rate the frames have: wider than asked when the cap spread them over a long video
+    let n = s.frames.len();
+    let actual = (n > 1).then(|| (s.frames[n - 1].0 - s.frames[0].0) / (n - 1) as f64);
+    let (every_s, spread) = match (ask.every_s, actual) {
+        (Some(e), Some(a)) if a > e * 1.2 => (Some(a), Some(format!("spread to the {}-frame cap", ask.max))),
+        (e, _) => (e, None),
+    };
+    let mut out = vec![json!({"type": "text", "text": video_note(s.duration_s, n, every_s, spread.as_deref(), s.note.as_deref()),
+                              "video_frame": {"v": v, "note": true, "duration_s": s.duration_s, "every_s": every_s, "how": s.note,
+                                        "frames": n}})];
+    for (i, (t, bytes)) in s.frames.iter().enumerate() {
+        let tag = json!({"v": v, "i": i, "t": t});
+        let lead = if i == 0 { "" } else { "\n" };
+        out.push(json!({"type": "text", "text": format!("{lead}{}", timestamp(*t, tenths)), "video_frame": tag}));
+        let url = format!("data:{};base64,{}", s.mime, base64::engine::general_purpose::STANDARD.encode(bytes));
+        out.push(json!({"type": "image_url", "image_url": {"url": url}, "video_frame": tag}));
+    }
+    out.push(json!({"type": "text", "text": "\n"}));
+    out
+}
+
+/// Keep `keep` frames of video `v` (evenly spread, its first always) in the rendered messages, dropping the others with
+/// their timestamps, and say so in its note. -> the frames it had.
+pub fn thin_video(messages: &mut [Value], v: usize, keep: usize) -> usize {
+    let mut frames: Vec<usize> = Vec::new();
+    for m in messages.iter() {
+        for item in m.get("content").and_then(Value::as_array).into_iter().flatten() {
+            if let Some(tag) = strata_frontend::images::frame_tag(item).filter(|t| t.video == v) {
+                if item.get("type").and_then(Value::as_str) == Some("image") {
+                    frames.push(tag.frame);
+                }
+            }
+        }
+    }
+    let had = frames.len();
+    if keep >= had || keep == 0 {
+        return had;
+    }
+    let kept: std::collections::HashSet<usize> = if keep == 1 {
+        [frames[0]].into()
+    } else {
+        (0..keep).map(|j| frames[((j as f64) * (had - 1) as f64 / (keep - 1) as f64).round() as usize]).collect()
+    };
+    for m in messages.iter_mut() {
+        let Some(items) = m.get_mut("content").and_then(Value::as_array_mut) else { continue };
+        items.retain(|item| strata_frontend::images::frame_tag(item).is_none_or(|t| t.video != v || kept.contains(&t.frame)));
+        for item in items.iter_mut() {
+            let note = item.get("video_frame").filter(|t| t.get("v").and_then(Value::as_u64) == Some(v as u64) && t.get("note") == Some(&json!(true))).cloned();
+            if let Some(tag) = note {
+                let d = tag["duration_s"].as_f64().unwrap_or(0.0);
+                let every = tag["every_s"].as_f64().map(|e| e * had as f64 / keep as f64);
+                item["text"] = json!(video_note(d, keep, every, Some("fewer, to fit the context"), tag["how"].as_str()));
+            }
+        }
+    }
+    had
+}
+
+/// Replace every video part in an OpenAI request's messages with its frames as image parts, each after a timestamp
+/// ("[00:42]"), preceded by a note so the model reads them as one video in order. The request's `video_fps`,
+/// `video_max_frames`, `video_width` (or the older `video_frames`) say how many (`video_ask`).
 pub async fn expand_videos(req: &mut Value) -> Result<usize> {
-    let n = req.get("video_frames").and_then(Value::as_u64).map(|n| n as usize).unwrap_or(DEFAULT_FRAMES).clamp(1, MAX_FRAMES);
+    let ask = video_ask(req);
     let Some(messages) = req.get_mut("messages").and_then(Value::as_array_mut) else { return Ok(0) };
     let mut videos = 0;
     for m in messages.iter_mut() {
@@ -263,29 +428,14 @@ pub async fn expand_videos(req: &mut Value) -> Result<usize> {
         if !parts.iter().any(|p| video_source(p).is_some()) {
             continue;
         }
-        let ffmpeg = ffmpeg_available();
-        let mut out = Vec::with_capacity(parts.len() + n);
+        let mut out = Vec::with_capacity(parts.len() + 2 * ask.max);
         for p in parts.drain(..) {
             match video_source(&p) {
                 Some(src) => {
                     let data = load_source(&src).await?;
-                    // ffmpeg when installed (any format); else the media engine's own MP4/H.264 decoder
-                    let (fs, mime, note) = if ffmpeg {
-                        (frames(&data, n).await?, "image/jpeg", None)
-                    } else {
-                        let r = rust_frames(&data, 0.0, n, 1280).await
-                            .map_err(|e| anyhow::anyhow!("this server cannot decode this video without ffmpeg: {e:#}. Install ffmpeg ({}), \
-                                                          or send the video's frames as images in one message",
-                                crate::doctor::install_hint(std::env::consts::OS, "ffmpeg", "ffmpeg", "Gyan.FFmpeg")))?;
-                        (r.0, "image/png", r.3)
-                    };
+                    let s = sample_video(&data, ask).await?;
+                    out.extend(video_parts(videos, &s, ask));
                     videos += 1;
-                    let how = note.map(|n| format!(" ({n})")).unwrap_or_default();
-                    out.push(json!({"type": "text", "text": format!("[A video, as {} frames in order{how}:]\n", fs.len())}));
-                    for f in fs {
-                        let url = format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(f));
-                        out.push(json!({"type": "image_url", "image_url": {"url": url}}));
-                    }
                 }
                 None => out.push(p),
             }
@@ -293,6 +443,52 @@ pub async fn expand_videos(req: &mut Value) -> Result<usize> {
         *parts = out;
     }
     Ok(videos)
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+
+    #[test]
+    fn timestamps_read_as_minutes_and_seconds() {
+        assert_eq!(timestamp(0.0, false), "[00:00]");
+        assert_eq!(timestamp(42.7, false), "[00:42]");
+        assert_eq!(timestamp(3723.0, false), "[1:02:03]");
+        assert_eq!(timestamp(2.5, true), "[00:02.5]");
+        assert_eq!(timestamp(61.0, true), "[01:01.0]");
+    }
+
+    #[test]
+    fn a_request_asks_for_a_rate_and_a_cap() {
+        assert_eq!(video_ask(&json!({})), VideoAsk { every_s: Some(1.0), max: 64, width: 640 });
+        assert_eq!(video_ask(&json!({"video_fps": 2, "video_max_frames": 1000, "video_width": 320})),
+                   VideoAsk { every_s: Some(0.5), max: 256, width: 320 });
+        // the older field: N frames evenly spread
+        assert_eq!(video_ask(&json!({"video_frames": 8})), VideoAsk { every_s: None, max: 8, width: 640 });
+    }
+
+    #[test]
+    fn frames_come_after_their_times_and_thin_evenly() {
+        let s = Sampled { frames: (0..5).map(|k| (k as f64, vec![k as u8])).collect(), fps: 4.0, duration_s: 5.0, note: None,
+                          mime: "image/png", keyframes_only: false };
+        let parts = video_parts(0, &s, video_ask(&json!({})));
+        let texts: Vec<&str> = parts.iter().filter(|p| p["type"] == "text").map(|p| p["text"].as_str().unwrap()).collect();
+        assert!(texts[0].starts_with("[A video of 5.0 s, as 5 frames in order, one a second"), "{}", texts[0]);
+        assert_eq!(&texts[1..6], &["[00:00]", "\n[00:01]", "\n[00:02]", "\n[00:03]", "\n[00:04]"]);
+        // as the template sees them (strata-frontend's parts_of keeps "video_frame")
+        let mut msgs = vec![json!({"role": "user", "content": parts.iter().map(|p| {
+            let mut q = p.clone();
+            if q["type"] == "image_url" { q = json!({"type": "image", "source": "x", "video_frame": p["video_frame"]}); }
+            q
+        }).collect::<Vec<_>>()})];
+        assert_eq!(thin_video(&mut msgs, 0, 3), 5);
+        let tags: Vec<usize> = strata_frontend::images::image_items(&msgs).iter().map(|(_, t)| t.unwrap().frame).collect();
+        assert_eq!(tags, vec![0, 2, 4]);
+        let note = msgs[0]["content"][0]["text"].as_str().unwrap();
+        assert!(note.contains("as 3 frames") && note.contains("one every 1.7 s") && note.contains("fewer, to fit the context"), "{note}");
+        let ts: Vec<&str> = msgs[0]["content"].as_array().unwrap().iter().filter(|p| p["type"] == "text").map(|p| p["text"].as_str().unwrap()).collect();
+        assert_eq!(&ts[1..4], &["[00:00]", "\n[00:02]", "\n[00:04]"]);
+    }
 }
 
 // ------------------------------------------------------------------------------------------------ documents (PDF)

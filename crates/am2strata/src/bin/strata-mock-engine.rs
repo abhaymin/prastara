@@ -12,6 +12,8 @@
 //!                 (the last one repeats); without it every reply is the token 0 once
 //!   MOCK_RECORD   a file each received command line is appended to
 //!   MOCK_IMAGE_TOKENS  the token count the vision mode reports (default 4)
+//!   MOCK_ENCODE_MS     how long the vision mode takes a picture
+//!   MOCK_NO_GENI_STREAM  an engine without `geni_stream=1` (GENI rows=stream is not offered)
 //!   MOCK_SPEED    the optimizer's table: {"-ub=512": 0.5, "-ub=1024": "fail"}: each engine argument set so multiplies
 //!                 the decode time a token (1 ms), and "fail" exits before READY (a setting that does not fit)
 
@@ -24,7 +26,8 @@ use std::time::Duration;
 fn record(line: &str) {
     if let Ok(path) = std::env::var("MOCK_RECORD") {
         if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = writeln!(f, "{line}");
+            // one write, so the encoder's lines (another process) never land inside a long GENI line
+            let _ = f.write_all(format!("{line}\n").as_bytes());
         }
     }
 }
@@ -40,6 +43,9 @@ fn vision() {
         let f: Vec<&str> = line.split_whitespace().collect();
         match f.as_slice() {
             ["ENC", img, dst] => {
+                if let Some(ms) = std::env::var("MOCK_ENCODE_MS").ok().and_then(|v| v.parse().ok()) {
+                    std::thread::sleep(Duration::from_millis(ms));
+                }
                 let ok = std::fs::metadata(img).is_ok() && std::fs::write(dst, vec![7u8; 16 * n as usize]).is_ok();
                 let _ = writeln!(out, "{}", if ok { format!("OK {n}") } else { "ERR cannot read".into() });
             }
@@ -122,7 +128,9 @@ fn main() {
             }
         }
     }
-    say(&format!("INFO context={max_context} mock=1"));
+    // geni_stream=1 as am2strata-hybrid: GENI rows=stream is waited for (MOCK_NO_GENI_STREAM=1: an engine without it)
+    let streams = std::env::var_os("MOCK_NO_GENI_STREAM").is_none();
+    say(&format!("INFO context={max_context} mock=1{}", if streams { " geni_stream=1" } else { "" }));
     say("READY mock");
     // stdin is read on its own thread so a STOP arrives while a reply is being written
     let (tx, rx) = mpsc::channel::<String>();
@@ -171,6 +179,24 @@ fn main() {
                 }
                 let max_new: usize = f.get(1).and_then(|n| n.parse().ok()).unwrap_or(1);
                 let n_prompt = f.last().map(|ids| ids.split(',').count()).unwrap_or(0);
+                // rows=stream: wait until the file holds every picture row (the mock encoder writes 16 bytes a token),
+                // then note what arrived ("ROWS <bytes> <pads>") in the record
+                if streams && f.contains(&"rows=stream") && f.len() >= 3 {
+                    let pad = f.iter().find_map(|k| k.strip_prefix("image_pad=")).unwrap_or("");
+                    let pads = f.last().map(|ids| ids.split(',').filter(|t| *t == pad).count()).unwrap_or(0);
+                    let file = f[f.len() - 2];
+                    let t0 = std::time::Instant::now();
+                    let size = |p: &str| std::fs::metadata(p).map(|m| m.len() as usize).unwrap_or(0);
+                    let mut k = 0u32;
+                    while size(file) < pads * 16 && t0.elapsed() < Duration::from_secs(20) && !stop.load(Ordering::SeqCst) {
+                        if k % 50 == 0 {
+                            say(&format!("PP 0 {n_prompt} 1.0"));
+                        }
+                        k += 1;
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    record(&format!("ROWS {} {pads}", size(file)));
+                }
                 say(&format!("PP {n_prompt} {n_prompt} 1.0 1000.0"));
                 let reply = script.replies.get(turn).or(script.replies.last()).cloned().unwrap_or_default();
                 turn += 1;

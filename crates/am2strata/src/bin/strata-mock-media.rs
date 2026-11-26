@@ -1,6 +1,7 @@
 //! A stand-in for am2strata-media in the tests: the same JSON-lines protocol, a 1x1 PNG per image, every command
 //! recorded to $MOCK_MEDIA_RECORD. A prompt containing FAIL answers with an error.
 
+use base64::Engine as _;
 use std::io::{BufRead, Write};
 
 const PNG: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==";
@@ -67,6 +68,29 @@ fn main() {
                 let path = cmd["file"].as_str().unwrap_or("");
                 if !std::path::Path::new(path).is_file() {
                     emit(serde_json::json!({"event": "error", "message": format!("{path}: the file was not found")}));
+                } else if let Some(secs) = std::fs::read(path).ok().and_then(|b| String::from_utf8(b).ok())
+                    .and_then(|t| t.strip_prefix("MOCKVIDEO ").and_then(|n| n.trim().parse::<f64>().ok()))
+                {
+                    // "MOCKVIDEO <seconds>": a clip of that length at 4 fps, sampled as the real op does (one frame each
+                    // every_s, at most max; "fit" spreads max over the whole clip); each frame's bytes differ (its index
+                    // after the PNG's end), so each is encoded on its own
+                    let total = (secs * 4.0).round().max(1.0) as usize;
+                    let max = cmd["max"].as_u64().unwrap_or(total as u64) as usize;
+                    let mut step = cmd["every_s"].as_f64().filter(|e| *e > 0.0).unwrap_or(secs / max.max(1) as f64);
+                    if cmd["fit"] == true && (secs / step).ceil() as usize > max {
+                        step = secs / max as f64;
+                    }
+                    let png = base64::engine::general_purpose::STANDARD.decode(PNG).unwrap();
+                    let mut frames = Vec::new();
+                    let mut k = 0usize;
+                    while (k as f64 * step) < secs - 1e-9 && frames.len() < max {
+                        let i = ((k as f64 * step * 4.0).round() as usize).min(total - 1);
+                        let mut b = png.clone();
+                        b.extend_from_slice(format!("frame{i}").as_bytes());
+                        frames.push(serde_json::json!({"t": i as f64 / 4.0, "png": base64::engine::general_purpose::STANDARD.encode(b)}));
+                        k += 1;
+                    }
+                    emit(serde_json::json!({"event": "frames", "fps": 4.0, "duration_s": secs, "width": 1, "height": 1, "frames": frames}));
                 } else {
                     let n = cmd["max"].as_u64().unwrap_or(4).min(4) as usize;
                     let frames: Vec<_> = (0..n).map(|i| serde_json::json!({"t": i as f64 * 0.25, "png": PNG})).collect();
