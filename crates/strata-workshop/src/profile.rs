@@ -163,7 +163,9 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     } else {
         2.0 * 4.0 * seq as f64 * per_token * block_passes
     };
-    let head = 6.0 * 4.0 * (seq * cfg.vocab_size) as f64;
+    // the head's loss goes a slice of rows at a time (model.rs, HEAD_SLICE_VALUES: 32 M logits): a slice's logits,
+    // its softmax and its one-hot, as f32
+    let head = 3.0 * 4.0 * ((seq * cfg.vocab_size) as f64).min((32u64 << 20) as f64);
     let frozen = if cached || first == 0 { 0.0 } else { 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq) };
     let activations = (graph + head + frozen + chunk_bytes(cfg, seq)) as u64;
 
@@ -193,7 +195,8 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let train_factor = if p.checkpointing { 4.0 } else { 3.0 };
     let flops = tokens * (lower_passes * first as f64 * block_fwd + passes * train_factor * (block_passes * block_fwd + head_fwd));
     let total = (weights + 5 * adapter + activations + widening).max(fill);
-    // split over devices: the blocks and their activations divide; the head (last device) and one widened matrix do not
+    // split over devices: the blocks and their activations divide; the head (last device: its matrix and loss slice)
+    // and one widened matrix do not
     let head_bytes = (cfg.vocab_size * cfg.hidden_size) as u64 * p.base_dtype.bytes() + head as u64;
     let per_device = if p.devices > 1 {
         (weights + 5 * adapter + activations).saturating_sub(head_bytes) / p.devices as u64 + head_bytes + widening

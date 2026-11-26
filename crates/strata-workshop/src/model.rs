@@ -563,6 +563,117 @@ fn widen_rows(w: &Tensor) -> usize {
     if w.dtype() == DType::F32 || rows * cols <= max { rows.max(1) } else { (max / cols.max(1)).max(1) }
 }
 
+/// The most logits the head's loss holds at once (32 M values, 128 MB as f32): Qwen3's 151,936-entry vocabulary gives
+/// about 220 rows per slice.
+static HEAD_SLICE_VALUES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(32 << 20);
+
+/// `x Wᵀ` for a detached `x` (no graph), a slice of W's rows widened at a time, as [`Linear::frozen`] does.
+fn frozen_product(x: &Tensor, w: &Tensor) -> candle_core::Result<Tensor> {
+    let rows = w.dim(0)?;
+    let step = widen_rows(w);
+    let mut parts = Vec::new();
+    for r0 in (0..rows).step_by(step) {
+        let s = w.narrow(0, r0, step.min(rows - r0))?;
+        let s = if s.dtype() == DType::F32 { s } else { s.to_dtype(DType::F32)? };
+        parts.push(x.matmul(&s.t()?)?);
+    }
+    if parts.len() == 1 { Ok(parts.pop().unwrap()) } else { Tensor::cat(&parts, D::Minus1) }
+}
+
+/// The mean cross-entropy of the frozen head `h Wᵀ` against `targets`, as ONE graph node. Built from the head's
+/// product and `cross_entropy` it keeps the whole `[rows, vocab]` logits and their log-softmax for the backward pass:
+/// 3.7 GB at 1,024 rows of a 151,936-entry vocabulary, all on the device that holds the head (the first real Mula
+/// run ran out of memory there). This keeps the loss only: the forward pass goes a slice of rows at a time, and the
+/// backward pass recomputes each slice's softmax for `dh = (softmax − onehot) · W / rows`.
+struct HeadLoss {
+    y: Mutex<Option<Tensor>>,
+    /// `[vocab, hidden]`, frozen
+    w: Tensor,
+    /// `[rows]` u32
+    targets: Tensor,
+}
+
+fn head_slice_rows(vocab: usize) -> usize {
+    (HEAD_SLICE_VALUES.load(std::sync::atomic::Ordering::Relaxed) / vocab.max(1)).max(1)
+}
+
+/// One slice's logits and their log-sum-exp `[c, 1]`.
+fn head_slice(h: &Tensor, w: &Tensor) -> candle_core::Result<(Tensor, Tensor)> {
+    let logits = frozen_product(h, w)?;
+    let m = logits.max_keepdim(D::Minus1)?;
+    let lse = (logits.broadcast_sub(&m)?.exp()?.sum_keepdim(D::Minus1)?.log()? + m)?;
+    Ok((logits, lse))
+}
+
+/// The loss for `h` `[rows, hidden]` (f32) against `targets`, through the head `w`.
+pub fn head_loss(h: &Tensor, w: &Tensor, targets: &[u32]) -> Result<Tensor> {
+    let n = h.dim(0)?;
+    if n != targets.len() || n == 0 {
+        bail!("head loss: {} rows and {} targets", n, targets.len());
+    }
+    let tg = Tensor::from_vec(targets.to_vec(), (n,), h.device())?;
+    let step = head_slice_rows(w.dim(0)?);
+    let hd = h.detach();
+    let mut sum: Option<Tensor> = None;
+    for r0 in (0..n).step_by(step) {
+        let c = step.min(n - r0);
+        let (logits, lse) = head_slice(&hd.narrow(0, r0, c)?, w)?;
+        let picked = logits.gather(&tg.narrow(0, r0, c)?.unsqueeze(1)?, 1)?;
+        let part = (lse - picked)?.sum_all()?;
+        sum = Some(match sum { Some(s) => (s + part)?, None => part });
+    }
+    let value = (sum.unwrap() / n as f64)?;
+    Ok(if h.track_op() { h.apply_op1(HeadLoss { y: Mutex::new(Some(value)), w: w.clone(), targets: tg })? } else { value })
+}
+
+impl CustomOp1 for HeadLoss {
+    fn name(&self) -> &'static str {
+        "head-loss"
+    }
+
+    fn cpu_fwd(&self, _storage: &CpuStorage, _layout: &Layout) -> candle_core::Result<(CpuStorage, Shape)> {
+        take_value(&self.y, "head-loss")
+    }
+
+    #[cfg(feature = "cuda")]
+    fn cuda_fwd(&self, _storage: &candle_core::CudaStorage, _layout: &Layout) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
+        take_cuda(&self.y, "head-loss")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(&self, _storage: &candle_core::MetalStorage, _layout: &Layout) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        take_metal(&self.y, "head-loss")
+    }
+
+    fn bwd(&self, h: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
+        let (n, vocab) = (h.dim(0)?, self.w.dim(0)?);
+        let g = (grad_res.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0] as f64) / n as f64;
+        let step = head_slice_rows(vocab);
+        let hd = h.detach();
+        let ids = Tensor::arange(0u32, vocab as u32, h.device())?.unsqueeze(0)?;
+        let wrows = widen_rows(&self.w);
+        let mut parts = Vec::new();
+        for r0 in (0..n).step_by(step) {
+            let c = step.min(n - r0);
+            let (logits, lse) = head_slice(&hd.narrow(0, r0, c)?, &self.w)?;
+            let onehot = self.targets.narrow(0, r0, c)?.unsqueeze(1)?.broadcast_eq(&ids)?.to_dtype(DType::F32)?;
+            let d = (logits.broadcast_sub(&lse)?.exp()? - onehot)?;
+            drop(logits);
+            // d · W, a slice of W's rows (the vocabulary) at a time
+            let mut acc: Option<Tensor> = None;
+            for v0 in (0..vocab).step_by(wrows) {
+                let k = wrows.min(vocab - v0);
+                let w = self.w.narrow(0, v0, k)?;
+                let w = if w.dtype() == DType::F32 { w } else { w.to_dtype(DType::F32)? };
+                let part = d.narrow(1, v0, k)?.contiguous()?.matmul(&w)?;
+                acc = Some(match acc { Some(a) => (a + part)?, None => part });
+            }
+            parts.push((acc.unwrap() * g)?);
+        }
+        Ok(Some(if parts.len() == 1 { parts.pop().unwrap() } else { Tensor::cat(&parts, 0)? }))
+    }
+}
+
 /// `softmax(x · scale + mask)` over the last dimension as ONE node of the graph. Built from candle's differentiable
 /// operations it would keep five `[heads, seq, seq]` tensors per block for the backward pass (scaled, masked, shifted,
 /// exponentiated, normalised) — the largest part of a long sequence's memory; this keeps the result only, and sends
@@ -1156,13 +1267,14 @@ impl LlamaModel {
         let dev = &devs[0];
         let last = &devs[devs.len() - 1];
         let cfg = ModelConfig::load(dir)?;
-        // the last device also holds the output head (and the final logits): it takes that many blocks' worth fewer
+        // the first device holds the embeddings and the last the output head (its loss is sliced, so no full logits):
+        // with an untied head the two ends weigh the same and the blocks split evenly; a tied head is the embedding
+        // matrix on the first device, so the first device takes that many blocks' worth fewer
         let block_dev: Vec<usize> = {
             let (n, d) = (cfg.num_hidden_layers.max(1), devs.len());
             let block = (cfg.block_params() - cfg.block_small_params()).max(1) as f64;
-            let head = if d > 1 { ((cfg.vocab_size * cfg.hidden_size) as f64 / block).round() as usize } else { 0 };
-            let units = n + head;
-            (0..n).map(|i| (i * d / units).min(d - 1)).collect()
+            let extra = if d > 1 && cfg.tie_word_embeddings { ((cfg.vocab_size * cfg.hidden_size) as f64 / block).round() as usize } else { 0 };
+            (0..n).map(|i| ((i + extra) * d / (n + extra)).min(d - 1)).collect()
         };
         let files = weight_files(dir)?;
         // mapped, not read: each tensor is copied out (and narrowed to the base dtype) one at a time
@@ -1746,8 +1858,8 @@ impl LlamaModel {
         let n = rows.len();
         let hidden = self.upper_hidden(h, ctx)?;
         let hidden = hidden.index_select(&Tensor::from_vec(rows, (n,), hidden.device())?, 0)?;
-        let logits = self.head(&hidden)?;
-        let ce = candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (n,), logits.device())?)?;
+        let w = self.lm_head.as_ref().or(self.embed.as_ref()).ok_or_else(|| anyhow!("no output head in memory"))?;
+        let ce = head_loss(&move_to(&hidden, w.device())?, w, &targets)?;
         // the upcycled blocks' load-balancing losses, averaged over the blocks (and loop passes) that ran
         let aux = std::mem::take(&mut *ctx.aux.borrow_mut());
         if aux.is_empty() {
@@ -1813,6 +1925,30 @@ pub fn adapter_tensors(model: &LlamaModel) -> BTreeMap<String, Tensor> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_sliced_head_loss_equals_cross_entropy_and_its_gradient() {
+        let dev = Device::Cpu;
+        // 37 rows over a 1,000-entry vocabulary, in slices of 8 rows (8,000 values), so the last slice is short
+        HEAD_SLICE_VALUES.store(8_000, std::sync::atomic::Ordering::Relaxed);
+        for dt in [DType::F32, DType::BF16] {
+            let h = Var::from_tensor(&(Tensor::randn(0f32, 1.0, (37, 24), &dev).unwrap())).unwrap();
+            let w = (Tensor::randn(0f32, 0.5, (1000, 24), &dev).unwrap()).to_dtype(dt).unwrap();
+            let targets: Vec<u32> = (0..37u32).map(|i| (i * 97 + 5) % 1000).collect();
+            let ours = head_loss(h.as_tensor(), &w, &targets).unwrap();
+            let wf = w.to_dtype(DType::F32).unwrap();
+            let reference = candle_nn::loss::cross_entropy(&h.as_tensor().matmul(&wf.t().unwrap()).unwrap(),
+                &Tensor::from_vec(targets.clone(), (37,), &dev).unwrap()).unwrap();
+            let (a, b) = (ours.to_scalar::<f32>().unwrap(), reference.to_scalar::<f32>().unwrap());
+            assert!((a - b).abs() < 1e-5 * b.abs().max(1.0), "{dt:?}: loss {a} vs {b}");
+            let ga = ours.backward().unwrap().get(h.as_tensor()).unwrap().clone();
+            let gb = reference.backward().unwrap().get(h.as_tensor()).unwrap().clone();
+            let diff = (ga - &gb).unwrap().abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+            let scale = gb.abs().unwrap().max_all().unwrap().to_scalar::<f32>().unwrap();
+            assert!(diff < 1e-5 * scale.max(1e-3) + 1e-7, "{dt:?}: gradient off by {diff} (largest {scale})");
+        }
+        HEAD_SLICE_VALUES.store(32 << 20, std::sync::atomic::Ordering::Relaxed);
+    }
 
     /// candle's `matmul` backward computes a gradient for both operands: through it, every frozen weight on the path
     /// got a full-size f32 gradient each step (542 MB peak instead of 228 MB on a 12-block model). No gradient may be

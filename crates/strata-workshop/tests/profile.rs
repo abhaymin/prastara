@@ -35,10 +35,10 @@ fn the_tiny_model_by_hand() {
     assert_eq!((e.adapter_bytes, e.optimizer_bytes, e.gradient_bytes), (2048, 4096, 4096));
     // kept per token and block: 10·16 + 11.5·16 + 8.5·16 + 4·32 + 2·(2 heads · 16 tokens) + 2 adapters · (4 + 3·16) = 776 values
     assert_eq!(profile::graph_floats_per_token(&cfg, &lora(4, None), 16), 776.0);
-    // × 4 bytes × 16 tokens × 2 blocks, twice (the gradients coming back) = 198 656; the head: 6 tensors of 16 × 32 values = 12 288
-    assert_eq!(e.activation_bytes, 198_656 + 12_288);
+    // × 4 bytes × 16 tokens × 2 blocks, twice (the gradients coming back) = 198 656; the head's sliced loss: 3 tensors of 16 × 32 values = 6 144
+    assert_eq!(e.activation_bytes, 198_656 + 6_144);
     assert_eq!((e.widening_bytes, e.fill_bytes, e.cache_disk_bytes), (0, 0, 0));
-    assert_eq!(e.total_bytes, 24_896 + 10_240 + 210_944);
+    assert_eq!(e.total_bytes, 24_896 + 10_240 + 204_800);
     // 20 conversations × 3 epochs / 4 per step
     assert_eq!(e.steps, 15);
     // per token: a block forward is 2 · 2560 + 4 · 16 · 12 = 5888 operations, the head 2 · 512; forward and backward ≈ 3 ×;
@@ -55,8 +55,8 @@ fn the_tiny_model_by_hand() {
     // (776 − 104 adapter values = 672 per token, kept once: 4 · 16 · 672)
     let top = profile::estimate(&input(cfg.clone(), 4, Some(1), BaseDtype::F32, 16, false));
     assert_eq!((top.trainable_params, top.trained_blocks), (256, 1));
-    assert_eq!(top.activation_bytes, 99_328 + 12_288 + 43_008);
-    assert_eq!(top.total_bytes, 24_896 + 5 * 1024 + 154_624);
+    assert_eq!(top.activation_bytes, 99_328 + 6_144 + 43_008);
+    assert_eq!(top.total_bytes, 24_896 + 5 * 1024 + 148_480);
     // the frozen block forward only: 12 · (60 · 5888 + 60 · 3 · (5888 + 1024))
     assert_eq!(top.flops, 19_169_280.0);
 
@@ -64,8 +64,8 @@ fn the_tiny_model_by_hand() {
     // conversation (20 passes, not 60); the states take 20 × 12 tokens × 16 values × 4 bytes on disk
     let cached = profile::estimate(&input(cfg, 4, Some(1), BaseDtype::F32, 16, true));
     assert_eq!(cached.weights_bytes, (2560 + 512) * 4 + (32 + 16) * 4);
-    assert_eq!(cached.activation_bytes, 99_328 + 12_288);
-    assert_eq!(cached.total_bytes, 12_480 + 5 * 1024 + 111_616);
+    assert_eq!(cached.activation_bytes, 99_328 + 6_144);
+    assert_eq!(cached.total_bytes, 12_480 + 5 * 1024 + 105_472);
     // while filling: one block (2560 · 4 + 32 · 4, more than the embeddings' 2048) and one conversation passing it
     assert_eq!(cached.fill_bytes, 10_368 + 43_008);
     assert_eq!(cached.cache_disk_bytes, 15_360);
@@ -86,19 +86,19 @@ fn llama_2_7b_by_hand() {
     assert_eq!(e.weights_bytes, 26_953_662_464);
     // per token and block: 10·4096 + 11.5·4096 + 8.5·4096 + 4·11008 + 2·32·1024 + 2·(16 + 3·4096) = 257 056 values
     assert_eq!(profile::graph_floats_per_token(&cfg, &lora(16, None), 1024), 257_056.0);
-    // 8 bytes (value and gradient) · 1024 tokens · 257 056 · 32 blocks, and the head's 6 · 1024 · 32000 · 4
-    assert_eq!(e.activation_bytes, 67_385_688_064 + 786_432_000);
-    assert_eq!(e.total_bytes, 26_953_662_464 + 167_772_160 + 68_172_120_064);
+    // 8 bytes (value and gradient) · 1024 tokens · 257 056 · 32 blocks, and the head's sliced loss, 3 · 1024 · 32000 · 4 (under the 32 M-logit slice)
+    assert_eq!(e.activation_bytes, 67_385_688_064 + 393_216_000);
+    assert_eq!(e.total_bytes, 26_953_662_464 + 167_772_160 + 67_778_904_064);
 
     // the limited-resource plan: 16-bit base, top 2 blocks, cache — 6.6 GB where the f32 run of every block is 95 GB
     let small = profile::estimate(&input(cfg.clone(), 16, Some(2), BaseDtype::F16, 1024, true));
     assert_eq!(small.trainable_params, 524_288);
     // two blocks' matrices and the head at 2 bytes; two blocks' norms and the final one at 4
     assert_eq!(small.weights_bytes, (2 * 202_375_168 + 131_072_000) * 2 + (2 * 8192 + 4096) * 4);
-    assert_eq!(small.activation_bytes, 2 * 2_105_802_752 + 786_432_000);
+    assert_eq!(small.activation_bytes, 2 * 2_105_802_752 + 393_216_000);
     // the embeddings (32000 × 4096, 131 M values) are the largest matrix, widened 64 M values at a time
     assert_eq!(small.widening_bytes, 268_435_456);
-    assert_eq!(small.total_bytes, 1_071_726_592 + 10_485_760 + 4_998_037_504 + 268_435_456);
+    assert_eq!(small.total_bytes, 1_071_726_592 + 10_485_760 + 4_604_821_504 + 268_435_456);
     // filling the cache: one block in 16 bits (404 783 104, more than the embeddings' 262 144 000), a conversation
     // passing it (4 · 1024 · 232 448) and the widened matrix
     assert_eq!(small.fill_bytes, 404_783_104 + 952_107_008 + 268_435_456);
@@ -118,8 +118,8 @@ fn the_verdict_compares_with_free_memory() {
     let cfg = profile::preset("llama-2-7b").unwrap();
     let p = input(cfg, 16, Some(2), BaseDtype::F16, 1024, true);
     let e = profile::estimate(&p);
-    // 6 348 685 312 + 10 % + 512 MiB
-    assert_eq!(profile::need_bytes(&e), 6_348_685_312 + 634_868_531 + (512 << 20));
+    // 5 955 469 312 + 10 % + 512 MiB
+    assert_eq!(profile::need_bytes(&e), 5_955_469_312 + 595_546_931 + (512 << 20));
     assert_eq!(profile::verdict(&e, &machine(16)).fits_ram, Some(true));
     assert_eq!(profile::verdict(&e, &machine(6)).fits_ram, Some(false));
     // a system that does not say how much is free is not refused

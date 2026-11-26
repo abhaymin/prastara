@@ -198,7 +198,7 @@ fn profile_and_autopilot_answer_before_any_training() {
                              "--targets", "q_proj,v_proj", "--train-layers", "2", "--base-dtype", "f16", "--cache-activations", p(&root.join("c"))]);
     assert!(ok, "{events:?}");
     let pr = of(&events, "profile")[0];
-    assert_eq!((pr["model"]["parameters"].as_u64(), pr["trainable_parameters"].as_u64(), pr["memory"]["total"].as_u64()), (Some(6_738_415_616), Some(524_288), Some(6_348_685_312)));
+    assert_eq!((pr["model"]["parameters"].as_u64(), pr["trainable_parameters"].as_u64(), pr["memory"]["total"].as_u64()), (Some(6_738_415_616), Some(524_288), Some(5_955_469_312)));
 
     // autopilot: the plan, its reasons, and a command that the trainer accepts as it is
     let (events, ok) = run(&["autopilot", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("auto")), "--time-budget", "1h", "--ram-budget", "4GB", "--cpu-gflops", "50"]);
