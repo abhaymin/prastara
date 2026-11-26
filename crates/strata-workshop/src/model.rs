@@ -532,6 +532,11 @@ impl CustomOp1 for FrozenLinear {
         take_cuda(&self.y, "frozen-half-linear")
     }
 
+    #[cfg(feature = "metal")]
+    fn metal_fwd(&self, _storage: &candle_core::MetalStorage, _layout: &Layout) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        take_metal(&self.y, "frozen-half-linear")
+    }
+
     fn bwd(&self, _arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         // grad · W, a slice of W's rows at a time when W is large (see `WIDEN_ROWS_MAX`)
         let rows = self.w.dim(0)?;
@@ -582,6 +587,11 @@ impl CustomOp1 for MaskedSoftmax {
         take_cuda(&self.y, "masked-softmax")
     }
 
+    #[cfg(feature = "metal")]
+    fn metal_fwd(&self, _storage: &candle_core::MetalStorage, _layout: &Layout) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        take_metal(&self.y, "masked-softmax")
+    }
+
     fn bwd(&self, _arg: &Tensor, res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let gy = grad_res.mul(res)?;
         let inner = gy.broadcast_sub(&res.broadcast_mul(&gy.sum_keepdim(D::Minus1)?)?)?;
@@ -609,6 +619,20 @@ fn take_cuda(slot: &Mutex<Option<Tensor>>, name: &str) -> candle_core::Result<(c
     match &*storage {
         candle_core::Storage::Cuda(c) => Ok((c.try_clone(layout)?, y.shape().clone())),
         _ => Err(candle_core::Error::Msg(format!("{name}: the value is not on a GPU"))),
+    }
+}
+
+/// The same for a value on Apple's GPU (Metal).
+#[cfg(feature = "metal")]
+fn take_metal(slot: &Mutex<Option<Tensor>>, name: &str) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+    use candle_core::backend::BackendStorage;
+    let y = slot.lock().map_err(|_| candle_core::Error::Msg(format!("{name}: lock")))?.take()
+        .ok_or_else(|| candle_core::Error::Msg(format!("{name}: forward ran twice")))?
+        .contiguous()?;
+    let (storage, layout) = y.storage_and_layout();
+    match &*storage {
+        candle_core::Storage::Metal(m) => Ok((m.try_clone(layout)?, y.shape().clone())),
+        _ => Err(candle_core::Error::Msg(format!("{name}: the value is not on Apple's GPU"))),
     }
 }
 
@@ -689,6 +713,12 @@ impl CustomOp3 for ChunkedAttention {
     fn cuda_fwd(&self, _: &candle_core::CudaStorage, _: &Layout, _: &candle_core::CudaStorage, _: &Layout, _: &candle_core::CudaStorage, _: &Layout)
         -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
         take_cuda(&self.y, "chunked-attention")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(&self, _: &candle_core::MetalStorage, _: &Layout, _: &candle_core::MetalStorage, _: &Layout, _: &candle_core::MetalStorage, _: &Layout)
+        -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        take_metal(&self.y, "chunked-attention")
     }
 
     fn bwd(&self, q: &Tensor, k: &Tensor, v: &Tensor, res: &Tensor, grad: &Tensor) -> candle_core::Result<(Option<Tensor>, Option<Tensor>, Option<Tensor>)> {
@@ -977,6 +1007,11 @@ impl CustomOp1 for CheckpointBlock {
     #[cfg(feature = "cuda")]
     fn cuda_fwd(&self, _storage: &candle_core::CudaStorage, _layout: &Layout) -> candle_core::Result<(candle_core::CudaStorage, Shape)> {
         take_cuda(&self.y, "checkpointed-block")
+    }
+
+    #[cfg(feature = "metal")]
+    fn metal_fwd(&self, _storage: &candle_core::MetalStorage, _layout: &Layout) -> candle_core::Result<(candle_core::MetalStorage, Shape)> {
+        take_metal(&self.y, "checkpointed-block")
     }
 
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {

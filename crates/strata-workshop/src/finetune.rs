@@ -91,16 +91,23 @@ pub struct TrainSettings {
     pub gradient_checkpointing: bool,
 }
 
-/// The devices named by `--devices` (`cpu`, `cuda:N`), opened.
+/// The devices named by `--devices` (`cpu`, `cuda:N`, `metal[:N]`), opened.
 pub fn open_devices(names: &[String]) -> Result<Vec<Device>> {
     if names.is_empty() {
         return Ok(vec![Device::Cpu]);
     }
     names.iter().map(|n| match n.trim() {
         "cpu" => Ok(Device::Cpu),
+        g if g == "metal" || g.starts_with("metal:") => {
+            let i: usize = if g == "metal" { 0 } else { g["metal:".len()..].parse().map_err(|_| anyhow!("device {g:?}: name metal or metal:N"))? };
+            #[cfg(feature = "metal")]
+            { Device::new_metal(i).map_err(|e| anyhow!("metal:{i}: {e}")) }
+            #[cfg(not(feature = "metal"))]
+            { let _ = i; bail!("device {g}: this Workshop was built without the metal feature (Apple Silicon builds have it)") }
+        }
         g => {
             let i: usize = g.strip_prefix("cuda:").and_then(|i| i.parse().ok())
-                .ok_or_else(|| anyhow!("device {g:?}: name cpu or cuda:N"))?;
+                .ok_or_else(|| anyhow!("device {g:?}: name cpu, cuda:N or metal[:N]"))?;
             #[cfg(feature = "cuda")]
             { Device::new_cuda(i).map_err(|e| anyhow!("cuda:{i}: {e}")) }
             #[cfg(not(feature = "cuda"))]

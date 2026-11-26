@@ -117,7 +117,7 @@ enum Cmd {
         /// answer N held-out prompts of each list before and after and count refusals (slow on big models: no cache)
         #[arg(long, default_value_t = 0)]
         check: usize,
-        /// cpu (the default), or cuda:N; several split the blocks
+        /// cpu (the default), cuda:N or metal[:N]; several split the blocks
         #[arg(long, value_delimiter = ',')]
         devices: Vec<String>,
         /// hold the model as f32, f16 or bf16 while reading (default: f32 for an f32 checkpoint, else bf16)
@@ -275,7 +275,7 @@ enum Cmd {
         /// an earlier report (report.json or its folder); several: each test against the best of them
         #[arg(long)]
         against: Vec<PathBuf>,
-        /// cpu (the default), or cuda:N; several split the blocks
+        /// cpu (the default), cuda:N or metal[:N]; several split the blocks
         #[arg(long, value_delimiter = ',')]
         devices: Vec<String>,
         #[arg(long)]
@@ -460,7 +460,7 @@ struct RunArgs {
     /// hold the frozen base as f32, f16 or bf16 (half the memory; LoRA and the loss stay f32)
     #[arg(long)]
     base_dtype: Option<String>,
-    /// where to train: cpu (default) or GPUs, e.g. cuda:0,cuda:1 (the blocks split between them; needs a cuda build)
+    /// where to train: cpu (default) or GPUs, e.g. cuda:0,cuda:1 (the blocks split between them; needs a cuda build) or metal (Apple Silicon builds)
     #[arg(long, value_delimiter = ',')]
     devices: Vec<String>,
     /// recompute each trained block's activations in the backward pass (less memory, about a third more time)
@@ -505,7 +505,7 @@ struct RunArgs {
     /// CPU threads (all cores when not given)
     #[arg(long)]
     threads: Option<usize>,
-    /// one device: cpu (default) or cuda:N; for several, --devices
+    /// one device: cpu (default), cuda:N or metal; for several, --devices
     #[arg(long, default_value = "cpu")]
     device: String,
 }

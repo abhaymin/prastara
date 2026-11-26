@@ -153,7 +153,7 @@ fn a_run_that_will_not_fit_is_refused_before_it_starts() {
     // other refusals, each plain: a 4-bit base, a GPU
     let msg = |args: &[&str]| run(args).0.last().unwrap()["message"].as_str().unwrap().to_string();
     assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--base-dtype", "4bit"]).contains("QLoRA"));
-    assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--device", "cuda"]).contains("cpu or cuda:N"));
+    assert!(msg(&["train", "--model", p(&model), "--data", p(&data), "--out", p(&root.join("o")), "--device", "cuda"]).contains("cpu, cuda:N or metal[:N]"));
 }
 
 #[test]
