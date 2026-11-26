@@ -776,7 +776,7 @@ mod tests {
 /// The loop (Avarta, model.rs `LoopSpec`) a converted model carries: `<arch>.loop.start`, `.end`, `.count` and the
 /// gates `loop.gate.<p>` (F32, one value per hidden channel, p = 1..count-1). Gates missing from `loop.safetensors`
 /// are zeros, as the Workshop reads them (a model just converted to a loop is exactly its base).
-fn loop_parts(dir: &Path, arch: &str, hidden: usize, layers: usize) -> Result<Option<(Vec<(String, Kv)>, Vec<(String, Vec<f32>)>)>> {
+pub(crate) fn loop_parts(dir: &Path, arch: &str, hidden: usize, layers: usize) -> Result<Option<(Vec<(String, Kv)>, Vec<(String, Vec<f32>)>)>> {
     let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json"))?)?;
     let Some(l) = crate::model::LoopSpec::from_json(&c["prastara_loop"], layers)? else { return Ok(None) };
     let kv = vec![(format!("{arch}.loop.start"), Kv::U32(l.start as u32)), (format!("{arch}.loop.end"), Kv::U32(l.end as u32)),
@@ -798,7 +798,7 @@ fn loop_parts(dir: &Path, arch: &str, hidden: usize, layers: usize) -> Result<Op
     Ok(Some((kv, gates)))
 }
 
-fn tensor_f32(s: &safetensors_io::Shard, t: &safetensors_io::TensorDesc, f: &Path) -> Result<Vec<f32>> {
+pub(crate) fn tensor_f32(s: &safetensors_io::Shard, t: &safetensors_io::TensorDesc, f: &Path) -> Result<Vec<f32>> {
     let raw = s.bytes(t);
     Ok(match t.dtype() {
         safetensors_io::Dtype::F32 => raw.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect(),
@@ -849,10 +849,7 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     let d = dir.display();
     let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("reading config for {d}"))?)?;
     let n = |k: &str| c[k].as_f64().ok_or_else(|| anyhow!("{d}: config.{k} missing or not a number"));
-    let (hidden, layers, heads) = (n("hidden_size")? as usize, n("num_hidden_layers")? as usize, n("num_attention_heads")? as usize);
-    let kv_heads = c["num_key_value_heads"].as_f64().map_or(heads, |v| v as usize);
-    let head_dim = c["head_dim"].as_f64().map_or(hidden / heads, |v| v as usize);
-    let theta = c["rope_theta"].as_f64().or_else(|| c["rope_parameters"]["rope_theta"].as_f64()).unwrap_or(1_000_000.0);
+    let (hidden, layers) = (n("hidden_size")? as usize, n("num_hidden_layers")? as usize);
     let rope_type = c["rope_scaling"]["rope_type"].as_str().or_else(|| c["rope_parameters"]["rope_type"].as_str()).unwrap_or("default");
     if rope_type != "default" {
         bail!("{d}: rope type {rope_type:?}: the engine's long-context path (docs/MULA-PLAN.md L5) is not written yet; convert the model before the long-context step");
@@ -860,7 +857,6 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     if c["layer_types"].as_array().is_some_and(|a| a.iter().any(|t| t != "full_attention")) {
         bail!("{d}: sliding-window layers: the engine's long-context path (docs/MULA-PLAN.md L5) is not written yet");
     }
-    let vocab_size = n("vocab_size")? as usize;
     let arch = "qwen3";
 
     // the weights: every shard but the loop's gates
@@ -892,50 +888,7 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     let lp = loop_parts(dir, arch, hidden, layers)?;
     let total_params: u64 = located.iter().map(|(_, _, t)| t.numel()).sum();
 
-    let pre = model_pre_tokenizer(dir, pre_tokenizer)?;
-    let (tokens, types, merges, ids) = full_vocab(dir, vocab_size)?;
-    let tc: Json = std::fs::read_to_string(dir.join("tokenizer_config.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Json::Null);
-    let id_of = |key: &str| special_text(&tc, key).and_then(|t| ids.get(&t).copied());
-    let eos = id_of("eos_token").or_else(|| c["eos_token_id"].as_u64().map(|v| v as u32)).unwrap_or(0);
-    let bos = id_of("bos_token").or_else(|| c["bos_token_id"].as_u64().map(|v| v as u32)).unwrap_or(eos);
-    let mut chat = chat_template(&tc);
-    if chat.is_empty() {
-        chat = std::fs::read_to_string(dir.join("chat_template.jinja")).unwrap_or_default();
-    }
-
-    let folder = dir.file_name().and_then(|n| n.to_str());
-    let mut kv: Vec<(String, Kv)> = vec![
-        ("general.architecture".into(), Kv::Str(arch.into())),
-        ("general.type".into(), Kv::Str("model".into())),
-        ("general.name".into(), Kv::Str(folder.map_or("qwen3".into(), id_to_title))),
-        ("general.size_label".into(), Kv::Str(model_size_label(total_params))),
-        (format!("{arch}.block_count"), Kv::U32(layers as u32)),
-        (format!("{arch}.context_length"), Kv::U32(n("max_position_embeddings")? as u32)),
-        (format!("{arch}.embedding_length"), Kv::U32(hidden as u32)),
-        (format!("{arch}.feed_forward_length"), Kv::U32(n("intermediate_size")? as u32)),
-        (format!("{arch}.attention.head_count"), Kv::U32(heads as u32)),
-        (format!("{arch}.attention.head_count_kv"), Kv::U32(kv_heads as u32)),
-        (format!("{arch}.rope.freq_base"), Kv::F32(theta as f32)),
-        (format!("{arch}.attention.layer_norm_rms_epsilon"), Kv::F32(n("rms_norm_eps")? as f32)),
-        (format!("{arch}.attention.key_length"), Kv::U32(head_dim as u32)),
-        (format!("{arch}.attention.value_length"), Kv::U32(head_dim as u32)),
-        ("general.file_type".into(), Kv::U32(outtype.file_type())),
-        ("general.quantization_version".into(), Kv::U32(2)),
-        ("tokenizer.ggml.model".into(), Kv::Str("gpt2".into())),
-        ("tokenizer.ggml.pre".into(), Kv::Str(pre)),
-        ("tokenizer.ggml.tokens".into(), Kv::Strings(tokens)),
-        ("tokenizer.ggml.token_type".into(), Kv::Ints(types)),
-        ("tokenizer.ggml.merges".into(), Kv::Strings(merges)),
-        ("tokenizer.ggml.eos_token_id".into(), Kv::U32(eos)),
-        ("tokenizer.ggml.bos_token_id".into(), Kv::U32(bos)),
-        ("tokenizer.ggml.add_bos_token".into(), Kv::Bool(get_bool(&tc, "add_bos_token"))),
-    ];
-    if let Some(p) = id_of("pad_token") {
-        kv.push(("tokenizer.ggml.padding_token_id".into(), Kv::U32(p)));
-    }
-    if !chat.is_empty() {
-        kv.push(("tokenizer.chat_template".into(), Kv::Str(chat)));
-    }
+    let mut kv = qwen3_header(dir, &c, arch, total_params, outtype.file_type(), pre_tokenizer)?;
     let (loop_kv, gates) = lp.unwrap_or_default();
     kv.extend(loop_kv);
 
@@ -960,6 +913,63 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     }
     w.finish()?;
     Ok(())
+}
+
+/// The metadata a `qwen3` (or `qwen3moe`, as `arch`) GGUF starts with, as llama.cpp's `Qwen3Model` writes it: the
+/// hyper-parameters from `config.json` and the tokenizer from `tokenizer.json` / `tokenizer_config.json`.
+pub(crate) fn qwen3_header(dir: &Path, c: &Json, arch: &str, total_params: u64, file_type: u32, pre_tokenizer: Option<&str>) -> Result<Vec<(String, Kv)>> {
+    let d = dir.display();
+    let n = |k: &str| c[k].as_f64().ok_or_else(|| anyhow!("{d}: config.{k} missing or not a number"));
+    let (hidden, layers, heads) = (n("hidden_size")? as usize, n("num_hidden_layers")? as usize, n("num_attention_heads")? as usize);
+    let kv_heads = c["num_key_value_heads"].as_f64().map_or(heads, |v| v as usize);
+    let head_dim = c["head_dim"].as_f64().map_or(hidden / heads, |v| v as usize);
+    let theta = c["rope_theta"].as_f64().or_else(|| c["rope_parameters"]["rope_theta"].as_f64()).unwrap_or(1_000_000.0);
+    let vocab_size = n("vocab_size")? as usize;
+    let pre = model_pre_tokenizer(dir, pre_tokenizer)?;
+    let (tokens, types, merges, ids) = full_vocab(dir, vocab_size)?;
+    let tc: Json = std::fs::read_to_string(dir.join("tokenizer_config.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Json::Null);
+    let id_of = |key: &str| special_text(&tc, key).and_then(|t| ids.get(&t).copied());
+    let eos = id_of("eos_token").or_else(|| c["eos_token_id"].as_u64().map(|v| v as u32)).unwrap_or(0);
+    let bos = id_of("bos_token").or_else(|| c["bos_token_id"].as_u64().map(|v| v as u32)).unwrap_or(eos);
+    let mut chat = chat_template(&tc);
+    if chat.is_empty() {
+        chat = std::fs::read_to_string(dir.join("chat_template.jinja")).unwrap_or_default();
+    }
+
+    let folder = dir.file_name().and_then(|n| n.to_str());
+    let mut kv: Vec<(String, Kv)> = vec![
+        ("general.architecture".into(), Kv::Str(arch.into())),
+        ("general.type".into(), Kv::Str("model".into())),
+        ("general.name".into(), Kv::Str(folder.map_or(arch.into(), id_to_title))),
+        ("general.size_label".into(), Kv::Str(model_size_label(total_params))),
+        (format!("{arch}.block_count"), Kv::U32(layers as u32)),
+        (format!("{arch}.context_length"), Kv::U32(n("max_position_embeddings")? as u32)),
+        (format!("{arch}.embedding_length"), Kv::U32(hidden as u32)),
+        (format!("{arch}.feed_forward_length"), Kv::U32(n("intermediate_size")? as u32)),
+        (format!("{arch}.attention.head_count"), Kv::U32(heads as u32)),
+        (format!("{arch}.attention.head_count_kv"), Kv::U32(kv_heads as u32)),
+        (format!("{arch}.rope.freq_base"), Kv::F32(theta as f32)),
+        (format!("{arch}.attention.layer_norm_rms_epsilon"), Kv::F32(n("rms_norm_eps")? as f32)),
+        (format!("{arch}.attention.key_length"), Kv::U32(head_dim as u32)),
+        (format!("{arch}.attention.value_length"), Kv::U32(head_dim as u32)),
+        ("general.file_type".into(), Kv::U32(file_type)),
+        ("general.quantization_version".into(), Kv::U32(2)),
+        ("tokenizer.ggml.model".into(), Kv::Str("gpt2".into())),
+        ("tokenizer.ggml.pre".into(), Kv::Str(pre)),
+        ("tokenizer.ggml.tokens".into(), Kv::Strings(tokens)),
+        ("tokenizer.ggml.token_type".into(), Kv::Ints(types)),
+        ("tokenizer.ggml.merges".into(), Kv::Strings(merges)),
+        ("tokenizer.ggml.eos_token_id".into(), Kv::U32(eos)),
+        ("tokenizer.ggml.bos_token_id".into(), Kv::U32(bos)),
+        ("tokenizer.ggml.add_bos_token".into(), Kv::Bool(get_bool(&tc, "add_bos_token"))),
+    ];
+    if let Some(p) = id_of("pad_token") {
+        kv.push(("tokenizer.ggml.padding_token_id".into(), Kv::U32(p)));
+    }
+    if !chat.is_empty() {
+        kv.push(("tokenizer.chat_template".into(), Kv::Str(chat)));
+    }
+    Ok(kv)
 }
 
 /// Whether a folder is a Qwen3ForCausalLM (`convert_qwen3`) rather than a Llama (`convert`).

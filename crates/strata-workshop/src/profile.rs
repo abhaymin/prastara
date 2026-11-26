@@ -97,10 +97,17 @@ pub struct Estimate {
 pub fn graph_floats_per_token(cfg: &ModelConfig, lora: &LoraSpec, seq: usize) -> f64 {
     let (h, i) = (cfg.hidden_size as f64, cfg.intermediate_size as f64);
     let (q, kv) = ((cfg.num_attention_heads * cfg.head_dim) as f64, (cfg.num_key_value_heads * cfg.head_dim) as f64);
-    let adapters: f64 = lora.targets.iter().map(|t| (lora.r + 3 * cfg.target_shape(*t).0) as f64).sum();
+    let shared = |t: &&Target| cfg.moe.is_none() || t.module() == "self_attn";
+    let adapters: f64 = lora.targets.iter().filter(shared).map(|t| (lora.r + 3 * cfg.target_shape(*t).0) as f64).sum();
     // past CHUNKED_ABOVE tokens the attention keeps no seq x seq table (model.rs, chunked_attention)
     let table = if seq > chunked_above() { 0.0 } else { 2.0 * (cfg.num_attention_heads * seq) as f64 };
-    10.0 * h + 11.5 * q + 8.5 * kv + 4.0 * i + table + adapters
+    // upcycled (model.rs, moe_ffn): the router's logits and softmax, and per chosen expert its gathered rows, its
+    // three LoRA terms, its gate/up/activation and its own down projection, then the weighted gather
+    let moe = cfg.moe.map_or(0.0, |m| {
+        let k = m.top_k as f64;
+        3.0 * m.experts as f64 + k * (h + 2.0 * lora.r as f64 + 3.0 * 2.0 * i + 3.0 * i + lora.r as f64 + 3.0 * h) + 2.0 * k * h
+    });
+    10.0 * h + 11.5 * q + 8.5 * kv + 4.0 * i + table + adapters + moe
 }
 
 fn chunked_above() -> usize {
@@ -177,7 +184,9 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     // per token: 2 operations per weight used, plus the attention products (4·Q·seq)
     let tokens = p.avg_tokens.clamp(2, seq) as f64;
     let q = (cfg.num_attention_heads * cfg.head_dim) as f64;
-    let block_fwd = 2.0 * (cfg.block_params() - cfg.block_small_params()) as f64 + 4.0 * q * tokens;
+    // an upcycled block: gate and up once, the down projection once per chosen expert, and the router
+    let moe_fwd = cfg.moe.map_or(0.0, |m| 2.0 * ((m.top_k - 1) * cfg.hidden_size * cfg.intermediate_size + m.experts * cfg.hidden_size) as f64);
+    let block_fwd = 2.0 * (cfg.block_params() - cfg.block_small_params()) as f64 + 4.0 * q * tokens + moe_fwd;
     let head_fwd = 2.0 * (cfg.vocab_size * cfg.hidden_size) as f64;
     let passes = p.examples as f64 * p.epochs;
     let lower_passes = if cached { p.examples as f64 } else { passes };
@@ -320,6 +329,11 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
                 human_bytes(e.activation_bytes), if e.widening_bytes > 0 { format!(" + widening one 16-bit matrix {}", human_bytes(e.widening_bytes)) } else { String::new() },
                 human_bytes(e.total_bytes)),
     ];
+    if let Some(m) = p.cfg.moe {
+        let (total, active) = m.params(&p.cfg);
+        out.push(format!("upcycled: {} experts, top-{} per token; exported it has {:.2} B parameters, {:.2} B active per token (the training holds the dense base and the experts' adapters)",
+                         m.experts, m.top_k, total as f64 / 1e9, active as f64 / 1e9));
+    }
     if e.per_device_bytes > 0 {
         out.push(format!("split over the devices: about {} on the busiest (the last, which also holds the head)", human_bytes(e.per_device_bytes)));
     }
@@ -346,6 +360,7 @@ pub fn estimate_json(p: &ProfileInput, e: &Estimate, m: &Machine) -> Value {
     json!({
         "model": {"family": p.cfg.family.as_str(), "blocks": p.cfg.num_hidden_layers, "parameters": e.total_params},
         "trainable_parameters": e.trainable_params, "trained_blocks": e.trained_blocks,
+        "moe": p.cfg.moe.map(|m| { let (total, active) = m.params(&p.cfg); json!({"experts": m.experts, "top_k": m.top_k, "total_parameters": total, "active_parameters": active}) }),
         "memory": {"weights": e.weights_bytes, "adapters": e.adapter_bytes, "optimizer": e.optimizer_bytes, "gradients": e.gradient_bytes,
                    "activations": e.activation_bytes, "widening": e.widening_bytes, "cache_fill_peak": e.fill_bytes, "total": e.total_bytes, "needed_with_headroom": v.need_bytes},
         "cache_disk_bytes": e.cache_disk_bytes, "steps": e.steps, "flops": e.flops,
@@ -520,7 +535,7 @@ pub fn source_dtype(dir: &std::path::Path) -> Result<BaseDtype> {
 pub fn preset(name: &str) -> Option<ModelConfig> {
     let c = |family, vocab, hidden, inter, layers, heads, kv, positions, theta, tied| ModelConfig {
         family, vocab_size: vocab, hidden_size: hidden, intermediate_size: inter, num_hidden_layers: layers, num_attention_heads: heads,
-        num_key_value_heads: kv, head_dim: hidden / heads, rms_norm_eps: 1e-5, rope_theta: theta, max_position_embeddings: positions, tie_word_embeddings: tied, loop_: None, yarn: None, sliding_window: None, layer_sliding: Vec::new(),
+        num_key_value_heads: kv, head_dim: hidden / heads, rms_norm_eps: 1e-5, rope_theta: theta, max_position_embeddings: positions, tie_word_embeddings: tied, loop_: None, moe: None, yarn: None, sliding_window: None, layer_sliding: Vec::new(),
     };
     Some(match name.to_ascii_lowercase().as_str() {
         "llama-2-7b" => c(Family::Llama, 32000, 4096, 11008, 32, 32, 32, 4096, 10000.0, false),

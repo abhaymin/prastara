@@ -17,6 +17,7 @@ pub mod chatdata;
 pub mod checkpoint;
 pub mod convert;
 pub mod dataset;
+pub mod export_moe;
 pub mod finetune;
 pub mod datagen;
 pub mod recipes;
