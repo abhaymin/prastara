@@ -941,6 +941,31 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .ws-upload__top .muted { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .ws-upload .st-btn { height: 28px; padding: 0 var(--st-s-3); font-size: 12px; }
 
+/* wide screens (QHD and up): a fourth column between the workspace and the jobs, with this machine and the
+   queue; ultra-high-res screens at 100% scaling: the whole Workshop drawn larger, so text stays readable */
+.ws-ctx { display: none; }
+@media (min-width: 2200px) {
+  .ws { grid-template-columns: 17.5rem minmax(0, 1fr) 30rem 26rem; }
+  .ws-ctx { display: flex; flex-direction: column; gap: var(--st-s-4); padding: var(--st-s-6) var(--st-s-5); overflow-y: auto;
+    border-left: 1px solid var(--st-line-soft); }
+  .ws-work { padding: var(--st-s-8) var(--st-s-10) var(--st-s-12); }
+  .ws-form { grid-template-columns: repeat(auto-fill, minmax(20rem, 1fr)); }
+  .ws-ov__grid { grid-template-columns: repeat(auto-fill, minmax(22rem, 1fr)); }
+}
+/* (the header too, so the bar and the page read at one size) */
+@media (min-width: 3000px) { .view--workshop, body:has(.view--workshop:not([hidden])) > .st-header { zoom: 1.35; } }
+.ws-ctx__card { margin: 0; padding: var(--st-s-5); display: flex; flex-direction: column; gap: var(--st-s-3); }
+.ws-ctx__card h3 { margin: 0; font-size: var(--st-fs-base); display: flex; align-items: baseline; gap: var(--st-s-2); }
+.ws-meter { display: flex; flex-direction: column; gap: 6px; }
+.ws-meter__top { display: flex; justify-content: space-between; gap: var(--st-s-2); font-size: var(--st-fs-sm); }
+.ws-meter__top .mono { font-size: 13px; }
+.ws-meter small { font-size: 12px; color: var(--st-ink-muted); }
+.ws-act { display: flex; flex-direction: column; gap: 6px; padding: var(--st-s-3) 0; border-bottom: 1px solid var(--st-line-soft); }
+.ws-act:last-child { border-bottom: 0; }
+.ws-act__top { display: flex; align-items: center; gap: var(--st-s-2); font-size: var(--st-fs-sm); }
+.ws-act__top .muted { margin-left: auto; font-size: 12px; }
+.ws-act p { margin: 0; font-size: 13px; color: var(--st-ink-soft); overflow-wrap: anywhere; }
+
 /* narrower windows: the jobs become a drawer, then the rail a step scroller on top */
 @media (max-width: 1280px) {
   .ws { grid-template-columns: 14rem minmax(0, 1fr); }

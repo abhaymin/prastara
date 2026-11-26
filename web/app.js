@@ -4660,6 +4660,7 @@ async function wsFetch(path, opts = {}) {
 async function loadWorkshop() {
   await wsFiles();
   refreshJobs();
+  wsCtxRefresh();
 }
 let wsKnownDatasets = "";
 const wsBase = (p) => String(p || "").replace(/\/+$/, "").split("/").pop();
@@ -5196,6 +5197,54 @@ async function wsUploadRun(items, folderName) {
   finally { $("ws-upload").hidden = true; wsUp.xhr = null; }
 }
 $("ws-up-cancel").onclick = () => { wsUp.cancelled = true; wsUp.xhr?.abort(); };
+
+// ------------------------------------------------------------------ Workshop: the context column (wide screens only)
+// This machine (GET api/system) and the queue (GET api/queue: what runs, what waits and for how long, from the
+// server's learnt durations). Read only while the Workshop is open on a screen wide enough to show the column.
+let wsCtxTimer = null;
+const wsCtxOn = () => tab === "workshop" && getComputedStyle($("ws-ctx")).display !== "none";
+const wsMeter = (name, text, pct, note, tone = "") => `<div class="ws-meter"><div class="ws-meter__top"><span>${esc(name)}</span><span class="mono">${esc(text)}</span></div>
+  <div class="st-progress"${tone ? ` data-tone="${tone}"` : ""}><div class="st-progress__bar" style="width:${Math.min(100, Math.max(0, pct)).toFixed(0)}%"></div></div>${note ? `<small>${esc(note)}</small>` : ""}</div>`;
+async function wsCtxRefresh() {
+  clearTimeout(wsCtxTimer);
+  if (!wsCtxOn()) { wsCtxTimer = null; return; }
+  try {
+    const [sys, q] = await Promise.all([fetch("api/system", {headers: headers()}).then((r) => r.ok ? r.json() : null),
+                                        fetch("api/queue", {headers: headers()}).then((r) => r.ok ? r.json() : null)]);
+    if (sys) {
+      const gb = (mib) => (mib / 1024).toFixed(1);
+      const rows = (sys.gpus || []).map((g) => wsMeter(`GPU ${g.index} · ${String(g.name).replace(/^NVIDIA GeForce /, "")}`,
+        `${gb(g.memory_used_mib)} / ${gb(g.memory_total_mib)} GB`, (100 * g.memory_used_mib) / g.memory_total_mib,
+        [`${Math.round(g.util_pct)}% busy`, g.temperature_c != null ? `${Math.round(g.temperature_c)} °C` : "",
+         g.pcie ? `PCIe ${g.pcie.gen_max || g.pcie.gen} x${g.pcie.width}` : ""].filter(Boolean).join(" · ")));
+      if (sys.memory) rows.push(wsMeter("System RAM", `${gb(sys.memory.used_mib)} / ${gb(sys.memory.total_mib)} GB`,
+        (100 * sys.memory.used_mib) / sys.memory.total_mib, `${gb(sys.memory.total_mib - sys.memory.used_mib)} GB available`, "info"));
+      if (sys.cpu) rows.push(wsMeter("CPU", `${Math.round(sys.cpu.util_pct)}%`, sys.cpu.util_pct, `${sys.cpu.cores} cores · ${sys.cpu.threads} threads`, "info"));
+      $("ws-ctx-machine").innerHTML = rows.join("") || '<p class="muted small">No figures from this machine.</p>';
+    }
+    if (q) {
+      const learnt = q.learnt_s || {};
+      const need = (x) => x?.need?.text_model || "";
+      const typical = (x) => learnt[`${x.kind}:${need(x)}`];
+      let ahead = q.running ? Math.max(0, (typical(q.running) || 0) - (q.running.running_s || 0)) : 0;
+      const items = [];
+      if (q.running) items.push({what: q.running.kind, state: "running", time: wsDur(q.running.running_s || 0), cls: "st-badge--generating",
+        line: `${q.running.label || need(q.running)}${typical(q.running) ? ` · usually about ${wsDur(typical(q.running))}` : ""}`});
+      for (const w of q.waiting || []) {
+        items.push({what: w.kind, state: "waiting", time: ahead ? `starts in ~${wsDur(ahead)}` : "next", cls: "st-badge--queued",
+          line: w.label || need(w) || ""});
+        ahead += typical(w) || 0;
+      }
+      $("ws-ctx-count").textContent = items.length ? `${items.length} in the queue` : "";
+      $("ws-ctx-activity").innerHTML = (items.length ? items.map((a) => `<div class="ws-act"><div class="ws-act__top"><b>${esc(a.what)}</b>` +
+          `<span class="st-badge ${a.cls}">${a.state}</span><span class="muted">${esc(a.time)}</span></div><p>${esc(a.line)}</p></div>`).join("")
+        : '<p class="muted small">Nothing in the queue.</p>') +
+        `<p class="muted small">Loaded: ${esc(q.resident?.text_model || "no model")}</p>`;
+    }
+  } catch (e) { /* the column stays as it was */ }
+  wsCtxTimer = setTimeout(wsCtxRefresh, 5000);
+}
+window.addEventListener("resize", () => { if (wsCtxOn() && !wsCtxTimer) wsCtxRefresh(); });
 
 // the step chosen last time (after the library and review code above, which it may call)
 wsStep(store.get("ws-step", "overview"));
