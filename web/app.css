@@ -1054,3 +1054,7 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .ws-rep tr.ws-rep__bad > th:first-child { box-shadow: inset 3px 0 0 var(--st-danger); }
 .ws-rep tr.ws-rep__good > th:first-child { box-shadow: inset 3px 0 0 var(--st-success, var(--st-accent)); }
 .ws-rep__alert { color: var(--st-danger-text); background: var(--st-danger-tint); border-radius: var(--st-r-md); padding: 8px 12px; font-size: var(--st-fs-sm); }
+.ws-rep__samples { margin-top: 8px; }
+.ws-rep__samples > summary { cursor: pointer; font-size: var(--st-fs-sm); }
+.ws-rep__pair { border-top: 1px solid var(--st-line-soft); padding: 6px 0; }
+.ws-rep__sample { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16em; overflow-y: auto; margin: 2px 0 6px; }

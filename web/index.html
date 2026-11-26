@@ -764,6 +764,12 @@
                   <button type="button" role="radio" data-dev="cpu" aria-checked="true">CPU</button>
                   <button type="button" role="radio" data-dev="cuda:0" aria-checked="false">GPU 0</button>
                   <button type="button" role="radio" data-dev="cuda:0,cuda:1" aria-checked="false">GPU 0 + 1</button></div></fieldset>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-gguf">Answer with the Rust engine <output>a GGUF of this model, optional</output></label>
+                <input class="st-input mono" id="ws-g-gguf" data-ws-pick="gguf" autocomplete="off" placeholder="without one, the Workshop's model answers (slow on long answers)"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-engine-args">Engine settings <output>with a GGUF</output></label>
+                <input class="st-input mono" id="ws-g-engine-args" autocomplete="off" placeholder="on the CPU; e.g. --devices cuda:0=14 --max-context 8192"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-judge">Judge model <output>judge tests</output></label>
+                <input class="st-input mono" id="ws-g-judge" autocomplete="off" placeholder="the suite's, else the loaded one; on a GPU run: a remote or CPU model"></div>
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-g-out">Report folder <output>optional</output></label>
                 <input class="st-input mono" id="ws-g-out" placeholder="in the Workshop's reports folder"></div>
             </div>
@@ -771,7 +777,7 @@
           </div>
           <div class="st-card ws-block" id="ws-g-result" hidden><div class="ws-curve__head"><span class="card-title" id="ws-g-result-title">Report</span><span class="muted small" id="ws-g-result-note"></span></div>
             <div id="ws-g-result-body"></div></div>
-          <p class="muted small">A suite is a JSON list of tests: held-out loss, code (HumanEval, MBPP, LiveCodeBench, Codeforces, Strandset-Rust), IndicQA-style questions and judge-scored answers. From a terminal: <code>am2strata-workshop regress --model &lt;hf-folder&gt; --suite suite.json --passes 1,2 --out &lt;report-dir&gt;</code>.</p>
+          <p class="muted small">A suite is a JSON list of tests: held-out loss, code (HumanEval, MBPP, LiveCodeBench, Codeforces, Strandset-Rust), IndicQA-style questions, judge-scored answers, <b>repeat</b> (how much answers repeat themselves: distinct 2- and 3-grams, repeated 4-grams and sentences; lower is better) and <b>samples</b> (answers kept to read, beside the earlier report's). With a GGUF the answers come from the Rust engine (its attention cache and GPU graph); the loss tests still use the Workshop's model, and an adapter must already be merged into the GGUF. A judge on the GPUs this run takes cannot answer until it ends, so the run is refused: judge with a remote (assist) model or a CPU model. From a terminal: <code>am2strata-workshop regress --model &lt;hf-folder&gt; --suite suite.json --passes 1,2 --engine-gguf model.gguf --engine-args "--devices cuda:0=14" --out &lt;report-dir&gt;</code>.</p>
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="grade" hidden>

@@ -785,3 +785,71 @@ fn regress_and_grade_train_jobs_check_their_inputs_and_carry_their_report() {
             && args.contains("--max-steps 10") && args.contains(&format!("--data {}", prompts.display())), "{args}");
     let _ = std::fs::remove_dir_all(&tools);
 }
+
+/// Regress through the Rust engine: `engine_gguf` is a .gguf inside the Workshop's folders, `engine_args` takes only the
+/// flags that place and size the engine (each value checked), and both reach the command. A judge on the GPUs the run
+/// takes is refused at once (it would wait for the run, and the run for it); on a CPU run it judges.
+#[cfg(unix)]
+#[test]
+fn regress_through_the_engine_checks_its_settings_and_a_gpu_judge_is_refused_on_a_gpu_run() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-engine-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    // the chat model runs on GPU 0
+    let gpu_model = Model { id: "gpu-judge", extra: json!({"gpu": [0]}), ..Model::default() };
+    let s = Server::start(&[gpu_model], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let ws = s.dir.join("workshop");
+    let model = ws.join("tiny-model");
+    std::fs::create_dir_all(&model).unwrap();
+    for f in ["config.json", "tokenizer.json"] {
+        std::fs::write(model.join(f), "{}").unwrap();
+    }
+    let gguf = ws.join("tiny-model.Q8_0.gguf");
+    std::fs::write(&gguf, "GGUF").unwrap();
+    let suites = ws.join("suites");
+    std::fs::create_dir_all(&suites).unwrap();
+    std::fs::write(suites.join("p.jsonl"), "{\"prompt\": \"hi\"}\n").unwrap();
+    let suite = suites.join("gen.json");
+    std::fs::write(&suite, r#"{"tests": [{"name": "rep", "kind": "repeat", "data": "p.jsonl"}, {"name": "s", "kind": "samples", "data": "p.jsonl"}]}"#).unwrap();
+    let judged = suites.join("judged.json");
+    std::fs::write(&judged, r#"{"tests": [{"name": "j", "kind": "judge", "data": "p.jsonl"}]}"#).unwrap();
+    let base = json!({"kind": "regress", "model": model, "suite": suite});
+    let with = |extra: Value| { let mut b = base.clone(); for (k, v) in extra.as_object().unwrap() { b[k] = v.clone(); } b };
+    for (bad, why) in [
+        (with(json!({"engine_gguf": "/etc/x.gguf"})), "a GGUF outside the Workshop"),
+        (with(json!({"engine_gguf": model.join("config.json")})), "not a .gguf"),
+        (with(json!({"engine_gguf": ws.join("none.gguf")})), "a GGUF that does not exist"),
+        (with(json!({"engine_gguf": 5})), "a GGUF that is no path"),
+        (with(json!({"engine_args": "--devices cuda:0"})), "engine settings without a GGUF"),
+        (with(json!({"engine_gguf": gguf, "engine_args": "--pack /etc"})), "a flag that names a file"),
+        (with(json!({"engine_gguf": gguf, "engine_args": "--remote-experts 1.2.3.4:9"})), "a flag that names another machine"),
+        (with(json!({"engine_gguf": gguf, "engine_args": "--devices gpu0"})), "bad devices"),
+        (with(json!({"engine_gguf": gguf, "engine_args": "--max-context lots"})), "a context that is no number"),
+        (with(json!({"engine_gguf": gguf, "engine_args": "--max-context"})), "a flag without its value"),
+        (with(json!({"engine_gguf": gguf, "engine_args": ["--threads", "2"]})), "settings that are no string"),
+        (with(json!({"engine_gguf": gguf, "judge_model": 3})), "a judge that is no name"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+        assert!(e["error"]["message"].is_string(), "{why}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &with(json!({"engine_gguf": gguf, "engine_args": "--threads 2 --max-context 4096 --no-graph"})));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("regress-args.txt")).unwrap();
+    assert!(args.contains(&format!("--engine-gguf {}", gguf.display())) && args.contains("--engine-args --threads 2 --max-context 4096 --no-graph"), "{args}");
+    // a judge test on a GPU run whose judge (the loaded chat model) is on the GPUs: refused before the GPUs are taken
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "regress", "model": model, "suite": judged, "devices": "cuda:0"}));
+    assert_eq!(code, 202, "{j}");
+    let failed = wait_state(&s, j["id"].as_u64().unwrap(), "failed");
+    let err = failed["error"].as_str().unwrap_or("");
+    assert!(err.contains("gpu-judge") && err.contains("remote") && err.contains("CPU"), "{failed}");
+    // the same through the engine on a GPU (the Workshop's model on the CPU): refused the same way
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "regress", "model": model, "suite": judged, "engine_gguf": gguf, "engine_args": "--devices cuda:0=14"}));
+    assert_eq!(code, 202, "{j}");
+    assert!(wait_state(&s, j["id"].as_u64().unwrap(), "failed")["error"].as_str().unwrap().contains("GPUs this run takes"));
+    // on the CPU the GPU model can judge: the run goes ahead
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "regress", "model": model, "suite": judged}));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let _ = std::fs::remove_dir_all(&tools);
+}

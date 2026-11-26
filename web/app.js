@@ -5530,7 +5530,13 @@ function wsGpuYes(devices, what) {
 $("ws-g-start").onclick = (e) => {
   const req = {kind: "regress", model: $("ws-g-model").value.trim(), adapter: $("ws-g-adapter").value.trim(), suite: $("ws-g-suite").value.trim(),
                passes: $("ws-g-passes").value.trim(), against: $("ws-g-against").value.trim(), devices: wsSegDev("ws-g-devs"), output: $("ws-g-out").value.trim()};
-  if (wsGpuYes(req.devices, "This test run")) wsSubmit(req, e.currentTarget);
+  const gguf = $("ws-g-gguf").value.trim(), eargs = $("ws-g-engine-args").value.trim(), judge = $("ws-g-judge").value.trim();
+  if (gguf) { req.engine_gguf = gguf; if (eargs) req.engine_args = eargs; }
+  if (judge) req.judge_model = judge;
+  // the engine on a GPU takes the GPUs as the Workshop's model does
+  const engineGpu = gguf && /--devices\s+\S*(cuda|hip|wgpu|vulkan|metal):/.test(eargs);
+  const devs = req.devices !== "cpu" ? req.devices : engineGpu ? (eargs.match(/--devices\s+(\S+)/)[1].split(",").filter((d) => !d.startsWith("cpu")).map((d) => d.split("=")[0]).join(",")) : "cpu";
+  if (wsGpuYes(devs, "This test run")) wsSubmit(req, e.currentTarget);
 };
 $("ws-gt-start").onclick = (e) => {
   const num = (id) => { const v = $(id).value.trim(); return v === "" ? undefined : Number(v); };
@@ -5557,8 +5563,21 @@ function wsReportTable(r) {
       `<td class="mono">${t.ci ? `${f(t.ci[0])} – ${f(t.ci[1])}` : "–"}</td><td class="mono">${t.n ?? 0}${t.skipped ? ` <small class="muted">+${t.skipped} left out</small>` : ""}</td><td>${vs}</td></tr>`;
   }).join("");
   const net = r.sandbox ? `<p class="muted small">Code ran with CPU and memory limits${r.sandbox.network_isolated ? " and no network" : "; this PC would not give it a network of its own, so it was not cut off from the network"}.</p>` : "";
+  // repetition: how many answers were flagged; the engine's speed; the samples to read, beside the earlier report's
+  const reps = (r.results || []).filter((t) => t.kind === "repeat" && !t.error).map((t) => `<p class="small">${esc(t.test)} at ${t.passes} pass${t.passes > 1 ? "es" : ""}: ` +
+    `${t.extra?.flagged ?? 0} of ${t.n ?? 0} answers repeat themselves (over ${t.extra?.threshold}); distinct-2 ${f(t.extra?.distinct_2)}, repeated 4-grams ${f(t.extra?.repeated_4grams)}.</p>`).join("");
+  const speed = (r.engine?.speed || []).map((x) => `<p class="muted small">Rust engine at ${x.passes} pass${x.passes > 1 ? "es" : ""}: ${x.requests} answers, ${x.generated} tokens at ${f(x.tokens_per_second, 1)} tokens/s.</p>`).join("");
+  const pre = (txt) => `<pre class="mono small ws-rep__sample">${esc(txt || "")}</pre>`;
+  const samples = (r.results || []).filter((t) => t.kind === "samples" && !t.error).map((t) => {
+    const before = t.extra?.before?.answers || [];
+    return `<details class="ws-rep__samples"><summary>${esc(t.test)} at ${t.passes} pass${t.passes > 1 ? "es" : ""}: ${(t.extra?.answers || []).length} answers${before.length ? ", beside the earlier report's" : ""}</summary>` +
+      (t.extra?.answers || []).map((a) => {
+        const old = before.find((b) => b.id === a.id);
+        return `<div class="ws-rep__pair"><p class="small"><b>${esc(a.id)}</b> ${esc(String(a.prompt || "").slice(0, 400))}</p>${old ? `<p class="muted small">Before</p>${pre(old.answer)}<p class="muted small">Now</p>` : ""}${pre(a.answer)}</div>`;
+      }).join("") + "</details>";
+  }).join("");
   return `<div class="ws-est">${head}<div class="ws-rep__wrap"><table class="ws-ab__check ws-rep"><thead><tr><th>Test</th><th>Passes</th><th>Metric</th><th>Value</th><th>95% interval</th><th>Items</th><th>Against earlier</th></tr></thead>` +
-    `<tbody>${rows}</tbody></table></div>${net}</div>`;
+    `<tbody>${rows}</tbody></table></div>${reps}${speed}${samples}${net}</div>`;
 }
 let wsTestId = null, wsTestAt = 0;
 async function wsTestRefresh(jobs) {
