@@ -642,6 +642,41 @@ mod tests {
         }
     }
 
+    /// The fast kernels' encodings on the graph (strata-gpu kernels.rs: Q8_0 repacked, Q4_K; one vector at a time, a
+    /// chunk, a chunk then tokens): against the CPU path on the same model dequantized to F32 (testgguf `dequantized`),
+    /// so only the products' arithmetic differs (the CPU rounds a quantized product's input to 8 bits, ggml's way; an
+    /// F32 one it does not).
+    #[test]
+    fn quantized_models_on_the_graph_equal_the_cpu() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        for ty in ["Q8_0", "Q4_K"] {
+            let spec = Spec { n_embd: 256, n_head: 4, n_kv: 2, head_dim: 64, ffn: 512, ty, seed: 0x5EED_0010, ..Spec::tiny_qwen3() };
+            let q = testgguf::tmp(&format!("tiny-qwen3-{ty}"), &spec);
+            let f = testgguf::tmp(&format!("tiny-qwen3-{ty}-as-f32"), &Spec { dequantized: true, ..spec.clone() });
+            let (cpu, _) = Model::load(&f, None).unwrap();
+            // 70 tokens: a chunk of more than one of the tiled kernel's token tiles
+            let toks: Vec<u32> = (0..70).map(|i| (i * 37 + 5) % 256).collect();
+            let mut st = cpu.new_state();
+            let want: Vec<Vec<f32>> = toks.iter().map(|&t| cpu.forward(&mut st, t)).collect();
+            let m = placed(&q, &dev, 1.0);
+            let gr = Graph::new(&m, 128).unwrap();
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| gr.forward(&m, &mut st, t)).collect();
+            let mut st = m.new_state();
+            let chunk = gr.forward_batch_all(&m, &mut st, &toks);
+            let mut st = m.new_state();
+            let mut mixed = gr.forward_batch_all(&m, &mut st, &toks[..40]);
+            mixed.extend(toks[40..].iter().map(|&t| gr.forward(&m, &mut st, t)));
+            let d = [max_diff(&one, &want), max_diff(&chunk, &want), max_diff(&mixed, &want)];
+            eprintln!("tiny qwen3 {ty}: max |graph - cpu on its F32 copy| one={:.2e} chunk={:.2e} mixed={:.2e}", d[0], d[1], d[2]);
+            for (i, (a, b)) in one.iter().zip(&want).enumerate() {
+                assert_eq!(argmax(a), argmax(b), "{ty}: token {i}'s best logit");
+            }
+            assert!(d.iter().all(|&v| v < TOL), "{ty}: {d:?}");
+        }
+    }
+
     /// Softmax-routed experts on the graph: all on the device, none (the CPU computes them, the activations cross), and
     /// some of each; also with the loop.
     #[test]

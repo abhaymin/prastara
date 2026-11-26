@@ -2,7 +2,7 @@
 //! (docs/GPU-PLAN.md) - within 1e-3 of the sum of |w x|, so only the order of the sums differs.
 
 use std::sync::atomic::Ordering;
-use strata_gpu::{list, Gpu, WIDE_ROWS};
+use strata_gpu::{list, Gpu, FAST_Q4K, WIDE_ROWS};
 
 /// A tiny deterministic generator (no rand dependency).
 struct Rng(u64);
@@ -48,12 +48,12 @@ fn weights(ty: &str, rows: usize, cols: usize, rng: &mut Rng) -> Vec<u8> {
 #[test]
 fn every_kernel_matches_the_cpu_on_every_device() {
     // CubeCL's own CPU runtime compiles slowly (minutes per kernel): STRATA_GPU_TEST_CPU=1 includes it
-    // STRATA_GPU_TEST_ONLY=<device> checks one device (another may be busy with a running model)
+    // STRATA_GPU_TEST_ONLY=<device> checks one device
     let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
     let devices: Vec<_> = list().into_iter().filter(|d| (d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some())
         && only.as_deref().is_none_or(|o| o == d.name)).collect();
     eprintln!("devices: {:?}", devices.iter().map(|d| d.name.as_str()).collect::<Vec<_>>());
-    let (rows, cols, tokens) = (70, 512, 3); // 70 rows: not a multiple of the cube; 3 vectors at once
+    let (rows, cols, tokens) = (70, 512, 3); // 70 rows: not a multiple of any cube's rows; 3 vectors at once
     let mut rng = Rng(0x9e3779b97f4a7c15);
     let x: Vec<f32> = (0..cols * tokens).map(|_| rng.unit()).collect();
     for ty in ["F32", "F16", "BF16", "Q8_0", "Q4_0", "Q5_0", "Q4_K", "Q5_K", "Q6_K", "IQ3_XXS"] {
@@ -74,14 +74,17 @@ fn every_kernel_matches_the_cpu_on_every_device() {
         for d in &devices {
             let g = Gpu::open(&d.name).unwrap();
             let wt = g.upload(ty, &w, rows, cols).unwrap();
-            for (kernel, limit) in [("plain", u32::MAX), ("wide", 0)] {
+            // the older kernels (plain, wide) and the fast decode kernels (Q8_0 always takes these)
+            for (kernel, limit, fast) in [("plain", u32::MAX, false), ("wide", 0, false), ("fast", u32::MAX, true)] {
                 WIDE_ROWS.store(limit, Ordering::Relaxed);
+                FAST_Q4K.store(fast, Ordering::Relaxed);
                 let got = g.matvec(&wt, &x);
                 assert_eq!(got.len(), rows * tokens);
                 let worst = got.iter().zip(&want).zip(&scale).map(|((g, w), s)| ((*g - *w).abs() as f64) / s.max(1e-12)).fold(0f64, f64::max);
                 eprintln!("{ty:5} on {:18} {kernel:6} worst relative error {worst:.2e}", d.name);
                 assert!(worst < 1e-3, "{ty} on {} ({kernel}): {worst}", d.name);
             }
+            FAST_Q4K.store(true, Ordering::Relaxed);
         }
     }
 }
@@ -89,7 +92,6 @@ fn every_kernel_matches_the_cpu_on_every_device() {
 /// A token's chain of kernels against the same arithmetic on the CPU (docs/ENGINE-PLAN.md phase 1).
 #[test]
 fn the_chain_of_kernels_matches_the_cpu() {
-    // STRATA_GPU_TEST_ONLY=<device> checks one device (another may be busy with a running model)
     let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
     let devices: Vec<_> = list().into_iter().filter(|d| (d.name != "cpu" || std::env::var_os("STRATA_GPU_TEST_CPU").is_some())
         && only.as_deref().is_none_or(|o| o == d.name)).collect();

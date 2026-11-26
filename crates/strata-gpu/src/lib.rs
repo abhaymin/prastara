@@ -126,6 +126,24 @@ pub struct Weights {
     /// whether matvec_q4k's shared memory (x, its group sums and the cube's partial sums) fits this device: Metal
     /// allows 32 KiB, so a 9216-column Q4_K matrix (a 3B model's ffn_down) must take the plain kernel there
     wide_fits: bool,
+    /// a Q8_0 matrix on CubeCL is repacked (kernels.rs, the fast products): `handle` holds its values, rows * cols
+    /// bytes, and this its f16 scales
+    scales: Option<Mem>,
+    /// whether the device's planes are 32 units wide, so the fast kernels sum a row's warp with a plane reduction
+    plane: bool,
+}
+
+impl Weights {
+    /// Whether the fast kernels take this matrix (kernels.rs, the fast products): Q8_0 (repacked) and Q4_K on CubeCL.
+    pub fn fast(&self) -> bool {
+        self.scales.is_some() || (self.geometry.2 == kernels::kind::Q4_K && matches!(self.handle, Mem::Cube(_))
+                                  && FAST_Q4K.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// The words of `handle`: a repacked Q8_0 matrix's values, or the whole matrix.
+    fn value_words(&self) -> usize {
+        if self.scales.is_some() { self.rows as usize * self.cols as usize / 4 } else { self.bytes.div_ceil(4) }
+    }
 }
 
 /// Values on the device, so that a chain of kernels needs no trip through the CPU.
@@ -175,11 +193,43 @@ macro_rules! native {
 /// From this many rows a Q4_K or Q6_K product takes `matvec_q4k` / `matvec_q6k` (a variable so a test can force either kernel).
 pub static WIDE_ROWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(kernels::WIDE_ROWS);
 
+/// Whether Q4_K products take the fast decode kernel (`kernels::mv_q4_k`); off, the older kernels (for comparisons).
+pub static FAST_Q4K: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Queues y[y_off..] (+)= W x for `tokens` vectors with a fast kernel (Weights::fast), once per vector. `ylen`: the
+/// values in y's buffer.
+macro_rules! fast {
+    ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $ylen:expr, $tokens:expr, $y_off:expr, $add:expr) => {{
+        let w: &Weights = $w;
+        let k = w.geometry.2;
+        stats::launch(1);
+        let words = w.value_words();
+        unsafe {
+            let y = ArrayArg::from_raw_parts($hy, $ylen);
+            let x4 = ArrayArg::from_raw_parts($hx, $n / 4);
+            let wd = ArrayArg::from_raw_parts(w.scales.as_ref().unwrap_or(&w.handle).cube(), 1);
+                kernels::mv_fast::launch_unchecked::<$R>($c, mv_count(w.rows, 0, 0, $tokens as u32), CubeDim::new_1d(kernels::MV_ROWS * 32),
+                    ArrayArg::from_raw_parts(w.handle.cube(), words / 4), wd, x4, y, w.rows, w.cols, $y_off, k, w.plane, $add);
+        }
+    }};
+}
+
+/// The grid of the fast decode kernels for these rows (of up to three matrices) and tokens: x and y (each axis has a
+/// limit of 65535 on some backends), z the tokens.
+fn mv_count(r0: u32, r1: u32, r2: u32, tokens: u32) -> CubeCount {
+    let cubes = r0.div_ceil(kernels::MV_ROWS) + r1.div_ceil(kernels::MV_ROWS) + r2.div_ceil(kernels::MV_ROWS);
+    let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
+    CubeCount::Static(cx, cy, tokens)
+}
+
 /// Queues y = W x for `tokens` vectors with the kernel that suits the matrix.
 macro_rules! product {
     ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $tokens:expr) => {{
         let w = $w;
         let (be, bb, k) = w.geometry;
+        if w.fast() {
+            fast!($c, $R, w, $hx, $n, $hy, $tokens as usize * w.rows as usize, $tokens, 0u32, false);
+        } else {
         let wide = (k == kernels::kind::Q4_K || k == kernels::kind::Q6_K) && w.wide_fits
             && w.rows >= WIDE_ROWS.load(std::sync::atomic::Ordering::Relaxed);
         // cubes over x and y of the grid (each axis has a limit of 65535 on some backends)
@@ -197,6 +247,7 @@ macro_rules! product {
             } else {
                 kernels::matvec::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::CUBE), wa, xa, y, w.rows, w.cols, w.row_bytes, be, bb, k);
             }
+        }
         }
     }};
 }
@@ -313,12 +364,31 @@ impl Gpu {
             let t = kernels::table_for(ty);
             let all: Vec<u8> = t.iter().chain(data).copied().collect();
             Ok(Weights { handle: Mem::Mtl(n.upload(&all)), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32,
-                         geometry, bytes: all.len(), wide_fits: false })
+                         geometry, bytes: all.len(), wide_fits: false, scales: None, plane: false })
         });
         // whole u32 words: the kind's lookup table first (IQ3_XXS's grid), then the rows, the tail padded with zeros.
         // A matrix with no table and whole words (every K-quant and float one) goes as it is: the client makes the
         // one copy the device thread uploads from, so the mapped file is read once and nothing is rebuilt here.
         let table = kernels::table_for(ty);
+        let (plane, shared) = with_client!(self, c, R, {
+            let p = c.properties();
+            (p.hardware.plane_size_min == 32 && p.hardware.plane_size_max == 32 && p.features.plane.contains(cubecl::ir::features::Plane::Ops),
+             p.hardware.max_shared_memory_size)
+        });
+        if geometry.2 == kernels::kind::Q8_0 {
+            // the values first, then the scales (kernels.rs): 16-byte rows the fast kernels read in 16-byte loads
+            let blocks = data.len() / 34;
+            let mut qs = Vec::with_capacity(blocks * 32);
+            let mut ds = Vec::with_capacity(blocks * 2 + 2);
+            for b in data.chunks_exact(34) {
+                ds.extend_from_slice(&b[..2]);
+                qs.extend_from_slice(&b[2..]);
+            }
+            ds.resize(ds.len().div_ceil(4) * 4, 0);
+            let (hq, hd) = with_client!(self, c, R, (c.create_from_slice(&qs), c.create_from_slice(&ds)));
+            return Ok(Weights { handle: Mem::Cube(hq), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry,
+                                bytes: data.len(), wide_fits: false, scales: Some(Mem::Cube(hd)), plane });
+        }
         let handle = if table.is_empty() && data.len() % 4 == 0 {
             Mem::Cube(with_client!(self, c, R, c.create_from_slice(data)))
         } else {
@@ -330,13 +400,12 @@ impl Gpu {
             Mem::Cube(with_client!(self, c, R, c.create_from_slice(&all)))
         };
         let data_len = table.len() + data.len();
-        let shared = with_client!(self, c, R, c.properties().hardware.max_shared_memory_size);
         let need = match geometry.2 {
             kernels::kind::Q6_K => kernels::wide_q6k_shared_bytes(cols as u32),
             _ => kernels::wide_shared_bytes(cols as u32),
         };
         let wide_fits = need <= shared;
-        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data_len, wide_fits })
+        Ok(Weights { handle, rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry, bytes: data_len, wide_fits, scales: None, plane })
     }
 
     /// Let go of the host copies of uploads the device has finished reading. The runtime keeps each upload's bytes

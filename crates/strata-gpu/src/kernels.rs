@@ -834,3 +834,152 @@ pub fn moe_combine(slots: &Array<f32>, routes: &Array<f32>, x: &mut Array<f32>, 
         x[i as usize] = x[i as usize] + acc;
     }
 }
+
+// ------------------------------------------------------------------ the fast products (docs/MULA-PLAN.md M8: bandwidth)
+// Decode (one vector, or a few) reads every weight once per token, so its speed is the card's bandwidth: these load 16
+// bytes per unit per load (coalesced across the warp), keep x in L1 (16-byte loads too), and sum a row's warp with one
+// reduction at the end.
+//
+// Q8_0 is repacked when it is uploaded (Gpu::upload): its 34-byte blocks are not 4-byte aligned, so the values go first
+// (rows * cols bytes, 16-byte aligned rows) and the f16 scales after them in a buffer of their own.
+
+/// Rows per cube of the fast decode kernels: a warp of 32 units per row.
+pub const MV_ROWS: u32 = 4;
+
+type V4 = Vector<u32, Const<4>>;
+type F4 = Vector<f32, Const<4>>;
+
+/// The sum of `v` over each warp of 32 units, valid in the warp's unit 0: a plane reduction where the device's planes
+/// are 32 wide (CUDA), else through shared memory (the whole cube must call it).
+#[cube]
+fn warp_sum(v: f32, #[comptime] plane: bool, #[comptime] cube: u32) -> f32 {
+    let mut out = v;
+    if comptime![plane] {
+        out = plane_sum(v);
+    } else {
+        let mut sum = SharedMemory::<f32>::new(comptime![cube as usize]);
+        sum[UNIT_POS as usize] = v;
+        sync_cube();
+        let lane = UNIT_POS % 32;
+        let mut stride = u32::new(16);
+        while stride > 0 {
+            if lane < stride {
+                sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+            }
+            sync_cube();
+            stride /= 2;
+        }
+        out = sum[UNIT_POS as usize];
+    }
+    out
+}
+
+/// The signed byte `k` of `w` as f32, without an integer conversion: 2^23 + 128 + b has b in its low mantissa bits.
+#[cube]
+fn i8f(w: u32, #[comptime] k: u32) -> f32 {
+    f32::reinterpret(0x4b00_0000u32 | (((w >> comptime![8 * k]) & 0xff) ^ 0x80)) - f32::new(8388736.0)
+}
+
+/// The nibble at bit `sh` of `w` as f32 (the same trick).
+#[cube]
+fn u4f(w: u32, #[comptime] sh: u32) -> f32 {
+    f32::reinterpret(0x4b00_0000u32 | ((w >> comptime![sh]) & 0x0f)) - f32::new(8388608.0)
+}
+
+/// The 4 signed bytes of `w` against the 4 values of `x`.
+#[cube]
+fn dot_i8x4(w: u32, x: F4) -> f32 {
+    i8f(w, 0u32) * x[0] + i8f(w, 1u32) * x[1] + i8f(w, 2u32) * x[2] + i8f(w, 3u32) * x[3]
+}
+
+/// The low (`hi` false) or high nibbles of the 4 bytes of `w` against x; and the sum of x.
+#[cube]
+fn dot_u4x4(w: u32, x: F4, #[comptime] hi: bool) -> f32 {
+    let s = if comptime![hi] { 4u32 } else { 0u32 };
+    u4f(w, comptime![s]) * x[0] + u4f(w, comptime![s + 8]) * x[1] + u4f(w, comptime![s + 16]) * x[2] + u4f(w, comptime![s + 24]) * x[3]
+}
+
+/// The f16 scale of block `b` of a repacked Q8_0 matrix (two per word).
+#[cube]
+fn q8_scale(wd: &Array<u32>, b: u32) -> f32 {
+    half_bits((wd[(b / 2) as usize] >> ((b % 2) * 16)) & 0xffff)
+}
+
+/// This unit's part of row `row`'s product with x[t] (a warp per row; the warp's sum is the product). Q8_0 (repacked:
+/// `w` its values, `wd` its scales): each unit 16 values (one 16-byte load) at a time. Q4_K (as in the file, 144-byte
+/// blocks: 9 loads of 16 bytes; `wd` unused): 8 units per block, each one 16-byte load of nibbles (16 values of two
+/// groups), 4 blocks at a time.
+#[cube]
+fn row_part(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, row: u32, cols: u32, t: u32, lane: u32, #[comptime] k: u32) -> f32 {
+    let mut acc = f32::new(0.0);
+    if comptime![k == kind::Q8_0] {
+        let nc = cols / 16;
+        let qb = row * nc;
+        let db = row * (cols / 32);
+        let xb = t * (cols / 4);
+        let mut c = lane;
+        while c < nc {
+            let q = w[(qb + c) as usize];
+            let d = q8_scale(wd, db + c / 2);
+            let xo = xb + c * 4;
+            let s = dot_i8x4(q[0], x[xo as usize]) + dot_i8x4(q[1], x[(xo + 1) as usize])
+                + dot_i8x4(q[2], x[(xo + 2) as usize]) + dot_i8x4(q[3], x[(xo + 3) as usize]);
+            acc += d * s;
+            c += 32;
+        }
+    } else {
+        let nb = cols / 256;
+        let s = lane % 8;
+        let ga = (s / 2) * 2;
+        let p0 = (s % 2) * 16;
+        let mut b = lane / 8;
+        while b < nb {
+            let blk = (row * nb + b) * 9;
+            let h = w[blk as usize];
+            let q = w[(blk + 1 + s) as usize];
+            let d = half_bits(h[0] & 0xffff);
+            let dmin = half_bits(h[0] >> 16);
+            // x of group ga at p0.., and of group ga + 1, in 16-byte loads
+            let xa = (t * cols + b * 256 + ga * 32 + p0) / 4;
+            let xb = xa + 8;
+            let (x0, x1, x2, x3) = (x[xa as usize], x[(xa + 1) as usize], x[(xa + 2) as usize], x[(xa + 3) as usize]);
+            let (z0, z1, z2, z3) = (x[xb as usize], x[(xb + 1) as usize], x[(xb + 2) as usize], x[(xb + 3) as usize]);
+            let pa = dot_u4x4(q[0], x0, false) + dot_u4x4(q[1], x1, false) + dot_u4x4(q[2], x2, false) + dot_u4x4(q[3], x3, false);
+            let pb = dot_u4x4(q[0], z0, true) + dot_u4x4(q[1], z1, true) + dot_u4x4(q[2], z2, true) + dot_u4x4(q[3], z3, true);
+            let sa = (x0[0] + x0[1] + x0[2] + x0[3]) + (x1[0] + x1[1] + x1[2] + x1[3]) + (x2[0] + x2[1] + x2[2] + x2[3]) + (x3[0] + x3[1] + x3[2] + x3[3]);
+            let sb = (z0[0] + z0[1] + z0[2] + z0[3]) + (z1[0] + z1[1] + z1[2] + z1[3]) + (z2[0] + z2[1] + z2[2] + z2[3]) + (z3[0] + z3[1] + z3[2] + z3[3]);
+            acc += d * f32::cast_from(k4_scale(h[1], h[2], h[3], ga, false)) * pa - dmin * f32::cast_from(k4_scale(h[1], h[2], h[3], ga, true)) * sa
+                + d * f32::cast_from(k4_scale(h[1], h[2], h[3], ga + 1, false)) * pb - dmin * f32::cast_from(k4_scale(h[1], h[2], h[3], ga + 1, true)) * sb;
+            b += 4;
+        }
+    }
+    acc
+}
+
+/// y[at] = v, or y[at] += v when `add` (the residual added in the product's own kernel).
+#[cube]
+fn put(y: &mut Array<f32>, at: u32, v: f32, #[comptime] add: bool) {
+    if comptime![add] {
+        y[at as usize] = y[at as usize] + v;
+    } else {
+        y[at as usize] = v;
+    }
+}
+
+/// y[y_off + t * rows + r] (+)= W[r] . x[t], W Q8_0 (repacked) or Q4_K: a warp per row (row_part), t = CUBE_POS_Z.
+/// `y_off` puts the result in a larger buffer (V straight into its cache), `add` adds it there (the residual).
+#[cube(launch_unchecked)]
+pub fn mv_fast(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, y: &mut Array<f32>, rows: u32, cols: u32, y_off: u32,
+               #[comptime] k: u32, #[comptime] plane: bool, #[comptime] add: bool) {
+    let lane = UNIT_POS % 32;
+    let row = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * MV_ROWS + UNIT_POS / 32;
+    let t = CUBE_POS_Z;
+    let mut acc = f32::new(0.0);
+    if row < rows {
+        acc = row_part(w, wd, x, row, cols, t, lane, k);
+    }
+    let total = warp_sum(acc, plane, comptime![MV_ROWS * 32]);
+    if lane == 0 && row < rows {
+        put(y, y_off + t * rows + row, total, add);
+    }
+}
