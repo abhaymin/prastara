@@ -828,6 +828,8 @@ pub struct Suite {
     pub path: PathBuf,
     pub name: String,
     pub judge_model: Option<String>,
+    /// false: prompts set the template's `enable_thinking` false (default true, the template's own default)
+    pub thinking: bool,
     pub tests: Vec<TestSpec>,
 }
 
@@ -866,7 +868,8 @@ impl Suite {
             bail!("{}: the suite has no tests", path.display());
         }
         Ok(Suite { path: path.to_path_buf(), name: v["name"].as_str().unwrap_or("suite").to_string(),
-                   judge_model: v["judge_model"].as_str().filter(|m| !m.is_empty()).map(str::to_string), tests })
+                   judge_model: v["judge_model"].as_str().filter(|m| !m.is_empty()).map(str::to_string),
+                   thinking: v["thinking"].as_bool().unwrap_or(true), tests })
     }
 }
 
@@ -1024,6 +1027,7 @@ fn report_file(p: &Path) -> PathBuf {
 pub fn run(o: &Options, judge: Option<&dyn Judge>, emit: &mut dyn FnMut(Value), should_stop: &dyn Fn() -> bool) -> Result<Report> {
     let suite = Suite::load(&o.suite)?;
     let tok = ChatTokenizer::load(&o.model, None)?;
+    let tok = if suite.thinking { tok } else { tok.without_thinking() };
     let cfg = crate::model::ModelConfig::load(&o.model)?;
     let own = cfg.loop_.map_or(1, |l| l.passes);
     let passes = if o.passes.is_empty() { vec![own] } else { o.passes.clone() };
@@ -1538,6 +1542,13 @@ mod tests {
         assert_eq!((s.tests[0].threshold, s.tests[1].kind.as_str()), (Some(0.3), "samples"));
         assert!(Suite::from_json(&json!({"tests": [{"kind": "repeat", "data": "p", "threshold": 2.0}]}), Path::new("/tmp/s.json")).is_err());
         assert!(Suite::from_json(&json!({"tests": [{"kind": "vibes", "data": "p"}]}), Path::new("/tmp/s.json")).is_err());
+    }
+
+    #[test]
+    fn a_suite_can_switch_thinking_off() {
+        let t = json!([{"kind": "repeat", "data": "p.jsonl"}]);
+        assert!(Suite::from_json(&json!({"tests": t}), Path::new("/tmp/s.json")).unwrap().thinking);
+        assert!(!Suite::from_json(&json!({"tests": t, "thinking": false}), Path::new("/tmp/s.json")).unwrap().thinking);
     }
 
     #[test]

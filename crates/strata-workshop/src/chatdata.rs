@@ -125,6 +125,8 @@ pub struct ChatTokenizer {
     template: ChatTemplate,
     /// `bos_token`, `eos_token`, ... as the template may name them
     vars: Map<String, Value>,
+    /// [`prompt_ids`](Self::prompt_ids) renders as [`prompt_ids_answering`](Self::prompt_ids_answering)
+    answer_directly: bool,
 }
 
 /// A special token as `tokenizer_config.json` stores it: a string, or an object with `content`.
@@ -158,7 +160,7 @@ impl ChatTokenizer {
                 vars.insert(key.to_string(), json!(t));
             }
         }
-        Ok(Self { tok, template, vars })
+        Ok(Self { tok, template, vars, answer_directly: false })
     }
 
     pub fn vocab_size(&self) -> usize {
@@ -260,6 +262,9 @@ impl ChatTokenizer {
     /// One user message wrapped in the chat template, up to and with the generation prompt (where the answer starts),
     /// as token ids.
     pub fn prompt_ids(&self, user: &str) -> Result<Vec<u32>> {
+        if self.answer_directly {
+            return self.prompt_ids_answering(user);
+        }
         let text = self.render(&[json!({"role": "user", "content": user})], true)?;
         Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.get_ids().to_vec())
     }
@@ -272,6 +277,14 @@ impl ChatTokenizer {
         vars.insert("enable_thinking".into(), json!(false));
         let text = self.template.render(&[json!({"role": "user", "content": user})], None, true, &vars).map_err(|e| anyhow!("chat template: {e}"))?;
         Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.get_ids().to_vec())
+    }
+
+    /// Every prompt from here on with the template's `enable_thinking` false (a suite's `"thinking": false`), so a
+    /// model that can think (Qwen3) answers at once and the comparison is not spent on thinking within a short budget.
+    /// Only the prompts that open an answer change; the loss tests' rendering does not.
+    pub fn without_thinking(mut self) -> Self {
+        self.answer_directly = true;
+        self
     }
 
     /// The ids that end an answer: the template's `eos_token` and the usual end-of-turn markers the vocabulary has.
