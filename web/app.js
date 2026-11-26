@@ -18,6 +18,35 @@ const store = {
 };
 
 // ------------------------------------------------------------------ toasts
+// "tell me when something finishes": a system notification while the tab is in the background (opt-in, kept in
+// this browser), a toast while it is in view
+function notifyDone(title, text, go) {
+  if (!document.hidden) { toast("success", title, text, 6000); return; }
+  let on = false;
+  try { on = localStorage.getItem("notify") === "on"; } catch (e) { /* storage off: no notifications */ }
+  if (!on || !("Notification" in window) || Notification.permission !== "granted") return;
+  try {
+    const n = new Notification(title, {body: text, tag: title, icon: "web/favicon.svg"});
+    n.onclick = () => { window.focus(); if (go) go(); n.close(); };
+  } catch (e) { /* the browser refused */ }
+}
+function notifyButton() {
+  const b = $("notify-btn");
+  if (!b) return;
+  let on = false;
+  try { on = localStorage.getItem("notify") === "on"; } catch (e) { /* off */ }
+  // browsers allow notifications only on a secure page: the HTTPS address, or this PC's own localhost
+  if (!window.isSecureContext) {
+    b.textContent = "Needs the HTTPS address";
+    b.disabled = true;
+    $("notify-hint").textContent = "Browsers show notifications only on a secure page: open Prastara at its https:// address (Settings › Secure connection), then turn this on.";
+    return;
+  }
+  const can = "Notification" in window, denied = can && Notification.permission === "denied";
+  b.setAttribute("aria-pressed", String(on && can && Notification.permission === "granted"));
+  b.textContent = !can ? "Not available" : denied ? "Blocked by the browser" : b.getAttribute("aria-pressed") === "true" ? "On · turn off" : "Turn on";
+  b.disabled = !can || denied;
+}
 function toast(kind, title, text = "", ms = 3500, action = null) {
   const names = {info: "info", success: "check", warn: "warning", error: "error"};
   const el = document.createElement("div");
@@ -2527,6 +2556,9 @@ async function send() {
    }
    running.delete(chatId);
    syncBusy();
+   if (!m.error && !m.stopped && Date.now() - m.time > 60000) {
+     notifyDone("Your reply is ready", `after ${wsDur((Date.now() - m.time) / 1000)}: ${(m.text || "").slice(0, 80)}`, () => showTab("chat"));
+   }
    if (chatId === current) clearUsing();   // the answer is done - hide the pill even if it was driving the computer or browser
   updateAssistant(el, m, false);
   saveChat();
@@ -4811,7 +4843,17 @@ async function refreshJobs(pushed = null) {
   clearTimeout(wsTimer);
   try {
     const j = pushed || await wsFetch("v1/workshop/jobs");
-    const jobs = ws.jobs = j.jobs || [];
+    const jobs = j.jobs || [];
+    // a job that just ended: said once (not on the first look at the list)
+    if (ws.seen) for (const x of jobs) {
+      const was = ws.seen.get(x.id);
+      if (was && was !== x.state && ["done", "failed"].includes(x.state)) {
+        notifyDone(x.state === "done" ? `Workshop: ${x.kind} done` : `Workshop: ${x.kind} failed`,
+          x.state === "done" ? `#${x.id} ${wsBase(wsJobOut(x))}` : `#${x.id} ${x.error || ""}`.slice(0, 140), () => showTab("workshop"));
+      }
+    }
+    ws.seen = new Map(jobs.map((x) => [x.id, x.state]));
+    ws.jobs = jobs;
     const active = jobs.filter((x) => x.state === "queued" || x.state === "running").length;
     const failed = jobs.filter((x) => x.state === "failed").length;
     $("ws-jobs-sum").textContent = jobs.length ? [active && `${active} active`, `${jobs.length - active - failed} done`, failed && `${failed} failed`].filter(Boolean).join(" · ") : "";
@@ -5422,6 +5464,16 @@ async function wsCtxRefresh() {
   wsCtxTimer = setTimeout(wsCtxRefresh, 5000);
 }
 window.addEventListener("resize", () => { if (wsCtxOn() && !wsCtxTimer) wsCtxRefresh(); });
+
+$("notify-btn").onclick = async () => {
+  let on = false;
+  try { on = localStorage.getItem("notify") === "on"; } catch (e) { /* off */ }
+  if (on) { try { localStorage.setItem("notify", "off"); } catch (e) { /* off */ } notifyButton(); return; }
+  const p = Notification.permission === "granted" ? "granted" : await Notification.requestPermission();
+  if (p === "granted") { try { localStorage.setItem("notify", "on"); } catch (e) { /* off */ } toast("success", "Notifications on", "you hear when a long reply or a Workshop job finishes"); }
+  notifyButton();
+};
+notifyButton();
 
 // the step chosen last time (after the library and review code above, which it may call)
 wsStep(store.get("ws-step", "overview"));
