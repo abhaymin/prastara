@@ -78,7 +78,7 @@ fn block_size(name: &str) -> usize {
 /// target when ne[0] is divisible by its block size; otherwise the demoted block-32 type (`Q4_K -> Q5_0`, `Q5_K -> Q5_1`,
 /// `Q6_K -> Q8_0`), or F16 when that still does not fit. This is the exact fallback used by `--pure` (the arch mixture
 /// logic is skipped when pure, so the type is only ever demoted by shape).
-fn resolve(target: &'static str, ne0: usize) -> &'static str {
+pub(crate) fn resolve(target: &'static str, ne0: usize) -> &'static str {
     if ne0 % block_size(target) == 0 {
         return target;
     }
@@ -97,7 +97,7 @@ fn resolve(target: &'static str, ne0: usize) -> &'static str {
 }
 
 /// Output byte length of a tensor of `numel` values written as `name`.
-fn type_nbytes(name: &str, numel: usize) -> u64 {
+pub(crate) fn type_nbytes(name: &str, numel: usize) -> u64 {
     match name {
         "F32" => numel as u64 * 4,
         "F16" | "BF16" => numel as u64 * 2,
@@ -109,7 +109,7 @@ fn type_nbytes(name: &str, numel: usize) -> u64 {
 }
 
 /// The ggml type id (the `ggml_type` field of a tensor info), from its name.
-fn type_id(name: &str) -> u32 {
+pub(crate) fn type_id(name: &str) -> u32 {
     match name {
         "F32" => 0,
         "F16" => 1,
@@ -148,7 +148,7 @@ fn read_as_f32(buf: &[u8], g: &Gguf, t: &strata_gguf::TensorInfo) -> Result<Vec<
 }
 
 /// Encode f32 values to the output precision `name`: F32/F16 inline, or a strata-pack block quantizer.
-fn encode(x: &[f32], name: &str) -> Vec<u8> {
+pub(crate) fn encode(x: &[f32], name: &str) -> Vec<u8> {
     match name {
         "F32" => x.iter().flat_map(|v| v.to_le_bytes()).collect(),
         "F16" => x.iter().flat_map(|v| f32_to_f16(*v).to_le_bytes()).collect(),

@@ -511,6 +511,7 @@
           <button type="button" role="tab" data-ws-step="library" aria-selected="false"><span>Model library</span><i class="ws-dot" data-ws-dot="library" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Build</p>
           <button type="button" role="tab" data-ws-step="loop" aria-selected="false"><span>Loop a model</span><i class="ws-dot" data-ws-dot="loop" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="upcycle" aria-selected="false"><span>Upcycle to MoE</span><i class="ws-dot" data-ws-dot="upcycle" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Train</p>
           <button type="button" role="tab" data-ws-step="train" aria-selected="false"><span>Train an adapter</span><i class="ws-dot" data-ws-dot="train" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Refine</p>
@@ -654,6 +655,51 @@
                   <input class="st-input mono" id="ws-lp-out" placeholder="in the Workshop folder"></div>
               </div>
               <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-loop">Make the looped copy</button></div>
+          </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="upcycle" hidden>
+          <header class="ws-panel__head"><h3>Upcycle to a mixture of experts</h3><p class="muted">Turns a dense Llama or Qwen3 model (looped or not) into a real mixture of experts. Each block's feed-forward becomes several experts with a router that picks the best ones for each token. In training the experts share the base weights, and each one learns its own LoRA. At the start the copy answers exactly like its base. When it is trained, export writes a <code>qwen3moe</code> GGUF that gives every expert its own weights, quantized as it is written.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+              <h4 class="ws-block__title">1 · Make the upcycled copy</h4>
+              <div class="ws-form">
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-u-in">Model (dense HF folder)</label>
+                  <input class="st-input mono" id="ws-u-in" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+                <div class="ws-field"><label class="st-label" for="ws-u-experts">Experts per block</label>
+                  <input class="st-input mono" id="ws-u-experts" type="number" min="2" max="256" value="10"></div>
+                <div class="ws-field"><label class="st-label" for="ws-u-topk">Experts per token (top-k)</label>
+                  <input class="st-input mono" id="ws-u-topk" type="number" min="1" max="256" value="1"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-u-out">Output folder <output>optional</output></label>
+                  <input class="st-input mono" id="ws-u-out" placeholder="in the Workshop folder"></div>
+              </div>
+              <div class="ws-est" id="ws-u-est" aria-live="polite"><p class="muted small">Choose a model to see its size as a mixture.</p></div>
+              <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-upcycle">Make the upcycled copy</button></div>
+          </div>
+          <div class="st-card ws-block">
+              <h4 class="ws-block__title">2 · Train it</h4>
+              <p class="muted small">Train an adapter on the upcycled folder, as on any model. Each trained block learns its router and every expert's LoRA, with a small load-balancing loss that keeps the experts in use. The router balance shows next to each step's loss. Full training of the experts' own weights would need far more GPU memory, so here they differ by their LoRA.</p>
+              <div class="ws-actions"><button type="button" class="st-btn st-btn--secondary" id="ws-u-train">Train the upcycled copy</button></div>
+          </div>
+          <div class="st-card ws-block">
+              <h4 class="ws-block__title">3 · Export the mixture</h4>
+              <div class="ws-form">
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-x-in">Upcycled folder</label>
+                  <input class="st-input mono" id="ws-x-in" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B-moe10x1"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-x-adapter">Adapter trained on it <output>optional</output></label>
+                  <input class="st-input mono" id="ws-x-adapter" data-ws-pick="adapters" autocomplete="off" placeholder="without one, every expert is the base"></div>
+                <div class="ws-field"><label class="st-label" for="ws-x-type">Type</label>
+                  <select class="st-input" id="ws-x-type">
+                    <option value="q4_k" selected>Q4_K (4.5 bits, the usual choice)</option><option value="q8_0">Q8_0 (8.5 bits)</option>
+                    <option value="q6_k">Q6_K (6.6 bits)</option><option value="q5_k">Q5_K (5.5 bits)</option>
+                    <option value="f16">F16</option><option value="f32">F32</option></select></div>
+                <div class="ws-field"><label class="st-label" for="ws-x-pre">Pre-tokenizer <output>only if asked for</output></label>
+                  <input class="st-input mono" id="ws-x-pre" placeholder="e.g. qwen2"></div>
+                <div class="ws-field ws-field--wide"><label class="st-label" for="ws-x-out">Output file <output>optional</output></label>
+                  <input class="st-input mono" id="ws-x-out" placeholder="in the Workshop folder"></div>
+              </div>
+              <div class="ws-est" id="ws-x-est" aria-live="polite"></div>
+              <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-export-moe">Export the qwen3moe GGUF</button></div>
           </div>
           </div>
         </section>

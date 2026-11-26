@@ -156,6 +156,8 @@ enum Cmd {
     /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
     /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
     /// | loop <hf-folder> 12..24x2 (a looped copy: blocks 12-23 run twice, behind gates that start closed)
+    /// | upcycle <hf-folder> 10x1 (a mixture of 10 experts, top-1, that starts as its base; train it, then export-moe)
+    /// | export-moe <upcycled-folder> [<adapter>] [--type q4_k] (the real qwen3moe GGUF, quantized as it is written)
     /// | abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto] [--check 8] (a private copy)
     /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
@@ -164,7 +166,8 @@ enum Cmd {
         action: String,
         /// convert/quantize/loop: the input; merge: the base model; job/cancel: the job id
         first: Option<String>,
-        /// merge: the adapter folder; loop: the blocks and passes, <start>..<end>[x<passes>]
+        /// merge: the adapter folder; loop: the blocks and passes, <start>..<end>[x<passes>]; upcycle: <experts>x<top-k>;
+        /// export-moe: the adapter trained on the upcycled folder
         second: Option<String>,
         #[arg(long)]
         out: Option<String>,
@@ -1462,6 +1465,19 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 let num = |v: &str| v.trim().parse::<u64>().map_err(|_| USE.to_string());
                 serde_json::json!({"kind": "loop", "input": abs(first.clone().ok_or(USE)?), "start": num(a)?, "end": num(b)?,
                                    "passes": num(passes)?, "output": out.clone().map(abs)})
+            }
+            "upcycle" => {
+                const USE: &str = "upcycle <hf-folder> <experts>x<top-k> (e.g. 10x1: ten experts, one per token, the dense model's active size)";
+                let spec = second.clone().unwrap_or_else(|| "10x1".into());
+                let (e, k) = spec.split_once('x').unwrap_or((spec.as_str(), "1"));
+                let num = |v: &str| v.trim().parse::<u64>().map_err(|_| USE.to_string());
+                serde_json::json!({"kind": "upcycle", "input": abs(first.clone().ok_or(USE)?), "experts": num(e)?, "top_k": num(k)?,
+                                   "output": out.clone().map(abs)})
+            }
+            "export-moe" => {
+                const USE: &str = "export-moe <upcycled-folder> [<adapter-folder>] [--type q4_k|q8_0|f16|f32]";
+                serde_json::json!({"kind": "export-moe", "input": abs(first.clone().ok_or(USE)?), "adapter": second.clone().map(abs),
+                                   "type": ty.clone(), "pre_tokenizer": pre, "output": out.clone().map(abs)})
             }
             "abliterate" => {
                 const USE: &str = "abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N] [--scale 1] [--check N]";

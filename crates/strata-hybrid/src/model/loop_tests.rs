@@ -68,3 +68,67 @@ fn one_pass_is_the_base() {
     let d = max_diff(&got, &rows(&want["base"]));
     assert!(d < TOL, "--loop-passes 1 runs the base: {d}");
 }
+
+/// LoRA upcycling (plan Part C): the Workshop's `export-moe` tiny qwen3moe GGUFs against its own forward pass
+/// (crates/strata-workshop/tests/fixtures/tiny-qwen3-moe, written by its upcycle.rs): 4 experts top-2 with trained
+/// experts and routers, the same quantized to Q8_0, a looped model upcycled to top-1 (the MoE blocks follow the
+/// loop's schedule like the attention ones), and the untrained export, which is the dense base.
+mod moe {
+    use super::{max_diff, rows, tokens, TOL};
+    use crate::model::Model;
+    use std::path::PathBuf;
+
+    fn load(name: &str) -> (Model, serde_json::Value) {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures/tiny-qwen3-moe");
+        let (m, _) = Model::load(&d.join(name), None).unwrap();
+        (m, serde_json::from_str(&std::fs::read_to_string(d.join("logits.json")).unwrap()).unwrap())
+    }
+
+    /// Token by token and a chunk at a time, against `want`.
+    fn check(m: &Model, toks: &[u32], want: &[Vec<f32>], tol: f32, what: &str) -> f32 {
+        let mut st = m.new_state();
+        let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+        let d1 = max_diff(&one, want);
+        let mut st = m.new_state();
+        let d2 = max_diff(&m.forward_batch_all(&mut st, toks), want);
+        println!("{what}: token by token {d1:.2e}, a chunk {d2:.2e}");
+        assert!(d1 < tol && d2 < tol, "{what}: {d1} / {d2}");
+        d1.max(d2)
+    }
+
+    #[test]
+    fn the_engine_runs_the_upcycled_moe_as_the_workshop_trains_it() {
+        let (m, want) = load("moe.f32.gguf");
+        assert_eq!(m.arch, "qwen3moe");
+        let (moe, base) = (rows(&want["moe"]), rows(&want["base"]));
+        assert!(max_diff(&moe, &base) > 0.1, "the fixture's experts are trained: they change the logits");
+        check(&m, &tokens(&want), &moe, TOL, "4 experts top-2");
+    }
+
+    #[test]
+    fn a_quantized_export_stays_close() {
+        let (m, want) = load("moe.q8_0.gguf");
+        check(&m, &tokens(&want), &rows(&want["moe"]), 5e-2, "Q8_0");
+    }
+
+    #[test]
+    fn a_looped_moe_runs_its_experts_in_every_pass() {
+        let (m, want) = load("moe-loop.f32.gguf");
+        assert_eq!(m.passes(), 3);
+        let looped = rows(&want["moe_loop"]);
+        assert!(max_diff(&looped, &rows(&want["base"])) > 0.1);
+        check(&m, &tokens(&want), &looped, TOL, "looped, top-1");
+        // a chunk, then single tokens: each pass's caches carry on
+        let toks = tokens(&want);
+        let mut st = m.new_state();
+        let mut mixed = m.forward_batch_all(&mut st, &toks[..4]);
+        mixed.extend(toks[4..].iter().map(|&t| m.forward(&mut st, t)));
+        assert!(max_diff(&mixed, &looped) < TOL);
+    }
+
+    #[test]
+    fn the_untrained_export_is_the_dense_base() {
+        let (m, want) = load("init.f32.gguf");
+        check(&m, &tokens(&want), &rows(&want["base"]), TOL, "untrained, 4 experts top-1");
+    }
+}

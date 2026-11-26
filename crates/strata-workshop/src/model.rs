@@ -24,7 +24,7 @@
 //! keeps only the 16-bit weight and widens it again, briefly, to send the gradient back. Every frozen product goes
 //! through it, in f32 too: candle's `matmul` backward would also compute a (useless, weight-sized) gradient for W.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -77,6 +77,8 @@ pub struct ModelConfig {
     pub sliding_window: Option<usize>,
     /// per layer: true for `sliding_attention` (empty: every layer attends to everything)
     pub layer_sliding: Vec<bool>,
+    /// LoRA upcycling: every trained block's feed-forward becomes a mixture of experts (`"prastara_moe"` in config.json)
+    pub moe: Option<MoeSpec>,
 }
 
 /// YaRN (transformers' `_compute_yarn_parameters`): rotary frequencies past the original length are interpolated
@@ -171,6 +173,57 @@ impl LoopSpec {
 
     pub fn to_json(&self) -> Value {
         serde_json::json!({"start": self.start, "end": self.end, "passes": self.passes})
+    }
+}
+
+/// LoRA upcycling (Mula-MoE, plan Part C): the dense feed-forward of every trained block becomes `experts` experts
+/// that share its frozen weights, each with its own LoRA on gate, up and down, behind a router `[experts, hidden]`
+/// (softmax, the best `top_k`, their weights renormalised to sum to 1, as the engine's qwen3moe routes). With B = 0
+/// every expert is the base feed-forward and the weights sum to 1, so an upcycled model starts exactly as its base.
+/// `export-moe` folds each expert's LoRA into a full copy of the weights: a real `qwen3moe` model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoeSpec {
+    pub experts: usize,
+    pub top_k: usize,
+}
+
+/// The weight of the Switch-style load-balancing loss added to the training loss (`E · Σ_e f_e · P_e`, averaged over
+/// the MoE blocks a forward pass ran: 1 when the router spreads the tokens evenly).
+pub const MOE_AUX_COEF: f64 = 0.01;
+
+impl MoeSpec {
+    pub fn from_json(v: &Value) -> Result<Option<MoeSpec>> {
+        if v.is_null() {
+            return Ok(None);
+        }
+        let n = |k: &str| v[k].as_u64().map(|x| x as usize).ok_or_else(|| anyhow!("config.prastara_moe.{k} is missing or not a number"));
+        let m = MoeSpec { experts: n("experts")?, top_k: n("top_k")? };
+        m.check()?;
+        Ok(Some(m))
+    }
+
+    pub fn check(&self) -> Result<()> {
+        if self.experts < 2 || self.experts > 256 {
+            bail!("an upcycled model needs 2 to 256 experts (got {})", self.experts);
+        }
+        if self.top_k == 0 || self.top_k > self.experts {
+            bail!("top-k {} must be 1 to the number of experts ({})", self.top_k, self.experts);
+        }
+        Ok(())
+    }
+
+    pub fn to_json(&self) -> Value {
+        serde_json::json!({"experts": self.experts, "top_k": self.top_k})
+    }
+
+    /// `(total, active per token)` parameters of the exported mixture: each block's feed-forward `experts` times
+    /// (`top_k` times active) and its router, everything else as the base.
+    pub fn params(&self, cfg: &ModelConfig) -> (u64, u64) {
+        let layers = cfg.num_hidden_layers as u64;
+        let ffn = 3 * (cfg.hidden_size * cfg.intermediate_size) as u64;
+        let router = (self.experts * cfg.hidden_size) as u64;
+        let base = cfg.total_params();
+        (base + layers * ((self.experts as u64 - 1) * ffn + router), base + layers * ((self.top_k as u64 - 1) * ffn + router))
     }
 }
 
@@ -277,6 +330,7 @@ impl ModelConfig {
             max_position_embeddings: c["max_position_embeddings"].as_u64().map(|x| x as usize).unwrap_or(2048),
             tie_word_embeddings: c["tie_word_embeddings"].as_bool().unwrap_or(false),
             loop_: LoopSpec::from_json(&c["prastara_loop"], n("num_hidden_layers")?)?,
+            moe: MoeSpec::from_json(&c["prastara_moe"])?,
             yarn, sliding_window, layer_sliding,
         })
     }
@@ -362,7 +416,7 @@ impl Target {
     }
 
     /// The module path inside a block, as Hugging Face names it.
-    fn module(self) -> &'static str {
+    pub fn module(self) -> &'static str {
         match self {
             Target::Q | Target::K | Target::V | Target::O => "self_attn",
             _ => "mlp",
@@ -405,10 +459,14 @@ impl LoraSpec {
     }
 
     /// Adapter parameters for `cfg`: per trained block and target, `r · (in + out)`.
+    /// On an upcycled model the feed-forward targets are each expert's own: every trained block has `experts`
+    /// LoRAs on gate, up and down and a router `[experts, hidden]`, and the attention targets are shared.
     pub fn trainable_params(&self, cfg: &ModelConfig) -> u64 {
         let blocks = (cfg.num_hidden_layers - self.first_trained(cfg.num_hidden_layers)) as u64;
-        let per: u64 = self.targets.iter().map(|t| { let (o, i) = cfg.target_shape(*t); (self.r * (o + i)) as u64 }).sum();
-        blocks * per
+        let shared = |t: &&Target| cfg.moe.is_none() || t.module() == "self_attn";
+        let per: u64 = self.targets.iter().filter(shared).map(|t| { let (o, i) = cfg.target_shape(*t); (self.r * (o + i)) as u64 }).sum();
+        let moe = cfg.moe.map_or(0, |m| (m.experts * (3 * self.r * (cfg.hidden_size + cfg.intermediate_size) + cfg.hidden_size)) as u64);
+        blocks * (per + moe)
     }
 }
 
@@ -695,12 +753,17 @@ pub struct Linear {
     pub lora: Option<Lora>,
 }
 
-/// Per-forward switches: training turns dropout on, and `seed` makes its masks repeat exactly.
+/// Per-forward switches: training turns dropout on, and `seed` makes its masks repeat exactly. A training pass
+/// through an upcycled model also collects each MoE block's load-balancing loss here.
 #[derive(Debug, Default)]
 pub struct Ctx {
     pub train: bool,
     pub seed: u64,
     calls: Cell<u64>,
+    /// each MoE block's load-balancing loss of this pass (training only), summed into the loss by `loss_from_hidden`
+    aux: RefCell<Vec<Tensor>>,
+    /// the mean load-balancing loss the last `loss_from_hidden` added (before its coefficient), for the log
+    aux_value: Cell<Option<f64>>,
 }
 
 impl Ctx {
@@ -708,7 +771,11 @@ impl Ctx {
         Self::default()
     }
     pub fn train(seed: u64) -> Self {
-        Self { train: true, seed, calls: Cell::new(0) }
+        Self { train: true, seed, ..Self::default() }
+    }
+    /// The mean load-balancing loss the last [`LlamaModel::loss_from_hidden`] with this context added (None: no MoE).
+    pub fn aux_loss(&self) -> Option<f64> {
+        self.aux_value.get()
     }
 }
 
@@ -755,20 +822,102 @@ impl Linear {
     pub fn forward(&self, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         let base = self.frozen(x)?;
         let Some(l) = &self.lora else { return Ok(base) };
-        let x = if ctx.train && l.dropout > 0.0 {
-            // our own mask (candle's CPU random numbers cannot be seeded): the same seed gives the same run
-            let n = ctx.calls.get();
-            ctx.calls.set(n + 1);
-            let mut state = ctx.seed ^ n.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-            let keep = 1.0 - l.dropout as f32;
-            let mask: Vec<f32> = (0..x.elem_count()).map(|_| if unit(&mut state) < keep { 1.0 / keep } else { 0.0 }).collect();
-            x.mul(&Tensor::from_vec(mask, x.shape(), x.device())?)?
-        } else {
-            x.clone()
-        };
-        let delta = (x.matmul(&l.a.as_tensor().t()?)?.matmul(&l.b.as_tensor().t()?)? * l.scaling)?;
-        Ok(base.add(&delta)?)
+        Ok(base.add(&lora_delta(l, x, ctx)?)?)
     }
+
+    /// `W x + s · B A drop(x)` with an adapter that is not this projection's own (an expert's, over the shared W).
+    pub fn forward_with(&self, x: &Tensor, l: &Lora, ctx: &Ctx) -> Result<Tensor> {
+        Ok(self.frozen(x)?.add(&lora_delta(l, x, ctx)?)?)
+    }
+}
+
+/// An adapter's term `s · B A drop(x)`.
+fn lora_delta(l: &Lora, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    let x = if ctx.train && l.dropout > 0.0 {
+        // our own mask (candle's CPU random numbers cannot be seeded): the same seed gives the same run
+        let n = ctx.calls.get();
+        ctx.calls.set(n + 1);
+        let mut state = ctx.seed ^ n.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+        let keep = 1.0 - l.dropout as f32;
+        let mask: Vec<f32> = (0..x.elem_count()).map(|_| if unit(&mut state) < keep { 1.0 / keep } else { 0.0 }).collect();
+        x.mul(&Tensor::from_vec(mask, x.shape(), x.device())?)?
+    } else {
+        x.clone()
+    };
+    Ok((x.matmul(&l.a.as_tensor().t()?)?.matmul(&l.b.as_tensor().t()?)? * l.scaling)?)
+}
+
+/// An upcycled block's feed-forward: the router and each expert's adapters on gate, up and down; the experts share
+/// the block's frozen gate, up and down weights.
+#[derive(Debug, Clone)]
+struct MoeBlock {
+    /// `[experts, hidden]`, f32
+    router: Var,
+    /// per expert: gate, up, down
+    experts: Vec<[Lora; 3]>,
+    top_k: usize,
+}
+
+/// Each row's best `k` experts (softmax order, ties to the lower index, as the engine's `route` sorts).
+fn top_k_rows(probs: &[Vec<f32>], k: usize) -> Vec<Vec<usize>> {
+    probs.iter().map(|p| {
+        let mut order: Vec<usize> = (0..p.len()).collect();
+        order.sort_by(|&a, &b| p[b].total_cmp(&p[a]));
+        order.truncate(k);
+        order
+    }).collect()
+}
+
+/// The mixture on `h` `[seq, hidden]` (the block's post-attention norm): the router's softmax picks each token's
+/// `top_k` experts, their probabilities renormalised to sum to 1 weigh the experts' outputs. Gate and up are applied
+/// once to every token; each chosen expert adds its own LoRA terms on its tokens, and the down projection runs once
+/// per (token, expert). With one expert per token the renormalised weight is exactly 1 and would teach the router
+/// nothing: its probability is added and taken away again (`w + p - stop(p)`, the same value) so the router learns as
+/// Switch's does. In training the block's load-balancing loss goes to `ctx`.
+fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    let (seq, hid) = h.dims2()?;
+    let (n_exp, k, dev) = (m.experts.len(), m.top_k, h.device().clone());
+    let probs = candle_nn::ops::softmax(&h.matmul(&m.router.as_tensor().t()?)?, D::Minus1)?;
+    let chosen = top_k_rows(&probs.detach().to_device(&Device::Cpu)?.to_vec2::<f32>()?, k);
+    let (base_g, base_u) = (block.lin[4].forward(h, ctx)?, block.lin[5].forward(h, ctx)?);
+    let mut outs = Vec::new();
+    let mut pos = vec![0u32; seq * k];
+    let mut offset = 0usize;
+    for (e, [lg, lu, ld]) in m.experts.iter().enumerate() {
+        let rows: Vec<u32> = (0..seq).filter(|r| chosen[*r].contains(&e)).map(|r| r as u32).collect();
+        if rows.is_empty() {
+            continue;
+        }
+        for (j, r) in rows.iter().enumerate() {
+            let slot = chosen[*r as usize].iter().position(|x| *x == e).unwrap();
+            pos[*r as usize * k + slot] = (offset + j) as u32;
+        }
+        let n = rows.len();
+        let idx = Tensor::from_vec(rows, (n,), &dev)?;
+        let he = h.index_select(&idx, 0)?;
+        let g = (base_g.index_select(&idx, 0)? + lora_delta(lg, &he, ctx)?)?;
+        let u = (base_u.index_select(&idx, 0)? + lora_delta(lu, &he, ctx)?)?;
+        let act = (candle_nn::ops::silu(&g)? * u)?;
+        outs.push(block.lin[6].forward_with(&act, ld, ctx)?);
+        offset += n;
+    }
+    let all = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
+    let picked = all.index_select(&Tensor::from_vec(pos, (seq * k,), &dev)?, 0)?.reshape((seq, k, hid))?;
+    let flat: Vec<u32> = chosen.iter().enumerate().flat_map(|(r, c)| c.iter().map(move |e| (r * n_exp + e) as u32)).collect();
+    let sel = probs.flatten_all()?.index_select(&Tensor::from_vec(flat, (seq * k,), &dev)?, 0)?.reshape((seq, k))?;
+    let mut w = sel.broadcast_div(&sel.sum_keepdim(1)?)?;
+    if k == 1 {
+        w = (w + (&sel - sel.detach())?)?;
+    }
+    let out = picked.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?;
+    if ctx.train {
+        // Switch: E · Σ_e (share of the assignments to e) · (mean probability of e)
+        let mut f = vec![0f32; n_exp];
+        chosen.iter().flatten().for_each(|e| f[*e] += 1.0 / (seq * k) as f32);
+        let aux = (probs.mean(0)? * Tensor::from_vec(f, (n_exp,), &dev)?)?.sum_all()? * n_exp as f64;
+        ctx.aux.borrow_mut().push(aux?);
+    }
+    Ok(out)
 }
 
 /// One decoder block.
@@ -780,14 +929,21 @@ struct Block {
     norm2: Tensor,
     q_norm: Option<Tensor>,
     k_norm: Option<Tensor>,
+    /// upcycled: the feed-forward is a mixture of experts over the shared gate, up and down
+    moe: Option<MoeBlock>,
 }
 
 impl Block {
     fn has_lora(&self) -> bool {
-        self.lin.iter().any(|l| l.lora.is_some())
+        self.lin.iter().any(|l| l.lora.is_some()) || self.moe.is_some()
     }
     fn lora_vars(&self) -> Vec<Var> {
-        self.lin.iter().filter_map(|l| l.lora.as_ref()).flat_map(|l| [l.a.clone(), l.b.clone()]).collect()
+        let mut v: Vec<Var> = self.lin.iter().filter_map(|l| l.lora.as_ref()).flat_map(|l| [l.a.clone(), l.b.clone()]).collect();
+        if let Some(m) = &self.moe {
+            v.push(m.router.clone());
+            v.extend(m.experts.iter().flatten().flat_map(|l| [l.a.clone(), l.b.clone()]));
+        }
+        v
     }
 }
 
@@ -804,6 +960,9 @@ struct CheckpointBlock {
     seed: u64,
     calls: u64,
     grads: CkptGrads,
+    /// the block's load-balancing loss rides in one extra row of the output (`[seq + 1, hidden]`, the value at
+    /// `[seq, 0]`), so its gradient comes back through this node too
+    with_aux: bool,
 }
 
 impl CustomOp1 for CheckpointBlock {
@@ -823,9 +982,15 @@ impl CustomOp1 for CheckpointBlock {
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let err = |e: anyhow::Error| candle_core::Error::Msg(format!("checkpointed block: {e}"));
         let x = Var::from_tensor(&arg.detach())?;
-        let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls) };
+        let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls), ..Ctx::default() };
         let y = block_forward(&self.cfg, &self.block, x.as_tensor(), &self.rope, &self.mask, &ctx).map_err(err)?;
-        let grads = (y * grad_res.detach())?.sum_all()?.backward()?;
+        let (seq, g) = (y.dim(0)?, grad_res.detach());
+        let mut total = (y * g.narrow(0, 0, seq)?)?.sum_all()?;
+        if self.with_aux {
+            let aux = ctx.aux.borrow_mut().pop().ok_or_else(|| candle_core::Error::Msg("checkpointed block: no load-balancing loss in the replay".into()))?;
+            total = (total + (aux * g.get(seq)?.get(0)?)?)?;
+        }
+        let grads = total.backward()?;
         let mut out = self.grads.lock().map_err(|_| candle_core::Error::Msg("checkpoint gradients: lock".into()))?;
         for v in self.block.lora_vars() {
             if let Some(g) = grads.get(&v) {
@@ -839,14 +1004,31 @@ impl CustomOp1 for CheckpointBlock {
 /// See [`CheckpointBlock`].
 fn checkpointed(cfg: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx, grads: &CkptGrads) -> Result<Tensor> {
     let calls = ctx.calls.get();
-    let value = block_forward(cfg, block, &x.detach(), rope, mask, ctx)?.detach();
+    let sub = Ctx { train: ctx.train, seed: ctx.seed, calls: Cell::new(calls), ..Ctx::default() };
+    let value = block_forward(cfg, block, &x.detach(), rope, mask, &sub)?.detach();
+    ctx.calls.set(sub.calls.get());
+    let aux = sub.aux.borrow_mut().pop().map(|a| a.detach());
     if !x.track_op() && !block.has_lora() {
         return Ok(value);
     }
+    let seq = value.dim(0)?;
+    let packed = match &aux {
+        Some(a) => {
+            let hid = value.dim(1)?;
+            let row = Tensor::cat(&[&a.reshape((1, 1))?, &Tensor::zeros((1, hid - 1), DType::F32, value.device())?], 1)?;
+            Tensor::cat(&[&value, &row], 0)?
+        }
+        None => value,
+    };
     // the input may not descend from a variable (the first trained block): give the node something to hang from
     let x_in = if x.track_op() { x.clone() } else { Var::from_tensor(&x.detach())?.as_tensor().clone() };
-    Ok(x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(value)), cfg: cfg.clone(), block: block.clone(), rope: rope.clone(), mask: mask.clone(),
-                                        train: ctx.train, seed: ctx.seed, calls, grads: grads.clone() })?)
+    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: block.clone(), rope: rope.clone(), mask: mask.clone(),
+                                               train: ctx.train, seed: ctx.seed, calls, grads: grads.clone(), with_aux: aux.is_some() })?;
+    if aux.is_none() {
+        return Ok(out);
+    }
+    ctx.aux.borrow_mut().push(out.get(seq)?.get(0)?);
+    Ok(out.narrow(0, 0, seq)?)
 }
 
 /// The decoder: frozen base, adapters in the trained blocks.
@@ -989,7 +1171,7 @@ impl LlamaModel {
             if cfg.family == Family::Qwen3 && (q_norm.is_none() || k_norm.is_none()) {
                 bail!("a Qwen3 model without self_attn.q_norm / k_norm in block {i}");
             }
-            blocks.push(Some(Block { lin, norm1: vector(&p("input_layernorm.weight"))?, norm2: vector(&p("post_attention_layernorm.weight"))?, q_norm, k_norm }));
+            blocks.push(Some(Block { lin, norm1: vector(&p("input_layernorm.weight"))?, norm2: vector(&p("post_attention_layernorm.weight"))?, q_norm, k_norm, moe: None }));
         }
         let has_head = names.contains_key("lm_head.weight");
         if !has_head && !cfg.tie_word_embeddings {
@@ -1055,11 +1237,32 @@ impl LlamaModel {
                       spec.train_layers.unwrap_or(0), l.start, l.end, l.start, l.end - 1);
             }
         }
+        let moe = self.cfg.moe;
+        let (h, inter) = (self.cfg.hidden_size, self.cfg.intermediate_size);
         for (i, block) in self.blocks.iter_mut().enumerate() {
             let Some(block) = block else { continue };
+            let bdev = &self.devs[self.block_dev[i]];
+            block.moe = None;
+            if let (Some(m), true) = (moe, i >= first) {
+                // the router: small seeded values, so the first choices are near-uniform but not all ties
+                let mut state = spec.seed ^ ((i as u64) << 32) ^ 0x0E7E_C0DE;
+                let router: Vec<f32> = (0..m.experts * h).map(|_| 0.02 * (2.0 * unit(&mut state) - 1.0)).collect();
+                let experts = (0..m.experts).map(|e| -> Result<[Lora; 3]> {
+                    let one = |ti: usize, out: usize, in_: usize| -> Result<Lora> {
+                        let mut state = spec.seed ^ ((i as u64) << 32) ^ ((ti as u64) << 24) ^ ((e as u64 + 1) << 12) ^ 0xA5A5_5A5A;
+                        let bound = 1.0 / (in_ as f32).sqrt();
+                        let a: Vec<f32> = (0..spec.r * in_).map(|_| bound * (2.0 * unit(&mut state) - 1.0)).collect();
+                        Ok(Lora { a: Var::from_tensor(&Tensor::from_vec(a, (spec.r, in_), bdev)?)?, b: Var::from_tensor(&Tensor::zeros((out, spec.r), DType::F32, bdev)?)?,
+                                  scaling: spec.scaling(), dropout: spec.dropout })
+                    };
+                    Ok([one(4, inter, h)?, one(5, inter, h)?, one(6, h, inter)?])
+                }).collect::<Result<Vec<_>>>()?;
+                block.moe = Some(MoeBlock { router: Var::from_tensor(&Tensor::from_vec(router, (m.experts, h), bdev)?)?, experts, top_k: m.top_k });
+            }
             for (ti, t) in Target::ALL.into_iter().enumerate() {
                 block.lin[ti].lora = None;
-                if i < first || !spec.targets.contains(&t) {
+                // an upcycled block's feed-forward adapters are its experts'
+                if i < first || !spec.targets.contains(&t) || block.moe.is_some() && t.module() == "mlp" {
                     continue;
                 }
                 let (out, in_) = self.cfg.target_shape(t);
@@ -1090,6 +1293,16 @@ impl LlamaModel {
                     let stem = format!("base_model.model.model.layers.{i}.{}.{}", t.module(), t.as_str());
                     out.push((format!("{stem}.lora_A.weight"), l.a.clone()));
                     out.push((format!("{stem}.lora_B.weight"), l.b.clone()));
+                }
+            }
+            if let Some(m) = &block.moe {
+                out.push((moe_router_name(i), m.router.clone()));
+                for (e, ls) in m.experts.iter().enumerate() {
+                    for (l, t) in ls.iter().zip(MOE_TARGETS) {
+                        let stem = moe_expert_stem(i, e, t);
+                        out.push((format!("{stem}.lora_A.weight"), l.a.clone()));
+                        out.push((format!("{stem}.lora_B.weight"), l.b.clone()));
+                    }
                 }
             }
         }
@@ -1140,8 +1353,41 @@ impl LlamaModel {
         let tensors = candle_core::safetensors::load(dir.join("adapter_model.safetensors"), &self.dev)?;
         let mut used = 0;
         let mut first = self.cfg.num_hidden_layers;
+        let saved_moe = MoeSpec::from_json(&cfg["prastara_moe"])?;
+        if saved_moe.is_some() && saved_moe != self.cfg.moe {
+            bail!("the adapter was trained on an upcycled model ({:?}); this model is {:?}", saved_moe.unwrap(), self.cfg.moe);
+        }
+        let (h, inter) = (self.cfg.hidden_size, self.cfg.intermediate_size);
         for (i, block) in self.blocks.iter_mut().enumerate() {
             let Some(block) = block else { continue };
+            block.moe = None;
+            let bdev = &self.devs[self.block_dev[i]];
+            if let (Some(m), Some(router)) = (self.cfg.moe, tensors.get(&moe_router_name(i))) {
+                if router.dims() != [m.experts, h] {
+                    bail!("{}: the router has shape {:?}, the model has {} experts of hidden size {h}", moe_router_name(i), router.dims(), m.experts);
+                }
+                let mut experts = Vec::with_capacity(m.experts);
+                for e in 0..m.experts {
+                    let mut three = Vec::with_capacity(3);
+                    for (t, (out, in_)) in MOE_TARGETS.into_iter().zip([(inter, h), (inter, h), (h, inter)]) {
+                        let stem = moe_expert_stem(i, e, t);
+                        let (Some(a), Some(b)) = (tensors.get(&format!("{stem}.lora_A.weight")), tensors.get(&format!("{stem}.lora_B.weight"))) else {
+                            bail!("{stem}: the adapter has a router for block {i} but not this expert's lora_A and lora_B");
+                        };
+                        if a.dims() != [r, in_] || b.dims() != [out, r] {
+                            bail!("{stem}: adapter shapes {:?} and {:?} do not fit a [{out}, {in_}] weight at rank {r}", a.dims(), b.dims());
+                        }
+                        three.push(Lora { a: Var::from_tensor(&a.to_dtype(DType::F32)?.to_device(bdev)?)?, b: Var::from_tensor(&b.to_dtype(DType::F32)?.to_device(bdev)?)?,
+                                          scaling: spec.scaling(), dropout: spec.dropout });
+                        used += 2;
+                    }
+                    let [g, u, d]: [Lora; 3] = three.try_into().map_err(|_| anyhow!("three adapters"))?;
+                    experts.push([g, u, d]);
+                }
+                block.moe = Some(MoeBlock { router: Var::from_tensor(&router.to_dtype(DType::F32)?.to_device(bdev)?)?, experts, top_k: m.top_k });
+                used += 1;
+                first = first.min(i);
+            }
             for (ti, t) in Target::ALL.into_iter().enumerate() {
                 let stem = format!("base_model.model.model.layers.{i}.{}.{}", t.module(), t.as_str());
                 let (a, b) = (tensors.get(&format!("{stem}.lora_A.weight")), tensors.get(&format!("{stem}.lora_B.weight")));
@@ -1176,7 +1422,7 @@ impl LlamaModel {
             }
         }
         if used != tensors.len() {
-            let unknown: Vec<&String> = tensors.keys().filter(|k| !k.contains(".lora_A.weight") && !k.contains(".lora_B.weight") || !k.contains(".layers.")).take(3).collect();
+            let unknown: Vec<&String> = tensors.keys().filter(|k| !k.contains(".lora_A.weight") && !k.contains(".lora_B.weight") || !k.contains(".layers.") || k.contains(".experts.")).take(3).collect();
             bail!("the adapter holds {} tensors, {used} of them fit this model (for example not: {unknown:?}); it was made for another model or is not a plain LoRA", tensors.len());
         }
         spec.targets.sort();
@@ -1283,6 +1529,9 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
         let x = (x + block.lin[3].forward(&out, ctx)?)?;
 
         let h = rms_norm(&x, &block.norm2, c.rms_norm_eps)?;
+        if let Some(m) = &block.moe {
+            return Ok((x + moe_ffn(block, m, &h, ctx)?)?);
+        }
         let gated = (candle_nn::ops::silu(&block.lin[4].forward(&h, ctx)?)? * block.lin[5].forward(&h, ctx)?)?;
         Ok((x + block.lin[6].forward(&gated, ctx)?)?)
     }
@@ -1443,7 +1692,20 @@ impl LlamaModel {
         let hidden = self.upper_hidden(h, ctx)?;
         let hidden = hidden.index_select(&Tensor::from_vec(rows, (n,), hidden.device())?, 0)?;
         let logits = self.head(&hidden)?;
-        Ok(candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (n,), logits.device())?)?)
+        let ce = candle_nn::loss::cross_entropy(&logits, &Tensor::from_vec(targets, (n,), logits.device())?)?;
+        // the upcycled blocks' load-balancing losses, averaged over the blocks (and loop passes) that ran
+        let aux = std::mem::take(&mut *ctx.aux.borrow_mut());
+        if aux.is_empty() {
+            return Ok(ce);
+        }
+        let n_aux = aux.len() as f64;
+        let mut sum = move_to(&aux[0], ce.device())?;
+        for a in &aux[1..] {
+            sum = (sum + move_to(a, ce.device())?)?;
+        }
+        let mean = (sum / n_aux)?;
+        ctx.aux_value.set(Some(mean.to_scalar::<f32>()? as f64));
+        Ok((ce + (mean * MOE_AUX_COEF)?)?)
     }
 
     pub fn loss(&self, tokens: &[u32], supervised: &[bool], ctx: &Ctx) -> Result<Tensor> {
@@ -1471,7 +1733,21 @@ pub fn adapter_config(spec: &LoraSpec, cfg: &ModelConfig, base: &str) -> Value {
         "inference_mode": true,
         "init_lora_weights": true,
         "modules_to_save": Value::Null,
+        "prastara_moe": cfg.moe.map_or(Value::Null, |m| serde_json::json!({"experts": m.experts, "top_k": m.top_k, "rank": spec.r})),
     })
+}
+
+/// The feed-forward projections every expert of an upcycled block adapts, in its `[Lora; 3]` order.
+pub const MOE_TARGETS: [Target; 3] = [Target::Gate, Target::Up, Target::Down];
+
+/// An upcycled block's router in the adapter (`…layers.N.mlp.gate.weight`, `[experts, hidden]`: Qwen3-MoE's name).
+pub fn moe_router_name(block: usize) -> String {
+    format!("base_model.model.model.layers.{block}.mlp.gate.weight")
+}
+
+/// An expert's adapter stem (`…layers.N.mlp.experts.E.gate_proj`), `.lora_A.weight` / `.lora_B.weight` after it.
+pub fn moe_expert_stem(block: usize, expert: usize, t: Target) -> String {
+    format!("base_model.model.model.layers.{block}.mlp.experts.{expert}.{}", t.as_str())
 }
 
 /// The adapter tensors as an ordered map, for saving.
@@ -1546,6 +1822,29 @@ pub fn make_looped(model: &Path, out: &Path, l: LoopSpec) -> Result<()> {
         .collect::<Result<_>>()?;
     candle_core::safetensors::save(&zeros, out.join(LOOP_FILE))?;
     Ok(())
+}
+
+/// LoRA upcycling (plan Part C): `out` becomes a copy of the dense model folder `model` (looped or not) whose
+/// config carries `"prastara_moe": {experts, top_k}`; the weights are linked, as [`make_looped`] does. Training then
+/// gives every trained block a router and `experts` expert LoRAs over the shared feed-forward; until then the copy
+/// is the base. Returns the mixture's `(total, active)` parameter counts once exported.
+pub fn make_upcycled(model: &Path, out: &Path, m: MoeSpec) -> Result<(u64, u64)> {
+    let mut cfg: Value = serde_json::from_str(&std::fs::read_to_string(model.join("config.json"))
+        .with_context(|| format!("{}: no config.json", model.display()))?)?;
+    // a mixture of experts is refused by name in from_json (num_experts, num_local_experts, ...)
+    let parsed = ModelConfig::from_json(&cfg).with_context(|| format!("{}: upcycling starts from a dense Llama, Mistral, Qwen2 or Qwen3", model.display()))?;
+    if parsed.moe.is_some() {
+        bail!("{} is already upcycled ({:?}); upcycle its base instead", model.display(), parsed.moe.unwrap());
+    }
+    m.check()?;
+    if out.exists() && std::fs::read_dir(out)?.next().is_some() {
+        bail!("{} exists and is not empty", out.display());
+    }
+    std::fs::create_dir_all(out)?;
+    link_model_files(model, out, &["config.json"])?;
+    cfg["prastara_moe"] = m.to_json();
+    std::fs::write(out.join("config.json"), serde_json::to_string_pretty(&cfg)?)?;
+    Ok(m.params(&parsed))
 }
 
 /// Every file of `model` except `skip`, linked into `out` (copied where links are not possible).

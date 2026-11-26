@@ -5,6 +5,8 @@
 //! am2strata-workshop convert <hf-folder> --out <model.gguf> [--outtype f16|f32] [--pre-tokenizer NAME]
 //! am2strata-workshop quantize <in.gguf> --out <out.gguf> --type q8_0|q6_k|q5_k|q4_k|q4_0|f16
 //! am2strata-workshop merge <base-hf-folder> <adapter-folder> --out <merged-hf-folder>
+//! am2strata-workshop upcycle <hf-folder> --experts 10 --top-k 1 --out <dir>
+//! am2strata-workshop export-moe <upcycled-folder> [--adapter <dir>] --out <model.gguf> [--type q4_k|q8_0|f16|f32]
 //! am2strata-workshop abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N|N:P] [--scale 1.0] [--check N] --out <dir>
 //! am2strata-workshop train --model <hf-folder> --data <chat.jsonl> --out <adapter-folder> [--soup soup.yaml] [...]
 //! am2strata-workshop find-lr --model <hf-folder> --data <chat.jsonl> [--steps 40]
@@ -61,6 +63,36 @@ enum Cmd {
         /// how many times the loop runs (2 to 16)
         #[arg(long, default_value_t = 2)]
         passes: usize,
+    },
+    /// LoRA upcycling: a copy of a dense Llama or Qwen3 folder (looped or not) marked as a mixture of `experts`
+    /// experts, `top-k` per token; weights linked. `train` on it trains a router and every expert's LoRA over the shared
+    /// feed-forward (it starts exactly as the base); `export-moe` writes the real qwen3moe model
+    Upcycle {
+        model: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// experts per block (2 to 256)
+        #[arg(long, default_value_t = 10)]
+        experts: usize,
+        /// experts each token is routed to (1: Switch-style, the active size of the dense base)
+        #[arg(long, default_value_t = 1)]
+        top_k: usize,
+    },
+    /// an upcycled folder and the adapter trained on it to a qwen3moe GGUF: each expert's LoRA folded into its own
+    /// copy of the feed-forward, the router from the adapter; streamed, and quantized as it is written with --type
+    ExportMoe {
+        model: PathBuf,
+        /// the adapter `train` wrote on the upcycled folder (without one every expert is the base feed-forward)
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        /// f32, f16, q8_0, q6_k, q5_k, q4_k or q4_0
+        #[arg(long = "type", default_value = "q4_k")]
+        ty: String,
+        /// name the BPE pre-tokenizer when its hash is not a known one (e.g. "qwen2", "llama-bpe", "gpt-2")
+        #[arg(long)]
+        pre_tokenizer: Option<String>,
     },
     /// abliteration: remove the direction the model writes into its residual stream before refusing (from the mean
     /// residuals of two prompt lists, one prompt per line) from every o_proj, down_proj and the embeddings; the copy
@@ -543,6 +575,31 @@ fn human(b: u64) -> String {
     if b >= 1e9 { format!("{:.2} GB", b / 1e9) } else if b >= 1e6 { format!("{:.1} MB", b / 1e6) } else { format!("{:.0} KB", b / 1e3) }
 }
 
+/// 57.2 B, 8.19 B, 412 M: a parameter count as people say it.
+fn params_label(n: u64) -> String {
+    if n >= 1_000_000_000 { format!("{:.2} B", n as f64 / 1e9) } else if n >= 1_000_000 { format!("{:.1} M", n as f64 / 1e6) } else { format!("{n}") }
+}
+
+/// Free bytes on the file system that `p` (or its folder) is on.
+fn disk_free(p: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let dir = std::iter::successors(Some(dir), |d| d.parent()).find(|d| d.exists())?;
+        let c = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).ok()?;
+        let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+            return None;
+        }
+        Some(s.f_bavail as u64 * s.f_frsize as u64)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = p;
+        None
+    }
+}
+
 fn size_of(p: &Path) -> u64 {
     if p.is_dir() {
         std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| size_of(&e.path())).sum()
@@ -616,9 +673,9 @@ fn info(path: &Path) -> Result<Value, String> {
 fn training_event(out: &Out, e: Event) {
     match e {
         Event::Log(m) => out.event(json!({"event": "log", "message": m})),
-        Event::Step { step, total, loss, lr, eta_seconds } => out.event(json!({
-            "event": "progress", "done": step, "total": total, "step": step, "loss": loss, "lr": lr, "eta": eta_seconds,
-            "message": format!("loss {loss:.4} · rate {lr:.3e} · {} left", profile::human_seconds(eta_seconds))})),
+        Event::Step { step, total, loss, lr, eta_seconds, aux } => out.event(json!({
+            "event": "progress", "done": step, "total": total, "step": step, "loss": loss, "lr": lr, "eta": eta_seconds, "aux_loss": aux,
+            "message": format!("loss {loss:.4}{} · rate {lr:.3e} · {} left", aux.map_or(String::new(), |a| format!(" (router balance {a:.3})")), profile::human_seconds(eta_seconds))})),
         Event::Eval { step, loss } => out.event(json!({"event": "log", "message": format!("held-out loss {loss:.4} at step {step}"), "step": step, "eval_loss": loss})),
         Event::Checkpoint { step, dir } => out.event(json!({"event": "log", "message": format!("checkpoint at step {step}: {}", dir.display()), "step": step, "checkpoint": dir.display().to_string()})),
         Event::Cache { done, total } => out.event(json!({"event": "progress", "done": done, "total": total, "message": "filling the activation cache"})),
@@ -793,6 +850,43 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                                "before": r.before.as_ref().map(|c| c.to_json()), "after": r.after.as_ref().map(|c| c.to_json())});
             Ok((dst.clone(), "hf-model".into(), extra))
         }
+        Cmd::Upcycle { model, out: dst, experts, top_k } => {
+            use strata_workshop::model::{make_upcycled, MoeSpec};
+            out.event(json!({"event": "start", "what": format!("upcycle {} to {experts} experts, top-{top_k}, as {}", model.display(), dst.display())}));
+            let m = MoeSpec { experts: *experts, top_k: *top_k };
+            let (total, active) = make_upcycled(model, dst, m).map_err(|e| format!("{e:#}"))?;
+            let cfg = ModelConfig::load(dst).map_err(|e| format!("{e:#}"))?;
+            out.event(json!({"event": "log", "message": format!("{experts} experts x top-{top_k}: {} parameters in all, {} active per token (the dense base has {})",
+                                                                 params_label(total), params_label(active), params_label(cfg.total_params()))}));
+            let sizes: serde_json::Map<String, Value> = ["q4_k", "q8_0", "f16"].iter().filter_map(|t| {
+                let ty = strata_workshop::export_moe::ExportType::from_s(t).ok()?;
+                Some((t.to_string(), json!(strata_workshop::export_moe::export_bytes(&cfg, ty).ok()?)))
+            }).collect();
+            out.event(json!({"event": "log", "message": format!("export sizes: q4_k {}, q8_0 {}, f16 {}",
+                human(sizes["q4_k"].as_u64().unwrap_or(0)), human(sizes["q8_0"].as_u64().unwrap_or(0)), human(sizes["f16"].as_u64().unwrap_or(0)))}));
+            Ok((dst.clone(), "hf-model".into(), json!({"experts": experts, "top_k": top_k, "total_parameters": total, "active_parameters": active,
+                                                         "dense_parameters": cfg.total_params(), "export_bytes": sizes})))
+        }
+        Cmd::ExportMoe { model, adapter, out: dst, ty, pre_tokenizer } => {
+            use strata_workshop::export_moe::{export_bytes, export_moe, ExportType};
+            let t = ExportType::from_s(ty).map_err(|e| e.to_string())?;
+            let cfg = ModelConfig::load(model).map_err(|e| format!("{e:#}"))?;
+            let need = export_bytes(&cfg, t).map_err(|e| format!("{}: {e}", model.display()))?;
+            if let Some(free) = disk_free(dst) {
+                if free < need + (1 << 30) {
+                    return Err(format!("the export needs about {} on disk and {} is free there", human(need), human(free)));
+                }
+            }
+            // one feed-forward matrix as f32, a few copies, and the adapter
+            fits(4 * 4 * (cfg.hidden_size * cfg.intermediate_size.max(cfg.vocab_size)) as u64 + adapter.as_ref().map_or(0, |a| size_of(a)), "exporting this model")?;
+            out.event(json!({"event": "start", "what": format!("export {}{} as a qwen3moe GGUF ({ty}, about {}) to {}", model.display(),
+                adapter.as_ref().map_or(String::new(), |a| format!(" with {}", a.display())), human(need), dst.display())}));
+            let r = export_moe(model, adapter.as_deref(), dst, t, pre_tokenizer.as_deref()).map_err(|e| format!("{e:#}"))?;
+            out.event(json!({"event": "log", "message": format!("{} experts x top-{}: {} parameters, {} active per token; {} of {} blocks carry trained experts",
+                r.moe.experts, r.moe.top_k, params_label(r.total_params), params_label(r.active_params), r.trained_blocks, cfg.num_hidden_layers)}));
+            Ok((r.out, "gguf".into(), json!({"experts": r.moe.experts, "top_k": r.moe.top_k, "total_parameters": r.total_params,
+                                              "active_parameters": r.active_params, "trained_blocks": r.trained_blocks})))
+        }
         other => plain(run_tools(other, out)),
     }
 }
@@ -857,7 +951,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))

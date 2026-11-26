@@ -4799,12 +4799,13 @@ async function wsFiles() {
     $("ws-folders").textContent = `It works in ${(f.folders || []).join(", ")}; results go to ${f.output_folder}.` +
       (f.installed ? "" : " (The am2strata-workshop command is not installed beside the server.)");
     wsOverview();
+    wsUpcycleEst(); wsExportEst();
   } catch (e) { wsError(e.message); }
 }
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", loop: "loop", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install"};
+const WS_STEP_OF = {datagen: "data", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install"};
 const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.seeds || (r.sources || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
@@ -4827,7 +4828,7 @@ function wsJobCard(x) {
   const size = x.result?.bytes ? fmtBytes(x.result.bytes) : "";
   const acts = [];
   if (x.state === "queued" || running) acts.push(`<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>`);
-  if (x.state === "done" && ["merge", "convert", "quantize", "loop", "abliterate", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
+  if (x.state === "done" && ["merge", "convert", "quantize", "loop", "upcycle", "export-moe", "abliterate", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
   if (x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
   if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
   const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
@@ -4882,6 +4883,8 @@ async function refreshJobs(pushed = null) {
       if (!x) return;
       const o = x.result.output;
       if (["loop", "merge", "abliterate"].includes(x.kind)) wsUse("convert", "ws-c-in", o); // a model folder → convert
+      if (x.kind === "upcycle") wsUse("train", "ws-t-model", o);                    // an upcycled folder → train it
+      if (x.kind === "export-moe") wsUse("install", "ws-s-in", o);                  // the qwen3moe GGUF → install
       if (x.kind === "convert") wsUse("quantize", "ws-q-in", o);                    // GGUF → quantize
       if (x.kind === "train") { $("ws-m-base").value = x.request?.model || ""; wsUse("merge", "ws-m-adapter", x.output || o); } // adapter → merge
       if (x.kind === "quantize") wsUse("install", "ws-s-in", o);                    // quantized GGUF → install
@@ -4923,6 +4926,59 @@ async function wsSubmit(body, btn) {
 }
 $("ws-loop").onclick = (e) => wsSubmit({kind: "loop", input: $("ws-lp-in").value.trim(), start: Number($("ws-lp-start").value),
   end: Number($("ws-lp-end").value), passes: Number($("ws-lp-passes").value), output: $("ws-lp-out").value.trim()}, e.currentTarget);
+$("ws-upcycle").onclick = (e) => wsSubmit({kind: "upcycle", input: $("ws-u-in").value.trim(), experts: Number($("ws-u-experts").value),
+  top_k: Number($("ws-u-topk").value), output: $("ws-u-out").value.trim()}, e.currentTarget);
+$("ws-u-train").onclick = () => {
+  const done = ws.jobs.find((x) => x.kind === "upcycle" && x.state === "done");
+  const up = ws.files.hf.find((x) => x.moe);
+  wsUse("train", "ws-t-model", done?.result?.output || up?.path || "");
+};
+$("ws-export-moe").onclick = (e) => wsSubmit({kind: "export-moe", input: $("ws-x-in").value.trim(), adapter: $("ws-x-adapter").value.trim(),
+  type: $("ws-x-type").value, pre_tokenizer: $("ws-x-pre").value.trim(), output: $("ws-x-out").value.trim()}, e.currentTarget);
+
+// LoRA upcycling: a model's size as a mixture, counted as the Workshop counts it (model.rs MoeSpec::params): each
+// block's feed-forward `experts` times in all and `top_k` times per token, plus a router per block
+function wsMoeCount(d, experts, topK) {
+  const n = (v) => Number(v) || 0;
+  const [h, ff, layers, vocab, heads] = [n(d.hidden), n(d.intermediate), n(d.layers), n(d.vocab), n(d.heads)];
+  if (!h || !ff || !layers || !vocab || !heads) return null;
+  const kv = n(d.kv_heads) || heads, hd = n(d.head_dim) || h / heads;
+  const extra = d.family === "qwen2" ? heads * hd + 2 * kv * hd : d.family === "qwen3" ? 2 * hd : 0;
+  const block = 2 * h * heads * hd + 2 * h * kv * hd + 3 * h * ff + 2 * h + extra;
+  const dense = vocab * h * (d.tied ? 1 : 2) + layers * block + h;
+  const ffn = 3 * h * ff, router = experts * h;
+  return {dense, total: dense + layers * ((experts - 1) * ffn + router), active: dense + layers * ((topK - 1) * ffn + router),
+          // the export at about 4.5, 8.5 and 16 bits a weight (the routers and norms stay f32)
+          bytes: (bits) => (dense + layers * ((experts - 1) * ffn)) * bits / 8};
+}
+const wsParams = (p) => p >= 1e9 ? `${(p / 1e9).toFixed(2)} B` : p >= 1e6 ? `${(p / 1e6).toFixed(1)} M` : `${Math.round(p / 1e3)} K`;
+function wsUpcycleEst() {
+  const box = $("ws-u-est");
+  const path = $("ws-u-in").value.trim();
+  const experts = Math.max(2, Number($("ws-u-experts").value) || 10), topK = Math.min(experts, Math.max(1, Number($("ws-u-topk").value) || 1));
+  const m = (ws.files?.hf || []).find((x) => x.path === path);
+  if (!m) { box.innerHTML = `<p class="muted small">${path ? "Not a model folder the Workshop has listed, so its size is not known here; the job says it when it runs." : "Choose a model to see its size as a mixture."}</p>`; return; }
+  if (m.moe) { box.innerHTML = `<p class="muted small">This folder is upcycled already (${m.moe.experts} experts, top-${m.moe.top_k}). Train it, or export it below.</p>`; return; }
+  const c = m.dims && wsMoeCount(m.dims, experts, topK);
+  if (!c) { box.innerHTML = '<p class="muted small">Its config.json does not give the sizes needed to count the parameters.</p>'; return; }
+  const q4 = m.dims.vocab ? c.bytes(4.5) : 0;
+  box.innerHTML = `<dl class="ws-moe-nums"><div><dt>Dense now</dt><dd>${wsParams(c.dense)}</dd></div><div><dt>Total as a mixture</dt><dd>${wsParams(c.total)}</dd></div>` +
+    `<div><dt>Active per token</dt><dd>${wsParams(c.active)}</dd></div><div><dt>Export, Q4_K</dt><dd>about ${fmtBytes(q4)}</dd></div>` +
+    `<div><dt>Q8_0</dt><dd>about ${fmtBytes(c.bytes(8.5))}</dd></div><div><dt>F16</dt><dd>about ${fmtBytes(c.bytes(16))}</dd></div></dl>` +
+    `<p class="muted small">${topK === 1 ? "One expert per token: each token costs what it does on the dense model." : `${topK} experts per token: each token costs about ${(c.active / c.dense).toFixed(1)}× the dense model.`} The copy links the weights, so it takes no extra disk until it is exported.</p>`;
+}
+function wsExportEst() {
+  const box = $("ws-x-est");
+  const m = (ws.files?.hf || []).find((x) => x.path === $("ws-x-in").value.trim());
+  if (!m?.moe || !m.dims) { box.innerHTML = m && !m.moe ? '<p class="muted small">This folder is not upcycled: make the upcycled copy first.</p>' : ""; return; }
+  const c = wsMoeCount(m.dims, m.moe.experts, m.moe.top_k);
+  const bits = {q4_k: 4.5, q8_0: 8.5, q6_k: 6.6, q5_k: 5.5, f16: 16, f32: 32}[$("ws-x-type").value] || 4.5;
+  box.innerHTML = c ? `<p class="muted small">${m.moe.experts} experts, top-${m.moe.top_k}: ${wsParams(c.total)} parameters, ${wsParams(c.active)} active per token. ` +
+    `The file is about ${fmtBytes(c.bytes(bits))}, written one tensor at a time, so it needs that much free disk and no more.</p>` : "";
+}
+for (const id of ["ws-u-in", "ws-u-experts", "ws-u-topk"]) $(id).addEventListener("input", wsUpcycleEst);
+$("ws-u-in").addEventListener("change", wsUpcycleEst);
+for (const id of ["ws-x-in", "ws-x-type"]) { $(id).addEventListener("input", wsExportEst); $(id).addEventListener("change", wsExportEst); }
 $("ws-abliterate").onclick = (e) => wsSubmit({kind: "abliterate", input: $("ws-a-in").value.trim(), harmful: $("ws-a-harmful").value.trim(),
   harmless: $("ws-a-harmless").value.trim(), layer: $("ws-a-layer").value.trim() || "auto", scale: Number($("ws-a-scale").value) || 1,
   check: Number($("ws-a-check").value) || 0, output: $("ws-a-out").value.trim()}, e.currentTarget);
@@ -4941,9 +4997,13 @@ function wsStep(id) {
   if (id === "library") wsLibLoad();
   if (id === "train") { wsCurveId = null; wsCurveRefresh(); }
   if (id === "abliterate") { wsAblitId = null; wsAblitRefresh(); }
+  if (id === "upcycle") { wsUpcycleEst(); wsExportEst(); }
   if (id === "overview") wsOverview();
 }
-function wsUse(step, inputId, path) { wsStep(step); $(inputId).value = path; wsPick.quiet = true; $(inputId).focus(); wsPick.quiet = false; }
+function wsUse(step, inputId, path) {
+  wsStep(step); $(inputId).value = path; wsPick.quiet = true; $(inputId).focus(); wsPick.quiet = false;
+  if (step === "upcycle") { wsUpcycleEst(); wsExportEst(); }
+}
 $("ws-steps").addEventListener("click", (e) => { const b = e.target.closest("[data-ws-step]"); if (b) wsStep(b.dataset.wsStep); });
 $("ws-steps").addEventListener("keydown", (e) => {
   if (!["ArrowDown", "ArrowUp"].includes(e.key)) return;
@@ -4975,8 +5035,10 @@ function wsOverview() {
       <div class="ws-art__from">${esc(from(x.result.output) || `installed by #${x.id} from ${wsBase(wsJobIn(x))}`)}</div>
       <div class="ws-art__actions"><button class="st-btn st-btn--secondary" data-ws-load>Load it</button></div></article>`)],
     ["Model folders", ws.files.hf.map((x) => card(x, [x.arch ? tag(x.arch) : "", x.loop ? tag(`loop ${x.loop.start}–${x.loop.end - 1} ×${x.loop.passes}`, " ws-tag--loop") : "",
-        x.private ? tag("private", " ws-tag--private") : ""],
-      btn("Convert", "convert", "ws-c-in", x.path) + (x.loop ? "" : btn("Loop", "loop", "ws-lp-in", x.path)) + btn("Merge into", "merge", "ws-m-base", x.path)
+        x.moe ? tag(`MoE ${x.moe.experts}×top-${x.moe.top_k}`, " ws-tag--moe") : "", x.private ? tag("private", " ws-tag--private") : ""],
+      (x.moe ? btn("Train", "train", "ws-t-model", x.path) + btn("Export MoE", "upcycle", "ws-x-in", x.path)
+             : btn("Convert", "convert", "ws-c-in", x.path) + btn("Upcycle", "upcycle", "ws-u-in", x.path))
+        + (x.loop ? "" : btn("Loop", "loop", "ws-lp-in", x.path)) + btn("Merge into", "merge", "ws-m-base", x.path)
         + (x.private ? "" : btn("Abliterate", "abliterate", "ws-a-in", x.path))))],
     ["Adapters", ws.files.adapters.map((x) => card(x, [tag("LoRA")], btn("Merge", "merge", "ws-m-adapter", x.path)))],
     ["GGUF files", ws.files.gguf.map((x) => card(x, [tag("GGUF")], btn("Quantize", "quantize", "ws-q-in", x.path) + btn("Install", "install", "ws-s-in", x.path)))],

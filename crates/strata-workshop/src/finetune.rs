@@ -160,7 +160,9 @@ impl TrainSettings {
 pub enum Event {
     Log(String),
     /// an optimizer step finished: `loss` is the mean over its conversations, before the update
-    Step { step: usize, total: usize, loss: f64, lr: f64, eta_seconds: f64 },
+    /// `aux`: on an upcycled model, the mean load-balancing loss of the step (1 when the router spreads the tokens
+    /// evenly), which `loss` includes times [`crate::model::MOE_AUX_COEF`]
+    Step { step: usize, total: usize, loss: f64, lr: f64, eta_seconds: f64, aux: Option<f64> },
     Eval { step: usize, loss: f64 },
     Checkpoint { step: usize, dir: PathBuf },
     /// the activation cache is being filled
@@ -436,6 +438,8 @@ struct Runner {
     orders: HashMap<usize, Vec<usize>>,
     tokens_seen: u64,
     lower_in_memory: bool,
+    /// the last step's mean load-balancing loss (an upcycled model only)
+    last_aux: Option<f64>,
 }
 
 impl Runner {
@@ -480,7 +484,7 @@ impl Runner {
         params.weight_decay = s.weight_decay;
         let opt = AdamWState::new(vars.clone(), params).map_err(|e| anyhow!("{e}"))?;
         Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, orders: HashMap::new(),
-                  tokens_seen: 0, lower_in_memory })
+                  tokens_seen: 0, lower_in_memory, last_aux: None })
     }
 
     fn hidden(&mut self, ex: &Example) -> Result<Tensor> {
@@ -502,6 +506,7 @@ impl Runner {
     fn step(&mut self, step: usize, count: usize, lr: f64) -> Result<f64> {
         let mut sum: Vec<Option<Tensor>> = vec![None; self.vars.len()];
         let mut loss_sum = 0.0;
+        let mut aux_sum: Option<f64> = None;
         for k in 0..count {
             let m = step * self.accumulation + k;
             let index = self.example_at(m);
@@ -515,6 +520,9 @@ impl Runner {
                 bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
             }
             loss_sum += value;
+            if let Some(a) = ctx.aux_loss() {
+                aux_sum = Some(aux_sum.unwrap_or(0.0) + a);
+            }
             self.tokens_seen += ex.tokens.len() as u64;
             let grads = loss.backward()?;
             // with checkpointing, the adapters inside a recomputed block get their gradient there
@@ -544,6 +552,7 @@ impl Runner {
         }
         self.opt.params.lr = lr;
         self.opt.step_grads(&sum).map_err(|e| anyhow!("{e}"))?;
+        self.last_aux = aux_sum.map(|a| a / count as f64);
         Ok(loss_sum / count as f64)
     }
 
@@ -668,7 +677,7 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         let done = (step - start_step) as f64;
         let eta = t_steps.elapsed().as_secs_f64() / done * (total - step) as f64;
         if s.logging_steps <= 1 || step % s.logging_steps == 0 || step == total || step == start_step + 1 {
-            on_event(Event::Step { step, total, loss, lr, eta_seconds: eta });
+            on_event(Event::Step { step, total, loss, lr, eta_seconds: eta, aux: run.last_aux });
         }
         if s.eval_steps > 0 && step % s.eval_steps == 0 && step < total {
             if let Some(l) = run.eval_loss()? {
@@ -809,7 +818,7 @@ pub fn find_lr(s: &TrainSettings, opts: FindLr, on_event: &mut dyn FnMut(Event))
         };
         lrs.push(lr);
         losses.push(loss);
-        on_event(Event::Step { step: step + 1, total: opts.steps, loss, lr, eta_seconds: 0.0 });
+        on_event(Event::Step { step: step + 1, total: opts.steps, loss, lr, eta_seconds: 0.0, aux: run.last_aux });
         best = best.min(loss);
         if step >= 4 && loss > 4.0 * best {
             diverged = true;

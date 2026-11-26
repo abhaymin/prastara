@@ -503,6 +503,34 @@ fn every_route_answers_each_caller_as_its_row_says() {
     assert_eq!(a.status, 200, "the server after the walk: {}", excerpt(&a));
 }
 
+/// The Workshop's job kinds share one route (`POST /v1/workshop/jobs`), so each kind's contract is a row here: a
+/// stranger and a client profile get 401, the owner's smallest body that names nothing real is refused with 400 and
+/// a JSON error (before anything runs), and a wrongly typed field is a 400, never a 5xx.
+#[test]
+fn every_workshop_job_kind_answers_each_caller_as_its_row_says() {
+    let s = Server::start(&[client_model(json!({}))], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": "/nonexistent/am2strata-workshop"}}));
+    // (kind, the owner's minimal body, what it is refused for)
+    let rows: [(&str, &str, &str); 4] = [
+        ("upcycle", r#"{"kind": "upcycle", "input": "/nope/model"}"#, "no such folder"),
+        ("upcycle", r#"{"kind": "upcycle", "input": "/nope/model", "experts": "ten", "top_k": []}"#, "wrongly typed shape"),
+        ("export-moe", r#"{"kind": "export-moe", "input": "/nope/upcycled"}"#, "no such folder"),
+        ("export-moe", r#"{"kind": "export-moe", "input": 5, "adapter": {}, "type": 3}"#, "wrongly typed fields"),
+    ];
+    let mut wrong = vec![];
+    for (kind, body, why) in rows {
+        let send = |key: Option<&str>| Req::new("POST", &s.base, "/v1/workshop/jobs").key(key).raw("application/json", body.as_bytes()).send();
+        for (who, key, want) in [("no key", None, 401), ("wrong key", Some(WRONG_KEY), 401), ("client key", Some(CLIENT_KEY), 401), ("owner key", Some(KEY), 400)] {
+            let a = send(key);
+            if a.status != want {
+                wrong.push(format!("{kind} ({why}) [{who}]: expected {want}, got {} ({})", a.status, excerpt(&a)));
+            } else if want == 400 && !a.json()["error"]["message"].is_string() {
+                wrong.push(format!("{kind} ({why}): a 400 without a JSON error.message ({})", excerpt(&a)));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n  "));
+}
+
 /// JSON of the wrong type everywhere (an array, a string, a number where an object is read; every usual field with
 /// the wrong type): a refusal, never a 5xx, and the server keeps running.
 #[test]
