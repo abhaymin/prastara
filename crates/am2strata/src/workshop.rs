@@ -113,6 +113,34 @@ pub fn exe() -> Option<PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Paths the Workshop never reads, writes, lists or takes uploads into, wherever they are, even inside a Workshop
+/// folder or under a folder added to the config: the system's own areas, credential folders and secret files.
+/// Returns why, for the refusal.
+pub fn sensitive(p: &Path) -> Option<&'static str> {
+    const SYSTEM: &[&str] = &["/etc", "/proc", "/sys", "/dev", "/boot", "/root", "/run", "/var/lib", "/var/log", "/usr/bin",
+                              "/usr/sbin", "/bin", "/sbin", "/lib", "/lib64", "/snap", "/private/etc", "/System", "/Library/Keychains"];
+    if SYSTEM.iter().any(|s| p.starts_with(s)) {
+        return Some("a system folder");
+    }
+    const DIRS: &[&str] = &[".ssh", ".gnupg", ".aws", ".azure", ".kube", ".docker", ".password-store", ".pki", "keyrings",
+                            ".mozilla", ".thunderbird", ".local/share/keyrings", ".config/gh", ".config/gcloud", ".vault-token"];
+    let parts: Vec<String> = p.components().filter_map(|c| match c {
+        std::path::Component::Normal(n) => Some(n.to_string_lossy().to_lowercase()),
+        _ => None,
+    }).collect();
+    let joined = parts.join("/");
+    if parts.iter().any(|x| DIRS.contains(&x.as_str())) || DIRS.iter().any(|d| d.contains('/') && joined.contains(d)) {
+        return Some("a folder of keys or credentials");
+    }
+    let name = parts.last().map(String::as_str).unwrap_or("");
+    let secret = matches!(name, "passwd" | "shadow" | "gshadow" | "sudoers" | ".env" | ".netrc" | ".git-credentials" | ".pgpass"
+                                | "node-tls.json" | "authorized_keys" | "known_hosts" | "credentials" | "credentials.json")
+        || ["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519"].iter().any(|k| name.starts_with(k))
+        || [".pem", ".key", ".p12", ".pfx", ".keystore", ".jks", ".kdbx", ".asc", ".gpg"].iter().any(|e| name.ends_with(e))
+        || name.starts_with(".env.");
+    secret.then_some("a file of keys, passwords or credentials")
+}
+
 impl Workshop {
     pub fn init(models_dir: &Path, data_dir: &Path, rest: &std::collections::BTreeMap<String, Value>) -> Arc<Workshop> {
         let out_dir = data_dir.join("workshop");
@@ -122,7 +150,12 @@ impl Workshop {
         }
         // every root resolved (symlinks followed) once, here; one that cannot be is left out, never compared unresolved
         std::fs::create_dir_all(&out_dir).ok();
+        let home = std::env::var_os("HOME").map(PathBuf::from).and_then(|h| h.canonicalize().ok());
         let roots = roots.into_iter().filter_map(|r| match r.canonicalize() {
+            Ok(c) if c.parent().is_none() || Some(&c) == home.as_ref() || sensitive(&c).is_some() => {
+                tracing::warn!("workshop: {} is too broad or sensitive to be a Workshop folder (the whole disk, a home folder, or system or key folders); left out", c.display());
+                None
+            }
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!("workshop: {} is not usable as a Workshop folder ({e}); left out", r.display());
@@ -194,6 +227,9 @@ impl Workshop {
             }
             r
         };
+        if let Some(why) = sensitive(&resolved).or_else(|| sensitive(&path)) {
+            return Err(format!("{p}: {why}; the Workshop never touches these"));
+        }
         if !self.roots.iter().any(|r| resolved.starts_with(r)) {
             return Err(format!("{p} is outside the Workshop's folders ({}); add its folder to \"workshop\": {{\"dirs\": [...]}} in the run config",
                                self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>().join(", ")));
@@ -727,6 +763,9 @@ pub async fn upload_post(State(s): State<AppState>, headers: HeaderMap, axum::ex
     if body.is_empty() {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "the file is empty");
     }
+    if let Some(why) = q.get("name").and_then(|raw| sensitive(std::path::Path::new(raw))).or_else(|| sensitive(std::path::Path::new(&name))) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("{name}: {why}; not accepted as an upload"));
+    }
     let (stem, ext) = match name.rfind('.') {
         Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
         _ => (name.clone(), String::new()),
@@ -749,6 +788,9 @@ pub async fn upload_folder_post(State(s): State<AppState>, headers: HeaderMap,
     let Some(name) = q.get("name").and_then(|n| safe_name(n)) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "give the folder's name: ?name=my-model");
     };
+    if let Some(why) = q.get("name").and_then(|raw| sensitive(std::path::Path::new(raw))).or_else(|| sensitive(std::path::Path::new(&name))) {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", format!("{name}: {why}; not accepted as an upload"));
+    }
     let dir = Workshop::fresh(&w.uploads_dir(), &name, "");
     match std::fs::create_dir_all(&dir) {
         Ok(()) => Json(json!({"folder": dir.display().to_string()})).into_response(),
@@ -776,6 +818,9 @@ fn upload_target(w: &Workshop, q: &std::collections::HashMap<String, String>) ->
             if parts.is_empty() || parts.len() > 16 {
                 return Err("give the file's path inside the folder: ?rel=sub/file.safetensors".into());
             }
+            if let Some(why) = sensitive(std::path::Path::new(rel)) {
+                return Err(format!("{rel}: {why}; not accepted as an upload"));
+            }
             for part in parts {
                 let safe = safe_name(part).ok_or_else(|| format!("{rel}: not a usable file name"))?;
                 if safe != part {
@@ -789,7 +834,12 @@ fn upload_target(w: &Workshop, q: &std::collections::HashMap<String, String>) ->
             Ok(p)
         }
         (None, None) => {
-            let name = q.get("name").and_then(|n| safe_name(n)).ok_or("give the file's name: ?name=model.gguf")?;
+            let raw = q.get("name").map(String::as_str).unwrap_or("");
+            let name = safe_name(raw).ok_or("give the file's name: ?name=model.gguf")?;
+            // the name as sent: the cleaning above drops a leading dot (".env" would pass as "env")
+            if let Some(why) = sensitive(std::path::Path::new(raw)).or_else(|| sensitive(std::path::Path::new(&name))) {
+                return Err(format!("{name}: {why}; not accepted as an upload"));
+            }
             let (stem, ext) = match name.rfind('.') {
                 Some(i) if i > 0 => (name[..i].to_string(), name[i..].to_string()),
                 _ => (name.clone(), String::new()),
@@ -886,6 +936,7 @@ pub async fn browse_get(State(s): State<AppState>, headers: HeaderMap,
         let name = e.file_name().to_string_lossy().to_string();
         if name.starts_with('.') || name.ends_with(".part") { return None; }
         let p = e.path();
+        if sensitive(&p).is_some() { return None; }
         let m = e.metadata().ok();
         let is_dir = p.is_dir();
         let modified = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());

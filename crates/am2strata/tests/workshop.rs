@@ -100,7 +100,8 @@ fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
     // nothing outside the Workshop's folders, in or out
     let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": "/etc"}));
     assert_eq!(code, 400);
-    assert!(e["error"]["message"].as_str().unwrap().contains("outside the Workshop"), "{e}");
+    let m = e["error"]["message"].as_str().unwrap();
+    assert!(m.contains("outside the Workshop") || m.contains("never touches"), "{e}");
     let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": model, "output": "/tmp/x.gguf"}));
     assert_eq!(code, 400);
     let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "convert", "input": model.join("../../..")}));
@@ -399,4 +400,42 @@ fn uploads_stream_files_and_folders_and_the_workshop_folders_can_be_browsed() {
     let e = up["entries"].as_array().unwrap().iter().find(|e| e["name"] == "my-model").expect("the uploaded folder");
     assert_eq!((e["dir"].as_bool(), e["kind"].as_str()), (Some(true), Some("hf-model")));
     assert_eq!(s.get("/v1/workshop/browse?path=/etc", true).0, 400, "nothing outside the Workshop's folders");
+}
+
+/// Sensitive paths are refused wherever they are, even inside a Workshop folder: the system's areas, key and
+/// credential folders, and secret files; as job inputs, as uploads (names and paths inside a folder) and in listings.
+#[test]
+fn sensitive_paths_are_never_read_written_uploaded_or_listed() {
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
+    let c = reqwest::blocking::Client::new();
+    let put = |q: &[(&str, &str)]| c.put(format!("{}/v1/workshop/upload", s.base)).query(q).bearer_auth(common::KEY).body("x").send().unwrap().status().as_u16();
+    let ws = s.dir.join("workshop");
+    // inside the Workshop folder, still refused: a key folder and a secret file
+    std::fs::create_dir_all(ws.join(".ssh")).unwrap();
+    std::fs::write(ws.join(".ssh/id_rsa"), "k").unwrap();
+    std::fs::write(ws.join("server.pem"), "k").unwrap();
+    std::fs::create_dir_all(ws.join("model")).unwrap();
+    std::fs::write(ws.join("model/config.json"), "{}").unwrap();
+    for p in [ws.join(".ssh/id_rsa"), ws.join("server.pem"), ws.join(".ssh"), "/etc/passwd".into(), "/proc/self/environ".into()] {
+        let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "quantize", "input": p, "type": "q8_0"}));
+        assert_eq!(code, 400, "{} {e}", p.display());
+    }
+    let (_, e) = s.post("/v1/workshop/jobs", &json!({"kind": "quantize", "input": ws.join("server.pem"), "type": "q8_0"}));
+    assert!(e["error"]["message"].as_str().unwrap().contains("never touches"), "{e}");
+    // uploads: secret names and paths are refused, whether a file or inside a folder
+    for name in ["id_ed25519", ".env", "passwd", "cert.key", "node-tls.json"] {
+        assert_eq!(put(&[("name", name)]), 400, "{name}");
+    }
+    let (_, f) = s.post("/v1/workshop/upload-folder?name=m", &json!({}));
+    let folder = f["folder"].as_str().unwrap().to_string();
+    for rel in ["etc/passwd", "ssh_dir/id_rsa", "keys/server.pem", "a/.env"] {
+        assert_eq!(put(&[("folder", &folder), ("rel", rel)]), 400, "{rel}");
+    }
+    assert_eq!(put(&[("folder", &folder), ("rel", "config.json")]), 200, "an ordinary file still goes in");
+    assert_eq!(s.post("/v1/workshop/upload-folder?name=.ssh", &json!({})).0, 400);
+    // listings leave them out
+    let (_, b) = s.get(&format!("/v1/workshop/browse?path={}", urlencode(ws.to_str().unwrap())), true);
+    let names: Vec<&str> = b["entries"].as_array().unwrap().iter().filter_map(|e| e["name"].as_str()).collect();
+    assert!(names.contains(&"model") && !names.contains(&"server.pem") && !names.contains(&".ssh"), "{names:?}");
+    assert_eq!(s.get(&format!("/v1/workshop/browse?path={}", urlencode(ws.join(".ssh").to_str().unwrap())), true).0, 400);
 }

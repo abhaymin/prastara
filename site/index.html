@@ -18,7 +18,7 @@
   if (t === "light" || t === "dark") d.dataset.theme = t;
   d.dataset.motion = m === "on" || m === "off" ? m : (matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on");
 } catch (e) { document.documentElement.dataset.motion = matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on"; }</script>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1020'/%3E%3Cpath d='M7 10h18M7 16h13M7 22h18' stroke='%235eead4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%231C2430'/%3E%3Crect x='10' y='12' width='44' height='12' rx='6' fill='%233DD68C'/%3E%3Crect x='10' y='30' width='30' height='12' rx='6' fill='%233DD68C' fill-opacity='.75'/%3E%3Ccircle cx='47' cy='48' r='8' fill='%23F2B84B'/%3E%3C/svg%3E">
 <style>
 @font-face { font-family: "Outfit"; src: url("fonts/outfit-latin-wght.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
 /* Colours: Catppuccin Mocha (dark) and Latte (light). Text colours reach WCAG AAA, 7:1, on every background they sit
@@ -76,7 +76,7 @@ nav { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px) saturat
 nav .wrap { display: flex; align-items: center; gap: 22px; height: 62px; }
 .brand { font-weight: 700; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; min-height: 44px; }
 .brand:hover { text-decoration: none; }
-.brand svg { width: 28px; height: 28px; filter: drop-shadow(0 4px 12px rgba(94, 234, 212, .35)); }
+.brand svg { width: 28px; height: 28px; filter: drop-shadow(0 4px 12px rgba(61, 214, 140, .35)); }
 nav .links { margin-left: auto; display: flex; gap: 6px; font-size: 15px; align-items: center; }
 nav .links a { min-height: 44px; display: inline-flex; align-items: center; padding: 0 8px; border-radius: 8px; }
 .navbtn { font: inherit; font-size: 14px; min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -363,7 +363,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
 <nav aria-label="Main">
   <div class="wrap">
     <a class="brand" href="#top" aria-label="Prastara home">
-      <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" fill="#0f1830"/><path d="M7 10h18M7 16h13M7 22h18" stroke="#5eead4" stroke-width="3" stroke-linecap="round"/></svg>
+      <svg viewBox="0 0 64 64" aria-hidden="true"><rect x="2" y="2" width="60" height="60" rx="16" fill="#1C2430"/><rect x="12" y="14" width="40" height="10" rx="5" fill="#3DD68C"/><rect x="12" y="28" width="28" height="10" rx="5" fill="#3DD68C" fill-opacity=".7"/><rect x="12" y="42" width="16" height="10" rx="5" fill="#3DD68C" fill-opacity=".45"/><circle cx="46" cy="46" r="6" fill="#F2B84B"/></svg>
       Prastara
     </a>
     <div class="links">
