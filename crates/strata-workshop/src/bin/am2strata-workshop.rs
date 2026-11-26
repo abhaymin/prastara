@@ -14,7 +14,7 @@
 //! am2strata-workshop profile (--model <hf-folder> | --preset llama-2-7b) [--data <chat.jsonl>] [...]
 //! am2strata-workshop autopilot --model <hf-folder> --data <chat.jsonl> [--time-budget 2h] [--ram-budget 12GB]
 //! am2strata-workshop regress --model <hf-folder> [--adapter <dir>] [--passes 1,2] --suite <suite.json> --out <report-dir> [--against <report>]
-//! am2strata-workshop clean <in.jsonl>... --out <out.jsonl> [--model <hf-folder>] [--max-len 1024] [--min-answer-tokens N] [--max-repeat R] [--dedupe exact|near|off] [--lang-match] [--exclude held-out.jsonl] [--cap-per-language N [--cap-only in.jsonl]] [--report card.md]
+//! am2strata-workshop clean <in.jsonl>... --out <out.jsonl> [--model <hf-folder>] [--max-len 1024] [--min-answer-tokens N] [--max-repeat R] [--dedupe exact|near|off] [--lang-match] [--drop-cut] [--exclude held-out.jsonl] [--cap-per-language N [--cap-only in.jsonl]] [--report card.md]
 //! am2strata-workshop grade-train --model <hf-folder> --data <prompts.jsonl> --samples N --grader code|judge --rounds R --suite <suite.json> --out <dir>
 //! ```
 //!
@@ -319,6 +319,9 @@ enum Cmd {
         /// the answer must be in the script of the prompt, its meta.language, or the language a translation asks for
         #[arg(long)]
         lang_match: bool,
+        /// drop rows longer than --max-len instead of keeping them for the trainer to cut
+        #[arg(long)]
+        drop_cut: bool,
         /// rows to keep out (a regression test's held-out set; repeat it)
         #[arg(long)]
         exclude: Vec<PathBuf>,
@@ -1531,7 +1534,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             Ok((dst.clone(), "dataset".into()))
         }
         Cmd::Clean { inputs, out: dst, model, chat_template, max_len, min_answer_tokens, min_answer_ratio, max_repeat, dedupe, near,
-                     lang_match, exclude, cap_per_language, cap_only, seed, report } => {
+                     lang_match, drop_cut, exclude, cap_per_language, cap_only, seed, report } => {
             let mut s = clean::Settings::new(inputs.clone(), dst.clone());
             s.model = model.clone();
             s.chat_template = chat_template.clone();
@@ -1542,6 +1545,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             s.dedupe = clean::Dedupe::from_s(dedupe).map_err(|e| e.to_string())?;
             s.near = *near;
             s.lang_match = *lang_match;
+            s.drop_cut = *drop_cut;
             s.exclude = exclude.clone();
             s.cap_per_language = *cap_per_language;
             s.cap_only = cap_only.clone();

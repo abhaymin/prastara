@@ -37,7 +37,7 @@
 //!   - clean: `"inputs"` (datasets, .jsonl), `"output"`? (a .jsonl; default `datasets/<first>-clean.jsonl`),
 //!     `"model"`? (an HF folder: its tokenizer measures the rows), `"max_len"`?, `"min_answer_tokens"`?,
 //!     `"min_answer_ratio"`?, `"max_repeat"`? (0-1), `"dedupe"`? (exact | near | off), `"near"`? (0-1),
-//!     `"lang_match"`?, `"exclude"`? (held-out .jsonl files to keep out), `"cap_per_language"`?, `"cap_only"`? (the
+//!     `"lang_match"`?, `"drop_cut"`? (drop rows longer than max_len), `"exclude"`? (held-out .jsonl files to keep out), `"cap_per_language"`?, `"cap_only"`? (the
 //!     inputs the cap draws from), `"seed"`?,
 //!     `"report"`? (the card, .md) — the dataset cleaned for training, with a card of the count per rule
 //!   - regress: `"model"` (an HF model folder), `"adapter"`? (an adapter folder), `"suite"` (a suite .json whose data
@@ -957,6 +957,11 @@ impl Workshop {
                     Value::Null | Value::Bool(false) => {}
                     Value::Bool(true) => args.push("--lang-match".into()),
                     _ => return Err("\"lang_match\" is true or false".into()),
+                }
+                match &req["drop_cut"] {
+                    Value::Null | Value::Bool(false) => {}
+                    Value::Bool(true) => args.push("--drop-cut".into()),
+                    _ => return Err("\"drop_cut\" is true or false".into()),
                 }
                 let output = match s("output") {
                     Some(o) if !o.ends_with(".jsonl") => return Err("\"output\" is a .jsonl file".into()),

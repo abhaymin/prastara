@@ -65,6 +65,8 @@ pub struct Settings {
     pub model: Option<PathBuf>,
     pub chat_template: Option<PathBuf>,
     pub max_len: usize,
+    /// drop rows longer than `max_len` (the trainer would cut their tail, so the answer is never seen to end)
+    pub drop_cut: bool,
     pub min_answer_tokens: usize,
     pub min_answer_ratio: f64,
     pub max_repeat: f64,
@@ -82,7 +84,7 @@ pub struct Settings {
 
 impl Settings {
     pub fn new(inputs: Vec<PathBuf>, out: PathBuf) -> Self {
-        Settings { inputs, out, model: None, chat_template: None, max_len: 1024, min_answer_tokens: 4, min_answer_ratio: 0.0,
+        Settings { inputs, out, model: None, chat_template: None, max_len: 1024, drop_cut: false, min_answer_tokens: 4, min_answer_ratio: 0.0,
                    max_repeat: 0.5, dedupe: Dedupe::Near, near: 0.8, lang_match: false, exclude: vec![], cap_per_language: None, cap_only: vec![],
                    seed: 7, report: None }
     }
@@ -97,6 +99,7 @@ pub const RULES: &[(&str, &str)] = &[
     ("bad_row", "not JSON, or no conversation with an answer"),
     ("held_out", "in an --exclude (held-out) file: same prompt or a near-copy"),
     ("prompt_too_long", "the prompt alone fills --max-len: the trainer would drop it (no answer token left)"),
+    ("too_long", "longer than --max-len with --drop-cut: the trainer would cut the answer before it ends"),
     ("empty_answer", "the answer is empty"),
     ("template_junk", "leftover <think> tags, chat-template markers or a JSON wrapper in the answer"),
     ("echo", "the answer only repeats the prompt"),
@@ -556,6 +559,9 @@ pub fn check_row(s: &Settings, row: &Row, len: &Length) -> Option<(&'static str,
     if !len.fits {
         return Some(("prompt_too_long", format!("{} prompt tokens (--max-len {})", len.prompt, s.max_len)));
     }
+    if s.drop_cut && len.total > s.max_len {
+        return Some(("too_long", format!("{} tokens (--max-len {})", len.total, s.max_len)));
+    }
     if row.record.messages.iter().any(|(r, c)| r == "assistant" && c.trim().is_empty()) {
         return Some(("empty_answer", String::new()));
     }
@@ -877,6 +883,16 @@ mod tests {
 
     fn words_len(r: &Row) -> Length {
         length_of(r, None, 1024).unwrap()
+    }
+
+    #[test]
+    fn drop_cut_drops_rows_the_trainer_would_cut() {
+        let mut s = settings();
+        let long = Length { prompt: 100, answer: 1000, total: 1100, fits: true };
+        let r = row("q", "a fine answer of several words", json!({}));
+        assert_eq!(check_row(&s, &r, &long), None, "kept and counted as cut by default");
+        s.drop_cut = true;
+        assert_eq!(check_row(&s, &r, &long).map(|x| x.0), Some("too_long"));
     }
 
     #[test]
