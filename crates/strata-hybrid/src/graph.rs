@@ -107,6 +107,8 @@ pub struct Graph<'a> {
     max_ctx: usize,
     /// a layer slides: chunks stay within its ring's slack
     sliding: bool,
+    /// every layer's chunk attention is the flash kernel, which keeps no table of scores
+    flash: bool,
     /// the caches' bytes on the device
     pub kv_bytes: u64,
 }
@@ -289,8 +291,9 @@ impl<'a> Graph<'a> {
         }
         let gates = looped.map_or(vec![], |l| l.gates.iter().map(|w| g.buffer(w)).collect());
         let sliding = m.layers.iter().any(|l| matches!(l.parts.first(), Some((_, Block::Attn(a))) if a.window.is_some()));
+        let flash = !g.is_native() && layers.iter().all(|l| g.has_flash(l.attn.hd));
         Ok(Graph { g, layers, kv, gates, out_norm: g.buffer(&m.out_norm), output, n_rot: rope.n_dims as u32, neox: rope.neox, max_ctx, sliding,
-                   kv_bytes })
+                   flash, kv_bytes })
     }
 
     /// How many routed experts are on the graph's device, and how many there are (for the INFO line).
@@ -378,14 +381,15 @@ impl<'a> Graph<'a> {
         self.chunks(m, st, tokens, true)
     }
 
-    /// A chunk split so that one layer's attention scores (tokens x heads x positions, f32) stay within 128 MiB.
+    /// A chunk split so that one layer's attention scores (tokens x heads x positions, f32) stay within 128 MiB (the
+    /// flash kernels keep none: their chunks are not split for it), and within a sliding layer's ring.
     fn chunks(&self, m: &Model, st: &mut State, tokens: &[u32], all: bool) -> Vec<Vec<f32>> {
         let heads = self.layers.iter().map(|l| l.attn.n_head as usize).max().unwrap_or(1);
         let mut outs = Vec::new();
         let mut i = 0;
         while i < tokens.len() {
             let mut n = tokens.len() - i;
-            while n > 1 && (n * heads * (st.pos + n) * 4 > 128 << 20 || (self.sliding && n > RING_SLACK)) {
+            while n > 1 && ((!self.flash && n * heads * (st.pos + n) * 4 > 128 << 20) || (self.sliding && n > RING_SLACK)) {
                 n /= 2;
             }
             let mut got = self.run(m, st, &tokens[i..i + n], all);
@@ -709,6 +713,64 @@ mod tests {
             // q8: the device's and the CPU's products differ in the last bits, which can move a value across a step
             let tol = if kv == KvType::Q8 { 1e-2 } else { TOL };
             assert!(d.iter().all(|&x| x < tol), "{kv:?} {d:?}");
+        }
+    }
+
+    /// A long prompt on the graph (docs/MULA-PLAN.md, Part E stage 1): a synthetic model of Qwen3-8B's shapes (4096
+    /// wide, 32 heads of 128, 8 KV heads, 12288 in the feed-forward; AM2_LONG_LAYERS layers, default 8; Q8_0) reads
+    /// AM2_LONG_TOKENS tokens (default 32768) in chunks of 128, as the server sends them, in each --kv encoding
+    /// (AM2_LONG_KV, default f16,q8,f32), then decodes 32 tokens. Prints prefill and decode tok/s, the caches' bytes and
+    /// the device memory this process holds (nvidia-smi).
+    ///   cargo test --release long_prompt -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn long_prompt_on_the_graph() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        let env = |k: &str, d: usize| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d);
+        let (n_tok, layers) = (env("AM2_LONG_TOKENS", 32768), env("AM2_LONG_LAYERS", 8));
+        let spec = Spec { arch: "qwen3", n_embd: 4096, n_head: 32, n_kv: 8, head_dim: 128, n_layer: layers, vocab: 32768, ffn: 12288,
+                          ty: "Q8_0", seed: 0x10C0, ..Spec::tiny_qwen3() };
+        let p = testgguf::tmp(&format!("long-qwen3-4096-{layers}l-q8_0"), &spec);
+        let toks: Vec<u32> = (0..n_tok).map(|i| ((i * 7919 + 13) % 32768) as u32).collect();
+        let kvs = std::env::var("AM2_LONG_KV").unwrap_or_else(|_| "f16,q8,f32".into());
+        let used = || -> String {
+            let out = std::process::Command::new("nvidia-smi").args(["--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits"]).output();
+            out.ok().and_then(|o| String::from_utf8(o.stdout).ok()).and_then(|s| s.lines().find_map(|l| {
+                let (pid, mb) = l.split_once(',')?;
+                (pid.trim().parse::<u32>().ok()? == std::process::id()).then(|| format!("{} MiB", mb.trim()))
+            })).unwrap_or_else(|| "?".into())
+        };
+        for kv in kvs.split(',') {
+            let kv = KvType::parse(kv).unwrap();
+            let (mut m, _) = Model::load(&p, None).unwrap();
+            crate::gpu::place(&mut m, &[(dev.clone(), 6 << 30)], None, 0).unwrap();
+            m.kv_type = kv;
+            let gr = Graph::new(&m, n_tok + 64).unwrap();
+            let mut st = m.new_state();
+            gr.forward_batch(&m, &mut st, &toks[..128]);
+            let mut st = m.new_state();
+            let t = std::time::Instant::now();
+            let mut logits = vec![];
+            let mut marks = vec![];
+            for (i, c) in toks.chunks(128).enumerate() {
+                logits = gr.forward_batch(&m, &mut st, c);
+                if (i + 1) * 128 % 8192 == 0 {
+                    marks.push(format!("{}K {:.0}s", (i + 1) * 128 / 1024, t.elapsed().as_secs_f64()));
+                }
+            }
+            let pre = t.elapsed().as_secs_f64();
+            let t = std::time::Instant::now();
+            let mut tok = argmax(&logits) as u32;
+            for _ in 0..32 {
+                logits = gr.forward(&m, &mut st, tok);
+                tok = argmax(&logits) as u32;
+            }
+            let dec = t.elapsed().as_secs_f64();
+            assert!(logits.iter().all(|v| v.is_finite()));
+            eprintln!("LONG kv={} layers={layers} prompt={n_tok}: prefill {:.0} tok/s ({pre:.1} s; {}), decode at {}K {:.1} tok/s; caches {:.2} GiB \
+                       ({} B/token), device memory {}", kv.name(), n_tok as f64 / pre, marks.join(", "), n_tok / 1024, 32.0 / dec,
+                      gr.kv_bytes as f64 / (1u64 << 30) as f64, gr.kv_bytes / (n_tok as u64 + 64), used());
         }
     }
 

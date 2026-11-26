@@ -1300,7 +1300,10 @@ fn kv_raw(c: &Array<u32>, row: u32, j: u32, hd: u32, #[comptime] mode: u32) -> f
     if comptime![mode == 0] {
         out = f32::reinterpret(c[i as usize]);
     } else if comptime![mode == 1] {
-        out = half_bits((c[(i / 2) as usize] >> ((i % 2) * 16)) & 0xffff);
+        // branch-free: the half's sign, exponent and mantissa moved into an f32's places, times 2^112 (exact for every
+        // finite half; a subnormal one may flush to 0 on a device that flushes f32 subnormals)
+        let h = (c[(i / 2) as usize] >> ((i % 2) * 16)) & 0xffff;
+        out = f32::reinterpret(((h & 0x8000) << 16) | ((h & 0x7fff) << 13)) * 5.192_297e33f32;
     } else {
         out = signed((c[(i / 4) as usize] >> ((i % 4) * 8)) & 0xff);
     }

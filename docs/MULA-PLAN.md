@@ -152,6 +152,63 @@ contexts, and Mula refining itself on Prastara's own tasks.
     - L5 is the engine: YaRN, sliding windows, the loop and an 8-bit tiered cache in `am2strata-hybrid` for
       qwen3.
     - L6, the needle tests, runs on the engine.
+- **Part E stage 1, the engine's long context (2026-11-26, branch `engine/long-context`):** 131K for the looped
+  Mula, and what L5 needs from the engine.
+  - **Convert:** `convert_qwen3` writes a config's YaRN as llama.cpp's keys (`rope.scaling.type` yarn, `.factor`,
+    `.original_context_length`, `.yarn_beta_fast` / `_slow`, `.attn_factor` only when the config's attention factor
+    is not YaRN's own), `context_length` the stretched length. `am2strata-workshop convert <dir> --yarn 4
+    [--yarn-original 32768]` adds YaRN to a folder that has none (Qwen's recommendation: 131,072 tokens; the default
+    original is the config's `max_position_embeddings`, at most 32,768). The `context` command's sliding layers convert
+    too: `attention.sliding_window` and the per-layer `attention.sliding_window_pattern` (true: the layer slides).
+  - **The cache, `--kv f16|f32|q8`** (f16 the default), on the CPU path (`kvcache.rs`) and the device graph
+    (strata-gpu `KvCache`): f16 is the rounding the CPU always did, now stored in half the memory; q8 is 8 bits with
+    one f32 scale per head row (amax / 127). On the graph K and V are written as f32 rows, then stored by one kernel;
+    the flash kernels and the scores/softmax/blend kernels read every encoding (`--kv f32` keeps the old cache and
+    its kernels' arithmetic).
+  - **Sliding windows** in the engine: a sliding qwen3 layer's query i sees the keys i - W < j <= i. The CPU keeps the
+    window and 256-512 tokens of slack (a rollback of prompt lookup's guesses stays exact); the graph keeps a ring of
+    W + 512 tokens, in any encoding, and reads prompts in chunks of at most 512 then.
+  - **Gates** (all green: the CPU tests, the graph tests on cuda:1, the Workshop's convert and long-context tests):
+    - The loop and MoE fixtures: the CPU's f16 cache within 6.1e-4 of an f32 cache, q8 within 1.6e-2, against the
+      Workshop's logits the same; a chunk equals token by token, bit for bit, in every encoding.
+    - The graph against the CPU in the same encoding: within 3e-4 (heads of 16, 32 and 64; f32 1e-6, q8 3e-4).
+    - A new Workshop fixture, `tiny-qwen3-long` (YaRN 4 over 32 added by `convert --yarn`; a `context` copy with YaRN 16
+      and two of its three layers over 5 tokens; 24 tokens): the engine equals the Workshop's forward pass within
+      1.9e-6 with an f32 cache (f16 9.7e-4, q8 2.7e-2), on the CPU and on the graph, token by token and in chunks.
+    - A windowed synthetic model over 1,300 tokens (the graph's ring wraps twice): the graph within 3.4e-4 of the
+      CPU (q8 2.9e-3).
+  - **Memory per token, the looped 8B** (36 layers + the loop's 12 again = 48 caches, 8 KV heads of 128):
+    | `--kv` | Per layer, K and V | Per token (48 caches) | 32K | 131K |
+    |---|---|---|---|---|
+    | f32 | 8,192 B | 384 KiB | 12 GiB | 48 GiB |
+    | f16 | 4,096 B | 192 KiB | 6 GiB | 24 GiB |
+    | q8 | 2,112 B (16 scales) | 99 KiB | 3.1 GiB | 12.4 GiB |
+
+    One 16 GB card (15.9 GiB) beside 8.1 GiB of Q8_0 weights, about 1 GiB kept for CUDA and the chunk's scratch,
+    leaves ~6.8 GiB: **~18K tokens in f32, ~37K in f16, ~72K in q8.** Without the loop's pass (36 caches) q8 fits ~96K.
+    131K in q8 needs 12.4 GiB of cache: in RAM on the CPU path it fits today; on the graph it needs the cache over two
+    cards or tiered into RAM (L5's Stara), or L2's hybrid layers (12 full caches at 131K in q8: 3.1 GiB, the windowed
+    ones 0.3 GiB, which fits one card).
+  - **A 32K prompt on the graph** (`graph.rs long_prompt_on_the_graph`, ignored; cuda:1 beside the live model): a
+    synthetic model of Qwen3-8B's shapes with 8 layers in Q8_0 (2 GB), 32,768 tokens in chunks of 128, then 32
+    decoded tokens:
+
+    | `--kv` | Prefill tok/s (8K / 16K / 24K / 32K reached at) | Decode at 32K | Caches | Device memory |
+    |---|---|---|---|---|
+    | f32 | 394 (8 / 25 / 50 / 83 s) | 83.7 tok/s | 2.04 GiB | 5.6 GB |
+    | f16 | 318 (8 / 26 / 65 / 103 s) | 62.4 tok/s | 1.00 GiB | 3.8 GB |
+    | q8 | 353 (9 / 27 / 55 / 93 s) | 65.2 tok/s | 0.52 GiB | 4.6 GB* |
+
+    *the CubeCL pool kept the f16 run's buffers. At 32K attention dominates (the speed falls from ~670 tok/s at 8K):
+    the chunk kernel reads K and V once per query token, so prompts cost N² reads. Decoding the compact caches costs
+    their unpacking (f16 first decoded with branches: 150 / 31.8 tok/s; branch-free now). For the 48-cache looped 8B
+    this predicts ~6x the time: a 32K prompt in about 10 minutes, 131K (16x the attention) in hours, until the chunk
+    kernel shares each K/V load across a tile of queries.
+  - **Not yet:** the graph's caches on more than one device or in RAM; q8 per 32-value block (llama.cpp's q8_0, more
+    accurate than a scale per 128-value row) or 4 bits; flash attention for chunks reads K and V once per query token
+    (a tile of queries sharing each K/V load, and tensor cores, would make long prompts several times faster); a
+    position-scaled engine run of the real 8B at 131K (the owner's, with the live model unloaded); export_moe still
+    refuses YaRN and sliding layers.
 - **What long training still needs (profile of the 1M copy over two cards, checkpointing on):**
   - **Estimates:** 31 GB on the busier card at 4K tokens, 98 GB at 16K, 186 GB at 32K.
   - **Where it goes:** the attention table is gone. The output head's logits for every position remain, 15 GB
