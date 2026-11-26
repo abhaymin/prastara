@@ -534,6 +534,7 @@ impl Runner {
             let grads = loss.backward()?;
             // with checkpointing, the adapters inside a recomputed block get their gradient there
             let extra = self.model.take_checkpoint_grads();
+            drop(loss);
             for (slot, var) in sum.iter_mut().zip(&self.vars) {
                 let id = var.as_tensor().id();
                 let parts = grads.get(var).into_iter().chain(extra.iter().filter(|(v, _)| v.as_tensor().id() == id).map(|(_, g)| g));
@@ -544,6 +545,9 @@ impl Runner {
                     });
                 }
             }
+            drop((grads, extra, h));
+            // the backward pass's buffers are free now: let the devices' memory pools take them back
+            self.model.synchronize()?;
         }
         // the mean gradient over the step's conversations, clipped by its norm over all adapters
         let mut norm_sq = 0.0f64;
@@ -559,6 +563,8 @@ impl Runner {
         }
         self.opt.params.lr = lr;
         self.opt.step_grads(&sum).map_err(|e| anyhow!("{e}"))?;
+        drop(sum);
+        self.model.synchronize()?;
         self.last_aux = aux_sum.map(|a| a / count as f64);
         Ok(loss_sum / count as f64)
     }

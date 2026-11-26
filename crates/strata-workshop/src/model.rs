@@ -1252,6 +1252,16 @@ impl LlamaModel {
         Self::load_parts_on(dir, base_dtype, std::slice::from_ref(dev), blocks_wanted, with_embeddings, with_head)
     }
 
+    /// Waits for every device's queued work. On CUDA that is also when the stream's memory pool gives freed blocks
+    /// back (its release threshold is 0): without it the pool only grows, and a two-GPU run of the looped Qwen3-8B
+    /// went from 13.7 to 15.8 GB a card in 20 steps, then ran out of memory at step 10 of the real run.
+    pub fn synchronize(&self) -> Result<()> {
+        for d in &self.devs {
+            d.synchronize()?;
+        }
+        Ok(())
+    }
+
     /// The whole model spread over `devs` (e.g. two GPUs): the blocks are split into equal runs in order, the first
     /// run with the embeddings on the first device, the last with the final norm and the head on the last. Hidden
     /// states move between devices, and so do their gradients.
