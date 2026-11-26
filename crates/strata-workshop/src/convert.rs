@@ -647,6 +647,12 @@ pub fn convert_with(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Opt
         }
     }
 
+    // an abliterated (private) model says so in its GGUF too, so the mark survives quantize and install
+    let raw_cfg: Json = std::fs::read_to_string(dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Json::Null);
+    for (k, v) in prastara_marks(&raw_cfg) {
+        kv.push((Box::leak(k.into_boxed_str()), v));
+    }
+
     let specs: Vec<TensorSpec> = mapped.iter().map(|m| {
         let dims: Vec<usize> = m.shape.iter().map(|&d| d as usize).collect();
         let (ggml_type, t) = tensor_type(&dims, outtype);
@@ -1034,7 +1040,34 @@ pub(crate) fn qwen3_header(dir: &Path, c: &Json, arch: &str, total_params: u64, 
     if !chat.is_empty() {
         kv.push(("tokenizer.chat_template".into(), Kv::Str(chat)));
     }
+    kv.extend(prastara_marks(c));
     Ok(kv)
+}
+
+/// The GGUF key that marks a model private: it stays on this PC (an abliterated model). `quantize` copies every key,
+/// and the server's install reads it (crates/am2strata/src/workshop.rs, kind "strata").
+pub const PRIVATE_KEY: &str = "prastara.private";
+/// The GGUF key that marks a model abliterated (its refusal direction removed): the server lists it as uncensored.
+pub const ABLITERATED_KEY: &str = "prastara.abliterated";
+
+/// The marks a folder's config.json carries into its GGUF: `"prastara_private": true` as [`PRIVATE_KEY`], and a
+/// `"prastara_abliterated"` block as [`ABLITERATED_KEY`] (true) and `prastara.abliterated.layer` / `.scale`.
+pub fn prastara_marks(c: &Json) -> Vec<(String, Kv)> {
+    let mut kv = vec![];
+    let abl = &c["prastara_abliterated"];
+    if c["prastara_private"] == true || abl.is_object() {
+        kv.push((PRIVATE_KEY.to_string(), Kv::Bool(true)));
+    }
+    if abl.is_object() {
+        kv.push((ABLITERATED_KEY.to_string(), Kv::Bool(true)));
+        if let Some(l) = abl["layer"].as_u64() {
+            kv.push((format!("{ABLITERATED_KEY}.layer"), Kv::U32(l as u32)));
+        }
+        if let Some(s) = abl["scale"].as_f64() {
+            kv.push((format!("{ABLITERATED_KEY}.scale"), Kv::F32(s as f32)));
+        }
+    }
+    kv
 }
 
 /// Whether a folder is a Qwen3ForCausalLM (`convert_qwen3`) rather than a Llama (`convert`).

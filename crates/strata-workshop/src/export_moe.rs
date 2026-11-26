@@ -23,7 +23,7 @@ use candle_core::{Device, Tensor};
 use serde_json::Value as Json;
 use strata_pack::gguf_write::{Kv, TensorSpec, Writer};
 
-use crate::convert::{loop_parts, qwen3_header, tensor_f32};
+use crate::convert::{long_context_kv, loop_parts, qwen3_header, tensor_f32};
 use crate::model::{moe_expert_stem, moe_router_name, ModelConfig, MoeSpec, Target, LOOP_FILE, MOE_TARGETS};
 use crate::quantize_gguf::{encode, resolve, type_id, type_nbytes, PureType};
 use crate::safetensors_io::{Shard, TensorDesc};
@@ -131,12 +131,22 @@ enum Source {
 /// See the module documentation. `adapter`: the folder `train` wrote on the upcycled model (None: every expert is the
 /// base feed-forward). `pre_tokenizer`: as `convert`'s, for a tokenizer whose hash is not a known one.
 pub fn export_moe(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType, pre_tokenizer: Option<&str>) -> Result<ExportReport> {
+    export_moe_with(dir, adapter, out, ty, pre_tokenizer, &mut |_, _, _| {})
+}
+
+/// [`export_moe`], calling `progress(bytes written, bytes in all, tensor)` after each tensor.
+pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType, pre_tokenizer: Option<&str>,
+                       progress: &mut dyn FnMut(u64, u64, &str)) -> Result<ExportReport> {
     let d = dir.display();
     let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("reading config for {d}"))?)?;
     let cfg = ModelConfig::from_json(&c).with_context(|| format!("{d}"))?;
     let moe = cfg.moe.ok_or_else(|| anyhow!("{d} is not an upcycled model (no prastara_moe in config.json): run `am2strata-workshop upcycle` on it first"))?;
-    if cfg.yarn.is_some() || cfg.layer_sliding.iter().any(|s| *s) {
-        bail!("{d}: YaRN positions or sliding-window layers: the engine's long-context path is not written yet");
+    // long context (the `context` copy, or a base with YaRN in its config): the keys convert_qwen3 writes
+    let yarn = cfg.yarn.map(|y| (y, cfg.max_position_embeddings));
+    if let Some((y, _)) = &yarn {
+        if !y.truncate {
+            bail!("{d}: rope_scaling yarn with truncate false: the engine rounds the ramp's ends as llama.cpp does");
+        }
     }
     let (h, ff, layers, e_n) = (cfg.hidden_size, cfg.intermediate_size, cfg.num_hidden_layers, moe.experts);
     let arch = "qwen3moe";
@@ -216,6 +226,8 @@ pub fn export_moe(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType
     kv.push((format!("{arch}.expert_used_count"), Kv::U32(moe.top_k as u32)));
     kv.push((format!("{arch}.expert_feed_forward_length"), Kv::U32(ff as u32)));
     kv.extend(loop_kv);
+    kv.extend(long_context_kv(arch, yarn, &cfg.layer_sliding, cfg.sliding_window));
+    // the config's max_position_embeddings is the stretched length already (convert_qwen3 does the same)
 
     // each tensor's type: 1-D and the routers F32 (llama.cpp never quantizes ffn_gate_inp), the rest the target,
     // demoted by its row length as `llama-quantize --pure` does
@@ -231,18 +243,21 @@ pub fn export_moe(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType
         std::fs::create_dir_all(p)?;
     }
     let partial = out.with_extension("gguf.part");
+    let all_bytes: u64 = specs.iter().map(|t| t.nbytes).sum();
+    let sizes: Vec<u64> = specs.iter().map(|t| t.nbytes).collect();
+    let mut done_bytes = 0u64;
     let mut w = Writer::create_typed(&partial, &kv_ref, specs)?;
     let base = |i: usize, t: &TensorDesc| tensor_f32(&shards[i], t, &files[i]);
-    for (g, shape, src) in &plan {
+    for (k, (g, shape, src)) in plan.iter().enumerate() {
         let t = type_of(g, shape);
         match src {
-            Source::Plain(i, desc) => w.tensor_data(&encode(&base(*i, desc)?, t))?,
+            Source::Plain(i, desc) => w.tensor_data(&encode_par(&base(*i, desc)?, t, *desc.shape().last().unwrap_or(&0)))?,
             Source::Attn(i, desc, stem) => {
                 let mut v = base(*i, desc)?;
                 if let Some(a) = &ad {
                     a.fold(stem, &mut v, desc.shape()[0], desc.shape()[1])?;
                 }
-                w.tensor_data(&encode(&v, t))?;
+                w.tensor_data(&encode_par(&v, t, desc.shape()[1]))?;
             }
             Source::Router(b) => {
                 let v = match &ad {
@@ -266,17 +281,43 @@ pub fn export_moe(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType
                             bail!("block {b} has a router in the adapter but expert {e} has no {} adapter", MOE_TARGETS[*role].as_str());
                         }
                     }
-                    w.tensor_data(&encode(&v, t))?;
+                    w.tensor_data(&encode_par(&v, t, inn))?;
                 }
             }
             Source::Values(v) => w.tensor_data(&encode(v, t))?,
         }
         w.end_tensor()?;
+        done_bytes += sizes[k];
+        progress(done_bytes, all_bytes, g);
     }
     w.finish()?;
     std::fs::rename(&partial, out).with_context(|| format!("moving the finished file to {}", out.display()))?;
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
     Ok(ExportReport { out: out.to_path_buf(), moe, total_params: total, active_params: active, trained_blocks: trained, bytes })
+}
+
+/// [`encode`] with the rows split over the CPUs: block quantizers work row by row (a row's blocks never depend on
+/// another row), so the bytes are the same as one thread's. `cols`: the row length. Small tensors stay on one thread.
+pub fn encode_par(v: &[f32], ty: &str, cols: usize) -> Vec<u8> {
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let rows = if cols == 0 { 0 } else { v.len() / cols };
+    if threads <= 1 || v.len() < (1 << 22) || cols == 0 || rows * cols != v.len() || ty == "F32" {
+        return encode(v, ty);
+    }
+    let per = rows.div_ceil(threads) * cols;
+    let parts: Vec<Vec<u8>> = std::thread::scope(|sc| {
+        let hs: Vec<_> = v.chunks(per).map(|c| sc.spawn(move || encode(c, ty))).collect();
+        hs.into_iter().map(|h| h.join().expect("an encoding thread")).collect()
+    });
+    parts.concat()
+}
+
+/// What an export needs, before it runs: the file, and the memory (one base matrix as f32, one expert's copy of it,
+/// their encoded bytes, the adapter's largest pair widened, and the threads' share).
+pub fn export_needs(cfg: &ModelConfig, ty: ExportType, adapter_bytes: u64) -> Result<(u64, u64)> {
+    let disk = export_bytes(cfg, ty)?;
+    let mat = (cfg.intermediate_size.max(cfg.vocab_size) * cfg.hidden_size) as u64 * 4;
+    Ok((disk, 3 * mat + adapter_bytes + (256 << 20)))
 }
 
 /// The exported file's size for `cfg` (an upcycled config) at `ty`, before writing it: what the UI and the disk check

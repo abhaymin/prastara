@@ -205,3 +205,85 @@ fn the_whole_run_from_text_prompts_with_a_check() {
     let _ = std::fs::remove_dir_all(&src);
     let _ = std::fs::remove_dir_all(&out);
 }
+
+#[test]
+fn the_private_mark_survives_convert_and_quantize() {
+    // a Qwen3 (convert_qwen3, the path the real model takes) and a Llama (the other converter)
+    for (name, tag) in [("tiny-qwen3-hf", "mark-qwen3"), ("tiny-llama-hf", "mark-llama")] {
+        let src = fixture(name);
+        let hidden = strata_workshop::model::ModelConfig::load(&src).unwrap().hidden_size;
+        let r: Vec<f32> = { let v: Vec<f32> = (0..hidden).map(|i| ((i * 7 % 5) as f32) - 2.0).collect(); let n = v.iter().map(|x| x * x).sum::<f32>().sqrt(); v.iter().map(|x| x / n).collect() };
+        let out = scratch(tag);
+        orthogonalize(&src, &out, &r, 1.0, serde_json::json!({"layer": 1, "scale": 1.0}), st_writer::SHARD_BYTES).unwrap();
+        let tok = fixture("tiny-llama-hf");
+        for f in ["tokenizer.json", "tokenizer_config.json"] {
+            if !out.join(f).exists() {
+                std::fs::copy(tok.join(f), out.join(f)).unwrap();
+            }
+        }
+        let gguf = out.join("model.f32.gguf");
+        strata_workshop::convert::convert(&out, &gguf, strata_workshop::convert::OutType::F32, Some("gpt-2")).unwrap();
+        let q8 = out.join("model.q8_0.gguf");
+        strata_workshop::quantize_gguf::quantize(&gguf, &q8, strata_workshop::quantize_gguf::PureType::from_s("q8_0").unwrap()).unwrap();
+        for f in [&gguf, &q8] {
+            let g = strata_gguf::Gguf::open(f).unwrap();
+            assert_eq!(g.metadata.get(strata_workshop::convert::PRIVATE_KEY), Some(&serde_json::json!(true)), "{name}: {}", f.display());
+            assert_eq!(g.metadata.get(strata_workshop::convert::ABLITERATED_KEY), Some(&serde_json::json!(true)), "{name}: {}", f.display());
+            assert_eq!(g.u64("prastara.abliterated.layer"), Some(1));
+        }
+        // the source model carries no mark
+        let plain = scratch(&format!("{tag}-plain"));
+        std::fs::create_dir_all(&plain).unwrap();
+        let pg = plain.join("plain.gguf");
+        let srcdir = if name == "tiny-qwen3-hf" { let d = scratch(&format!("{tag}-src")); std::fs::create_dir_all(&d).unwrap();
+            for e in std::fs::read_dir(&src).unwrap().flatten() { std::fs::copy(e.path(), d.join(e.file_name())).unwrap(); }
+            for f in ["tokenizer.json", "tokenizer_config.json"] { std::fs::copy(tok.join(f), d.join(f)).unwrap(); } d } else { src.clone() };
+        strata_workshop::convert::convert(&srcdir, &pg, strata_workshop::convert::OutType::F32, Some("gpt-2")).unwrap();
+        assert!(strata_gguf::Gguf::open(&pg).unwrap().metadata.get(strata_workshop::convert::PRIVATE_KEY).is_none());
+        for d in [out, plain] {
+            let _ = std::fs::remove_dir_all(d);
+        }
+        if name == "tiny-qwen3-hf" {
+            let _ = std::fs::remove_dir_all(srcdir);
+        }
+    }
+}
+
+#[test]
+fn harmless_prompts_come_from_our_own_chat_data() {
+    let d = scratch("harvest");
+    std::fs::create_dir_all(d.join("sub")).unwrap();
+    let rec = |u: &str| serde_json::json!({"messages": [{"role": "system", "content": "be kind"}, {"role": "user", "content": u}, {"role": "assistant", "content": "ok"}]}).to_string();
+    std::fs::write(d.join("a.jsonl"), [rec("Explain how a\nrainbow forms."), rec("नमस्ते, आप कैसे हैं? मुझे बताइए"), rec("Explain how a rainbow forms."), rec("hi")].join("\n")).unwrap();
+    std::fs::write(d.join("sub/b.jsonl"), [rec("Write a Rust function that adds two numbers."), rec("List four fruits that are yellow."), "not json".into()].join("\n")).unwrap();
+    let all = abliterate::harvest_prompts(&[d.clone()], 100, 300, false).unwrap();
+    assert_eq!(all, vec!["Explain how a rainbow forms.", "Write a Rust function that adds two numbers.", "नमस्ते, आप कैसे हैं? मुझे बताइए", "List four fruits that are yellow."],
+               "newlines folded, duplicates and too-short ones dropped, the files taken in turn");
+    let latin = abliterate::harvest_prompts(&[d.clone()], 2, 300, true).unwrap();
+    assert_eq!(latin, vec!["Explain how a rainbow forms.", "Write a Rust function that adds two numbers."]);
+    // a .jsonl list is read the same way by abliterate
+    assert_eq!(abliterate::read_prompt_list(&d.join("sub/b.jsonl")).unwrap().len(), 2);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn the_estimate_counts_the_real_looped_8b() {
+    // the Mula base: Qwen3-8B, blocks 12..24 looped twice, untied head, bf16
+    let cfg = strata_workshop::model::ModelConfig::from_json(&serde_json::json!({
+        "architectures": ["Qwen3ForCausalLM"], "model_type": "qwen3", "hidden_size": 4096, "intermediate_size": 12288, "num_hidden_layers": 36,
+        "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "vocab_size": 151936, "rms_norm_eps": 1e-6, "rope_theta": 1000000,
+        "max_position_embeddings": 40960, "tie_word_embeddings": false, "prastara_loop": {"start": 12, "end": 24, "passes": 2}})).unwrap();
+    let src = 16_381_470_720u64;
+    let cpu = abliterate::estimate(&cfg, BaseDtype::BF16, 0, 976, 21, 32, 24, src);
+    assert_eq!(cpu.sites, 48, "36 blocks and the 12 looped ones once more");
+    assert!((16.0e9..16.8e9).contains(&(cpu.model_bytes as f64)), "{}", cpu.model_bytes);
+    assert!(cpu.ram_bytes > cpu.model_bytes && cpu.ram_bytes < 24_000_000_000, "{}", cpu.ram_bytes);
+    assert_eq!(cpu.card_bytes, 0);
+    let gpu = abliterate::estimate(&cfg, BaseDtype::BF16, 2, 976, 21, 32, 24, src);
+    assert!(gpu.card_bytes < 14_000_000_000 && gpu.card_bytes > gpu.model_bytes / 2, "{}", gpu.card_bytes);
+    assert!(gpu.ram_bytes < 6_000_000_000, "the GPUs hold the model: {}", gpu.ram_bytes);
+    assert_eq!(gpu.disk_bytes, src);
+    // the check (no cache) costs more than reading the prompts
+    let no_check = abliterate::estimate(&cfg, BaseDtype::BF16, 2, 976, 21, 0, 24, src);
+    assert!(gpu.flops > 2.0 * no_check.flops);
+}

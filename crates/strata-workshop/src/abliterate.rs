@@ -1,6 +1,7 @@
 //! Abliteration: remove the direction a model writes into its residual stream when it is about to refuse.
 //!
-//! 1. **Capture.** Each prompt (one per line, wrapped in the model's chat template up to where the answer starts) is run
+//! 1. **Capture.** Each prompt (one per line, wrapped in the model's chat template up to where the answer starts, with
+//!    the template's `enable_thinking` false so a Qwen3 opens its answer at once rather than its thinking) is run
 //!    through the model; the residual stream at the last prompt token is kept after every block, and after every block
 //!    of each extra pass of an Avarta loop ([`LlamaModel::residuals`]). Each such place is a *site*.
 //! 2. **Direction.** Per site, r = mean(harmful) − mean(harmless), normalised. Its *separation* is the gap between the
@@ -480,7 +481,7 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Value)) -> Result<Report> {
     let check_tokens = o.check_tokens.clamp(1, 24);
     let cfg = ModelConfig::load(&o.model)?;
     let tok = ChatTokenizer::load(&o.model, None)?;
-    let enc = |list: &[String]| -> Result<Vec<(String, Vec<u32>)>> { list.iter().map(|p| Ok((p.clone(), tok.prompt_ids(p)?))).collect() };
+    let enc = |list: &[String]| -> Result<Vec<(String, Vec<u32>)>> { list.iter().map(|p| Ok((p.clone(), tok.prompt_ids_answering(p)?))).collect() };
     let (harmful, harmless) = (enc(&o.harmful)?, enc(&o.harmless)?);
     let need = 2 + o.check;
     if harmful.len() < need || harmless.len() < need {
@@ -534,6 +535,157 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Value)) -> Result<Report> {
         None
     };
     Ok(Report { chosen, scores, ortho, before, after })
+}
+
+/// What a run needs, before it starts (printed first, as `profile` does for training).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Estimate {
+    /// the model as held while reading (all of it: on the CPU, or split over the GPUs)
+    pub model_bytes: u64,
+    /// RAM: the model on a CPU run, the residuals of every prompt at every site, and while writing the largest
+    /// tensor as f32 with its encoded copy (the source is mapped, a tensor at a time)
+    pub ram_bytes: u64,
+    /// on a GPU run: the busiest card (its blocks, the embeddings or head, a widened matrix and the logits) plus
+    /// [`crate::profile::CUDA_OVERHEAD_BYTES`]
+    pub card_bytes: u64,
+    /// the output folder: every tensor as stored (an untied head once more)
+    pub disk_bytes: u64,
+    /// sites read per prompt: blocks, plus the loop's blocks once per extra pass
+    pub sites: usize,
+    /// floating-point operations: reading every prompt, and the check's answers (no attention cache, so each new token
+    /// runs the whole sequence again) on the original and the abliterated model
+    pub flops: f64,
+}
+
+/// The estimate for `cfg` with `prompts` prompts of about `prompt_tokens` tokens each (template included), `check`
+/// held-out prompts of each list answered with `check_tokens` new tokens, on `devices` GPUs (0: the CPU), the base
+/// held as `dtype`. `source_bytes`: the checkpoint's weights on disk.
+pub fn estimate(cfg: &ModelConfig, dtype: BaseDtype, devices: usize, prompts: usize, prompt_tokens: usize, check: usize, check_tokens: usize, source_bytes: u64) -> Estimate {
+    let (h, vocab) = (cfg.hidden_size as u64, cfg.vocab_size as u64);
+    let sites = cfg.num_hidden_layers + cfg.loop_.map_or(0, |l| (l.passes - 1) * (l.end - l.start));
+    let emb = vocab * h;
+    let matrices = cfg.total_params() - cfg.num_hidden_layers as u64 * cfg.block_small_params() - h;
+    let model = matrices * dtype.bytes() + (cfg.num_hidden_layers as u64 * cfg.block_small_params() + h) * 4;
+    let residuals = (prompts * sites) as u64 * h * 4;
+    let seq = (prompt_tokens + check_tokens) as u64;
+    // one forward pass: the logits of the whole sequence as f32, a block's activations, and a widened matrix
+    let largest = (cfg.intermediate_size as u64 * h).max(emb);
+    let widen = if dtype == BaseDtype::F32 { 0 } else { largest.min(64 << 20) * 4 };
+    let forward = seq * vocab * 4 * 2 + seq * (cfg.intermediate_size as u64 * 4 + h * 12) * 4 + widen;
+    let write = emb * 4 + emb * dtype.bytes().max(2);
+    let ram = if devices == 0 { model + forward } else { 0 } + residuals + write.max(if devices == 0 { 0 } else { forward });
+    let card = if devices == 0 { 0 } else {
+        let blocks = model - emb * dtype.bytes() * if cfg.tie_word_embeddings { 1 } else { 2 };
+        blocks / devices as u64 + emb * dtype.bytes() + forward + crate::profile::CUDA_OVERHEAD_BYTES
+    };
+    let disk = source_bytes + if cfg.tie_word_embeddings { emb * dtype.bytes() } else { 0 };
+    let per_token = 2.0 * (cfg.total_params() - emb) as f64 + 2.0 * (sites.saturating_sub(cfg.num_hidden_layers)) as f64 * (cfg.block_params() as f64);
+    let read = prompts as f64 * prompt_tokens as f64 * per_token;
+    // an answer of n tokens without a cache runs sequences of prompt + 1 .. prompt + n tokens
+    let answer: f64 = (1..=check_tokens).map(|t| (prompt_tokens + t) as f64).sum::<f64>() * per_token;
+    let checked = 2.0 * (2 * check) as f64 * answer;
+    Estimate { model_bytes: model, ram_bytes: ram, card_bytes: card, disk_bytes: disk, sites, flops: read + checked }
+}
+
+impl Estimate {
+    /// Readable lines, with the time on this CPU (`cpu_gflops`, measured) or on the GPUs (the trainer's measured speed).
+    pub fn lines(&self, devices: usize, cpu_gflops: f64) -> Vec<String> {
+        use crate::profile::{human_bytes, human_seconds, ASSUMED_GPU_GFLOPS};
+        let mut out = vec![format!("{} sites a prompt (blocks, and the loop's blocks again per extra pass); the model as held: {}", self.sites, human_bytes(self.model_bytes))];
+        if devices == 0 {
+            out.push(format!("memory: about {} of RAM (the model, the residuals, writing the largest tensor)", human_bytes(self.ram_bytes)));
+            out.push(format!("time: about {} on this CPU ({cpu_gflops:.0} GFLOP/s measured, 60 % reached)", human_seconds(self.flops / (cpu_gflops.max(0.01) * 0.6 * 1e9))));
+        } else {
+            out.push(format!("memory: about {} on the busiest of {devices} GPU(s) (with {} for CUDA itself), {} of RAM", human_bytes(self.card_bytes),
+                             human_bytes(crate::profile::CUDA_OVERHEAD_BYTES), human_bytes(self.ram_bytes)));
+            out.push(format!("time: about {} on the GPUs ({ASSUMED_GPU_GFLOPS:.0} GFLOP/s, the trainer's measured speed)", human_seconds(self.flops / (ASSUMED_GPU_GFLOPS * 1e9))));
+        }
+        out.push(format!("disk: about {} for the output folder", human_bytes(self.disk_bytes)));
+        out
+    }
+
+    pub fn to_json(&self) -> Value {
+        json!({"model_bytes": self.model_bytes, "ram_bytes": self.ram_bytes, "card_bytes": self.card_bytes, "disk_bytes": self.disk_bytes,
+               "sites": self.sites, "flops": self.flops})
+    }
+}
+
+/// The prompts of a list file: a `.txt` (one per line) or a chat `.jsonl` (each record's first user message; see
+/// [`harvest_prompts`]).
+pub fn read_prompt_list(path: &Path) -> Result<Vec<String>> {
+    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        harvest_prompts(&[path.to_path_buf()], usize::MAX, 400, false)
+    } else {
+        read_prompts(path)
+    }
+}
+
+/// Ordinary prompts from our own chat data, for the harmless list (no download): the first user message of each
+/// `{"messages": [...]}` record of the `.jsonl` files given (or found in the folders given), at most `max_chars`
+/// long, newlines folded to spaces, duplicates dropped, taken in turn from each file so no one source dominates, at
+/// most `max` in all. `latin`: only prompts that are almost all ASCII (to match an English harmful list: the direction
+/// is a difference of means, so a language difference between the two lists would be read as "refusal").
+pub fn harvest_prompts(paths: &[PathBuf], max: usize, max_chars: usize, latin: bool) -> Result<Vec<String>> {
+    let mut files = Vec::new();
+    for p in paths {
+        if p.is_dir() {
+            let mut found: Vec<PathBuf> = walk_jsonl(p);
+            found.sort();
+            files.extend(found);
+        } else {
+            files.push(p.clone());
+        }
+    }
+    if files.is_empty() {
+        bail!("no .jsonl files in {:?}", paths);
+    }
+    let mut per: Vec<Vec<String>> = Vec::new();
+    for f in &files {
+        let text = std::fs::read_to_string(f).with_context(|| format!("{}", f.display()))?;
+        let mut got = Vec::new();
+        for line in text.lines() {
+            let Ok(v) = serde_json::from_str::<Value>(line) else { continue };
+            let first = v["messages"].as_array().and_then(|m| m.iter().find(|x| x["role"] == "user")).and_then(|x| x["content"].as_str());
+            let Some(t) = first else { continue };
+            let t = t.split_whitespace().collect::<Vec<_>>().join(" ");
+            let n = t.chars().count();
+            if n < 8 || n > max_chars {
+                continue;
+            }
+            if latin && (t.chars().filter(|c| c.is_ascii()).count() as f64) < 0.97 * n as f64 {
+                continue;
+            }
+            got.push(t);
+        }
+        per.push(got);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while out.len() < max && per.iter().any(|v| i < v.len()) {
+        for v in &per {
+            if let Some(t) = v.get(i) {
+                if out.len() < max && seen.insert(t.to_lowercase()) {
+                    out.push(t.clone());
+                }
+            }
+        }
+        i += 1;
+    }
+    Ok(out)
+}
+
+fn walk_jsonl(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_jsonl(&p));
+        } else if p.extension().and_then(|x| x.to_str()) == Some("jsonl") {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// A few harmless prompts, for tests and a first try (the harmful list is the person's own file).

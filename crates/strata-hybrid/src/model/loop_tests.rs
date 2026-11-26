@@ -127,6 +127,17 @@ mod moe {
     }
 
     #[test]
+    fn a_long_context_moe_slides_and_stretches_its_positions() {
+        // the Workshop's `context` copy (YaRN 512 over 32, layers 0 and 1 sliding over 5 of the 8 tokens) upcycled to
+        // 4 experts top-2 and exported with export-moe's rope.scaling.* and sliding_window keys
+        let (m, want) = load("moe-long.f32.gguf");
+        assert_eq!(m.arch, "qwen3moe");
+        let long = rows(&want["moe_long"]);
+        assert!(max_diff(&long, &rows(&want["moe"])) > 1e-3, "the window and positions change the logits");
+        check(&m, &tokens(&want), &long, TOL, "long context, 4 experts top-2");
+    }
+
+    #[test]
     fn the_untrained_export_is_the_dense_base() {
         let (m, want) = load("init.f32.gguf");
         check(&m, &tokens(&want), &rows(&want["base"]), TOL, "untrained, 4 experts top-1");
