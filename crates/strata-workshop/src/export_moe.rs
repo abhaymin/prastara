@@ -316,8 +316,12 @@ pub fn encode_par(v: &[f32], ty: &str, cols: usize) -> Vec<u8> {
 /// their encoded bytes, the adapter's largest pair widened, and the threads' share).
 pub fn export_needs(cfg: &ModelConfig, ty: ExportType, adapter_bytes: u64) -> Result<(u64, u64)> {
     let disk = export_bytes(cfg, ty)?;
-    let mat = (cfg.intermediate_size.max(cfg.vocab_size) * cfg.hidden_size) as u64 * 4;
-    Ok((disk, 3 * mat + adapter_bytes + (256 << 20)))
+    let h = cfg.hidden_size as u64;
+    // the embeddings (or the head) as f32 with their encoded bytes, or a feed-forward matrix, an expert's copy and its
+    // LoRA product, whichever is more
+    let emb = cfg.vocab_size as u64 * h * (4 + 4);
+    let ffn = 3 * cfg.intermediate_size as u64 * h * 4;
+    Ok((disk, emb.max(ffn) + adapter_bytes + (256 << 20)))
 }
 
 /// The exported file's size for `cfg` (an upcycled config) at `ty`, before writing it: what the UI and the disk check

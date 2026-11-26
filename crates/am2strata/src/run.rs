@@ -417,6 +417,16 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             tracing::info!(model = %loaded.entry.id, "memory: {moved} older message(s) moved to the conversation's archive to fit the context");
         }
     }
+    // an uncensored (abliterated) model: the minor-safety check reads the request first, and the reply as it is written
+    let mut guard = if crate::minor_safety::applies(&loaded.entry.id, &loaded.entry.cfg) {
+        if let Some(why) = crate::minor_safety::check(&crate::minor_safety::request_text(&prep.messages)) {
+            tracing::warn!(model = %loaded.entry.id, "minor-safety check: the request was refused ({why})");
+            return Err(Refusal::bad(crate::minor_safety::REFUSAL));
+        }
+        Some(crate::minor_safety::Watch::new(&crate::minor_safety::last_user_text(&prep.messages)))
+    } else {
+        None
+    };
     let mut prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
     let mut ids = prompt.ids.clone();
     let mut items = image_items(&prep.messages);
@@ -625,6 +635,14 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                         other => other,
                     };
                     if let Event::Content(t) | Event::Reasoning(t) = &out {
+                        if guard.as_mut().is_some_and(|g| g.push(t)) {
+                            // the minor-safety check: this piece is not sent, and the reply ends here (the engine is
+                            // told to STOP when the caller returns)
+                            tracing::warn!(model = %lc.entry.id, "minor-safety check: the reply was stopped");
+                            let _ = tx.send(RunEvent::Error(crate::minor_safety::REFUSAL.to_string())).await;
+                            alive = false;
+                            break;
+                        }
                         tail = format!("{tail}{t}").chars().rev().take(2).collect::<Vec<_>>().into_iter().rev().collect();
                     }
                     match &out {

@@ -1100,7 +1100,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             let (need, ram) = export_needs(&cfg, t, adapter.as_ref().map_or(0, |a| size_of(a))).map_err(|e| format!("{}: {e}", model.display()))?;
             let free = disk_free(dst);
             let mut lines = vec![format!("the file: about {} ({ty}), written one tensor at a time (no larger file first)", human(need)),
-                                 format!("memory: about {} (one feed-forward matrix as f32, an expert's copy, the adapter)", human(ram))];
+                                 format!("memory: about {} (the embeddings as f32 and encoded, or a feed-forward matrix, an expert's copy and its LoRA product; the adapter)", human(ram))];
             if let Some(f) = free {
                 lines.push(format!("{} is free on the disk it goes to{}", human(f), if f < need + (1 << 30) { ": NOT ENOUGH" } else { "" }));
             }

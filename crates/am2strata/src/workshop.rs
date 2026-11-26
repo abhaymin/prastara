@@ -40,6 +40,9 @@
 //! - `POST /v1/workshop/uploads?name=notes.pdf` (the file as the body) saves a document into `<data>/workshop/uploads`.
 //! - `GET /v1/workshop/dataset?path=…&offset=&limit=` pages through a dataset's records (with its card);
 //!   `POST /v1/workshop/dataset` `{"path", "remove": [i, …], "replace": {"i": record}}` edits it in place.
+//! - `POST /v1/workshop/estimate` with a train request: `am2strata-workshop profile`'s estimate; with an abliterate,
+//!   upcycle or export-moe request (the job's own fields): its command's `--estimate` (`{"event": "estimate", "kind",
+//!   "lines", ...}`: memory, disk, time, and for upcycle the training need on this machine's cards).
 //! - `GET /v1/workshop/jobs` lists jobs, `GET /v1/workshop/jobs/{id}` one (with its log), `DELETE` cancels.
 //! - `GET /v1/workshop/files` lists the models and adapters the Workshop may use, for its pickers.
 //! - `GET /v1/workshop/library` lists the model library's recipes (abilities, and whether the Workshop trains each);
@@ -63,6 +66,9 @@ use serde_json::{json, Value};
 use crate::{authorized, error, AppState};
 
 const KINDS: [&str; 12] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen", "regress", "grade-train"];
+
+/// The job kinds `POST /v1/workshop/estimate` estimates with their own command's `--estimate` (train uses `profile`).
+const ESTIMATED: [&str; 3] = ["abliterate", "upcycle", "export-moe"];
 
 /// What `export-moe` writes as: the converter's two float types and the quantizer's.
 const EXPORT_TYPES: [&str; 7] = ["q4_k", "q8_0", "q6_k", "q5_k", "q4_0", "f16", "f32"];
@@ -123,6 +129,37 @@ static WORKSHOP: std::sync::OnceLock<Arc<Workshop>> = std::sync::OnceLock::new()
 
 pub fn get() -> Option<Arc<Workshop>> {
     WORKSHOP.get().cloned()
+}
+
+/// The Workshop's marks in a GGUF's metadata (strata-workshop convert.rs `PRIVATE_KEY`, `ABLITERATED_KEY`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Marks {
+    pub private: bool,
+    pub abliterated: bool,
+}
+
+pub fn marks_of(g: &strata_gguf::Gguf) -> Marks {
+    let on = |k: &str| g.metadata.get(k) == Some(&Value::Bool(true));
+    Marks { private: on("prastara.private") || on("prastara.abliterated"), abliterated: on("prastara.abliterated") }
+}
+
+/// [`marks_of`] for a file (none when it cannot be read: the install then fails on it with its own message).
+pub fn gguf_marks(path: &Path) -> Marks {
+    strata_gguf::Gguf::open(path).map(|g| marks_of(&g)).unwrap_or_default()
+}
+
+/// The run config of an installed model gets the marks: `"private": true` (it stays on this PC) and, for an
+/// abliterated one, `"uncensored": true` and `"abliterated": true`; the minor-safety check applies to both
+/// (crate::minor_safety).
+fn mark_config(path: &Path, m: &Marks) -> Result<(), String> {
+    let mut cfg: Value = std::fs::read_to_string(path).ok().and_then(|t| serde_json::from_str(&t).ok())
+        .ok_or_else(|| format!("{}: the run config just written cannot be read", path.display()))?;
+    cfg["private"] = json!(true);
+    if m.abliterated {
+        cfg["uncensored"] = json!(true);
+        cfg["abliterated"] = json!(true);
+    }
+    std::fs::write(path, serde_json::to_string_pretty(&cfg).unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
 /// A file or folder's name without its extension, for default output names.
@@ -570,9 +607,14 @@ impl Workshop {
             "strata" => {
                 let input = self.allowed(s("input").ok_or("strata needs \"input\": a .gguf")?, true)?;
                 let file = input.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf");
-                let id = s("name").map(strata_hub::config::id_of).unwrap_or_else(|| strata_hub::config::id_of(file));
+                let mut id = s("name").map(strata_hub::config::id_of).unwrap_or_else(|| strata_hub::config::id_of(file));
                 if id.is_empty() {
                     return Err("\"name\" has no letters or digits".into());
+                }
+                // an abliterated model (the Workshop's prastara.abliterated / prastara.private marks) is named so
+                let marks = gguf_marks(&input);
+                if marks.abliterated && !id.contains("abliterated") {
+                    id = format!("{id}-abliterated");
                 }
                 let cfg = self.models_dir.join(format!("strata-{id}.json"));
                 if cfg.exists() && req["overwrite"] != true {
@@ -792,9 +834,15 @@ impl Workshop {
                 let display = if args[2].is_empty() {
                     g.metadata.get("general.name").and_then(|v| v.as_str()).map(str::to_string).unwrap_or_else(|| args[1].clone())
                 } else { args[2].clone() };
+                let marks = marks_of(&g);
+                let display = if marks.abliterated && !display.to_lowercase().contains("abliterated") { format!("{display} (abliterated)") } else { display };
                 let w = strata_hub::config::write(&models, &packs, &gguf, &g, None, None, &args[1], &display)?;
+                if marks.private || marks.abliterated {
+                    mark_config(&w.config, &marks)?;
+                }
                 Ok(json!({"output": w.config.display().to_string(), "kind": "run-config", "model": args[1], "architecture": arch,
-                          "tokenizer": w.tokenizer.display().to_string(), "display_name": display}))
+                          "tokenizer": w.tokenizer.display().to_string(), "display_name": display,
+                          "private": marks.private, "uncensored": marks.abliterated}))
             }).await.unwrap_or_else(|e| Err(e.to_string()));
             self.update(id, |j| {
                 j.finished_at = Some(now());
@@ -802,6 +850,9 @@ impl Workshop {
                     Ok(v) => {
                         j.log.push(format!("{} is installed ({}): pick it in the model list to load it",
                                            v["model"].as_str().unwrap_or(""), v["architecture"].as_str().unwrap_or("")));
+                        if v["private"] == true {
+                            j.log.push("it is marked private and uncensored (an abliterated model stays on this PC), and every chat with it goes through the minor-safety check".into());
+                        }
                         j.result = Some(v);
                         j.state = "done";
                     }
@@ -885,6 +936,12 @@ impl Workshop {
                         }
                     }
                     Some("done") => j.result = Some(ev.clone()),
+                    // what the run needs, said first (abliterate)
+                    Some("estimate") => {
+                        for l in ev["lines"].as_array().into_iter().flatten() {
+                            j.log.push(l.as_str().unwrap_or("").to_string());
+                        }
+                    }
                     // abliterate: the layer score table (kept in full for the form) and the refusal checks
                     Some("layers") => {
                         j.log.push(ev["message"].as_str().unwrap_or("").to_string());
@@ -1153,6 +1210,36 @@ pub async fn estimate_post(State(s): State<AppState>, headers: HeaderMap, Json(r
         return crate::not_own_page("training can be estimated");
     }
     if let Some(r) = library_missing() { return r; }
+    // abliterate, upcycle and export-moe: the job's own command with --estimate (memory, disk, time; for upcycle the
+    // training it takes on this machine's cards), before anything runs
+    if let Some(kind) = req["kind"].as_str().filter(|k| ESTIMATED.contains(k)) {
+        // an estimate writes nothing: a default output that exists already (an earlier copy) does not stop it
+        let mut req = req.clone();
+        if req["output"].as_str().is_none_or(|o| o.is_empty()) {
+            let ext = if kind == "export-moe" { ".gguf" } else { "" };
+            req["output"] = json!(Workshop::fresh(&w.out_dir, "estimate-only", ext).display().to_string());
+        }
+        let (_, mut args, _) = match w.plan(&req) {
+            Ok(p) => p,
+            Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+        };
+        args.push("--estimate".into());
+        let o = match tokio::process::Command::new(exe().unwrap_or_default()).arg("--json").args(&args).output().await {
+            Ok(o) => o,
+            Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("am2strata-workshop: {e}")),
+        };
+        let events: Vec<Value> = String::from_utf8_lossy(&o.stdout).lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+        if let Some(e) = events.iter().find(|e| e["event"] == "error") {
+            return error(StatusCode::BAD_REQUEST, "invalid_request_error", e["message"].as_str().unwrap_or("the estimate failed").to_string());
+        }
+        return match events.into_iter().find(|e| e["event"] == "estimate") {
+            Some(mut v) => {
+                v["gpu"] = json!(kind == "abliterate" && Workshop::train_on_gpu(&req));
+                Json(v).into_response()
+            }
+            None => error(StatusCode::BAD_REQUEST, "invalid_request_error", String::from_utf8_lossy(&o.stderr).trim().to_string()),
+        };
+    }
     let args = match w.train_args(&req) {
         Ok(a) => a,
         Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),

@@ -151,6 +151,11 @@ fn jobs_run_one_at_a_time_report_cancel_and_stay_inside_their_folders() {
 
 /// A small but complete llama GGUF: the metadata and BPE tokenizer an engine needs (tokens, types, merges, bos/eos).
 fn small_llama_gguf(path: &std::path::Path) {
+    small_llama_gguf_with(path, &[])
+}
+
+/// [`small_llama_gguf`] with boolean keys added (the Workshop's prastara.* marks).
+fn small_llama_gguf_with(path: &std::path::Path, marks: &[(&str, bool)]) {
     use strata_pack::gguf_write::{Kv, TensorSpec, Writer};
     let tokens: Vec<String> = ["<s>", "</s>", "t", "o", "to", "a"].iter().map(|s| s.to_string()).collect();
     let kv: Vec<(&str, Kv)> = vec![
@@ -164,6 +169,8 @@ fn small_llama_gguf(path: &std::path::Path) {
         ("tokenizer.ggml.merges", Kv::Strings(vec!["t o".into()])),
         ("tokenizer.ggml.bos_token_id", Kv::U32(0)), ("tokenizer.ggml.eos_token_id", Kv::U32(1)),
     ];
+    let mut kv = kv;
+    kv.extend(marks.iter().map(|(k, v)| (*k, Kv::Bool(*v))));
     let raw: Vec<u8> = (0..24u32).flat_map(|i| (i as f32).to_le_bytes()).collect();
     let mut w = Writer::create_typed(path, &kv, vec![TensorSpec { name: "token_embd.weight".into(), shape: vec![6, 4], ggml_type: 0, nbytes: 96 }]).unwrap();
     w.tensor_data(&raw).unwrap();
@@ -206,6 +213,23 @@ fn a_gguf_made_strata_ready_appears_in_the_model_list_and_is_not_overwritten() {
     assert!(e["error"]["message"].as_str().unwrap().contains("already installed"), "{e}");
     let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "strata", "input": gguf, "name": "my-tiny", "overwrite": true}));
     assert_eq!(code, 202);
+    // an abliterated GGUF (the Workshop's prastara.* marks): named -abliterated, marked private and uncensored
+    let marked = s.dir.join("workshop/small-llama-marked.gguf");
+    small_llama_gguf_with(&marked, &[("prastara.private", true), ("prastara.abliterated", true)]);
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "strata", "input": marked, "name": "mula"}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert_eq!((done["result"]["model"].as_str(), done["result"]["private"].as_bool(), done["result"]["uncensored"].as_bool()),
+               (Some("mula-abliterated"), Some(true), Some(true)), "{done}");
+    let cfg: Value = serde_json::from_slice(&std::fs::read(s.dir.join("strata-mula-abliterated.json")).unwrap()).unwrap();
+    assert_eq!((&cfg["private"], &cfg["uncensored"], &cfg["abliterated"]), (&json!(true), &json!(true), &json!(true)), "{cfg}");
+    assert!(cfg["display_name"].as_str().unwrap().contains("abliterated"), "{cfg}");
+    let (_, l) = s.get("/api/models", true);
+    let m = l["models"].as_array().unwrap().iter().find(|m| m["id"] == "mula-abliterated").cloned().expect("listed");
+    assert_eq!((&m["private"], &m["uncensored"]), (&json!(true), &json!(true)), "{m}");
+    // a plain one is neither
+    let plain = l["models"].as_array().unwrap().iter().find(|m| m["id"] == "my-tiny").cloned().unwrap();
+    assert_eq!((&plain["private"], &plain["uncensored"]), (&json!(false), &json!(false)));
 }
 
 
@@ -216,6 +240,11 @@ fn fake_datagen(dir: &std::path::Path) -> std::path::PathBuf {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::write(&p, r#"#!/bin/sh
 here="$(dirname "$0")"
+case " $* " in *" --estimate "*)
+  echo "$@" > "$here/estimate-args.txt"
+  echo "{\"event\":\"estimate\",\"kind\":\"$2\",\"lines\":[\"needs about 11 GB a card\"],\"estimate\":{\"card_bytes\":11000000000,\"disk_bytes\":16000000000}}"
+  exit 0;;
+esac
 if [ "$1" = "--json" ] && [ "$2" = "library" ]; then
   echo "$@" > "$here/library-args.txt"
   [ "$3" = "init" ] && { mkdir -p "$6"; echo 'base: x' > "$6/soup.yaml"; echo '# x' > "$6/DATA.md"; }
@@ -274,6 +303,7 @@ if [ "$1" = "--json" ] && [ "$2" = "abliterate" ]; then
   for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
   mkdir -p "$out"; echo '{"prastara_private": true}' > "$out/config.json"; echo x > "$out/model.safetensors"
   echo '{"event":"start","what":"abliterate"}'
+  echo '{"event":"estimate","kind":"abliterate","lines":["memory: about 11 GB on the busiest of 2 GPU(s)"],"estimate":{"card_bytes":11000000000}}'
   echo '{"event":"layers","chosen":1,"layers":[{"block":0,"pass":0,"separation":0.5},{"block":1,"pass":0,"separation":2.5}],"message":"direction from block 1 pass 0"}'
   echo '{"event":"check","which":"before","result":{"n":4,"harmful_refusal_rate":0.75,"harmless_refusal_rate":0.0,"harmless_loss":1.2}}'
   echo '{"event":"check","which":"after","result":{"n":4,"harmful_refusal_rate":0.0,"harmless_refusal_rate":0.0,"harmless_loss":1.25}}'
@@ -606,6 +636,27 @@ fn abliteration_jobs_check_their_inputs_and_keep_the_layer_table_and_checks() {
     let (_, f) = s.get("/v1/workshop/files", true);
     let it = f["hf_models"].as_array().unwrap().iter().find(|m| m["path"].as_str().unwrap().ends_with("tiny-model-abliterated")).cloned();
     assert_eq!(it.expect("the copy is listed")["private"], true);
+    // the estimate first in the log
+    assert!(log.iter().any(|l| l.as_str().unwrap().contains("busiest of 2 GPU")), "{log:?}");
+    // the form's estimate: the job's own command with --estimate, nothing run
+    let (code, e) = s.post("/v1/workshop/estimate", &json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "check": 4, "devices": "cuda:0,cuda:1"}));
+    assert_eq!(code, 200, "{e}");
+    assert_eq!((e["event"].as_str(), e["kind"].as_str(), e["gpu"].as_bool()), (Some("estimate"), Some("abliterate"), Some(true)), "{e}");
+    let ea = std::fs::read_to_string(tools.join("estimate-args.txt")).unwrap();
+    assert!(ea.starts_with("--json abliterate") && ea.contains("--devices cuda:0,cuda:1") && ea.contains("--check 4") && ea.ends_with("--estimate\n"), "{ea}");
+    let (code, _) = s.post("/v1/workshop/estimate", &json!({"kind": "abliterate", "input": model, "harmless": b}));
+    assert_eq!(code, 400, "an estimate checks the request as the job does");
+    // a harmless list may be a chat .jsonl (its first user messages)
+    std::fs::write(lists.join("plain.jsonl"), "{\"messages\":[{\"role\":\"user\",\"content\":\"Explain how a rainbow forms.\"}]}\n").unwrap();
+    let (code, _) = s.post("/v1/workshop/estimate", &json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": lists.join("plain.jsonl")}));
+    assert_eq!(code, 200);
+    // on the GPUs: the run takes them from the chat model, as training does (unloaded, then loaded again)
+    let (code, j3) = s.post("/v1/workshop/jobs", &json!({"kind": "abliterate", "input": model, "harmful": h, "harmless": b, "devices": "cuda:0,cuda:1"}));
+    assert_eq!(code, 202, "{j3}");
+    wait_state(&s, j3["id"].as_u64().unwrap(), "done");
+    let (_, d3) = s.get(&format!("/v1/workshop/jobs/{}", j3["id"]), true);
+    assert!(d3["log"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().contains("waiting for the GPUs")), "{d3}");
+    assert!(std::fs::read_to_string(tools.join("abliterate-args.txt")).unwrap().contains("--devices cuda:0,cuda:1"));
     let _ = std::fs::remove_file(&outside);
     let _ = std::fs::remove_dir_all(&tools);
 }
@@ -688,6 +739,15 @@ fn upcycle_and_export_moe_jobs_check_their_inputs() {
     assert_eq!(u["moe"], json!({"experts": 4, "top_k": 2}));
     let d = hf.iter().find(|x| x["path"].as_str().unwrap().ends_with("tiny-dense")).unwrap();
     assert_eq!((d["dims"]["hidden"].as_u64(), d["dims"]["layers"].as_u64()), (Some(32), Some(4)));
+    // the forms' estimates: the command with --estimate (for upcycle: the sizes and the training it takes on the cards)
+    let (code, e) = s.post("/v1/workshop/estimate", &json!({"kind": "upcycle", "input": dense, "experts": 10, "top_k": 1}));
+    assert_eq!((code, e["kind"].as_str()), (200, Some("upcycle")), "{e}");
+    let ea = std::fs::read_to_string(tools.join("estimate-args.txt")).unwrap();
+    assert!(ea.contains("upcycle") && ea.contains("--experts 10 --top-k 1") && ea.contains("--estimate"), "{ea}");
+    let (code, e) = s.post("/v1/workshop/estimate", &json!({"kind": "export-moe", "input": up, "type": "q4_k"}));
+    assert_eq!((code, e["kind"].as_str(), e["gpu"].as_bool()), (200, Some("export-moe"), Some(false)), "{e}");
+    let (code, _) = s.post("/v1/workshop/estimate", &json!({"kind": "export-moe", "input": dense}));
+    assert_eq!(code, 400, "not upcycled");
     let _ = std::fs::remove_dir_all(&tools);
 }
 
