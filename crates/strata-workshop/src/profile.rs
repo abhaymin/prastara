@@ -271,11 +271,16 @@ impl Machine {
     /// short benchmark for the CPU. Missing sources leave their fields empty.
     pub fn detect() -> Self {
         let (ram_total, ram_available) = std::fs::read_to_string("/proc/meminfo").map(|t| parse_meminfo(&t)).unwrap_or((0, 0));
-        let gpus = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=index,name,memory.total,memory.free", "--format=csv,noheader,nounits"]).output()
-            .map(|o| parse_nvidia_smi(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default();
+        let gpus = detect_gpus();
         Self { ram_total, ram_available, cpus: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1), gpus, cpu_gflops: measure_cpu_gflops() }
     }
+}
+
+/// This machine's NVIDIA cards (`nvidia-smi`; none when it is missing).
+pub fn detect_gpus() -> Vec<Gpu> {
+    std::process::Command::new("nvidia-smi")
+        .args(["--query-gpu=index,name,memory.total,memory.free", "--format=csv,noheader,nounits"]).output()
+        .map(|o| parse_nvidia_smi(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default()
 }
 
 /// Whether an estimate fits, and how long it would take.
@@ -308,6 +313,41 @@ pub fn verdict(e: &Estimate, m: &Machine) -> Verdict {
         cpu_seconds: cpu_seconds(e, m.cpu_gflops),
         gpu_seconds: e.flops / (ASSUMED_GPU_GFLOPS * 1e9),
     }
+}
+
+/// The memory an inference run (regress, grade-train's sampling: no backward pass, `Ctx::inference`) needs on each of
+/// `devices` devices, as the model is split by [`crate::model::block_devices`], for sequences up to `seq` tokens:
+/// the weights each device holds, plus one block's working set at a time (f32) — the hidden state and norms, q/k/v
+/// with the grouped heads spread, the attention (a `[heads, seq, seq]` table up to one chunk, then a chunk of
+/// queries against all keys), the MLP's four products, one widened 16-bit matrix slice, and on the last device the
+/// head's sliced loss — with a quarter more for the allocator's pool and fragmentation. `adapter_bytes` (f32 LoRA
+/// tensors, small) is split like the blocks.
+pub fn inference_bytes(cfg: &ModelConfig, dtype: BaseDtype, devices: usize, seq: usize, adapter_bytes: u64) -> Vec<u64> {
+    let d = devices.max(1);
+    let seq = seq.max(2) as f64;
+    let placement = crate::model::block_devices(cfg, d);
+    let block = (cfg.block_params() - cfg.block_small_params()) * dtype.bytes() + cfg.block_small_params() * 4;
+    let emb = (cfg.vocab_size * cfg.hidden_size) as u64 * dtype.bytes();
+    let mut w = vec![0u64; d];
+    for dev in &placement {
+        w[*dev] += block;
+    }
+    w[0] += emb;
+    if !cfg.tie_word_embeddings {
+        w[d - 1] += emb;
+    }
+    let (h, q, i) = (cfg.hidden_size as f64, (cfg.num_attention_heads * cfg.head_dim) as f64, cfg.intermediate_size as f64);
+    let chunk = crate::model::ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed) as f64;
+    let heads = cfg.num_attention_heads as f64;
+    let attention = 3.0 * heads * seq.min(chunk) * seq + if seq <= chunk { seq * seq } else { 0.0 };
+    let largest = Target::ALL.iter().map(|t| { let (o, i) = cfg.target_shape(*t); o * i }).max().unwrap_or(0).max(cfg.vocab_size * cfg.hidden_size) as f64;
+    let widening = if dtype == BaseDtype::F32 { 0.0 } else { largest.min((64u64 << 20) as f64) };
+    let working = 4.0 * (4.0 * seq * h + 5.0 * seq * q + attention + 4.0 * seq * i + widening);
+    let head = 3.0 * 4.0 * (seq * cfg.vocab_size as f64).min((32u64 << 20) as f64);
+    (0..d).map(|k| {
+        let act = working + if k == d - 1 { head } else { 0.0 };
+        w[k] + adapter_bytes / d as u64 + (1.25 * act) as u64 + HEADROOM_BYTES
+    }).collect()
 }
 
 pub fn human_bytes(b: u64) -> String {

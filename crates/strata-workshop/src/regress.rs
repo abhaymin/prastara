@@ -82,9 +82,13 @@ impl<'a> Generator<'a> {
             if seq.len() >= room {
                 break;
             }
-            let h = self.model.upper_hidden(&self.model.lower(&seq)?, &Ctx::eval())?;
+            // nothing recorded for a backward pass, and the head on the last row only (not [seq, vocab] logits)
+            let h = self.model.upper_hidden(&self.model.lower(&seq)?, &Ctx::inference())?;
             let last = h.narrow(0, seq.len() - 1, 1)?;
             let logits = self.model.head(&last)?.squeeze(0)?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.to_vec1::<f32>()?;
+            drop(h);
+            // CUDA's stream pool gives freed blocks back only when the device is synchronized
+            self.model.synchronize()?;
             let next = match (sampling, draw.as_mut()) {
                 (Some(s), Some(d)) if s.temperature > 0.0 => sample(&logits, s, d),
                 _ => argmax(&logits),
@@ -851,12 +855,14 @@ pub struct Options {
     pub base_dtype: Option<BaseDtype>,
     /// prompts longer than this are left out
     pub max_prompt_tokens: usize,
+    /// run even when the memory estimate says a device is too small
+    pub force: bool,
 }
 
 impl Options {
     pub fn new(model: impl Into<PathBuf>, suite: impl Into<PathBuf>, out: impl Into<PathBuf>) -> Self {
         Options { model: model.into(), adapter: None, passes: vec![], suite: suite.into(), out: out.into(), against: vec![], devices: vec![],
-                  base_dtype: None, max_prompt_tokens: 4096 }
+                  base_dtype: None, max_prompt_tokens: 4096, force: false }
     }
 }
 
@@ -884,8 +890,12 @@ fn report_file(p: &Path) -> PathBuf {
 pub fn run(o: &Options, judge: Option<&dyn Judge>, emit: &mut dyn FnMut(Value), should_stop: &dyn Fn() -> bool) -> Result<Report> {
     let suite = Suite::load(&o.suite)?;
     let tok = ChatTokenizer::load(&o.model, None)?;
+    let on_gpu = o.devices.iter().any(|d| d.trim() != "cpu");
+    let dtype = o.base_dtype.unwrap_or(if on_gpu { BaseDtype::BF16 } else { BaseDtype::F32 });
+    // the estimate first: a run that cannot fit is refused before a device is opened
+    let longest = o.max_prompt_tokens + suite.tests.iter().map(answer_tokens).max().unwrap_or(0);
+    memory_check(o, &crate::model::ModelConfig::load(&o.model)?, dtype, longest, emit)?;
     let devs = crate::finetune::open_devices(&o.devices)?;
-    let dtype = o.base_dtype.unwrap_or(if devs.iter().any(|d| !d.is_cpu()) { BaseDtype::BF16 } else { BaseDtype::F32 });
     let mut model = LlamaModel::load_on(&o.model, dtype, &devs)?;
     if let Some(a) = &o.adapter {
         model.load_adapter(a).with_context(|| format!("the adapter {}", a.display()))?;
@@ -915,6 +925,8 @@ pub fn run(o: &Options, judge: Option<&dyn Judge>, emit: &mut dyn FnMut(Value), 
             emit(json!({"event": "log", "message": format!("[{done_tests}/{total_tests}] {} ({}) at {p} pass{}", spec.name, spec.kind, if p == 1 { "" } else { "es" })}));
             let mut progress = |i: usize, n: usize| emit(json!({"event": "progress", "done": i, "total": n, "message": format!("{} at {p} pass{}", spec.name, if p == 1 { "" } else { "es" })}));
             let r = run_test(spec, p, &gen, &runner, judge, &mut progress, &mut answers, should_stop);
+            // whatever the test left (an error midway too) goes back to the pool before the next one
+            model.synchronize()?;
             let r = r.unwrap_or_else(|e| {
                 let mut t = TestResult::new(spec, p, "", true);
                 t.error = Some(format!("{e:#}"));
@@ -955,6 +967,47 @@ pub fn run(o: &Options, judge: Option<&dyn Judge>, emit: &mut dyn FnMut(Value), 
     std::fs::write(o.out.join("report.json"), serde_json::to_string_pretty(&report_json)?)?;
     std::fs::write(o.out.join("report.md"), report_markdown(&report_json))?;
     Ok(Report { results, comparisons, json: report_json })
+}
+
+/// The most tokens a test's answers add to a prompt (what its generator may run to).
+fn answer_tokens(t: &TestSpec) -> usize {
+    match t.kind.as_str() {
+        "loss" => 0,
+        "code" => t.max_tokens.unwrap_or(512),
+        "qa" => t.max_tokens.unwrap_or(48),
+        _ => t.max_tokens.unwrap_or(256),
+    }
+}
+
+/// The memory line, like train's profile: about how much each device needs at `longest` tokens, against what
+/// nvidia-smi says is free on it; a device that is too small refuses the run (unless `o.force`).
+fn memory_check(o: &Options, cfg: &crate::model::ModelConfig, dtype: BaseDtype, longest: usize, emit: &mut dyn FnMut(Value)) -> Result<()> {
+    use crate::profile::{human_bytes, inference_bytes};
+    let names: Vec<String> = if o.devices.is_empty() { vec!["cpu".into()] } else { o.devices.iter().map(|d| d.trim().to_string()).collect() };
+    let adapter = o.adapter.as_ref().and_then(|a| std::fs::metadata(a.join("adapter_model.safetensors")).ok()).map_or(0, |m| 2 * m.len());
+    let need = inference_bytes(cfg, dtype, names.len(), longest, adapter);
+    let gpus = if names.iter().any(|n| n.starts_with("cuda:")) { crate::profile::detect_gpus() } else { Vec::new() };
+    let mut short = Vec::new();
+    let mut parts = Vec::new();
+    for (n, b) in names.iter().zip(&need) {
+        let free = n.strip_prefix("cuda:").and_then(|i| i.parse::<u32>().ok()).and_then(|i| gpus.iter().find(|g| g.index == i)).map(|g| g.free_bytes);
+        parts.push(format!("{} on {n}{}", human_bytes(*b), free.map_or(String::new(), |f| format!(" ({} free)", human_bytes(f)))));
+        if free.is_some_and(|f| *b > f) {
+            short.push(n.clone());
+        }
+    }
+    let line = format!("memory: about {} for sequences up to {longest} tokens, base held as {} (inference: no graph, attention in chunks)",
+                       parts.join(", "), dtype.as_str());
+    emit(json!({"event": "log", "message": line}));
+    if !short.is_empty() {
+        let msg = format!("{line}: too little free memory on {}; free the card(s), split over more (--devices cuda:0,cuda:1), lower --max-prompt-tokens, \
+                           or generate through the Rust engine (--engine-gguf)", short.join(", "));
+        if !o.force {
+            bail!("{msg}; --force runs it anyway");
+        }
+        emit(json!({"event": "log", "message": format!("{msg}; running anyway (--force)")}));
+    }
+    Ok(())
 }
 
 fn report_to_json(o: &Options, suite: &Suite, results: &[TestResult], comps: &[(usize, String, Comparison)], python: bool, judge: Option<String>) -> Value {
@@ -1036,7 +1089,9 @@ fn run_test(spec: &TestSpec, passes: usize, gen: &Generator, runner: &CodeRunner
                 if should_stop() { bail!("stopped"); }
                 match gen.tok.encode(rec, gen.max_prompt, false) {
                     Ok(ex) => {
-                        let l = gen.model.loss(&ex.tokens, &ex.supervised, &Ctx::eval())?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64;
+                        // the sliced head loss (HeadLoss) under inference: no graph, no [seq, vocab] logits
+                        let l = gen.model.loss(&ex.tokens, &ex.supervised, &Ctx::inference())?.to_dtype(DType::F32)?.to_scalar::<f32>()? as f64;
+                        gen.model.synchronize()?;
                         r.items.push((i.to_string(), l));
                     }
                     Err(_) => r.skipped += 1,
