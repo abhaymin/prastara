@@ -2634,6 +2634,36 @@ mod tests {
         }
     }
 
+    /// The 56B-A5B shape in miniature: 120 experts per layer, top-5, narrow experts (the Workshop's fine-grained
+    /// export: expert_feed_forward_length below the dense width), with the loop. A chunk equals token by token bit for
+    /// bit; with `--resident-experts` (the page prefetch) and Q4_K experts the same; the routing picks 5 experts.
+    #[test]
+    fn a_120_expert_top_5_moe_runs_with_and_without_the_loop() {
+        use crate::testgguf::{tmp, Spec};
+        let toks: Vec<u32> = (0..19).map(|i| (i * 37 + 5) % 256).collect();
+        let fine = Spec { n_expert: 120, top_k: 5, expert_ffn: 32, n_layer: 3, seed: 0x5EED_0120, ..Spec::tiny_qwen3moe() };
+        for (name, spec) in [("tiny-qwen3moe-120", fine.clone()), ("tiny-qwen3moe-120-loop", Spec { loop_: Some((1, 3, 2)), ..fine.clone() }),
+                             ("tiny-qwen3moe-120-q4k", Spec { ty: "Q4_K", n_embd: 256, n_head: 8, expert_ffn: 256, ffn: 256, ..fine.clone() })] {
+            let (m, _) = Model::load(&tmp(name, &spec), None).unwrap();
+            let e = m.moes().next().unwrap();
+            assert_eq!((e.n_expert, e.top_k), (120, 5));
+            let (chosen, w) = m.route(e, &vec![0.1; e.router.len() / 120]);
+            assert_eq!(chosen.len(), 5);
+            assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-5, "{name}: the weights are renormalised");
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            assert!(one.iter().flatten().all(|x| x.is_finite()));
+            let mut st = m.new_state();
+            let mut chunk = m.forward_batch_all(&mut st, &toks[..11]);
+            chunk.extend(m.forward_batch_all(&mut st, &toks[11..]));
+            assert!(one == chunk, "{name}: a chunk's logits are token by token's, bit for bit");
+            m.prefetch.store(true, Ordering::Relaxed);
+            let mut st = m.new_state();
+            let pre: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            assert!(one == pre, "{name}: the resident-experts tier changes nothing but the pages");
+        }
+    }
+
     /// A rows x cols matrix of `ty` with random bytes and finite f16 scales where the type keeps them.
     fn random_qmat(ty: &str, rows: usize, cols: usize, next: &mut dyn FnMut() -> u64) -> QMat {
         let rb = QMat::row_bytes(ty, cols);

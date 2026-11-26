@@ -144,6 +144,72 @@ mod moe {
     }
 }
 
+/// Fine-grained upcycling (the 56B-A5B design): each expert a slice of the dense feed-forward's neurons
+/// (crates/strata-workshop/tests/upcycle_fine.rs `write_the_engines_fine_fixture`): 8 experts of 16 neurons (4 groups x
+/// 2 copies) top-2 with shuffled neurons and an untrained block routed by its start; a looped model with 12 experts
+/// (4 x 3) top-3 and A shared per group; and every group once (E = G = top-k, a uniform router), the dense base. The
+/// engine reads the experts' width from the tensors (`expert_feed_forward_length` = 16 here, 1,024 for Mula-MoE).
+mod fine {
+    use super::{max_diff, rows, tokens, TOL};
+    use crate::model::Model;
+    use std::path::PathBuf;
+
+    fn load(name: &str) -> (Model, serde_json::Value) {
+        let d = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures/tiny-qwen3-moe");
+        let (m, _) = Model::load(&d.join(name), None).unwrap();
+        (m, serde_json::from_str(&std::fs::read_to_string(d.join("fine-logits.json")).unwrap()).unwrap())
+    }
+
+    /// Token by token and a chunk at a time against `want`: within 1e-4 with an f32 cache (the Workshop's own
+    /// arithmetic: the gate), and within `f16_tol` with the default f16 cache.
+    fn check(m: &mut Model, toks: &[u32], want: &[Vec<f32>], what: &str, f16_tol: f32) {
+        let default = m.kv_type;
+        for (kv, tol) in [(crate::kvcache::KvType::F32, 1e-4), (default, f16_tol)] {
+            m.kv_type = kv;
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            let mut st = m.new_state();
+            let chunk = m.forward_batch_all(&mut st, toks);
+            let (d1, d2) = (max_diff(&one, want), max_diff(&chunk, want));
+            println!("{what}, {kv:?} cache: token by token {d1:.2e}, a chunk {d2:.2e}");
+            assert!(d1 < tol && d2 < tol, "{what}, {kv:?} cache: {d1} / {d2}");
+        }
+        m.kv_type = default;
+    }
+
+    #[test]
+    fn the_engine_runs_fine_grained_experts_as_the_workshop_trains_them() {
+        let (mut m, want) = load("fine.f32.gguf");
+        assert_eq!(m.arch, "qwen3moe");
+        let e = m.moes().next().expect("MoE blocks");
+        assert_eq!((e.n_expert, e.top_k, e.down_exps.0[0].cols), (8, 2, 16));
+        let fine = rows(&want["fine"]);
+        assert!(max_diff(&fine, &rows(&want["base"])) > 0.1);
+        check(&mut m, &tokens(&want), &fine, "8 experts of 16 neurons, top-2", TOL);
+    }
+
+    #[test]
+    fn a_looped_fine_moe_runs_its_experts_in_every_pass() {
+        let (mut m, want) = load("fine-loop.f32.gguf");
+        assert_eq!(m.passes(), 3);
+        let looped = rows(&want["fine_loop"]);
+        // three passes through blocks of 12 experts top-3: the f16 keys and values' rounding (6e-4 on the base) moves
+        // the routers' choices near their k-th place; the f32 cache shows the arithmetic itself is the Workshop's
+        check(&mut m, &tokens(&want), &looped, "looped, 12 experts of 16 neurons, top-3", 1e-2);
+        let toks = tokens(&want);
+        let mut st = m.new_state();
+        let mut mixed = m.forward_batch_all(&mut st, &toks[..4]);
+        mixed.extend(toks[4..].iter().map(|&t| m.forward(&mut st, t)));
+        assert!(max_diff(&mixed, &looped) < 1e-2);
+    }
+
+    #[test]
+    fn every_group_once_is_the_dense_base() {
+        let (mut m, want) = load("fine-all.f32.gguf");
+        check(&mut m, &tokens(&want), &rows(&want["base"]), "E = G = top-k = 4", TOL);
+    }
+}
+
 /// The compact caches (kvcache.rs, `--kv`) on the loop and MoE fixtures: f16 (the default, the engine's values since
 /// the start) and q8 against an f32 cache and against the Workshop's own f32 logits, token by token and a chunk at a
 /// time.

@@ -884,5 +884,19 @@ pub(crate) mod tests {
         check("tiny qwen3moe loop, half on the device", &lp, &dev, 0.5, 0);
         let mixtral = testgguf::tmp("tiny-mixtral", &Spec { arch: "llama", seed: 0x5EED_0006, ..Spec::tiny_qwen3moe() });
         check("tiny mixtral-style llama", &mixtral, &dev, 1.0, 0);
+        // the 56B-A5B shape in miniature: 120 narrow experts, top-5, with the loop, split between the device and the CPU
+        let fine = Spec { n_expert: 120, top_k: 5, expert_ffn: 32, n_layer: 3, seed: 0x5EED_0120, ..Spec::tiny_qwen3moe() };
+        let f = testgguf::tmp("tiny-qwen3moe-120", &fine);
+        check("120 experts top-5", &f, &dev, 1.0, 0);
+        check("120 experts top-5, a third on the device", &f, &dev, 0.33, 0);
+        let fl = testgguf::tmp("tiny-qwen3moe-120-loop", &Spec { loop_: Some((1, 3, 2)), ..fine });
+        check("120 experts top-5 looped, half on the device", &fl, &dev, 0.5, 0);
+        // the Workshop's fine-grained exports (experts of 16 neurons, shuffled; looped; every group once), f32 caches
+        let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures/tiny-qwen3-moe");
+        for name in ["fine.f32.gguf", "fine-loop.f32.gguf", "fine-all.f32.gguf"] {
+            for share in [1.0, 0.5] {
+                check_kv(name, &fx.join(name), &dev, share, 0, KvType::F32, TOL);
+            }
+        }
     }
 }
