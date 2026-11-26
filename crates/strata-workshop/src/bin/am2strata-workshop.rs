@@ -88,7 +88,7 @@ enum Cmd {
         #[arg(long)]
         out: PathBuf,
         /// f32, f16, q8_0, q6_k, q5_k, q4_k or q4_0
-        #[arg(long = "type", default_value = "q8_0")]
+        #[arg(long = "type", default_value = "q4_k")]
         ty: String,
         /// name the BPE pre-tokenizer when its hash is not a known one (e.g. "qwen2", "llama-bpe", "gpt-2")
         #[arg(long)]

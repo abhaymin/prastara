@@ -9,6 +9,12 @@
 //!   - loop: `"input"` (an HF model folder), `"start"`, `"end"` (its blocks start..end), `"passes"`? (2-16, default 2),
 //!     `"output"`? (a folder) — a looped copy (Avarta): the core runs again behind gates that start closed, so the copy
 //!     is exactly its base until trained; convert carries the loop into the GGUF and the Rust engine runs it
+//!   - upcycle: `"input"` (a dense HF model folder, looped or not), `"experts"`? (2-256, default 10), `"top_k"`? (1 to
+//!     experts, default 1), `"output"`? (a folder; default `<stem>-moe<E>x<K>`) — a linked copy marked as a mixture of
+//!     experts (LoRA upcycling): `train` on it trains a router and each expert's LoRA, and it starts as its base
+//!   - export-moe: `"input"` (an upcycled folder), `"adapter"`? (the adapter trained on it), `"type"`? (q4_k | q8_0 |
+//!     q6_k | q5_k | q4_0 | f16 | f32, default q4_k), `"pre_tokenizer"`?, `"output"`? (a .gguf) — the real qwen3moe
+//!     model, each expert's LoRA folded into its own copy of the feed-forward, quantized as it is written
 //!   - abliterate: `"input"` (an HF model folder), `"harmful"` and `"harmless"` (text files in Workshop folders, one
 //!     prompt per line), `"layer"`? (auto | N | "N:P"), `"scale"`? (0-2, default 1), `"check"`? (held-out prompts to
 //!     answer before and after), `"devices"`?, `"output"`? (a folder; default `<stem>-abliterated`) — the refusal
@@ -47,7 +53,10 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 8] = ["convert", "quantize", "merge", "loop", "abliterate", "train", "strata", "datagen"];
+const KINDS: [&str; 10] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen"];
+
+/// What `export-moe` writes as: the converter's two float types and the quantizer's.
+const EXPORT_TYPES: [&str; 7] = ["q4_k", "q8_0", "q6_k", "q5_k", "q4_0", "f16", "f32"];
 
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -411,6 +420,75 @@ impl Workshop {
                 }
                 Ok((kind.into(), vec!["loop".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
                                       "--start".into(), start.to_string(), "--end".into(), end.to_string(), "--passes".into(), passes.to_string()], output))
+            }
+            "upcycle" => {
+                let input = self.allowed(s("input").ok_or("upcycle needs \"input\": a dense Hugging Face model folder")?, true)?;
+                let cfg: Value = std::fs::read_to_string(input.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+                    .ok_or_else(|| format!("{} has no config.json: upcycle takes a Hugging Face model folder", input.display()))?;
+                if !cfg["prastara_moe"].is_null() {
+                    return Err(format!("{} is already upcycled", input.display()));
+                }
+                if let Some(k) = ["num_experts", "num_local_experts", "num_experts_per_tok", "moe_intermediate_size"].iter()
+                    .find(|k| cfg.get(**k).is_some_and(|v| !v.is_null() && v.as_u64() != Some(0))) {
+                    return Err(format!("{} is a mixture of experts already ({k} in its config.json): upcycle starts from a dense model", input.display()));
+                }
+                let num = |k: &str, default: u64| -> Result<u64, String> {
+                    match &req[k] { Value::Null => Ok(default), v => v.as_u64().ok_or_else(|| format!("\"{k}\" is a whole number")) }
+                };
+                let (experts, top_k) = (num("experts", 10)?, num("top_k", 1)?);
+                if !(2..=256).contains(&experts) {
+                    return Err(format!("\"experts\" is 2 to 256 (got {experts})"));
+                }
+                if top_k == 0 || top_k > experts {
+                    return Err(format!("\"top_k\" is 1 to the number of experts, {experts} (got {top_k})"));
+                }
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => self.default_output(&input, &format!("-moe{experts}x{top_k}")),
+                };
+                if output.exists() {
+                    return Err(format!("{} already exists", output.display()));
+                }
+                Ok((kind.into(), vec!["upcycle".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
+                                      "--experts".into(), experts.to_string(), "--top-k".into(), top_k.to_string()], output))
+            }
+            "export-moe" => {
+                let input = self.allowed(s("input").ok_or("export-moe needs \"input\": an upcycled model folder")?, true)?;
+                let cfg: Value = std::fs::read_to_string(input.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+                    .ok_or_else(|| format!("{} has no config.json: export-moe takes an upcycled model folder", input.display()))?;
+                let moe = &cfg["prastara_moe"];
+                if moe.is_null() {
+                    return Err(format!("{} is not upcycled (no prastara_moe in its config.json): run an upcycle job on it first", input.display()));
+                }
+                let ty = s("type").unwrap_or("q4_k").to_ascii_lowercase();
+                if !EXPORT_TYPES.contains(&ty.as_str()) {
+                    return Err(format!("\"type\" is one of {} (got {ty:?})", EXPORT_TYPES.join(", ")));
+                }
+                let mut args = vec!["export-moe".to_string(), input.display().to_string()];
+                if let Some(a) = s("adapter") {
+                    let a = self.allowed(a, true)?;
+                    let ac: Value = std::fs::read_to_string(a.join("adapter_config.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+                        .ok_or_else(|| format!("{} has no adapter_config.json: \"adapter\" is the folder train wrote", a.display()))?;
+                    if ac["prastara_moe"]["experts"] != moe["experts"] || ac["prastara_moe"]["top_k"] != moe["top_k"] {
+                        return Err(format!("{} was not trained on this upcycled model (its prastara_moe is {}, the model's {moe})", a.display(), ac["prastara_moe"]));
+                    }
+                    args.extend(["--adapter".into(), a.display().to_string()]);
+                }
+                if let Some(p) = s("pre_tokenizer") {
+                    if !p.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
+                        return Err("\"pre_tokenizer\" is a name like qwen2 or llama-bpe".into());
+                    }
+                    args.extend(["--pre-tokenizer".into(), p.into()]);
+                }
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => self.default_output(&input, &format!("-{ty}.gguf")),
+                };
+                if output.exists() {
+                    return Err(format!("{} already exists", output.display()));
+                }
+                args.extend(["--out".into(), output.display().to_string(), "--type".into(), ty]);
+                Ok((kind.into(), args, output))
             }
             "abliterate" => {
                 let input = self.allowed(s("input").ok_or("abliterate needs \"input\": a Hugging Face model folder")?, true)?;
@@ -816,8 +894,13 @@ impl Workshop {
                         .any(|f| f.path().extension().and_then(|x| x.to_str()) == Some("safetensors")) {
                         // what the overview shows of a model folder: its architecture, a loop, a private mark
                         let c: Value = std::fs::read_to_string(p.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                        // the shape the Upcycle form counts parameters from
+                        let dims = json!({"hidden": c["hidden_size"], "intermediate": c["intermediate_size"], "layers": c["num_hidden_layers"],
+                                          "vocab": c["vocab_size"], "heads": c["num_attention_heads"], "kv_heads": c["num_key_value_heads"],
+                                          "head_dim": c["head_dim"], "tied": c["tie_word_embeddings"] == true, "family": c["model_type"]});
                         hf.push(json!({"path": p.display().to_string(), "modified": modified(&p.join("config.json")),
-                                       "arch": c["model_type"], "loop": c["prastara_loop"], "private": c["prastara_private"] == true}));
+                                       "arch": c["model_type"], "loop": c["prastara_loop"], "moe": c["prastara_moe"], "dims": dims,
+                                       "private": c["prastara_private"] == true}));
                     } else if depth > 0 {
                         walk(&p, depth - 1, gguf, hf, adapters);
                     }

@@ -236,6 +236,20 @@ if [ "$1" = "--json" ] && [ "$2" = "train" ]; then
   echo '{"event":"done","output":"x","kind":"adapter","bytes":10,"seconds":0.1}'
   exit 0
 fi
+if [ "$1" = "--json" ] && { [ "$2" = "upcycle" ] || [ "$2" = "export-moe" ]; }; then
+  echo "$@" > "$here/$2-args.txt"
+  out=""; prev=""
+  for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
+  echo "{\"event\":\"start\",\"what\":\"$2\"}"
+  if [ "$2" = "upcycle" ]; then
+    mkdir -p "$out"; echo '{"model_type": "qwen3", "prastara_moe": {"experts": 10, "top_k": 1}}' > "$out/config.json"; echo x > "$out/model.safetensors"
+    echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"hf-model\",\"experts\":10,\"top_k\":1,\"total_parameters\":57200000000,\"active_parameters\":8200000000,\"bytes\":10,\"seconds\":0.1}"
+  else
+    mkdir -p "$(dirname "$out")"; echo gguf > "$out"
+    echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"gguf\",\"experts\":10,\"top_k\":1,\"trained_blocks\":36,\"bytes\":5,\"seconds\":0.1}"
+  fi
+  exit 0
+fi
 if [ "$1" = "--json" ] && [ "$2" = "abliterate" ]; then
   echo "$@" > "$here/abliterate-args.txt"
   out=""; prev=""
@@ -575,5 +589,86 @@ fn abliteration_jobs_check_their_inputs_and_keep_the_layer_table_and_checks() {
     let it = f["hf_models"].as_array().unwrap().iter().find(|m| m["path"].as_str().unwrap().ends_with("tiny-model-abliterated")).cloned();
     assert_eq!(it.expect("the copy is listed")["private"], true);
     let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&tools);
+}
+
+/// LoRA upcycling from the Workshop (plan Part C): `upcycle` takes a dense folder (never an MoE or an upcycled one) and
+/// an experts × top-k shape; `export-moe` takes an upcycled folder, the adapter trained on it (the same shape) and an
+/// export type; both become the command's arguments and land beside the others. The model list shows the shape.
+#[cfg(unix)]
+#[test]
+fn upcycle_and_export_moe_jobs_check_their_inputs() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-moe-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let ws = s.dir.join("workshop");
+    let dense = ws.join("tiny-dense");
+    std::fs::create_dir_all(&dense).unwrap();
+    std::fs::write(dense.join("config.json"), r#"{"model_type": "qwen3", "num_hidden_layers": 4, "hidden_size": 32, "intermediate_size": 64}"#).unwrap();
+    std::fs::write(dense.join("model.safetensors"), "x").unwrap();
+    let mixtral = ws.join("tiny-mixtral");
+    std::fs::create_dir_all(&mixtral).unwrap();
+    std::fs::write(mixtral.join("config.json"), r#"{"model_type": "mixtral", "num_local_experts": 8}"#).unwrap();
+    let up = ws.join("tiny-up");
+    std::fs::create_dir_all(&up).unwrap();
+    std::fs::write(up.join("config.json"), r#"{"model_type": "qwen3", "num_hidden_layers": 4, "prastara_moe": {"experts": 4, "top_k": 2}}"#).unwrap();
+    std::fs::write(up.join("model.safetensors"), "x").unwrap();
+    let ad = ws.join("tiny-up-adapter");
+    std::fs::create_dir_all(&ad).unwrap();
+    std::fs::write(ad.join("adapter_config.json"), r#"{"r": 16, "prastara_moe": {"experts": 4, "top_k": 2, "rank": 16}}"#).unwrap();
+    let wrong = ws.join("other-adapter");
+    std::fs::create_dir_all(&wrong).unwrap();
+    std::fs::write(wrong.join("adapter_config.json"), r#"{"r": 16}"#).unwrap();
+    for (bad, why) in [
+        (json!({"kind": "upcycle"}), "no model"),
+        (json!({"kind": "upcycle", "input": mixtral}), "a mixture of experts already"),
+        (json!({"kind": "upcycle", "input": up}), "upcycled already"),
+        (json!({"kind": "upcycle", "input": dense, "experts": 1}), "one expert"),
+        (json!({"kind": "upcycle", "input": dense, "experts": 300}), "too many experts"),
+        (json!({"kind": "upcycle", "input": dense, "experts": 4, "top_k": 5}), "top-k above the experts"),
+        (json!({"kind": "upcycle", "input": dense, "top_k": 0}), "top-0"),
+        (json!({"kind": "upcycle", "input": dense, "experts": "ten"}), "experts not a number"),
+        (json!({"kind": "upcycle", "input": "/etc"}), "outside the Workshop"),
+        (json!({"kind": "export-moe", "input": dense}), "not upcycled"),
+        (json!({"kind": "export-moe", "input": up, "type": "q3_x"}), "an unknown type"),
+        (json!({"kind": "export-moe", "input": up, "adapter": wrong}), "an adapter for another model"),
+        (json!({"kind": "export-moe", "input": up, "adapter": dense}), "not an adapter"),
+        (json!({"kind": "export-moe", "input": up, "pre_tokenizer": "a b; rm"}), "a pre-tokenizer that is no name"),
+        (json!({"kind": "export-moe", "input": up, "output": "/tmp/x.gguf"}), "an output outside"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "upcycle", "input": dense}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let out = done["result"]["output"].as_str().unwrap().to_string();
+    assert!(out.ends_with("/workshop/tiny-dense-moe10x1"), "the default shape is 10x1: {out}");
+    assert_eq!(done["result"]["active_parameters"], 8_200_000_000u64);
+    let args = std::fs::read_to_string(tools.join("upcycle-args.txt")).unwrap();
+    assert!(args.contains("--experts 10 --top-k 1") && args.contains(&format!("--out {out}")), "{args}");
+    let (code, _) = s.post("/v1/workshop/jobs", &json!({"kind": "upcycle", "input": dense}));
+    assert_eq!(code, 400, "the copy exists: never written over");
+    let (_, j) = s.post("/v1/workshop/jobs", &json!({"kind": "upcycle", "input": dense, "experts": 8, "top_k": 2}));
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(done["result"]["output"].as_str().unwrap().ends_with("tiny-dense-moe8x2"));
+
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "export-moe", "input": up, "adapter": ad, "pre_tokenizer": "qwen2"}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(done["result"]["output"].as_str().unwrap().ends_with("/workshop/tiny-up-q4_k.gguf"), "{done}");
+    let args = std::fs::read_to_string(tools.join("export-moe-args.txt")).unwrap();
+    assert!(args.contains(&format!("--adapter {}", ad.display())) && args.contains("--type q4_k") && args.contains("--pre-tokenizer qwen2"), "{args}");
+    let (_, j) = s.post("/v1/workshop/jobs", &json!({"kind": "export-moe", "input": up, "type": "Q8_0"}));
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("export-moe-args.txt")).unwrap();
+    assert!(args.contains("--type q8_0") && !args.contains("--adapter"), "{args}");
+    // the model list carries the shape and the dimensions the form counts parameters from
+    let (_, f) = s.get("/v1/workshop/files", true);
+    let hf = f["hf_models"].as_array().unwrap();
+    let u = hf.iter().find(|x| x["path"].as_str().unwrap().ends_with("tiny-up")).unwrap();
+    assert_eq!(u["moe"], json!({"experts": 4, "top_k": 2}));
+    let d = hf.iter().find(|x| x["path"].as_str().unwrap().ends_with("tiny-dense")).unwrap();
+    assert_eq!((d["dims"]["hidden"].as_u64(), d["dims"]["layers"].as_u64()), (Some(32), Some(4)));
     let _ = std::fs::remove_dir_all(&tools);
 }
