@@ -21,7 +21,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use strata_gguf::Gguf;
 
-mod inkling;
+pub(crate) mod inkling;
 #[cfg(test)]
 mod loop_tests;
 pub(crate) use inkling::InkSlot;

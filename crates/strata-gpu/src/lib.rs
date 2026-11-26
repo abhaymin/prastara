@@ -876,3 +876,6 @@ impl Gpu {
         })
     }
 }
+
+// Inkling 2's blocks (strata-hybrid graph_inkling.rs): after the macros above, which it uses
+pub mod ink;

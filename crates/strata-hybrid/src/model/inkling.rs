@@ -8,73 +8,73 @@
 use super::*;
 
 pub(crate) struct InkLayer {
-    swa: bool,
-    n_head: usize,
-    n_kv: usize,
-    hd: usize,
-    wq: QMat,
-    wk: QMat,
-    wv: QMat,
-    wo: QMat,
-    gate: QMat,
-    q_clip: Vec<f32>,
-    sink: QMat,
-    rel: QMat,
+    pub(crate) swa: bool,
+    pub(crate) n_head: usize,
+    pub(crate) n_kv: usize,
+    pub(crate) hd: usize,
+    pub(crate) wq: QMat,
+    pub(crate) wk: QMat,
+    pub(crate) wv: QMat,
+    pub(crate) wo: QMat,
+    pub(crate) gate: QMat,
+    pub(crate) q_clip: Vec<f32>,
+    pub(crate) sink: QMat,
+    pub(crate) rel: QMat,
     /// rows: a distance; columns: the relative features
-    rel_bias: QMat,
-    rel_clip: Vec<f32>,
-    k_conv: Vec<f32>,
-    v_conv: Vec<f32>,
-    post_conv: Vec<f32>,
-    ffn_conv: Vec<f32>,
+    pub(crate) rel_bias: QMat,
+    pub(crate) rel_clip: Vec<f32>,
+    pub(crate) k_conv: Vec<f32>,
+    pub(crate) v_conv: Vec<f32>,
+    pub(crate) post_conv: Vec<f32>,
+    pub(crate) ffn_conv: Vec<f32>,
     /// one norm (windowed layers) or one each for the Q, K and V inputs (full-attention layers)
-    norms: Vec<Vec<f32>>,
-    k_proj: Option<QMat>,
-    v_proj: Option<QMat>,
+    pub(crate) norms: Vec<Vec<f32>>,
+    pub(crate) k_proj: Option<QMat>,
+    pub(crate) v_proj: Option<QMat>,
     /// the depth-mixing queries of the attention inputs (1 or 3), none in the first layer
-    res_query: Option<Vec<f32>>,
-    ffn_query: Vec<f32>,
-    ffn_norm: Vec<f32>,
-    router: QMat,
-    probs_b: Option<Vec<f32>>,
-    gate_up: Experts,
-    down: Experts,
-    top_k: usize,
+    pub(crate) res_query: Option<Vec<f32>>,
+    pub(crate) ffn_query: Vec<f32>,
+    pub(crate) ffn_norm: Vec<f32>,
+    pub(crate) router: QMat,
+    pub(crate) probs_b: Option<Vec<f32>>,
+    pub(crate) gate_up: Experts,
+    pub(crate) down: Experts,
+    pub(crate) top_k: usize,
 }
 
-struct InkCtrl {
-    down: QMat,
-    gain: QMat,
-    forget: QMat,
+pub(crate) struct InkCtrl {
+    pub(crate) down: QMat,
+    pub(crate) gain: QMat,
+    pub(crate) forget: QMat,
 }
 
 /// A looped layer's controllers: the queries that read the previous pass (Q, K, V, FFN) and the gates that mix it in.
 pub(crate) struct InkLoop {
-    msg_query: Vec<f32>,
-    ctrl: Vec<InkCtrl>,
+    pub(crate) msg_query: Vec<f32>,
+    pub(crate) ctrl: Vec<InkCtrl>,
 }
 
 pub(crate) struct Inkling {
-    layers: Vec<InkLayer>,
-    loops: Vec<InkLoop>,
+    pub(crate) layers: Vec<InkLayer>,
+    pub(crate) loops: Vec<InkLoop>,
     /// (start, end, passes) of the looped core
-    core: Option<(usize, usize, usize)>,
-    block: usize,
-    n_conv: usize,
-    n_rel: usize,
-    extent: usize,
-    n_swa: usize,
-    qk_clip: f32,
-    rel_clip: f32,
-    floor: f32,
-    alpha: f32,
-    situ_beta: f32,
-    situ_lb: f32,
-    w_scale: f32,
-    softcap: f32,
-    n_vocab: usize,
-    tok_norm: Vec<f32>,
-    out_query: Vec<f32>,
+    pub(crate) core: Option<(usize, usize, usize)>,
+    pub(crate) block: usize,
+    pub(crate) n_conv: usize,
+    pub(crate) n_rel: usize,
+    pub(crate) extent: usize,
+    pub(crate) n_swa: usize,
+    pub(crate) qk_clip: f32,
+    pub(crate) rel_clip: f32,
+    pub(crate) floor: f32,
+    pub(crate) alpha: f32,
+    pub(crate) situ_beta: f32,
+    pub(crate) situ_lb: f32,
+    pub(crate) w_scale: f32,
+    pub(crate) softcap: f32,
+    pub(crate) n_vocab: usize,
+    pub(crate) tok_norm: Vec<f32>,
+    pub(crate) out_query: Vec<f32>,
 }
 
 /// One cache slot (a layer in one pass): the keys and values of every token so far, and the convolutions' last inputs
@@ -169,6 +169,11 @@ fn dump(name: &str, slot: usize, v: &[f32]) {
         let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
         f.write_all(&bytes).expect("dump");
     }
+}
+
+/// A matrix's values as f32 (the device graph uploads the small ones this way).
+pub(crate) fn f32s(q: &QMat) -> Vec<f32> {
+    q.all_f32()
 }
 
 impl Inkling {
@@ -281,6 +286,24 @@ impl Inkling {
     /// (layer, experts) of every layer, for the placement's order.
     pub(crate) fn expert_counts(&self) -> Vec<(usize, usize)> {
         self.layers.iter().enumerate().map(|(l, ly)| (l, ly.router.rows)).collect()
+    }
+
+    /// situ(gate, up) = beta tanh(gate / beta) sigmoid(gate) * lb tanh(up / lb), of a fused gate/up product.
+    fn situ(&self, gu: &[f32]) -> Vec<f32> {
+        let n_ff = gu.len() / 2;
+        let (beta, lb) = (self.situ_beta, self.situ_lb);
+        (0..n_ff).map(|i| {
+            let (gt, up) = (gu[i], gu[n_ff + i]);
+            let up = if lb > 0.0 { lb * tanh_f32(up / lb) } else { up };
+            beta * tanh_f32(gt / beta) * sigmoid(gt) * up
+        }).collect()
+    }
+
+    /// Expert `e` of layer `il` for several inputs, unweighted (the device graph's CPU experts): down(situ(gate_up x)).
+    pub(crate) fn expert_rows(&self, il: usize, e: usize, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let ly = &self.layers[il];
+        let mids: Vec<Vec<f32>> = ly.gate_up.0[e].matmul(xs).iter().map(|g| self.situ(g)).collect();
+        ly.down.0[e].matmul(&mids)
     }
 
     fn control(&self, cur: &[f32], message: &[f32], c: &InkCtrl) -> Vec<f32> {
@@ -427,15 +450,7 @@ impl Inkling {
         }
         for &e in &order {
             m.heat[il * m.profile_experts + e].fetch_add(1, Ordering::Relaxed);
-            let gu = ly.gate_up.0[e].mul(&x);
-            let n_ff = gu.len() / 2;
-            let (beta, lb) = (self.situ_beta, self.situ_lb);
-            // situ(gate, up) = beta tanh(gate / beta) sigmoid(gate) * lb tanh(up / lb)
-            let mid: Vec<f32> = (0..n_ff).map(|i| {
-                let (gt, up) = (gu[i], gu[n_ff + i]);
-                let up = if lb > 0.0 { lb * tanh_f32(up / lb) } else { up };
-                beta * tanh_f32(gt / beta) * sigmoid(gt) * up
-            }).collect();
+            let mid = self.situ(&ly.gate_up.0[e].mul(&x));
             let w = probs[e] / sum * ws;
             acc.iter_mut().zip(&ly.down.0[e].mul(&mid)).for_each(|(a, v)| *a += w * v);
         }
@@ -499,5 +514,46 @@ impl Inkling {
 
     pub(crate) fn embed(&self, m: &Model, token: u32) -> Vec<f32> {
         rms_norm(&m.embd.row(token as usize), &self.tok_norm, m.eps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The CPU path on a synthetic Inkling (testgguf `InkSpec::tiny`: the loop over layers 2-3 three times, windowed and
+    //! full layers, a 16-token window and a 24-position bias table, both crossed by the 40-token prompt): the oracle the
+    //! device graph (graph_inkling.rs) is checked against. Its own parity with llama.cpp is I6's (the Workshop fixtures).
+    use crate::model::Model;
+    use crate::testgguf::{tmp_inkling, InkSpec};
+
+    #[test]
+    fn the_cpu_path_runs_a_synthetic_inkling_consistently() {
+        let p = tmp_inkling("tiny-inkling-cpu", &InkSpec::tiny());
+        let (m, _) = Model::load(&p, None).unwrap();
+        let ink = m.ink.as_ref().unwrap();
+        assert_eq!(ink.n_slots(), 6 + 2 * 2, "6 layers, and the core's 2 layers twice more");
+        let toks: Vec<u32> = (0..40).map(|i| (i * 37 + 5) % 256).collect();
+        let mut st = m.new_state();
+        let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+        assert!(one.iter().all(|l| l.len() == 250 && l.iter().all(|v| v.is_finite() && v.abs() <= 30.0)), "250 logits, soft-capped at 30");
+        let spread = one.iter().map(|l| l.iter().cloned().fold(f32::MIN, f32::max) - l.iter().cloned().fold(f32::MAX, f32::min)).fold(f32::MAX, f32::min);
+        assert!(spread > 0.5, "the logits are spread: {spread}");
+        // the same again, as a chunk, and after a rollback
+        let mut st = m.new_state();
+        assert_eq!(m.forward_batch_all(&mut st, &toks), one, "a chunk is token by token");
+        let mut st = m.new_state();
+        toks[..20].iter().for_each(|&t| { m.forward(&mut st, t); });
+        let ck = st.checkpoint();
+        toks[20..30].iter().for_each(|&t| { m.forward(&mut st, t); });
+        st.rollback(ck);
+        let again: Vec<Vec<f32>> = toks[20..].iter().map(|&t| m.forward(&mut st, t)).collect();
+        assert_eq!(again, one[20..], "a rollback forgets the tokens after it");
+        // the loop's later passes change the logits: the same model without its core run again differs
+        let flat = tmp_inkling("tiny-inkling-cpu-noloop", &InkSpec { loop_: None, ..InkSpec::tiny() });
+        let (m2, _) = Model::load(&flat, None).unwrap();
+        assert_eq!(m2.arch, "inkling2");
+        let mut st = m2.new_state();
+        let two: Vec<Vec<f32>> = toks.iter().map(|&t| m2.forward(&mut st, t)).collect();
+        let d = one.iter().flatten().zip(two.iter().flatten()).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(d > 0.1, "the loop moves the logits: {d}");
     }
 }

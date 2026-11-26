@@ -18,6 +18,8 @@ mod model;
 mod gpu;
 #[cfg(feature = "gpu")]
 mod graph;
+#[cfg(feature = "gpu")]
+mod graph_inkling;
 mod pack;
 mod remote;
 #[cfg(test)]
@@ -287,7 +289,7 @@ fn main() {
         let devs = gpu::parse(&spec).unwrap_or_else(|e| fail(e));
         // the device graph's KV cache is kept free on the first device when the graph can run this model (its experts
         // would otherwise fill the budget first and leave the graph no room)
-        let reserve = if !args.iter().any(|a| a == "--no-graph") && graph::refusal(&m).is_none() { graph::kv_need(&m, max_ctx, 4) } else { 0 };
+        let reserve = if !args.iter().any(|a| a == "--no-graph") && graph_inkling::refusal(&m).is_none() { graph_inkling::kv_need(&m, max_ctx, 4) } else { 0 };
         let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref(), reserve).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} {summary}");
         // findings item 2: --devices asked the GPU to take weights but nothing landed on it (the device opened and its
@@ -360,7 +362,7 @@ fn main() {
     // after every product (about 6x slower on a Mac M4's Metal); --no-graph keeps that path
     #[cfg(feature = "gpu")]
     let graph = if args.iter().any(|a| a == "--graph") {
-        let g = graph::Graph::new(&m, max_ctx).unwrap_or_else(|e| fail(e));
+        let g = graph_inkling::AnyGraph::new(&m, max_ctx).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} graph=1");
         Some(g)
     } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") && std::env::var_os("AM2_DEBUG_LAYERS").is_some() {
@@ -368,7 +370,7 @@ fn main() {
         eprintln!("AM2_DEBUG_LAYERS: matrix by matrix on the device, not the graph, so every layer's checksum is printed");
         None
     } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") {
-        match graph::Graph::new(&m, max_ctx) {
+        match graph_inkling::AnyGraph::new(&m, max_ctx) {
             Ok(g) => {
                 let (on, all) = g.experts_on();
                 placement = format!("{placement} graph=auto{}", if all > 0 { format!(" graph_experts_on_device={on}/{all}") } else { String::new() });
@@ -397,6 +399,19 @@ fn main() {
     let (on_graph, graph_batches) = (graph.is_some(), graph.as_ref().is_some_and(|g| g.batches()));
     #[cfg(not(feature = "gpu"))]
     let (on_graph, graph_batches) = (false, false);
+    // whether a GENI's picture rows can be read where the model runs (the CPU path, or Inkling's graph)
+    #[cfg(feature = "gpu")]
+    let rows_here = graph.as_ref().is_none_or(|g| g.takes_rows());
+    #[cfg(not(feature = "gpu"))]
+    let rows_here = true;
+    // a picture's row in place of its token: on Inkling's graph when it runs there
+    let forward_embd = |st: &mut model::State, row: Vec<f32>| -> Vec<f32> {
+        #[cfg(feature = "gpu")]
+        if let Some(g) = graph.as_ref().filter(|g| g.takes_rows()) {
+            return g.forward_embd(&m, st, row);
+        }
+        m.forward_embd(st, row)
+    };
     let batch: usize = if (m.batchable() && !on_graph) || graph_batches {
         std::env::var("AM2_PROMPT_BATCH").ok().and_then(|v| v.parse().ok()).unwrap_or(if graph_batches { 128 } else { 32 }).max(1)
     } else {
@@ -494,8 +509,8 @@ fn main() {
                 out("ERR GENI: no image_pad");
                 continue;
             };
-            if !m.takes_rows() || on_graph {
-                out(&format!("ERR GENI: {} takes no image rows{}", m.arch, if on_graph { " on the device graph" } else { "" }));
+            if !m.takes_rows() || !rows_here {
+                out(&format!("ERR GENI: {} takes no image rows{}", m.arch, if !rows_here { " on the device graph" } else { "" }));
                 continue;
             }
             match std::fs::File::open(parts[parts.len() - 2]) {
@@ -510,8 +525,8 @@ fn main() {
                 out("ERR GENI: no image_pad");
                 continue;
             };
-            if !m.takes_rows() || on_graph {
-                out(&format!("ERR GENI: {} takes no image rows{}", m.arch, if on_graph { " on the device graph" } else { "" }));
+            if !m.takes_rows() || !rows_here {
+                out(&format!("ERR GENI: {} takes no image rows{}", m.arch, if !rows_here { " on the device graph" } else { "" }));
                 continue;
             }
             let bytes = match std::fs::read(parts[parts.len() - 2]) {
@@ -575,7 +590,7 @@ fn main() {
                         }
                         if stopped || failed.is_some() { break; }
                     }
-                    logits = m.forward_embd(&mut st, rows[row * m.n_embd..(row + 1) * m.n_embd].to_vec());
+                    logits = forward_embd(&mut st, rows[row * m.n_embd..(row + 1) * m.n_embd].to_vec());
                     row += 1;
                     i += 1;
                 } else {
