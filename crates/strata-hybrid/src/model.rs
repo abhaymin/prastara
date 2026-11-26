@@ -20,6 +20,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use strata_gguf::Gguf;
+use crate::kvcache::{KvStore, KvType};
 
 mod inkling;
 #[cfg(test)]
@@ -396,7 +397,7 @@ fn f16_round(v: &mut [f32]) {
     v.iter_mut().for_each(|x| *x = strata_pack::num::f16_to_f32(strata_pack::num::f32_to_f16(*x)));
 }
 
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(crate) fn dot(a: &[f32], b: &[f32]) -> f32 {
     // eight accumulators: vectorizes, and does not lose much to one long serial sum
     let mut acc = [0f32; 8];
     let n = a.len() / 8 * 8;
@@ -748,6 +749,8 @@ pub struct Attn {
     /// q carries a gate per head after its query: the attention's output is multiplied by its sigmoid (Qwen3.5)
     pub(crate) gated: bool,
     pub(crate) qsa: Option<Qsa>,
+    /// a sliding-window layer: query i sees keys i - window < j <= i (`attention.sliding_window_pattern`)
+    pub(crate) window: Option<usize>,
 }
 
 /// QSA: past `top` cells, attention reads the blocks of `r` tokens that an indexer scores best, and the unfinished tail.
@@ -890,6 +893,8 @@ pub struct Model {
     pub(crate) loop_: Option<Loop>,
     /// How many passes the loop runs (`--loop-passes`): 0 is the model's own count, 1 the base alone
     pub loop_passes: std::sync::atomic::AtomicUsize,
+    /// How the attention caches store keys and values (`--kv`; kvcache.rs), set before any state is made
+    pub kv_type: KvType,
 }
 
 /// A loop over the core blocks, as the Workshop trains it (crates/strata-workshop/src/model.rs `LoopSpec`): pass 1 is
@@ -917,6 +922,8 @@ pub(crate) enum Step {
 pub struct State {
     pub pos: usize,
     kv: HashMap<usize, (Vec<f32>, Vec<f32>)>,
+    /// per attention slot: keys and values (kvcache.rs)
+    kvs: HashMap<usize, (KvStore, KvStore)>,
     conv: HashMap<usize, Vec<f32>>,
     ssm: HashMap<usize, Vec<f32>>,
     /// per QSA layer: the unfinished block's raw keys, and the finished blocks' keys
@@ -953,6 +960,10 @@ impl State {
             for (k, v) in self.kv.values_mut() {
                 k.truncate(k.len() / self.pos * ck.pos);
                 v.truncate(v.len() / self.pos * ck.pos);
+            }
+            for (k, v) in self.kvs.values_mut() {
+                k.cut(ck.pos);
+                v.cut(ck.pos);
             }
             for s in self.ink.iter_mut() {
                 s.cut(self.pos, ck.pos);
@@ -1021,7 +1032,7 @@ impl Model {
                 hc: 0, hc_head: None, layers: vec![],
                 heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
                 prefetch: AtomicBool::new(false), remote: None, profile_experts, ink: Some(Box::new(ink)), arch, file_order, file_map,
-                loop_: None, loop_passes: Default::default(),
+                loop_: None, loop_passes: Default::default(), kv_type: KvType::default(),
             }, from_pack));
         }
         let k = |n: &str| format!("{arch}.{n}");
@@ -1050,6 +1061,23 @@ impl Model {
         };
         let ple_layer = if qwen4 { Some(arr_u64(&g, &k("ple.layers"), 0) as usize) } else { None };
         let full_attn = u("full_attention_interval").unwrap_or(4).max(1) as usize;
+        // sliding-window layers (qwen3 from the Workshop's `context` copy; llama.cpp's keys): a window per layer
+        let swa: Vec<bool> = match g.metadata.get(&k("attention.sliding_window_pattern")) {
+            Some(serde_json::Value::Array(a)) if arch == "qwen3" || arch == "qwen3moe" =>
+                a.iter().map(|v| v.as_bool().unwrap_or_else(|| v.as_u64().unwrap_or(0) != 0)).collect(),
+            _ => vec![],
+        };
+        let swa_window = if swa.iter().any(|s| *s) {
+            if swa.len() != n_layer {
+                return Err(format!("{arch}: the sliding-window pattern has {} entries for {n_layer} layers", swa.len()));
+            }
+            match u("attention.sliding_window")? as usize {
+                0 => return Err(format!("{arch}: attention.sliding_window is 0")),
+                w => Some(w),
+            }
+        } else {
+            None
+        };
         let mut layers = Vec::with_capacity(n_layer);
         let mut max_expert = 0usize;
         let dense_lead = u("leading_dense_block_count").unwrap_or(0) as usize;
@@ -1064,6 +1092,7 @@ impl Model {
                     o: take(&p("attn_output.weight"))?, q_b: optf(&p("attn_q.bias")), k_b: optf(&p("attn_k.bias")),
                     v_b: optf(&p("attn_v.bias")), o_b: optf(&p("attn_output.bias")), q_norm: optf(&p("attn_q_norm.weight")),
                     k_norm: optf(&p("attn_k_norm.weight")), n_head, n_kv, head_dim, rope, gated: qwen35,
+                    window: if swa.get(l) == Some(&true) { swa_window } else { None },
                     qsa: match arr_u64(&g, &k("attention.compress_ratios"), l) as usize {
                         0 => None,
                         r => Some(Qsa {
@@ -1259,12 +1288,12 @@ impl Model {
             heat: (0..n_layer * profile_experts).map(|_| AtomicU32::new(0)).collect(),
             prefetch: AtomicBool::new(false),
             remote: None, ink: None, file_order, file_map,
-            profile_experts, layers, arch, loop_, loop_passes: Default::default(),
+            profile_experts, layers, arch, loop_, loop_passes: Default::default(), kv_type: KvType::default(),
         }, from_pack))
     }
 
     pub fn new_state(&self) -> State {
-        State { pos: 0, kv: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new(), idx: HashMap::new(), ple_win: vec![], prev: vec![],
+        State { pos: 0, kv: HashMap::new(), kvs: HashMap::new(), conv: HashMap::new(), ssm: HashMap::new(), idx: HashMap::new(), ple_win: vec![], prev: vec![],
                 ink: self.ink.as_ref().map_or(vec![], |i| vec![InkSlot::default(); i.n_slots()]) }
     }
 
@@ -1883,31 +1912,29 @@ impl Model {
         if ts != 1.0 {
             qv.iter_mut().for_each(|v| *v *= ts);
         }
-        // the cache holds f16 values (llama.cpp's default cache type: half the memory of f32)
-        f16_round(&mut kv);
-        f16_round(&mut vv);
-        let cache = st.kv.entry(slot).or_default();
-        cache.0.extend_from_slice(&kv);
-        cache.1.extend_from_slice(&vv);
-        let (kc, vc) = (&cache.0, &cache.1);
+        // the cache (kvcache.rs): f16 by default, llama.cpp's cache type; a sliding layer keeps its window
         let n_kv = a.n_kv;
-        let n = kc.len() / (n_kv * hd);
+        let (ty, window) = (self.kv_type, a.window);
+        let cache = st.kvs.entry(slot).or_insert_with(|| (KvStore::new(ty, hd, n_kv, window), KvStore::new(ty, hd, n_kv, window)));
+        cache.0.push(&kv);
+        cache.1.push(&vv);
+        let (kc, vc) = (&cache.0, &cache.1);
+        let (lo, n) = (kc.first_visible(), kc.end());
         let scale = 1.0 / (hd as f32).sqrt();
         let group = a.n_head / n_kv;
         let mut att = vec![0f32; a.n_head * hd];
         att.par_chunks_mut(hd).enumerate().for_each(|(hh, oh)| {
             let kh = hh / group;
             let qh = &qv[hh * hd..(hh + 1) * hd];
-            let score = |t: usize| dot(qh, &kc[(t * n_kv + kh) * hd..(t * n_kv + kh + 1) * hd]) * scale;
+            let score = |t: usize| kc.dot(t, kh, qh) * scale;
             let mut scores: Vec<f32> = match &top {
                 Some(cells) => cells.iter().map(|&t| score(t)).collect(),
-                None => (0..n).map(score).collect(),
+                None => (lo..n).map(score).collect(),
             };
             softmax(&mut scores);
             for (i, p) in scores.iter().enumerate() {
-                let t = top.as_ref().map_or(i, |c| c[i]);
-                let vt = &vc[(t * n_kv + kh) * hd..(t * n_kv + kh + 1) * hd];
-                oh.iter_mut().zip(vt).for_each(|(o, v)| *o += p * v);
+                let t = top.as_ref().map_or(lo + i, |c| c[i]);
+                vc.axpy(t, kh, *p, oh);
             }
         });
         if let Some(g) = &gate {

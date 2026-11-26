@@ -18,7 +18,8 @@
 //! path keeps f16), so a logit can differ a little more; the parity tests (below) decide.
 
 use crate::model::{Act, Block, Gating, Model, Moe, QMat, State, Step};
-use strata_gpu::{Buf, Gpu, Weights};
+use crate::kvcache::KvType;
+use strata_gpu::{Buf, Gpu, KvCache, KvMode, Weights};
 
 struct Attn<'a> {
     norm: Buf,
@@ -33,11 +34,45 @@ struct Attn<'a> {
     hd: u32,
 }
 
-/// One attention cache on the device: a layer's in one pass of the loop.
-struct Kv {
-    kc: Buf,
-    vc: Buf,
-    s: Buf,
+/// One attention cache on the device: a layer's in one pass of the loop. `Plain`: f32 (half on native Metal), written
+/// by the products' kernels directly, any head size; `Packed`: f16 or 8-bit (`--kv`), or a sliding layer's ring, on
+/// the flash kernels (strata-gpu KvCache).
+enum Kv {
+    Plain { kc: Buf, vc: Buf, s: Buf },
+    Packed(KvCache),
+}
+
+/// Tokens a sliding layer's ring holds past its window: the longest chunk the graph runs when a layer slides.
+const RING_SLACK: usize = 512;
+
+/// The device encoding of `--kv` for this model on `g`, or None for the plain cache (f32 on CubeCL, written by the
+/// products' kernels directly; half on native Metal); an error when it cannot.
+fn packed_mode(m: &Model, g: &Gpu) -> Result<Option<KvMode>, String> {
+    let atts: Vec<_> = m.layers.iter().filter_map(|l| match l.parts.first() { Some((_, Block::Attn(a))) => Some(a), _ => None }).collect();
+    let windows = atts.iter().any(|a| a.window.is_some());
+    if g.is_native() {
+        return match (m.kv_type, windows) {
+            (_, true) => Err("--graph: sliding-window layers are not on the native Metal backend yet (AM2_METAL_NATIVE=0 runs them on wgpu)".into()),
+            (KvType::Q8, _) => Err("--graph: --kv q8 is not on the native Metal backend yet (its cache is f16)".into()),
+            _ => Ok(None),
+        };
+    }
+    let mode = match m.kv_type {
+        KvType::F32 if !windows => return Ok(None),
+        KvType::F32 => KvMode::F32,
+        KvType::F16 => KvMode::F16,
+        KvType::Q8 => KvMode::Q8,
+    };
+    let unit = match mode { KvMode::F16 => 2, KvMode::Q8 => 4, KvMode::F32 => 1 };
+    if let Some(a) = atts.iter().find(|a| a.head_dim % unit != 0) {
+        return Err(format!("--graph: --kv {} needs heads of a multiple of {unit} values, not {}", m.kv_type.name(), a.head_dim));
+    }
+    Ok(Some(mode))
+}
+
+/// Tokens a layer's device cache holds for `max_ctx`: its window and the ring's slack for a sliding layer.
+fn cache_tokens(window: Option<usize>, max_ctx: usize) -> usize {
+    window.map_or(max_ctx, |w| (w + RING_SLACK).min(max_ctx))
 }
 
 /// A routed expert layer: the router on the device, and each expert's (gate, up, down) when they are all there.
@@ -70,6 +105,10 @@ pub struct Graph<'a> {
     n_rot: u32,
     neox: bool,
     max_ctx: usize,
+    /// a layer slides: chunks stay within its ring's slack
+    sliding: bool,
+    /// the caches' bytes on the device
+    pub kv_bytes: u64,
 }
 
 fn on_device<'a>(q: &'a QMat, dev: &mut Option<usize>) -> Result<&'a Weights, String> {
@@ -129,9 +168,10 @@ pub fn refusal(m: &Model) -> Option<String> {
     None
 }
 
-/// The bytes the graph's KV caches and score scratch take for `max_ctx` tokens at `per_value` bytes a K or V value:
-/// what placement keeps free on the first device for them (main.rs), so the experts do not fill the budget first.
-pub fn kv_need(m: &Model, max_ctx: usize, per_value: u64) -> u64 {
+/// The bytes the graph's KV caches and score scratch take for `max_ctx` tokens, K and V at `--kv`'s encoding (f32 on a
+/// device without the flash kernels): what placement keeps free on the first device for them (main.rs), so the
+/// experts do not fill the budget first.
+pub fn kv_need(m: &Model, max_ctx: usize) -> u64 {
     let passes = m.loop_.as_ref().map_or(1, |l| l.passes);
     let mut b = 0u64;
     for pass in 0..passes {
@@ -140,7 +180,8 @@ pub fn kv_need(m: &Model, max_ctx: usize, per_value: u64) -> u64 {
                 continue;
             }
             if let Some((_, Block::Attn(a))) = layer.parts.first() {
-                b += (2 * a.n_kv * a.head_dim) as u64 * max_ctx as u64 * per_value + a.n_head as u64 * max_ctx as u64 * 4;
+                let mode = match m.kv_type { KvType::F32 => KvMode::F32, KvType::F16 => KvMode::F16, KvType::Q8 => KvMode::Q8 };
+                b += mode.token_bytes(a.n_kv, a.head_dim) * cache_tokens(a.window, max_ctx) as u64;
             }
         }
     }
@@ -199,10 +240,14 @@ impl<'a> Graph<'a> {
         let passes = looped.map_or(1, |l| l.passes);
         let wanted = |pass: usize, l: usize| pass == 0 || looped.is_some_and(|lp| (lp.start..lp.end).contains(&l));
         let kvb = g.kv_bytes();
+        let packed = packed_mode(m, g)?;
         let mut kv_bytes = 0u64;
         for pass in 0..passes {
             for (_, r) in raw.iter().enumerate().filter(|(l, _)| wanted(pass, *l)) {
-                kv_bytes += (2 * r.1.n_kv * r.1.head_dim) as u64 * max_ctx as u64 * kvb + r.1.n_head as u64 * max_ctx as u64 * 4;
+                kv_bytes += match packed {
+                    None => (2 * r.1.n_kv * r.1.head_dim) as u64 * max_ctx as u64 * kvb + r.1.n_head as u64 * max_ctx as u64 * 4,
+                    Some(mode) => mode.token_bytes(r.1.n_kv, r.1.head_dim) * cache_tokens(r.1.window, max_ctx) as u64,
+                };
             }
         }
         if let Some(room) = crate::gpu::ROOM.get().and_then(|r| r.get(dev)) {
@@ -216,7 +261,10 @@ impl<'a> Graph<'a> {
         for pass in 0..passes {
             for (l, r) in raw.iter().enumerate() {
                 let row = r.1.n_kv * r.1.head_dim;
-                kv.push(wanted(pass, l).then(|| Kv { kc: g.kv_cache(row * max_ctx), vc: g.kv_cache(row * max_ctx), s: g.scratch(r.1.n_head * max_ctx) }));
+                kv.push(wanted(pass, l).then(|| match packed {
+                    None => Kv::Plain { kc: g.kv_cache(row * max_ctx), vc: g.kv_cache(row * max_ctx), s: g.scratch(r.1.n_head * max_ctx) },
+                    Some(mode) => Kv::Packed(g.kv_alloc(mode, r.1.n_kv, r.1.head_dim, cache_tokens(r.1.window, max_ctx), r.1.window.unwrap_or(0))),
+                }));
             }
         }
         let mut layers = Vec::with_capacity(n_layers);
@@ -240,7 +288,9 @@ impl<'a> Graph<'a> {
             });
         }
         let gates = looped.map_or(vec![], |l| l.gates.iter().map(|w| g.buffer(w)).collect());
-        Ok(Graph { g, layers, kv, gates, out_norm: g.buffer(&m.out_norm), output, n_rot: rope.n_dims as u32, neox: rope.neox, max_ctx })
+        let sliding = m.layers.iter().any(|l| matches!(l.parts.first(), Some((_, Block::Attn(a))) if a.window.is_some()));
+        Ok(Graph { g, layers, kv, gates, out_norm: g.buffer(&m.out_norm), output, n_rot: rope.n_dims as u32, neox: rope.neox, max_ctx, sliding,
+                   kv_bytes })
     }
 
     /// How many routed experts are on the graph's device, and how many there are (for the INFO line).
@@ -269,7 +319,10 @@ impl<'a> Graph<'a> {
         };
         let l0 = &self.layers[0];
         let a = &l0.attn;
-        let kv = self.kv[0].as_ref().expect("layer 0's cache");
+        let Some(Kv::Plain { kc, vc, s }) = self.kv[0].as_ref() else {
+            eprintln!("GPU_BENCH: the kernel times are for the plain f32 cache (--kv f32)");
+            return;
+        };
         let dim = m.n_embd;
         let x = g.buffer(&vec![0.01f32; dim]);
         let mut mats = vec![("attn_q", a.q), ("attn_k", a.k), ("attn_v", a.v), ("attn_o", a.o), ("output", self.output)];
@@ -287,9 +340,9 @@ impl<'a> Graph<'a> {
         let q = g.scratch(a.q.rows as usize);
         time("rope q", 0, &|| { g.rope(&tab, &q, a.hd, self.n_rot, self.neox); q.clone() });
         let k = g.scratch(a.k.rows as usize);
-        time("kv_append", 0, &|| { g.kv_append(&k, &kv.kc, 0); k.clone() });
+        time("kv_append", 0, &|| { g.kv_append(&k, kc, 0); k.clone() });
         for ctx in [16u32, 128, 1024] {
-            time(&format!("attend n={ctx}"), 0, &|| g.attend(&q, &kv.kc, &kv.vc, &kv.s, ctx, a.n_head, a.n_kv, a.hd, 0.1));
+            time(&format!("attend n={ctx}"), 0, &|| g.attend(&q, kc, vc, s, ctx, a.n_head, a.n_kv, a.hd, 0.1));
         }
         time("buffer upload (rope table)", 0, &|| g.buffer(&rope.table(5)));
         let mut st = m.new_state();
@@ -332,7 +385,7 @@ impl<'a> Graph<'a> {
         let mut i = 0;
         while i < tokens.len() {
             let mut n = tokens.len() - i;
-            while n > 1 && n * heads * (st.pos + n) * 4 > 128 << 20 {
+            while n > 1 && (n * heads * (st.pos + n) * 4 > 128 << 20 || (self.sliding && n > RING_SLACK)) {
                 n /= 2;
             }
             let mut got = self.run(m, st, &tokens[i..i + n], all);
@@ -399,14 +452,29 @@ impl<'a> Graph<'a> {
         // q, k and v in one kernel where it can (v straight into its cache), then q/k norms, RoPE and k into its cache in
         // one more (strata-gpu lib.rs qkv, qk_rope)
         let row = (a.n_kv * a.hd) as usize;
-        let (q, k) = g.qkv(a.q, a.k, a.v, &h, n, &kv.vc, base * row);
-        let q = g.qk_rope(&q, &k, a.q_norm.as_ref(), a.k_norm.as_ref(), tab, &kv.kc, base * row, a.hd, self.n_rot, self.neox, n, m.eps);
-        let att = match scales {
-            None => {
-                let ts = m.temp_scale_at(base);
-                g.attend(&q, &kv.kc, &kv.vc, &kv.s, base as u32 + 1, a.n_head, a.n_kv, a.hd, ts / (a.hd as f32).sqrt())
+        let att = match kv {
+            Kv::Plain { kc, vc, s } => {
+                let (q, k) = g.qkv(a.q, a.k, a.v, &h, n, vc, base * row);
+                let q = g.qk_rope(&q, &k, a.q_norm.as_ref(), a.k_norm.as_ref(), tab, kc, base * row, a.hd, self.n_rot, self.neox, n, m.eps);
+                match scales {
+                    None => {
+                        let ts = m.temp_scale_at(base);
+                        g.attend(&q, kc, vc, s, base as u32 + 1, a.n_head, a.n_kv, a.hd, ts / (a.hd as f32).sqrt())
+                    }
+                    Some(sc) => g.attend_tokens(&q, kc, vc, sc, base as u32, n, a.n_head, a.n_kv, a.hd),
+                }
             }
-            Some(sc) => g.attend_tokens(&q, &kv.kc, &kv.vc, sc, base as u32, n, a.n_head, a.n_kv, a.hd),
+            Kv::Packed(c) => {
+                // k and v as f32 rows first (the products' kernels write f32), then stored in the cache's encoding
+                let (ks, vs) = (g.scratch(nt * row), g.scratch(nt * row));
+                let (q, k) = g.qkv(a.q, a.k, a.v, &h, n, &vs, 0);
+                let q = g.qk_rope(&q, &k, a.q_norm.as_ref(), a.k_norm.as_ref(), tab, &ks, 0, a.hd, self.n_rot, self.neox, n, m.eps);
+                g.kv_store(c, &ks, &vs, base, n);
+                match scales {
+                    None => g.attend_kv(&q, c, base as u32 + 1, a.n_head, m.temp_scale_at(base) / (a.hd as f32).sqrt()),
+                    Some(sc) => g.attend_kv_tokens(&q, c, sc, base as u32, n, a.n_head),
+                }
+            }
         };
         g.mv_add(a.o, &att, x, n);
     }
@@ -519,12 +587,19 @@ mod tests {
     /// The CPU path's logits token by token against the graph's token by token, a chunk at a time, a chunk then
     /// tokens, and a chunk's last. -> (the worst difference, the experts on the device and in all).
     fn check(name: &str, path: &Path, dev: &str, experts: f64, passes: usize) -> (f32, (usize, usize)) {
-        let (cpu, _) = Model::load(path, None).unwrap();
+        check_kv(name, path, dev, experts, passes, KvType::default(), TOL)
+    }
+
+    /// `check` with the caches of both paths in `kv`, within `tol`.
+    fn check_kv(name: &str, path: &Path, dev: &str, experts: f64, passes: usize, kv: KvType, tol: f32) -> (f32, (usize, usize)) {
+        let (mut cpu, _) = Model::load(path, None).unwrap();
+        cpu.kv_type = kv;
         cpu.loop_passes.store(passes, std::sync::atomic::Ordering::Relaxed);
         let toks: Vec<u32> = TOKENS.iter().map(|&t| t % cpu.embd.rows as u32).collect();
         let mut st = cpu.new_state();
         let want: Vec<Vec<f32>> = toks.iter().map(|&t| cpu.forward(&mut st, t)).collect();
-        let m = placed(path, dev, experts);
+        let mut m = placed(path, dev, experts);
+        m.kv_type = kv;
         m.loop_passes.store(passes, std::sync::atomic::Ordering::Relaxed);
         let gr = Graph::new(&m, 64).unwrap();
         let mut st = m.new_state();
@@ -537,13 +612,13 @@ mod tests {
         let mut st = m.new_state();
         let last = gr.forward_batch(&m, &mut st, &toks);
         let d = [max_diff(&one, &want), max_diff(&chunk, &want), max_diff(&mixed, &want), max_diff(&[last], &want[want.len() - 1..])];
-        eprintln!("{name}: experts {:?} on the device, passes={passes}: max |graph - cpu| one={:.2e} chunk={:.2e} mixed={:.2e} last={:.2e}",
-                  gr.experts_on(), d[0], d[1], d[2], d[3]);
+        eprintln!("{name}: kv {}, experts {:?} on the device, passes={passes}: max |graph - cpu| one={:.2e} chunk={:.2e} mixed={:.2e} last={:.2e}",
+                  kv.name(), gr.experts_on(), d[0], d[1], d[2], d[3]);
         for (i, (a, b)) in one.iter().zip(&want).enumerate() {
             assert_eq!(argmax(a), argmax(b), "{name}: token {i}'s best logit");
         }
         let worst = d.iter().copied().fold(0.0, f32::max);
-        assert!(worst < TOL, "{name}: {d:?}");
+        assert!(worst < tol, "{name}: {d:?}");
         (worst, gr.experts_on())
     }
 
@@ -565,6 +640,25 @@ mod tests {
         check("tiny qwen3 loop (testgguf)", &own, &dev, 1.0, 0);
         let llama = testgguf::tmp("tiny-llama", &Spec { arch: "llama", seed: 0x5EED_0004, ..Spec::tiny_qwen3() });
         check("tiny llama", &llama, &dev, 1.0, 0);
+    }
+
+    /// The caches' three encodings on the graph against the CPU path's (the same rounding on both): f32 (the plain cache),
+    /// f16 and q8 (the packed one), on the loop and the Workshop's MoE fixtures.
+    #[test]
+    fn compact_caches_on_the_graph_equal_the_cpu() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures");
+        // heads of 16 (the scores, softmax and blend kernels), and of 32 and 64 (the flash kernels on CUDA)
+        let flash = [testgguf::tmp("tiny-qwen3", &Spec::tiny_qwen3()),
+                     testgguf::tmp("tiny-qwen3moe-64", &Spec { head_dim: 64, n_embd: 128, seed: 0x5EED_0011, ..Spec::tiny_qwen3moe() })];
+        for (name, path) in [("tiny qwen3 loop", fx.join("tiny-qwen3-loop/model.f32.gguf")), ("tiny qwen3moe", fx.join("tiny-qwen3-moe/moe.f32.gguf")),
+                             ("tiny qwen3moe loop", fx.join("tiny-qwen3-moe/moe-loop.f32.gguf")), ("tiny qwen3, heads of 32", flash[0].clone()),
+                             ("tiny qwen3moe, heads of 64", flash[1].clone())] {
+            for kv in [KvType::F32, KvType::F16, KvType::Q8] {
+                check_kv(name, &path, &dev, 1.0, 0, kv, TOL);
+            }
+        }
     }
 
     /// The looped fixture on the graph against the Workshop's own (f32) forward pass, which the CPU path matches
@@ -599,7 +693,9 @@ mod tests {
         let toks: Vec<u32> = (0..23).map(|i| (i * 37 + 5) % 256).collect();
         let p = testgguf::tmp("tiny-qwen3moe", &Spec::tiny_qwen3moe());
         for share in [1.0, 0.5] {
-            let m = placed(&p, &dev, share);
+            // the plain f32 cache: rounding K and V to f16 would turn the chunk's last-bit differences into an f16 step
+            let mut m = placed(&p, &dev, share);
+            m.kv_type = KvType::F32;
             let mut st = m.new_state();
             let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
             let mut st = m.new_state();

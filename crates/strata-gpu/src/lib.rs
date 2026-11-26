@@ -169,6 +169,46 @@ impl Buf {
     }
 }
 
+/// How a [`KvCache`] stores keys and values: f32, f16 (two per word), or 8 bits (four per word) with an f32 scale per
+/// row of a head (amax / 127).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum KvMode {
+    F32,
+    F16,
+    Q8,
+}
+
+impl KvMode {
+    fn code(self) -> u32 {
+        match self { KvMode::F32 => 0, KvMode::F16 => 1, KvMode::Q8 => 2 }
+    }
+
+    /// The words (4 bytes) a token's row of `vals` values takes.
+    pub fn words(self, vals: usize) -> usize {
+        match self { KvMode::F32 => vals, KvMode::F16 => vals.div_ceil(2), KvMode::Q8 => vals.div_ceil(4) }
+    }
+
+    /// The bytes per token of K and V together for `n_kv` heads of `hd` (with the scales).
+    pub fn token_bytes(self, n_kv: usize, hd: usize) -> u64 {
+        let scales = if self == KvMode::Q8 { n_kv * 4 } else { 0 };
+        2 * (self.words(n_kv * hd) * 4 + scales) as u64
+    }
+}
+
+/// One layer's K and V on the device ([`Gpu::kv_alloc`]).
+pub struct KvCache {
+    k: Buf,
+    v: Buf,
+    ks: Buf,
+    vs: Buf,
+    pub mode: KvMode,
+    /// tokens held (a ring when `window` > 0)
+    pub cap: usize,
+    pub window: usize,
+    pub n_kv: usize,
+    pub hd: usize,
+}
+
 pub struct Gpu {
     client: Client,
     pub name: String,
@@ -696,7 +736,7 @@ impl Gpu {
             let warps = (n_head / n_kv).clamp(1, 8);
             with_client!(self, c, R, unsafe {
                 kernels::attend_split::launch_unchecked::<R>(c, CubeCount::Static(n_kv, splits, 1), CubeDim::new_1d(32 * warps), q.arg(), k.arg(), v.arg(),
-                    part.arg(), n, n_kv, n_head / n_kv, scale, len, per);
+                    k.arg(), v.arg(), part.arg(), 0, n, n_kv, n_head / n_kv, scale, len, 1, per, 0, false);
                 kernels::attend_merge::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), part.arg(), o.arg(),
                     splits, hd);
             });
@@ -708,9 +748,11 @@ impl Gpu {
         let o = self.scratch((n_head * hd) as usize);
         let group = n_head / n_kv;
         with_client!(self, c, R, unsafe {
-            kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(), n, n_kv, group, hd, scale);
+            kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), k.arg(), s.arg(),
+                0, n, n_kv, group, hd, scale, 1, 0, false);
             kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
-            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), v.arg(), o.arg(),
+                0, n, n_kv, group, hd, n_head, 1, 0, false);
         });
         o
     }
@@ -735,8 +777,8 @@ impl Gpu {
         stats::launch(1);
         let o = self.scratch((tokens * n_head * per * 32) as usize);
         with_client!(self, c, R, unsafe {
-            kernels::attend_rows::launch_unchecked::<R>(c, CubeCount::Static(n_head, tokens, 1), CubeDim::new_1d(128), q.arg(), k.arg(), v.arg(), o.arg(),
-                scales.arg(), base, n_kv, n_head / n_kv, n_head, scale, per, chunk);
+            kernels::attend_rows::launch_unchecked::<R>(c, CubeCount::Static(n_head, tokens, 1), CubeDim::new_1d(128), q.arg(), k.arg(), v.arg(),
+                k.arg(), v.arg(), o.arg(), scales.arg(), base, n_kv, n_head / n_kv, n_head, scale, 0, 1, per, chunk, 0, false);
         });
         o
     }
@@ -783,10 +825,110 @@ impl Gpu {
         let o = self.scratch((rows * hd) as usize);
         let group = n_head / n_kv;
         with_client!(self, c, R, unsafe {
-            kernels::attn_scores_tokens::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, tokens), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(),
-                                                               scales.arg(), n, n_kv, group, hd, n_head, base);
+            kernels::attn_scores_tokens::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, tokens), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(),
+                k.arg(), s.arg(), scales.arg(), 0, n, n_kv, group, hd, n_head, base, 0, 1, 0, false);
             kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
-            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), v.arg(), o.arg(),
+                0, n, n_kv, group, hd, n_head, 1, 0, false);
+        });
+        o
+    }
+
+    /// Whether this device runs the flash attention kernels for heads of `hd` values (32, 64, 128 or 256 on 32-wide
+    /// planes; AM2_FLASH=0 turns them off).
+    pub fn has_flash(&self, hd: u32) -> bool {
+        self.flash(hd).is_some()
+    }
+
+    /// A layer's K and V cache of `cap` tokens (`n_kv` heads of `hd`) in `mode`; `window` > 0: a sliding layer, whose
+    /// cache is a ring of `cap` tokens (cap >= window + the longest chunk). CubeCL devices (not the native Metal
+    /// backend); f16 needs an even `hd`, q8 a multiple of 4.
+    pub fn kv_alloc(&self, mode: KvMode, n_kv: usize, hd: usize, cap: usize, window: usize) -> KvCache {
+        let words = mode.words(n_kv * hd) * cap;
+        let scales = if mode == KvMode::Q8 { n_kv * cap } else { 1 };
+        KvCache { k: self.scratch(words), v: self.scratch(words), ks: self.scratch(scales), vs: self.scratch(scales), mode, cap, window, n_kv, hd }
+    }
+
+    /// The chunk's keys and values (`tokens` rows of n_kv * hd f32 each, `k` and `v`) into the cache at positions
+    /// base.., queued: one launch for both.
+    pub fn kv_store(&self, kv: &KvCache, k: &Buf, v: &Buf, base: usize, tokens: u32) {
+        stats::launch(1);
+        let (n_kv, hd) = (kv.n_kv as u32, kv.hd as u32);
+        let mode = kv.mode.code();
+        with_client!(self, c, R, unsafe {
+            kernels::kv_store::launch_unchecked::<R>(c, CubeCount::Static(tokens * n_kv, 2, 1), CubeDim::new_1d(kernels::CUBE), k.arg(), v.arg(),
+                kv.k.arg(), kv.v.arg(), kv.ks.arg(), kv.vs.arg(), base as u32, n_kv, hd, kv.cap as u32, mode);
+        });
+    }
+
+    /// Decode attention of q (`n_head` heads) over positions ..n of the cache (its window's for a sliding layer),
+    /// queued: the flash kernels where they run ([`Gpu::has_flash`]), else scores, softmax and blend.
+    pub fn attend_kv(&self, q: &Buf, kv: &KvCache, n: u32, n_head: u32, scale: f32) -> Buf {
+        let (n_kv, hd) = (kv.n_kv as u32, kv.hd as u32);
+        let lo = if kv.window > 0 { n.saturating_sub(kv.window as u32) } else { 0 };
+        let m = n - lo;
+        let (mode, ring) = (kv.mode.code(), kv.window > 0);
+        let Some(per) = self.flash(hd) else {
+            // scores, softmax, blend (heads of any size)
+            stats::launch(3);
+            let s = self.scratch((n_head * m) as usize);
+            let o = self.scratch((n_head * hd) as usize);
+            let group = n_head / n_kv;
+            with_client!(self, c, R, unsafe {
+                kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(m, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), kv.k.arg(),
+                    kv.ks.arg(), s.arg(), lo, m, n_kv, group, hd, scale, kv.cap as u32, mode, ring);
+                kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), m);
+                kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), kv.v.arg(),
+                    kv.vs.arg(), o.arg(), lo, m, n_kv, group, hd, n_head, kv.cap as u32, mode, ring);
+            });
+            return o;
+        };
+        stats::launch(2);
+        let len = m.div_ceil(32).div_ceil(32).max(1) * 32;
+        let splits = m.div_ceil(len);
+        let part = self.scratch((n_head * splits * (hd + 2)) as usize);
+        let o = self.scratch((n_head * hd) as usize);
+        let warps = (n_head / n_kv).clamp(1, 8);
+        with_client!(self, c, R, unsafe {
+            kernels::attend_split::launch_unchecked::<R>(c, CubeCount::Static(n_kv, splits, 1), CubeDim::new_1d(32 * warps), q.arg(), kv.k.arg(),
+                kv.v.arg(), kv.ks.arg(), kv.vs.arg(), part.arg(), lo, n, n_kv, n_head / n_kv, scale, len, kv.cap as u32, per, mode, ring);
+            kernels::attend_merge::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), part.arg(), o.arg(),
+                splits, hd);
+        });
+        o
+    }
+
+    /// Causal attention for a chunk of `tokens` queries at positions base.. over the cache (K and V stored already),
+    /// each token's scale in `scales`, queued. A ring must hold the window and the chunk.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attend_kv_tokens(&self, q: &Buf, kv: &KvCache, scales: &Buf, base: u32, tokens: u32, n_head: u32) -> Buf {
+        let (n_kv, hd) = (kv.n_kv as u32, kv.hd as u32);
+        let (mode, ring) = (kv.mode.code(), kv.window > 0);
+        let Some(per) = self.flash(hd) else {
+            stats::launch(3);
+            let n = base + tokens;
+            // the positions any of the chunk's tokens sees
+            let lo = if kv.window > 0 { (base + 1).saturating_sub(kv.window as u32) } else { 0 };
+            let m = n - lo;
+            let rows = tokens * n_head;
+            let s = self.scratch((rows * m) as usize);
+            let o = self.scratch((rows * hd) as usize);
+            let group = n_head / n_kv;
+            with_client!(self, c, R, unsafe {
+                kernels::attn_scores_tokens::launch_unchecked::<R>(c, CubeCount::Static(m, n_head, tokens), CubeDim::new_1d(kernels::CUBE), q.arg(),
+                    kv.k.arg(), kv.ks.arg(), s.arg(), scales.arg(), lo, m, n_kv, group, hd, n_head, base, kv.window as u32, kv.cap as u32, mode, ring);
+                kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), m);
+                kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), kv.v.arg(),
+                    kv.vs.arg(), o.arg(), lo, m, n_kv, group, hd, n_head, kv.cap as u32, mode, ring);
+            });
+            return o;
+        };
+        stats::launch(1);
+        let o = self.scratch((tokens * n_head * per * 32) as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::attend_rows::launch_unchecked::<R>(c, CubeCount::Static(n_head, tokens, 1), CubeDim::new_1d(128), q.arg(), kv.k.arg(), kv.v.arg(),
+                kv.ks.arg(), kv.vs.arg(), o.arg(), scales.arg(), base, n_kv, n_head / n_kv, n_head, 0.0, kv.window as u32, kv.cap as u32, per, true,
+                mode, ring);
         });
         o
     }

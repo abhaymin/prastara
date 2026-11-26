@@ -13,6 +13,7 @@
 
 mod cpu_dot;
 mod cpu_q8;
+mod kvcache;
 mod model;
 #[cfg(feature = "gpu")]
 mod gpu;
@@ -222,6 +223,8 @@ fn main() {
     #[allow(unused_mut)]
     let (mut m, from_pack) = model::Model::load(std::path::Path::new(&model_path), pk.as_ref()).unwrap_or_else(|e| fail(e));
     m.loop_passes.store(loop_passes, std::sync::atomic::Ordering::Relaxed);
+    // --kv f16|f32|q8: how the attention caches store keys and values (f16 by default; q8 about a quarter of f32)
+    m.kv_type = arg("--kv").map(|v| kvcache::KvType::parse(&v).unwrap_or_else(|e| fail(e))).unwrap_or_default();
     let n_layers = m.profile_layers();
     // the expert host: this machine lends its memory to a paired master (remote.rs); it serves until stopped
     if let Some(addr) = arg("--serve-experts") {
@@ -287,7 +290,7 @@ fn main() {
         let devs = gpu::parse(&spec).unwrap_or_else(|e| fail(e));
         // the device graph's KV cache is kept free on the first device when the graph can run this model (its experts
         // would otherwise fill the budget first and leave the graph no room)
-        let reserve = if !args.iter().any(|a| a == "--no-graph") && graph::refusal(&m).is_none() { graph::kv_need(&m, max_ctx, 4) } else { 0 };
+        let reserve = if !args.iter().any(|a| a == "--no-graph") && graph::refusal(&m).is_none() { graph::kv_need(&m, max_ctx) } else { 0 };
         let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref(), reserve).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} {summary}");
         // findings item 2: --devices asked the GPU to take weights but nothing landed on it (the device opened and its
@@ -418,6 +421,7 @@ fn main() {
         None => String::new(),
     };
     // geni_stream=1: GENI takes rows=stream (a video's frames read as they are encoded)
+    placement = format!("{placement} kv={}", m.kv_type.name());
     out(&format!("INFO engine=am2strata-hybrid geni_stream=1 arch={} context={max_ctx} {} placement={placement}{packed}{prof} load_ms={}", m.arch,
                  m.summary(), t0.elapsed().as_millis()));
     let mut last_heat: Vec<u32> = Vec::new();

@@ -580,19 +580,22 @@ pub fn kv_append(x: &Array<f32>, cache: &mut Array<f32>, at: u32, n: u32) {
     }
 }
 
-/// Attention scores: s[hh * n + t] = (q_hh . k_t) * scale * ts for every query head and position (a cube per pair).
-/// K and V hold `n_kv` heads per position, and query head hh reads KV head hh / group.
+/// Attention scores: s[hh * m + i] = (q_hh . k_t) * scale for every query head and position t = lo + i of lo..lo + m
+/// (a cube per pair). K and V hold `n_kv` heads per position (in the cache's encoding `mode`, a ring of `cap` tokens
+/// when `ring`: kv_raw, kv_row), and query head hh reads KV head hh / group.
 #[cube(launch_unchecked)]
-pub fn attn_scores(q: &Array<f32>, k: &Array<f32>, s: &mut Array<f32>, n: u32, n_kv: u32, group: u32, hd: u32, scale: f32) {
-    let t = CUBE_POS_X;
+pub fn attn_scores(q: &Array<f32>, k: &Array<u32>, ks: &Array<f32>, s: &mut Array<f32>, lo: u32, m: u32, n_kv: u32, group: u32, hd: u32,
+                   scale: f32, cap: u32, #[comptime] mode: u32, #[comptime] ring: bool) {
+    let i = CUBE_POS_X;
+    let t = lo + i;
     let hh = CUBE_POS_Y;
     let kh = hh / group;
     let qo = hh * hd;
-    let ko = (t * n_kv + kh) * hd;
+    let row = kv_row(t, kh, n_kv, cap, ring);
     let mut acc = f32::new(0.0);
     let mut j = UNIT_POS;
     while j < hd {
-        acc += q[(qo + j) as usize] * k[(ko + j) as usize];
+        acc += q[(qo + j) as usize] * kv_raw(k, row, j, hd, mode);
         j += CUBE;
     }
     let mut sum = SharedMemory::<f32>::new(CUBE as usize);
@@ -607,7 +610,7 @@ pub fn attn_scores(q: &Array<f32>, k: &Array<f32>, s: &mut Array<f32>, n: u32, n
         stride /= 2;
     }
     if UNIT_POS == 0 {
-        s[(hh * n + t) as usize] = sum[0usize] * scale;
+        s[(hh * m + i) as usize] = kv_scaled(sum[0usize], ks, row, mode) * scale;
     }
 }
 
@@ -661,42 +664,47 @@ pub fn attn_softmax(s: &mut Array<f32>, n: u32) {
     }
 }
 
-/// o[r * hd + j] = sum over t of p[r, t] * v[t, (r % n_head) / group][j]: a cube per row r of scores (a query head of
-/// a token: r = token * n_head + head), a unit per `j % CUBE`.
+/// o[r * hd + j] = sum over i of p[r, i] * v[lo + i, (r % n_head) / group][j]: a cube per row r of `m` scores (a
+/// query head of a token: r = token * n_head + head), a unit per `j % CUBE`. V as in attn_scores.
 #[cube(launch_unchecked)]
-pub fn attn_blend(p: &Array<f32>, v: &Array<f32>, o: &mut Array<f32>, n: u32, n_kv: u32, group: u32, hd: u32, n_head: u32) {
+pub fn attn_blend(p: &Array<f32>, v: &Array<u32>, vs: &Array<f32>, o: &mut Array<f32>, lo: u32, m: u32, n_kv: u32, group: u32, hd: u32,
+                  n_head: u32, cap: u32, #[comptime] mode: u32, #[comptime] ring: bool) {
     let r = CUBE_POS_X;
     let kh = (r % n_head) / group;
     let mut j = UNIT_POS;
     while j < hd {
         let mut acc = f32::new(0.0);
-        let mut t = u32::new(0);
-        while t < n {
-            acc += p[(r * n + t) as usize] * v[((t * n_kv + kh) * hd + j) as usize];
-            t += 1;
+        let mut i = u32::new(0);
+        while i < m {
+            let row = kv_row(lo + i, kh, n_kv, cap, ring);
+            acc += kv_scaled(p[(r * m + i) as usize], vs, row, mode) * kv_raw(v, row, j, hd, mode);
+            i += 1;
         }
         o[(r * hd + j) as usize] = acc;
         j += CUBE;
     }
 }
 
-/// Causal attention scores for a chunk of tokens at positions base..: s[(tok * n_head + hh) * n + t] for t < n, the
-/// positions after the token's own masked to -1e30 (softmax gives them 0). A cube per (position, head, token).
+/// Causal attention scores for a chunk of tokens at positions base..: s[(tok * n_head + hh) * m + i] for the positions
+/// t = lo + i of lo..lo + m, the positions after the token's own (and, when win > 0, those before its window) masked
+/// to -1e30 (softmax gives them 0). A cube per (position, head, token). K as in attn_scores.
 #[cube(launch_unchecked)]
-pub fn attn_scores_tokens(q: &Array<f32>, k: &Array<f32>, s: &mut Array<f32>, scales: &Array<f32>, n: u32, n_kv: u32, group: u32,
-                          hd: u32, n_head: u32, base: u32) {
-    let t = CUBE_POS_X;
+pub fn attn_scores_tokens(q: &Array<f32>, k: &Array<u32>, ks: &Array<f32>, s: &mut Array<f32>, scales: &Array<f32>, lo: u32, m: u32,
+                          n_kv: u32, group: u32, hd: u32, n_head: u32, base: u32, win: u32, cap: u32, #[comptime] mode: u32,
+                          #[comptime] ring: bool) {
+    let i = CUBE_POS_X;
+    let t = lo + i;
     let hh = CUBE_POS_Y;
     let tok = CUBE_POS_Z;
     let kh = hh / group;
     let qo = (tok * n_head + hh) * hd;
-    let ko = (t * n_kv + kh) * hd;
-    let live = t <= base + tok;
+    let row = kv_row(t, kh, n_kv, cap, ring);
+    let live = t <= base + tok && (win == 0 || t + win > base + tok);
     let mut acc = f32::new(0.0);
     if live {
         let mut j = UNIT_POS;
         while j < hd {
-            acc += q[(qo + j) as usize] * k[(ko + j) as usize];
+            acc += q[(qo + j) as usize] * kv_raw(k, row, j, hd, mode);
             j += CUBE;
         }
     }
@@ -714,9 +722,9 @@ pub fn attn_scores_tokens(q: &Array<f32>, k: &Array<f32>, s: &mut Array<f32>, sc
     if UNIT_POS == 0 {
         let mut v = f32::new(-1.0e30);
         if live {
-            v = sum[0usize] * scales[tok as usize];
+            v = kv_scaled(sum[0usize], ks, row, mode) * scales[tok as usize];
         }
-        s[((tok * n_head + hh) * n + t) as usize] = v;
+        s[((tok * n_head + hh) * m + i) as usize] = v;
     }
 }
 
@@ -1281,14 +1289,187 @@ pub fn mm(w: &Array<u32>, wh: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, y: &mu
     }
 }
 
+// ------------------------------------------------------------------ the attention cache's encodings
+
+/// Value j of cache row `row` (a KV head of a token, hd values) without its scale: the cache's words hold f32
+/// (`mode` 0), two f16 (1) or four signed bytes (2, times the row's scale: [`kv_scale`]).
+#[cube]
+fn kv_raw(c: &Array<u32>, row: u32, j: u32, hd: u32, #[comptime] mode: u32) -> f32 {
+    let i = row * hd + j;
+    let mut out = f32::new(0.0);
+    if comptime![mode == 0] {
+        out = f32::reinterpret(c[i as usize]);
+    } else if comptime![mode == 1] {
+        out = half_bits((c[(i / 2) as usize] >> ((i % 2) * 16)) & 0xffff);
+    } else {
+        out = signed((c[(i / 4) as usize] >> ((i % 4) * 8)) & 0xff);
+    }
+    out
+}
+
+/// x times the scale of cache row `row` (8-bit rows; the others have none).
+#[cube]
+fn kv_scaled(x: f32, sc: &Array<f32>, row: u32, #[comptime] mode: u32) -> f32 {
+    let mut out = x;
+    if comptime![mode == 2] {
+        out = x * sc[row as usize];
+    }
+    out
+}
+
+/// The physical row of token t's KV head kh: a ring of `cap` tokens for a sliding layer.
+#[cube]
+fn kv_row(t: u32, kh: u32, n_kv: u32, cap: u32, #[comptime] ring: bool) -> u32 {
+    let mut p = t;
+    if comptime![ring] {
+        p = t % cap;
+    }
+    p * n_kv + kh
+}
+
+/// f32 -> f16 bits, round to nearest even (overflow to inf), as strata-pack's f32_to_f16.
+#[cube]
+fn f16_of(x: f32) -> u32 {
+    let b = u32::reinterpret(x);
+    let sign = (b >> 16) & 0x8000;
+    let e = (b >> 23) & 0xff;
+    let m = b & 0x7fffff;
+    let mut h = sign;
+    if e >= 143 {
+        h = sign | 0x7c00;
+    } else if e >= 113 {
+        let mut v = ((e - 112) << 10) | (m >> 13);
+        let rem = m & 0x1fff;
+        if rem > 0x1000 || (rem == 0x1000 && (v & 1) == 1) {
+            v += 1;
+        }
+        h = sign | v;
+    } else if e >= 102 {
+        let mm = m | 0x800000;
+        let shift = 126 - e;
+        let mut v = mm >> shift;
+        let rem = mm & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        if rem > halfway || (rem == halfway && (v & 1) == 1) {
+            v += 1;
+        }
+        h = sign | v;
+    }
+    h
+}
+
+/// Stores a chunk's keys (CUBE_POS_Y 0) and values (1) into their caches: a cube per row r = token * n_kv + head of
+/// the f32 rows `ksrc` / `vsrc`, written at token base + token (mod `cap`, a ring) in the cache's encoding: f32, two
+/// f16 per word, or four bytes per word with the row's scale amax / 127 (`round(x * 127 / amax)`, kvcache.rs q8_row).
+#[cube(launch_unchecked)]
+pub fn kv_store(ksrc: &Array<f32>, vsrc: &Array<f32>, kc: &mut Array<u32>, vc: &mut Array<u32>, ks: &mut Array<f32>, vs: &mut Array<f32>,
+                base: u32, n_kv: u32, hd: u32, cap: u32, #[comptime] mode: u32) {
+    let r = CUBE_POS_X;
+    let is_v = CUBE_POS_Y == 1;
+    let tok = r / n_kv;
+    let head = r % n_kv;
+    let row = ((base + tok) % cap) * n_kv + head;
+    let so = r * hd;
+    if comptime![mode == 0] {
+        let mut j = UNIT_POS;
+        while j < hd {
+            if is_v {
+                vc[(row * hd + j) as usize] = u32::reinterpret(vsrc[(so + j) as usize]);
+            } else {
+                kc[(row * hd + j) as usize] = u32::reinterpret(ksrc[(so + j) as usize]);
+            }
+            j += CUBE;
+        }
+    } else if comptime![mode == 1] {
+        let mut j = UNIT_POS;
+        while j < hd / 2 {
+            let mut a = f32::new(0.0);
+            let mut b = f32::new(0.0);
+            if is_v {
+                a = vsrc[(so + 2 * j) as usize];
+                b = vsrc[(so + 2 * j + 1) as usize];
+            } else {
+                a = ksrc[(so + 2 * j) as usize];
+                b = ksrc[(so + 2 * j + 1) as usize];
+            }
+            let w = f16_of(a) | (f16_of(b) << 16);
+            if is_v {
+                vc[(row * hd / 2 + j) as usize] = w;
+            } else {
+                kc[(row * hd / 2 + j) as usize] = w;
+            }
+            j += CUBE;
+        }
+    } else {
+        let mut m = SharedMemory::<f32>::new(CUBE as usize);
+        let mut top = f32::new(0.0);
+        let mut j = UNIT_POS;
+        while j < hd {
+            let mut a = f32::new(0.0);
+            if is_v {
+                a = vsrc[(so + j) as usize];
+            } else {
+                a = ksrc[(so + j) as usize];
+            }
+            top = f32::max(top, f32::abs(a));
+            j += CUBE;
+        }
+        m[UNIT_POS as usize] = top;
+        sync_cube();
+        let mut stride = u32::new(64);
+        while stride > 0 {
+            if UNIT_POS < stride {
+                m[UNIT_POS as usize] = f32::max(m[UNIT_POS as usize], m[(UNIT_POS + stride) as usize]);
+            }
+            sync_cube();
+            stride /= 2;
+        }
+        let amax = m[0usize];
+        let mut id = f32::new(0.0);
+        if amax > 0.0 {
+            id = f32::new(127.0) / amax;
+        }
+        if UNIT_POS == 0 {
+            if is_v {
+                vs[row as usize] = amax / 127.0;
+            } else {
+                ks[row as usize] = amax / 127.0;
+            }
+        }
+        let mut j = UNIT_POS;
+        while j < hd / 4 {
+            let mut w = u32::new(0);
+            #[unroll]
+            for b in 0..4u32 {
+                let mut a = f32::new(0.0);
+                if is_v {
+                    a = vsrc[(so + 4 * j + b) as usize];
+                } else {
+                    a = ksrc[(so + 4 * j + b) as usize];
+                }
+                let q = f32::max(f32::min(f32::round(a * id), 127.0), -127.0);
+                w |= (u32::cast_from(q + 256.0) & 0xff) << (b * 8);
+            }
+            if is_v {
+                vc[(row * hd / 4 + j) as usize] = w;
+            } else {
+                kc[(row * hd / 4 + j) as usize] = w;
+            }
+            j += CUBE;
+        }
+    }
+}
+
 /// Attention in one kernel (scores, softmax and the blend of V, with a running maximum as flash attention keeps it), for
 /// each query head (CUBE_POS_X) of each token (CUBE_POS_Y) of a chunk at positions base..: token `tok` sees positions
-/// 0..=base + tok. Four warps split the positions; a warp's 32 units split the head's values (`per` each, hd = 32 per),
-/// one plane sum per position. The warps' partial results are merged at the end. The scale is scales[tok] for a chunk
-/// (`chunk`), else `scale`. Needs 32-wide planes (CUDA).
+/// 0..=base + tok (the last `win` of them when win > 0, a sliding layer). Four warps split the positions; a warp's 32
+/// units split the head's values (`per` each, hd = 32 per), one plane sum per position. The warps' partial results are
+/// merged at the end. The scale is scales[tok] for a chunk (`chunk`), else `scale`. K and V in the cache's encoding
+/// `mode` (kv_raw), rows in a ring of `cap` tokens when `ring`. Needs 32-wide planes (CUDA).
 #[cube(launch_unchecked)]
-pub fn attend_rows(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, o: &mut Array<f32>, scales: &Array<f32>, base: u32, n_kv: u32,
-                   group: u32, n_head: u32, scale: f32, #[comptime] per: u32, #[comptime] chunk: bool) {
+pub fn attend_rows(q: &Array<f32>, k: &Array<u32>, v: &Array<u32>, ks: &Array<f32>, vs: &Array<f32>, o: &mut Array<f32>, scales: &Array<f32>,
+                   base: u32, n_kv: u32, group: u32, n_head: u32, scale: f32, win: u32, cap: u32, #[comptime] per: u32, #[comptime] chunk: bool,
+                   #[comptime] mode: u32, #[comptime] ring: bool) {
     let head = CUBE_POS_X;
     let tok = CUBE_POS_Y;
     let kh = head / group;
@@ -1296,6 +1477,10 @@ pub fn attend_rows(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, o: &mut Array
     let lane = UNIT_POS % 32;
     let warp = UNIT_POS / 32;
     let n = base + tok + 1;
+    let mut lo = u32::new(0);
+    if win > 0 && n > win {
+        lo = n - win;
+    }
     let mut sc = scale;
     if comptime![chunk] {
         sc = scales[tok as usize];
@@ -1310,22 +1495,23 @@ pub fn attend_rows(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, o: &mut Array
     }
     let mut m = f32::new(-1.0e30);
     let mut l = f32::new(0.0);
-    let mut t = warp;
+    let mut t = lo + warp;
     while t < n {
-        let ko = (t * n_kv + kh) * hd;
+        let row = kv_row(t, kh, n_kv, cap, ring);
         let mut d = f32::new(0.0);
         #[unroll]
         for i in 0..per {
-            d += qv[i as usize] * k[(ko + lane + 32 * i) as usize];
+            d += qv[i as usize] * kv_raw(k, row, lane + 32 * i, hd, mode);
         }
-        let s = plane_sum(d) * sc;
+        let s = kv_scaled(plane_sum(d), ks, row, mode) * sc;
         let m2 = f32::max(m, s);
         let c = f32::exp(m - m2);
         let p = f32::exp(s - m2);
         l = l * c + p;
+        let pv = kv_scaled(p, vs, row, mode);
         #[unroll]
         for i in 0..per {
-            acc[i as usize] = acc[i as usize] * c + p * v[(ko + lane + 32 * i) as usize];
+            acc[i as usize] = acc[i as usize] * c + pv * kv_raw(v, row, lane + 32 * i, hd, mode);
         }
         m = m2;
         t += 4;
@@ -1357,20 +1543,20 @@ pub fn attend_rows(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, o: &mut Array
 }
 
 /// Decode attention split over positions (flash decoding): a cube per KV head (CUBE_POS_X) and run of `len` positions
-/// (CUBE_POS_Y), its warps taking the query heads that share that KV head (so K and V are read once for them all), a
-/// warp's units splitting the head's values (`per` each), two positions at a time. -> part[(head * splits + split) *
-/// (hd + 2)..]: the run's blend (not yet divided), its maximum and its sum, which attend_merge merges. Needs 32-wide
-/// planes.
+/// (CUBE_POS_Y) of lo..n, its warps taking the query heads that share that KV head (so K and V are read once for them
+/// all), a warp's units splitting the head's values (`per` each), two positions at a time. -> part[(head * splits +
+/// split) * (hd + 2)..]: the run's blend (not yet divided), its maximum and its sum, which attend_merge merges. K and V
+/// as in attend_rows. Needs 32-wide planes.
 #[cube(launch_unchecked)]
-pub fn attend_split(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, part: &mut Array<f32>, n: u32, n_kv: u32, group: u32, scale: f32,
-                    len: u32, #[comptime] per: u32) {
+pub fn attend_split(q: &Array<f32>, k: &Array<u32>, v: &Array<u32>, ks: &Array<f32>, vs: &Array<f32>, part: &mut Array<f32>, lo: u32, n: u32,
+                    n_kv: u32, group: u32, scale: f32, len: u32, cap: u32, #[comptime] per: u32, #[comptime] mode: u32, #[comptime] ring: bool) {
     let kh = CUBE_POS_X;
     let split = CUBE_POS_Y;
     let splits = CUBE_COUNT_Y;
     let hd = comptime![per * 32];
     let lane = UNIT_POS % 32;
     let warps = CUBE_DIM / 32;
-    let t0 = split * len;
+    let t0 = lo + split * len;
     let t1 = u32::min(n, t0 + len);
     let mut wq = UNIT_POS / 32;
     while wq < group {
@@ -1388,20 +1574,20 @@ pub fn attend_split(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, part: &mut A
         while t < t1 {
             // positions t and t + 1 (the second masked past the run's end)
             let two = t + 1 < t1;
-            let ka = (t * n_kv + kh) * hd;
-            let mut kb = ka;
+            let ra = kv_row(t, kh, n_kv, cap, ring);
+            let mut rb = ra;
             if two {
-                kb = ka + n_kv * hd;
+                rb = kv_row(t + 1, kh, n_kv, cap, ring);
             }
             let mut da = f32::new(0.0);
             let mut db = f32::new(0.0);
             #[unroll]
             for i in 0..per {
-                da += qv[i as usize] * k[(ka + lane + 32 * i) as usize];
-                db += qv[i as usize] * k[(kb + lane + 32 * i) as usize];
+                da += qv[i as usize] * kv_raw(k, ra, lane + 32 * i, hd, mode);
+                db += qv[i as usize] * kv_raw(k, rb, lane + 32 * i, hd, mode);
             }
-            let sa = plane_sum(da) * scale;
-            let mut sb = plane_sum(db) * scale;
+            let sa = kv_scaled(plane_sum(da), ks, ra, mode) * scale;
+            let mut sb = kv_scaled(plane_sum(db), ks, rb, mode) * scale;
             if !two {
                 sb = f32::new(-1.0e30);
             }
@@ -1410,9 +1596,11 @@ pub fn attend_split(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, part: &mut A
             let pa = f32::exp(sa - m2);
             let pb = f32::exp(sb - m2);
             l = l * c + pa + pb;
+            let pva = kv_scaled(pa, vs, ra, mode);
+            let pvb = kv_scaled(pb, vs, rb, mode);
             #[unroll]
             for i in 0..per {
-                acc[i as usize] = acc[i as usize] * c + pa * v[(ka + lane + 32 * i) as usize] + pb * v[(kb + lane + 32 * i) as usize];
+                acc[i as usize] = acc[i as usize] * c + pva * kv_raw(v, ra, lane + 32 * i, hd, mode) + pvb * kv_raw(v, rb, lane + 32 * i, hd, mode);
             }
             m = m2;
             t += 2;

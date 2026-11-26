@@ -132,3 +132,42 @@ mod moe {
         check(&m, &tokens(&want), &rows(&want["base"]), TOL, "untrained, 4 experts top-1");
     }
 }
+
+/// The compact caches (kvcache.rs, `--kv`) on the loop and MoE fixtures: f16 (the default, the engine's values since
+/// the start) and q8 against an f32 cache and against the Workshop's own f32 logits, token by token and a chunk at a
+/// time.
+mod compact_cache {
+    use super::{max_diff, rows, tokens};
+    use crate::kvcache::KvType;
+    use crate::model::Model;
+    use std::path::PathBuf;
+
+    fn logits(m: &Model, toks: &[u32], chunk: bool) -> Vec<Vec<f32>> {
+        let mut st = m.new_state();
+        if chunk { m.forward_batch_all(&mut st, toks) } else { toks.iter().map(|&t| m.forward(&mut st, t)).collect() }
+    }
+
+    #[test]
+    fn f16_and_q8_caches_keep_the_logits() {
+        let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures");
+        for (file, key, json) in [("tiny-qwen3-loop/model.f32.gguf", "looped", "tiny-qwen3-loop/logits.json"),
+                                  ("tiny-qwen3-moe/moe.f32.gguf", "moe", "tiny-qwen3-moe/logits.json"),
+                                  ("tiny-qwen3-moe/moe-loop.f32.gguf", "moe_loop", "tiny-qwen3-moe/logits.json")] {
+            let want: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(fx.join(json)).unwrap()).unwrap();
+            let (toks, ws) = (tokens(&want), rows(&want[key]));
+            let (mut m, _) = Model::load(&fx.join(file), None).unwrap();
+            let mut got = vec![];
+            for kv in [KvType::F32, KvType::F16, KvType::Q8] {
+                m.kv_type = kv;
+                let (one, chunk) = (logits(&m, &toks, false), logits(&m, &toks, true));
+                assert_eq!(one, chunk, "{file} {kv:?}: a chunk is token by token, bit for bit");
+                got.push(one);
+            }
+            let d = |i: usize| (max_diff(&got[i], &got[0]), max_diff(&got[i], &ws));
+            let (f32w, f16, q8) = (d(0).1, d(1), d(2));
+            println!("{file}: vs the f32 cache: f16 {:.2e}, q8 {:.2e}; vs the Workshop: f32 {f32w:.2e}, f16 {:.2e}, q8 {:.2e}", f16.0, q8.0, f16.1, q8.1);
+            assert!(f32w < 2e-3 && f16.0 < 2e-3 && f16.1 < 2e-3, "{file}");
+            assert!(q8.0 < 3e-2 && q8.1 < 3e-2, "{file}: q8 {q8:?}");
+        }
+    }
+}
