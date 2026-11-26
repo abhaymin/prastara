@@ -101,10 +101,56 @@ fn moe_refusal(m: &Moe) -> Option<&'static str> {
     }
 }
 
+/// Why the graph cannot run this model's layers whatever the placement, if it cannot.
+pub fn refusal(m: &Model) -> Option<String> {
+    if m.arch.starts_with("inkling2") {
+        return Some("--graph does not run Inkling yet".into());
+    }
+    if m.rope.is_none() {
+        return Some("--graph needs a model with RoPE".into());
+    }
+    for l in &m.layers {
+        if l.hc.is_some() || l.ple.is_some() {
+            return Some("--graph does not run hyper-connections yet".into());
+        }
+        let [(_, Block::Attn(a)), (_, ffn)] = &l.parts[..] else {
+            return Some("--graph runs attention layers with a feed-forward only so far".into());
+        };
+        if a.q_b.is_some() || a.k_b.is_some() || a.v_b.is_some() || a.o_b.is_some() || !a.rope || a.gated || a.qsa.is_some() {
+            return Some("--graph: this model's attention has parts the device path does not have yet".into());
+        }
+        match ffn {
+            Block::Dense(f) if f.gate.is_none() || f.act != Act::Silu => return Some("--graph needs SiLU-gated feed-forwards".into()),
+            Block::Dense(_) => {}
+            Block::Moe(e) => if let Some(why) = moe_refusal(e) { return Some(why.into()) },
+            _ => return Some("--graph runs dense and expert feed-forwards only so far".into()),
+        }
+    }
+    None
+}
+
+/// The bytes the graph's KV caches and score scratch take for `max_ctx` tokens at `per_value` bytes a K or V value:
+/// what placement keeps free on the first device for them (main.rs), so the experts do not fill the budget first.
+pub fn kv_need(m: &Model, max_ctx: usize, per_value: u64) -> u64 {
+    let passes = m.loop_.as_ref().map_or(1, |l| l.passes);
+    let mut b = 0u64;
+    for pass in 0..passes {
+        for (l, layer) in m.layers.iter().enumerate() {
+            if pass > 0 && !m.loop_.as_ref().is_some_and(|lp| (lp.start..lp.end).contains(&l)) {
+                continue;
+            }
+            if let Some((_, Block::Attn(a))) = layer.parts.first() {
+                b += (2 * a.n_kv * a.head_dim) as u64 * max_ctx as u64 * per_value + a.n_head as u64 * max_ctx as u64 * 4;
+            }
+        }
+    }
+    b
+}
+
 impl<'a> Graph<'a> {
     pub fn new(m: &'a Model, max_ctx: usize) -> Result<Graph<'a>, String> {
-        if m.arch.starts_with("inkling2") {
-            return Err("--graph does not run Inkling yet".into());
+        if let Some(why) = refusal(m) {
+            return Err(why);
         }
         let mut dev = None;
         let rope = m.rope.as_ref().ok_or("--graph needs a model with RoPE")?;
@@ -132,9 +178,6 @@ impl<'a> Graph<'a> {
                 Block::Moe(e) => {
                     if let Some(why) = moe_refusal(e) {
                         return Err(why.into());
-                    }
-                    if !cfg!(any()) {
-                        return Err("--graph: not yet for experts".into());
                     }
                     None
                 }
@@ -468,7 +511,7 @@ mod tests {
     /// them, 0.0 none: they are the CPU's), the first layers' first.
     fn placed(path: &Path, dev: &str, experts: f64) -> Model {
         let (mut m, _) = Model::load(path, None).unwrap();
-        crate::gpu::place(&mut m, &[(dev.to_string(), 2 << 30)], None).unwrap();
+        crate::gpu::place(&mut m, &[(dev.to_string(), 2 << 30)], None, 0).unwrap();
         let (_, mut ex) = m.matrices_mut();
         let mut keys: Vec<(usize, usize)> = ex.keys().copied().collect();
         keys.sort();
@@ -563,5 +606,24 @@ mod tests {
         let (a, b) = (max_diff(&one, &looped), max_diff(&chunk, &looped));
         eprintln!("graph vs the Workshop's looped logits: one={a:.2e} chunk={b:.2e}");
         assert!(a < 2e-3 && b < 2e-3, "{a} {b}");
+    }
+
+    /// Softmax-routed experts on the graph: all on the device, none (the CPU computes them, the activations cross), and
+    /// some of each; also with the loop.
+    #[test]
+    fn experts_on_the_graph_equal_the_cpu() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        let moe = testgguf::tmp("tiny-qwen3moe", &Spec::tiny_qwen3moe());
+        let (_, on) = check("tiny qwen3moe", &moe, &dev, 1.0, 0);
+        assert_eq!(on.0, on.1, "every expert on the device");
+        let (_, on) = check("tiny qwen3moe, experts on the CPU", &moe, &dev, 0.0, 0);
+        assert_eq!(on.0, 0);
+        let (_, on) = check("tiny qwen3moe, half the experts on the device", &moe, &dev, 0.5, 0);
+        assert!(on.0 > 0 && on.0 < on.1, "{on:?}");
+        let lp = testgguf::tmp("tiny-qwen3moe-loop", &Spec { loop_: Some((1, 3, 2)), seed: 0x5EED_0005, ..Spec::tiny_qwen3moe() });
+        check("tiny qwen3moe loop, half on the device", &lp, &dev, 0.5, 0);
+        let mixtral = testgguf::tmp("tiny-mixtral", &Spec { arch: "llama", seed: 0x5EED_0006, ..Spec::tiny_qwen3moe() });
+        check("tiny mixtral-style llama", &mixtral, &dev, 1.0, 0);
     }
 }

@@ -285,7 +285,10 @@ fn main() {
     #[cfg(feature = "gpu")]
     if let Some(spec) = arg("--devices") {
         let devs = gpu::parse(&spec).unwrap_or_else(|e| fail(e));
-        let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref()).unwrap_or_else(|e| fail(e));
+        // the device graph's KV cache is kept free on the first device when the graph can run this model (its experts
+        // would otherwise fill the budget first and leave the graph no room)
+        let reserve = if !args.iter().any(|a| a == "--no-graph") && graph::refusal(&m).is_none() { graph::kv_need(&m, max_ctx, 4) } else { 0 };
+        let (summary, dense_on_device, experts_on_device) = gpu::place(&mut m, &devs, profile.as_ref(), reserve).unwrap_or_else(|e| fail(e));
         placement = format!("{placement} {summary}");
         // findings item 2: --devices asked the GPU to take weights but nothing landed on it (the device opened and its
         // self-check passed, yet no matrix fit or a kernel was absent). A chat then only keep-alives for minutes. So
@@ -366,7 +369,11 @@ fn main() {
         None
     } else if args.iter().any(|a| a == "--devices") && !args.iter().any(|a| a == "--no-graph") {
         match graph::Graph::new(&m, max_ctx) {
-            Ok(g) => { placement = format!("{placement} graph=auto"); Some(g) }
+            Ok(g) => {
+                let (on, all) = g.experts_on();
+                placement = format!("{placement} graph=auto{}", if all > 0 { format!(" graph_experts_on_device={on}/{all}") } else { String::new() });
+                Some(g)
+            }
             Err(why) => { eprintln!("matrix by matrix on the device ({why})"); None }
         }
     } else {
