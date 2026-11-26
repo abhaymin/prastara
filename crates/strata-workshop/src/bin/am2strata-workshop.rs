@@ -12,6 +12,8 @@
 //! am2strata-workshop find-lr --model <hf-folder> --data <chat.jsonl> [--steps 40]
 //! am2strata-workshop profile (--model <hf-folder> | --preset llama-2-7b) [--data <chat.jsonl>] [...]
 //! am2strata-workshop autopilot --model <hf-folder> --data <chat.jsonl> [--time-budget 2h] [--ram-budget 12GB]
+//! am2strata-workshop regress --model <hf-folder> [--adapter <dir>] [--passes 1,2] --suite <suite.json> --out <report-dir> [--against <report>]
+//! am2strata-workshop grade-train --model <hf-folder> --data <prompts.jsonl> --samples N --grader code|judge --rounds R --suite <suite.json> --out <dir>
 //! ```
 //!
 //! `train` fine-tunes a LoRA adapter on the CPU (after Soup, in Rust: docs/MODEL-WORKSHOP-PLAN.md). Its progress
@@ -247,6 +249,96 @@ enum Cmd {
         adapter: PathBuf,
         #[arg(long)]
         out: PathBuf,
+    },
+    /// the regression suite on a model (and an adapter), at each pass count of a loop: held-out loss, code run in a
+    /// sandbox (pass@1), QA exact match and F1, judge scores (through the server's API, AM2STRATA_URL/KEY); writes
+    /// report.json, report.md and answers.jsonl, and with --against lists what regressed beyond noise (a paired bootstrap)
+    Regress {
+        #[arg(long)]
+        model: PathBuf,
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// pass counts to run a looped model at, e.g. 1,2 (default: its own)
+        #[arg(long, value_delimiter = ',')]
+        passes: Vec<usize>,
+        #[arg(long)]
+        suite: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        /// an earlier report (report.json or its folder); several: each test against the best of them
+        #[arg(long)]
+        against: Vec<PathBuf>,
+        /// cpu (the default), or cuda:N; several split the blocks
+        #[arg(long, value_delimiter = ',')]
+        devices: Vec<String>,
+        #[arg(long)]
+        base_dtype: Option<String>,
+        /// prompts longer than this many tokens are left out
+        #[arg(long, default_value_t = 4096)]
+        max_prompt_tokens: usize,
+        /// the model that judges (any the server lists); default the suite's judge_model, else the loaded one
+        #[arg(long)]
+        judge_model: Option<String>,
+    },
+    /// training by grading, in rounds: N sampled answers per prompt, graded (code: run with its tests; judge: 1-5
+    /// through the server's API), the best of each prompt fine-tuned on, the suite run, and the adapter promoted only
+    /// when nothing regressed; a round log in --out (rounds.jsonl, rounds.md, promoted.json)
+    GradeTrain {
+        #[arg(long)]
+        model: PathBuf,
+        /// an adapter to start from
+        #[arg(long)]
+        adapter: Option<PathBuf>,
+        /// prompts: code {"id","prompt","language","test"|"cases"}, judge {"id","prompt","reference"?}
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, default_value_t = 4)]
+        samples: usize,
+        /// code or judge
+        #[arg(long, default_value = "code")]
+        grader: String,
+        #[arg(long, default_value_t = 1)]
+        rounds: usize,
+        #[arg(long)]
+        suite: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 0.8)]
+        temperature: f64,
+        #[arg(long, default_value_t = 0.95)]
+        top_p: f64,
+        /// new tokens per answer
+        #[arg(long, default_value_t = 512)]
+        max_tokens: usize,
+        /// judge: the least score (1-5) an answer needs to be trained on
+        #[arg(long, default_value_t = 4)]
+        min_score: u8,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long, value_delimiter = ',')]
+        passes: Vec<usize>,
+        #[arg(long, value_delimiter = ',')]
+        devices: Vec<String>,
+        #[arg(long)]
+        base_dtype: Option<String>,
+        #[arg(long, default_value_t = 2e-4)]
+        lr: f64,
+        #[arg(long, default_value_t = 2.0)]
+        epochs: f64,
+        #[arg(long)]
+        max_steps: Option<usize>,
+        #[arg(long, default_value_t = 16)]
+        rank: usize,
+        #[arg(long)]
+        train_layers: Option<usize>,
+        #[arg(long, default_value_t = 2048)]
+        max_len: usize,
+        #[arg(long, default_value_t = 1)]
+        accumulation: usize,
+        #[arg(long, default_value_t = 4096)]
+        max_prompt_tokens: usize,
+        #[arg(long)]
+        judge_model: Option<String>,
     },
     /// fine-tune a LoRA adapter on chat data (CPU; Llama, Mistral, Qwen2, Qwen3 decoders; a 4-bit base is not done)
     Train {
@@ -682,6 +774,24 @@ fn training_event(out: &Out, e: Event) {
     }
 }
 
+/// The judge for a suite's judge tests: the server's model (`--judge-model`, the suite's `judge_model`, or the loaded
+/// one), when the suite has such tests and the server answers; otherwise None (those tests then report why).
+fn judge_for(s: &strata_workshop::regress::Suite, want: Option<&str>, out: &Out) -> Option<datagen::Model> {
+    if !s.tests.iter().any(|t| t.kind == "judge") && want.is_none() {
+        return None;
+    }
+    match datagen::Model::from_env_with(want.or(s.judge_model.as_deref())) {
+        Ok(m) => {
+            out.event(json!({"event": "log", "message": format!("judging with {} through the server's API", m.name)}));
+            Some(m)
+        }
+        Err(e) => {
+            out.event(json!({"event": "log", "message": format!("no judge ({e:#}): the judge tests will report an error")}));
+            None
+        }
+    }
+}
+
 fn install_term_handler() {
     // a cancel (SIGTERM from the server) is noticed after the current step: a checkpoint is written, then the run ends
     #[cfg(unix)]
@@ -887,6 +997,71 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             Ok((r.out, "gguf".into(), json!({"experts": r.moe.experts, "top_k": r.moe.top_k, "total_parameters": r.total_params,
                                               "active_parameters": r.active_params, "trained_blocks": r.trained_blocks})))
         }
+        Cmd::Regress { model, adapter, passes, suite, out: dst, against, devices, base_dtype, max_prompt_tokens, judge_model } => {
+            use strata_workshop::regress;
+            out.event(json!({"event": "start", "what": format!("the suite {} on {}{} into {}", suite.display(), model.display(),
+                adapter.as_ref().map_or(String::new(), |a| format!(" with {}", a.display())), dst.display())}));
+            let mut o = regress::Options::new(model, suite, dst);
+            o.adapter = adapter.clone();
+            o.passes = passes.clone();
+            o.against = against.clone();
+            o.devices = devices.clone();
+            o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
+            o.max_prompt_tokens = *max_prompt_tokens;
+            let s = regress::Suite::load(suite).map_err(|e| format!("{e:#}"))?;
+            let judge = judge_for(&s, judge_model.as_deref(), out);
+            install_term_handler();
+            let r = regress::run(&o, judge.as_ref().map(|j| j as &dyn regress::Judge), &mut |v| out.event(v), &|| TERM.load(std::sync::atomic::Ordering::SeqCst))
+                .map_err(|e| format!("{e:#}"))?;
+            if !out.json {
+                print!("{}", regress::report_markdown(&r.json));
+            }
+            Ok((dst.join("report.json"), "report".into(), json!({"regressions": r.json["regressions"], "results": r.results.len(),
+                "summary": r.results.iter().map(|t| json!({"test": t.test, "passes": t.passes, "metric": t.metric, "value": t.value, "n": t.items.len(), "error": t.error})).collect::<Vec<_>>()})))
+        }
+        Cmd::GradeTrain { model, adapter, data, samples, grader, rounds, suite, out: dst, temperature, top_p, max_tokens, min_score, seed, passes, devices, base_dtype,
+                          lr, epochs, max_steps, rank, train_layers, max_len, accumulation, max_prompt_tokens, judge_model } => {
+            use strata_workshop::{gradetrain, regress};
+            let code = match grader.as_str() { "code" => true, "judge" => false, g => return Err(format!("--grader {g:?}: code or judge")) };
+            out.event(json!({"event": "start", "what": format!("grade and train {} on {} ({rounds} round(s), {samples} samples each, graded by {grader}) into {}",
+                                                               model.display(), data.display(), dst.display())}));
+            let prompts = gradetrain::load_prompts(data, code).map_err(|e| format!("{e:#}"))?;
+            let mut o = gradetrain::Options::new(model, prompts, suite, dst);
+            o.adapter = adapter.clone();
+            o.samples = *samples;
+            o.rounds = *rounds;
+            o.temperature = *temperature;
+            o.top_p = *top_p;
+            o.max_tokens = *max_tokens;
+            o.seed = *seed;
+            o.passes = passes.clone();
+            o.devices = devices.clone();
+            o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
+            o.max_prompt_tokens = *max_prompt_tokens;
+            o.train.lr = *lr;
+            o.train.epochs = *epochs;
+            o.train.max_steps = *max_steps;
+            o.train.lora.r = *rank;
+            o.train.lora.alpha = 2.0 * *rank as f64;
+            o.train.lora.train_layers = *train_layers;
+            o.train.max_len = *max_len;
+            o.train.accumulation = *accumulation;
+            o.train.validate().map_err(|e| e.to_string())?;
+            let s = regress::Suite::load(suite).map_err(|e| format!("{e:#}"))?;
+            let judge = judge_for(&s, judge_model.as_deref(), out);
+            let judge_ref = judge.as_ref().map(|j| j as &dyn regress::Judge);
+            install_term_handler();
+            let stop = || TERM.load(std::sync::atomic::Ordering::SeqCst);
+            let r = if code {
+                gradetrain::run(&o, &gradetrain::CodeGrader(regress::CodeRunner::detect()), judge_ref, &mut |v| out.event(v), &stop)
+            } else {
+                let j = judge_ref.ok_or("--grader judge: the server's API is not reachable (AM2STRATA_URL, AM2STRATA_API_KEY)")?;
+                gradetrain::run(&o, &gradetrain::JudgeGrader { judge: j, min: *min_score as f64 }, judge_ref, &mut |v| out.event(v), &stop)
+            }.map_err(|e| format!("{e:#}"))?;
+            Ok((dst.clone(), "grade-train".into(), json!({"promoted": r.promoted.as_ref().map(|p| p.display().to_string()),
+                "rounds": r.rounds.iter().map(|x| json!({"round": x.round, "sampled": x.sampled, "passing": x.passing, "kept": x.kept,
+                    "regressions": x.regressions, "promoted": x.promoted, "note": x.note})).collect::<Vec<_>>()})))
+        }
         other => plain(run_tools(other, out)),
     }
 }
@@ -951,7 +1126,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))

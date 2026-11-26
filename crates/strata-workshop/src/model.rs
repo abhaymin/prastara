@@ -1054,6 +1054,8 @@ pub struct LlamaModel {
     checkpoint: bool,
     /// the adapter gradients a checkpointed block's backward pass computes, waiting for [`LlamaModel::take_checkpoint_grads`]
     ckpt_grads: CkptGrads,
+    /// run at most this many passes of the loop (1: the base's own pass only); `None`: all of them
+    passes_cap: Option<usize>,
 }
 
 /// Gradients of adapter variables found while recomputing checkpointed blocks: (variable, gradient).
@@ -1200,7 +1202,7 @@ impl LlamaModel {
             }
         }
         Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone(), loop_gates,
-                  devs: devs.to_vec(), block_dev, checkpoint: false, ckpt_grads: Default::default() })
+                  devs: devs.to_vec(), block_dev, checkpoint: false, ckpt_grads: Default::default(), passes_cap: None })
     }
 
     pub fn device(&self) -> &Device {
@@ -1324,6 +1326,23 @@ impl LlamaModel {
     /// are recomputed there, one block at a time. The adapters' gradients from that recomputation are collected by
     /// [`LlamaModel::take_checkpoint_grads`]; add them to the graph's own. Memory falls from every block's activations
     /// to one block's plus each block's input, for about one more forward pass of work.
+    /// Run the loop `passes` times in all (1: the base's own pass, as if there were no loop), for comparing a looped
+    /// model at each pass count; `passes` above the model's own is refused. A model without a loop takes only 1.
+    pub fn set_passes(&mut self, passes: usize) -> Result<()> {
+        let most = self.cfg.loop_.map_or(1, |l| l.passes);
+        if passes == 0 || passes > most {
+            bail!("{passes} passes: this model runs 1{}", if most > 1 { format!(" to {most}") } else { " (it has no loop)".into() });
+        }
+        self.passes_cap = Some(passes);
+        Ok(())
+    }
+
+    /// The passes the loop runs now (1 without a loop).
+    pub fn passes(&self) -> usize {
+        let most = self.cfg.loop_.map_or(1, |l| l.passes);
+        self.passes_cap.unwrap_or(most).min(most)
+    }
+
     pub fn set_checkpointing(&mut self, on: bool) {
         self.checkpoint = on;
     }
@@ -1604,7 +1623,8 @@ impl LlamaModel {
             }
             match self.cfg.loop_ {
                 Some(l) if i + 1 == l.end && range.start <= l.start => {
-                    for (p, g) in self.loop_gates.iter().enumerate() {
+                    let extra = self.passes_cap.map_or(self.loop_gates.len(), |c| c.saturating_sub(1));
+                    for (p, g) in self.loop_gates.iter().enumerate().take(extra) {
                         let mut y = x.clone();
                         for j in l.start..l.end {
                             y = step(j, &y)?;
