@@ -439,12 +439,14 @@ impl Gpu {
     }
 
     /// y = x * w / sqrt(mean(x^2) + eps), queued.
+    /// The norm of each row of `w.len` values: one vector, a chunk's tokens, or each head (q/k norms).
     pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
         stats::launch(1);
         native!(self, n, Buf { handle: Mem::Mtl(n.rms_norm(x.handle.mtl(), w.handle.mtl(), w.len as u32, (x.len / w.len) as u32, eps)), len: x.len });
         let y = self.scratch(x.len);
+        let rows = (x.len / w.len) as u32;
         with_client!(self, c, R, unsafe {
-            kernels::rms_norm::launch_unchecked::<R>(c, CubeCount::Static(1, 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), w.arg(), y.arg(), x.len as u32, eps);
+            kernels::rms_norm::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), w.arg(), y.arg(), w.len as u32, eps);
         });
         y
     }
@@ -474,8 +476,13 @@ impl Gpu {
         stats::launch(1);
         let heads = x.len as u32 / hd;
         native!(self, m, m.rope(tab.handle.mtl(), x.handle.mtl(), heads, hd, n_rot, neox));
+        self.rope_cube(tab, x, hd, n_rot, neox, heads, 1);
+    }
+
+    fn rope_cube(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool, heads: u32, tokens: u32) {
         with_client!(self, c, R, unsafe {
-            kernels::rope::launch_unchecked::<R>(c, CubeCount::Static(heads, 1, 1), CubeDim::new_1d(kernels::CUBE), tab.arg(), x.arg(), hd, n_rot, neox as u32);
+            kernels::rope::launch_unchecked::<R>(c, CubeCount::Static(heads, tokens, 1), CubeDim::new_1d(kernels::CUBE), tab.arg(), x.arg(), hd, n_rot,
+                                                 neox as u32, heads);
         });
     }
 
@@ -501,7 +508,7 @@ impl Gpu {
         with_client!(self, c, R, unsafe {
             kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(), n, n_kv, group, hd, scale);
             kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
-            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
         });
         o
     }
@@ -520,25 +527,106 @@ impl Gpu {
     pub fn rope_tokens(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool, tokens: u32) {
         stats::launch(1);
         native!(self, m, m.rope_tokens(tab.handle.mtl(), x.handle.mtl(), x.len as u32 / hd / tokens, tokens, hd, n_rot, neox));
-        panic!("rope_tokens needs the native Metal backend")
+        self.rope_cube(tab, x, hd, n_rot, neox, x.len as u32 / hd / tokens, tokens);
     }
 
     /// x[at .. at + n] as a buffer of its own (native Metal only).
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn row(&self, x: &Buf, at: usize, n: usize) -> Buf {
-        stats::launch(1);
-        native!(self, m, Buf { handle: Mem::Mtl(m.copy_from(x.handle.mtl(), at as u32, n as u32)), len: n });
-        panic!("row needs the native Metal backend")
+        native!(self, m, { stats::launch(1); Buf { handle: Mem::Mtl(m.copy_from(x.handle.mtl(), at as u32, n as u32)), len: n } });
+        let y = self.scratch(n);
+        self.copy(x, &y, at, 0, n);
+        y
     }
 
     /// Causal attention for a chunk (native Metal only): `tokens` queries at positions base.., K and V already appended.
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn attend_tokens(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Buf {
+        native!(self, m, { stats::launch(1); Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
+                                                                n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize } });
+        stats::launch(3);
+        let n = base + tokens;
+        let rows = tokens * n_head;
+        let s = self.scratch((rows * n) as usize);
+        let o = self.scratch((rows * hd) as usize);
+        let group = n_head / n_kv;
+        with_client!(self, c, R, unsafe {
+            kernels::attn_scores_tokens::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, tokens), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(),
+                                                               scales.arg(), n, n_kv, group, hd, n_head, base);
+            kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
+            kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(rows, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
+        });
+        o
+    }
+
+    /// Whether this device has the kernels of the loop and of the experts below (CubeCL; not yet the native Metal backend).
+    pub fn has_moe_kernels(&self) -> bool {
+        !self.is_native()
+    }
+
+    /// y[dst .. dst + n] = x[src .. src + n], queued.
+    pub fn copy(&self, x: &Buf, y: &Buf, src: usize, dst: usize, n: usize) {
         stats::launch(1);
-        native!(self, m, Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
-                                                                n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize });
-        panic!("attend_tokens needs the native Metal backend")
+        let n = n as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::copy_range::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), x.arg(), y.arg(),
+                                                       src as u32, dst as u32, n);
+        });
+    }
+
+    /// x = saved + g * (x - saved), `g` one value per channel, queued (the loop's gate mix).
+    pub fn loop_mix(&self, saved: &Buf, x: &Buf, g: &Buf) {
+        stats::launch(1);
+        let n = x.len as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::loop_mix::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), saved.arg(), x.arg(),
+                                                     g.arg(), n, g.len as u32);
+        });
+    }
+
+    /// The router's top `k` of `n_e` experts per token from its logits (`tokens` rows of n_e), softmax gating, queued.
+    /// -> per token k indices (f32), then k weights (kernels::route_topk).
+    pub fn route_topk(&self, logits: &Buf, n_e: u32, k: u32, norm: bool, scale: f32) -> Buf {
+        stats::launch(1);
+        let tokens = logits.len as u32 / n_e;
+        let out = self.scratch((tokens * 2 * k) as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::route_topk::launch_unchecked::<R>(c, CubeCount::Static(tokens, 1, 1), CubeDim::new_1d(32), logits.arg(), out.arg(), n_e, k, norm as u32, scale);
+        });
+        out
+    }
+
+    /// The rows `idx` (f32 row numbers) of x, `dim` wide, queued.
+    pub fn gather_rows(&self, x: &Buf, idx: &Buf, dim: usize) -> Buf {
+        stats::launch(1);
+        let y = self.scratch(idx.len * dim);
+        with_client!(self, c, R, unsafe {
+            kernels::gather_rows::launch_unchecked::<R>(c, CubeCount::Static((dim as u32).div_ceil(kernels::CUBE), idx.len as u32, 1), CubeDim::new_1d(kernels::CUBE),
+                                                        x.arg(), idx.arg(), y.arg(), dim as u32);
+        });
+        y
+    }
+
+    /// Row r of x to row idx[r] of y, `dim` wide, queued.
+    pub fn scatter_rows(&self, x: &Buf, idx: &Buf, y: &Buf, dim: usize) {
+        stats::launch(1);
+        with_client!(self, c, R, unsafe {
+            kernels::scatter_rows::launch_unchecked::<R>(c, CubeCount::Static((dim as u32).div_ceil(kernels::CUBE), idx.len as u32, 1), CubeDim::new_1d(kernels::CUBE),
+                                                         x.arg(), idx.arg(), y.arg(), dim as u32);
+        });
+    }
+
+    /// x += the chosen experts' outputs (`slots`: tokens * k rows of x's width), weighted by `routes` and added in
+    /// routing order, queued.
+    pub fn moe_combine(&self, slots: &Buf, routes: &Buf, x: &Buf, k: u32) {
+        stats::launch(1);
+        let n = x.len as u32;
+        let dim = (slots.len / (routes.len / 2)) as u32;
+        with_client!(self, c, R, unsafe {
+            kernels::moe_combine::launch_unchecked::<R>(c, CubeCount::Static(n.div_ceil(kernels::CUBE), 1, 1), CubeDim::new_1d(kernels::CUBE), slots.arg(),
+                                                        routes.arg(), x.arg(), k, dim, n);
+        });
     }
 
     /// y = W x for `x.len() / cols` vectors at once (rows of y in the same order).

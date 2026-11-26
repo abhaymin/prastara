@@ -496,14 +496,16 @@ pub fn matvec_q6k(w: &Array<u32>, x: &Array<f32>, y: &mut Array<f32>, rows: u32,
 // ------------------------------------------------------------------ a whole token on the device (docs/ENGINE-PLAN.md phase 1)
 // These run between the matrix products, so the activations stay on the device and only the logits come back.
 
-/// y = x * w / sqrt(mean(x^2) + eps): the RMS norm of one vector of `n` values. One cube.
+/// y = x * w / sqrt(mean(x^2) + eps): the RMS norm of rows of `n` values, a cube per row (CUBE_POS_X): one vector, a
+/// chunk's tokens, or a vector's heads (Qwen3's q/k norms, `w` the head's `n` weights).
 #[cube(launch_unchecked)]
 pub fn rms_norm(x: &Array<f32>, w: &Array<f32>, y: &mut Array<f32>, n: u32, eps: f32) {
+    let base = CUBE_POS_X * n;
     let mut sum = SharedMemory::<f32>::new(CUBE as usize);
     let mut acc = f32::new(0.0);
     let mut j = UNIT_POS;
     while j < n {
-        let v = x[j as usize];
+        let v = x[(base + j) as usize];
         acc += v * v;
         j += CUBE;
     }
@@ -520,7 +522,7 @@ pub fn rms_norm(x: &Array<f32>, w: &Array<f32>, y: &mut Array<f32>, n: u32, eps:
     let k = f32::new(1.0) / f32::sqrt(sum[0usize] / f32::cast_from(n) + eps);
     let mut j = UNIT_POS;
     while j < n {
-        y[j as usize] = x[j as usize] * k * w[j as usize];
+        y[(base + j) as usize] = x[(base + j) as usize] * k * w[j as usize];
         j += CUBE;
     }
 }
@@ -544,15 +546,17 @@ pub fn silu_gate(gate: &Array<f32>, up: &mut Array<f32>, n: u32) {
     }
 }
 
-/// Rotates each of the head vectors of x (`hd` values each) by the (cos, sin) pairs of `tab`: `n_rot / 2` pairs for this
-/// position, adjacent values (`neox` 0) or the two halves (`neox` 1). A cube per head.
+/// Rotates each of the head vectors of x (`hd` values each) by the (cos, sin) pairs of `tab`: `n_rot / 2` pairs per
+/// token, adjacent values (`neox` 0) or the two halves (`neox` 1). A cube per head (CUBE_POS_X) and token (CUBE_POS_Y):
+/// x holds `heads` heads per token, `tab` each token's pairs in turn.
 #[cube(launch_unchecked)]
-pub fn rope(tab: &Array<f32>, x: &mut Array<f32>, hd: u32, n_rot: u32, neox: u32) {
-    let at = CUBE_POS_X * hd;
-    let p = UNIT_POS;
-    if p < n_rot / 2 {
-        let c = tab[(p * 2) as usize];
-        let s = tab[(p * 2 + 1) as usize];
+pub fn rope(tab: &Array<f32>, x: &mut Array<f32>, hd: u32, n_rot: u32, neox: u32, heads: u32) {
+    let at = (CUBE_POS_Y * heads + CUBE_POS_X) * hd;
+    let tb = CUBE_POS_Y * n_rot;
+    let mut p = UNIT_POS;
+    while p < n_rot / 2 {
+        let c = tab[(tb + p * 2) as usize];
+        let s = tab[(tb + p * 2 + 1) as usize];
         let mut a = at + p * 2;
         let mut b = a + 1;
         if neox == 1 {
@@ -563,6 +567,7 @@ pub fn rope(tab: &Array<f32>, x: &mut Array<f32>, hd: u32, n_rot: u32, neox: u32
         let x1 = x[b as usize];
         x[a as usize] = x0 * c - x1 * s;
         x[b as usize] = x0 * s + x1 * c;
+        p += CUBE;
     }
 }
 
@@ -656,20 +661,176 @@ pub fn attn_softmax(s: &mut Array<f32>, n: u32) {
     }
 }
 
-/// o[hh * hd + j] = sum over t of p[hh, t] * v[t, hh / group][j]: a cube per query head, a unit per `j % CUBE`.
+/// o[r * hd + j] = sum over t of p[r, t] * v[t, (r % n_head) / group][j]: a cube per row r of scores (a query head of
+/// a token: r = token * n_head + head), a unit per `j % CUBE`.
 #[cube(launch_unchecked)]
-pub fn attn_blend(p: &Array<f32>, v: &Array<f32>, o: &mut Array<f32>, n: u32, n_kv: u32, group: u32, hd: u32) {
-    let hh = CUBE_POS_X;
-    let kh = hh / group;
+pub fn attn_blend(p: &Array<f32>, v: &Array<f32>, o: &mut Array<f32>, n: u32, n_kv: u32, group: u32, hd: u32, n_head: u32) {
+    let r = CUBE_POS_X;
+    let kh = (r % n_head) / group;
     let mut j = UNIT_POS;
     while j < hd {
         let mut acc = f32::new(0.0);
         let mut t = u32::new(0);
         while t < n {
-            acc += p[(hh * n + t) as usize] * v[((t * n_kv + kh) * hd + j) as usize];
+            acc += p[(r * n + t) as usize] * v[((t * n_kv + kh) * hd + j) as usize];
             t += 1;
         }
-        o[(hh * hd + j) as usize] = acc;
+        o[(r * hd + j) as usize] = acc;
         j += CUBE;
+    }
+}
+
+/// Causal attention scores for a chunk of tokens at positions base..: s[(tok * n_head + hh) * n + t] for t < n, the
+/// positions after the token's own masked to -1e30 (softmax gives them 0). A cube per (position, head, token).
+#[cube(launch_unchecked)]
+pub fn attn_scores_tokens(q: &Array<f32>, k: &Array<f32>, s: &mut Array<f32>, scales: &Array<f32>, n: u32, n_kv: u32, group: u32,
+                          hd: u32, n_head: u32, base: u32) {
+    let t = CUBE_POS_X;
+    let hh = CUBE_POS_Y;
+    let tok = CUBE_POS_Z;
+    let kh = hh / group;
+    let qo = (tok * n_head + hh) * hd;
+    let ko = (t * n_kv + kh) * hd;
+    let live = t <= base + tok;
+    let mut acc = f32::new(0.0);
+    if live {
+        let mut j = UNIT_POS;
+        while j < hd {
+            acc += q[(qo + j) as usize] * k[(ko + j) as usize];
+            j += CUBE;
+        }
+    }
+    let mut sum = SharedMemory::<f32>::new(CUBE as usize);
+    sum[UNIT_POS as usize] = acc;
+    sync_cube();
+    let mut stride = u32::new(64);
+    while stride > 0 {
+        if UNIT_POS < stride {
+            sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+        }
+        sync_cube();
+        stride /= 2;
+    }
+    if UNIT_POS == 0 {
+        let mut v = f32::new(-1.0e30);
+        if live {
+            v = sum[0usize] * scales[tok as usize];
+        }
+        s[((tok * n_head + hh) * n + t) as usize] = v;
+    }
+}
+
+// ------------------------------------------------------------------ the loop and the experts on the device
+
+/// y[dst + j] = x[src + j], over `n` values.
+#[cube(launch_unchecked)]
+pub fn copy_range(x: &Array<f32>, y: &mut Array<f32>, src: u32, dst: u32, n: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    if j < n {
+        y[(dst + j) as usize] = x[(src + j) as usize];
+    }
+}
+
+/// The loop's mix after an extra pass: x = s + g * (x - s), `g` one value per channel of `dim`, x and s `n` values
+/// (whole tokens).
+#[cube(launch_unchecked)]
+pub fn loop_mix(s: &Array<f32>, x: &mut Array<f32>, g: &Array<f32>, n: u32, dim: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    if j < n {
+        let sv = s[j as usize];
+        x[j as usize] = sv + g[(j % dim) as usize] * (x[j as usize] - sv);
+    }
+}
+
+/// The router's choice per token (a cube per token, CUBE_POS_X), as model.rs `route` makes it with softmax gating: the
+/// probabilities of `n_e` logits, the `k` best (ties to the lower index, as a stable sort), their weights renormalised
+/// to sum 1 when `norm` is 1 (the sum at least 2^-14), times `scale` when it is not 0 or 1. -> out[tok * 2k ..]: the
+/// experts' indices (as f32, exact below 2^24), then their weights.
+#[cube(launch_unchecked)]
+pub fn route_topk(logits: &Array<f32>, out: &mut Array<f32>, n_e: u32, k: u32, norm: u32, scale: f32) {
+    if UNIT_POS == 0 {
+        let tok = CUBE_POS_X;
+        let base = tok * n_e;
+        let ob = tok * 2 * k;
+        let mut m = f32::new(-1.0e30);
+        for e in 0..n_e {
+            m = f32::max(m, logits[(base + e) as usize]);
+        }
+        let mut total = f32::new(0.0);
+        for e in 0..n_e {
+            total += f32::exp(logits[(base + e) as usize] - m);
+        }
+        // each pick is the best below the previous one in the order (p descending, then index ascending)
+        let mut prev_p = f32::new(1.0e30);
+        let mut prev_e = u32::new(0);
+        let mut first = true;
+        let mut wsum = f32::new(0.0);
+        for s in 0..k {
+            let mut best_p = f32::new(-1.0);
+            let mut best_e = u32::new(0);
+            for e in 0..n_e {
+                let p = f32::exp(logits[(base + e) as usize] - m) / total;
+                let below = first || p < prev_p || (p == prev_p && e > prev_e);
+                if below && p > best_p {
+                    best_p = p;
+                    best_e = e;
+                }
+            }
+            out[(ob + s) as usize] = f32::cast_from(best_e);
+            out[(ob + k + s) as usize] = best_p;
+            wsum += best_p;
+            prev_p = best_p;
+            prev_e = best_e;
+            first = false;
+        }
+        if norm == 1 {
+            let d = f32::max(wsum, f32::new(6.103515625e-5));
+            for s in 0..k {
+                out[(ob + k + s) as usize] = out[(ob + k + s) as usize] / d;
+            }
+        }
+        if scale != f32::new(0.0) && scale != f32::new(1.0) {
+            for s in 0..k {
+                out[(ob + k + s) as usize] = out[(ob + k + s) as usize] * scale;
+            }
+        }
+    }
+}
+
+/// y[r * dim + j] = x[idx[r] * dim + j]: the rows of the tokens an expert takes, `idx` as f32.
+#[cube(launch_unchecked)]
+pub fn gather_rows(x: &Array<f32>, idx: &Array<f32>, y: &mut Array<f32>, dim: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    let r = CUBE_POS_Y;
+    if j < dim {
+        let from = u32::cast_from(idx[r as usize]);
+        y[(r * dim + j) as usize] = x[(from * dim + j) as usize];
+    }
+}
+
+/// y[idx[r] * dim + j] = x[r * dim + j]: an expert's outputs to their (token, slot) rows, `idx` as f32.
+#[cube(launch_unchecked)]
+pub fn scatter_rows(x: &Array<f32>, idx: &Array<f32>, y: &mut Array<f32>, dim: u32) {
+    let j = CUBE_POS_X * CUBE + UNIT_POS;
+    let r = CUBE_POS_Y;
+    if j < dim {
+        let to = u32::cast_from(idx[r as usize]);
+        y[(to * dim + j) as usize] = x[(r * dim + j) as usize];
+    }
+}
+
+/// x[tok * dim + j] += sum over slots s (in order) of w[tok, s] * slots[(tok * k + s) * dim + j]: the chosen experts'
+/// outputs weighted and added in routing order, as model.rs `moe` sums them; `routes` as route_topk writes it.
+#[cube(launch_unchecked)]
+pub fn moe_combine(slots: &Array<f32>, routes: &Array<f32>, x: &mut Array<f32>, k: u32, dim: u32, n: u32) {
+    let i = CUBE_POS_X * CUBE + UNIT_POS;
+    if i < n {
+        let tok = i / dim;
+        let j = i % dim;
+        let mut acc = f32::new(0.0);
+        for s in 0..k {
+            acc += routes[(tok * 2 * k + k + s) as usize] * slots[((tok * k + s) * dim + j) as usize];
+        }
+        x[i as usize] = x[i as usize] + acc;
     }
 }
