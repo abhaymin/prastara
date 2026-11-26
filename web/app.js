@@ -1062,7 +1062,8 @@ $("metrics").innerHTML = METRICS.map((m) => `
 
 function spark(id, values, max) {
   const svg = $(id);
-  const v = (values || []).map((x) => (x == null ? 0 : x));
+  const raw = (values || []).map((x) => (x == null ? 0 : x));
+  const v = raw.map((x, i) => (raw[Math.max(0, i - 1)] + x + raw[Math.min(raw.length - 1, i + 1)]) / 3);
   if (v.length < 2) { svg.querySelector(".line").setAttribute("d", ""); svg.querySelector(".area").setAttribute("d", ""); return; }
   const top = Math.max(max || 0, ...v, 1);
   const pts = v.map((x, i) => [(i / (v.length - 1)) * 100, 30 - (x / top) * 26]);
@@ -1393,20 +1394,23 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
               `${now ? "Now" : "Last"}: ${mediaLabel(media.kind).toLowerCase()}`);
     setMetric("prefill", media.seed == null ? null : String(media.seed), "", now ? "Seed now" : "Seed of the last one");
   } else {
-    const speed = live.state === "generating" ? live.tok_s : last ? last.decode_tok_s : null;
+    // both numbers from one time: the request running now (writing has not started while it reads), else the last one
+    const busy = live.state === "reading" || live.state === "generating";
+    const speed = busy ? (live.state === "generating" ? live.tok_s : null) : last ? last.decode_tok_s : null;
     setMetric("speed", speed == null ? null : fmt(speed, 1), "t/s",
-              live.state === "generating" ? "Decode now" : last ? "Decode last request" : "Decode");
-    const prefill = live.state !== "idle" ? live.prefill_tok_s_mean
+              busy ? (live.state === "generating" ? "Writing now" : "Writing: after the prompt") : last ? "Writing, last request" : "Writing");
+    const prefill = busy ? live.prefill_tok_s_mean
                   : last && last.prompt_ms > 0 ? Math.max(0, last.prompt_tokens - (last.reused || 0)) / (last.prompt_ms / 1000) : null;
-    setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s",
-              live.state === "reading" ? "Prefill now" : live.state === "generating" ? "Prefill this request" : last ? "Prefill last request" : "Prefill");
+    setMetric("prefill", prefill == null ? null : fmt(prefill), "t/s", busy ? "Reading now" : last ? "Reading, last request" : "Reading");
   }
   spark("sp-speed", h.tok_s);
   spark("sp-prefill", h.prefill_tok_s_mean);
   // a model split across several cards (issue #112): the cards show their total / mean / hottest, and each card's own
   const per = (f) => (hw.gpus || []).map((g) => `GPU ${g.index} ${f(g)}`).join(" · ");
   const multi = (hw.gpus || []).length > 1;
-  setMetric("gpu", hw.gpu_util == null ? null : fmt(hw.gpu_util), "%",
+  // two cards: both values as the headline (an average hid an idle card beside a busy one)
+  const pair = (f) => (hw.gpus || []).length === 2 && hw.gpus.every((g) => f(g) != null) ? hw.gpus.map((g) => fmt(f(g))).join(" · ") : null;
+  setMetric("gpu", pair((g) => g.util) ?? (hw.gpu_util == null ? null : fmt(hw.gpu_util)), "%",
             multi ? per((g) => (g.util == null ? "–" : `${fmt(g.util)}%`)) : st.gpu_name || (st.gpu_note ? "not available" : ""));
   spark("sp-gpu", h.gpu_util, 100);
   setMetric("vram", hw.gpu_mem_used == null ? null : gb(hw.gpu_mem_used), hw.gpu_mem_total ? `/ ${gb(hw.gpu_mem_total, 0)} GB` : "GB",
@@ -1416,7 +1420,7 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   setMetric("ram", hw.ram_used == null ? null : gb(hw.ram_used), hw.ram_total ? `/ ${gb(hw.ram_total, 0)} GB` : "GB",
             hw.ram_total ? `${fmt((100 * hw.ram_used) / hw.ram_total)}% used · ${gb(hw.ram_total - hw.ram_used)} GB free` : "");
   spark("sp-ram", h.ram_used, hw.ram_total);
-  setMetric("temp", hw.gpu_temp == null ? null : fmt(hw.gpu_temp), "°C",
+  setMetric("temp", pair((g) => g.temp) ?? (hw.gpu_temp == null ? null : fmt(hw.gpu_temp)), "°C",
             multi ? per((g) => (g.temp == null ? "–" : `${fmt(g.temp)}°`)) : "");
   spark("sp-temp", h.gpu_temp, 90);
   setMetric("power", hw.gpu_power == null ? null : fmt(hw.gpu_power), "W", hw.gpu_power_limit ? `of ${fmt(hw.gpu_power_limit)} W limit` : "");

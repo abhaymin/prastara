@@ -147,8 +147,10 @@ h2 { margin: 0; font-size: 20px; font-weight: var(--st-fw-black); letter-spacing
 .state-card { display: flex; flex-direction: column; gap: var(--st-s-3); }
 .state-card__head { display: flex; align-items: center; gap: var(--st-s-4); flex-wrap: wrap; }
 .badges { display: flex; gap: var(--st-s-2); flex-wrap: wrap; }
-.badges .st-badge { opacity: .38; transition: opacity var(--st-dur); }
+/* the state legend: the state now as a badge, the others as quiet labels (not buttons) */
+.badges .st-badge:not(.on) { background: transparent; border-color: transparent; color: var(--st-ink-muted); opacity: .7; padding-inline: 4px; }
 .badges .st-badge.on { opacity: 1; }
+.badges .st-badge { transition: opacity var(--st-dur); cursor: default; }
 .state-card__row { display: flex; justify-content: space-between; gap: var(--st-s-4); font-size: var(--st-fs-sm);
                    font-weight: var(--st-fw-medium); font-variant-numeric: tabular-nums; }
 .metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
@@ -1023,3 +1025,6 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .ws-legend { display: flex; gap: var(--st-s-4); font-size: 12px; color: var(--st-ink-soft); }
 .ws-legend i { display: inline-block; width: 14px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--st-accent); }
 .ws-legend i.e { width: 8px; height: 8px; border-radius: 50%; background: var(--st-warn); }
+/* Monitor: the context card keeps its own height; pager buttons big enough to hit */
+.monitor-row > .ctx-card { align-self: start; }
+.req-pager .st-btn { min-height: 32px; min-width: 32px; }
