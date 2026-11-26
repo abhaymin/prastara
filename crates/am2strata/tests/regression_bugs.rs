@@ -121,7 +121,10 @@ fn pr13_workshop_symlinks_cannot_escape_their_folders() {
 fn pr16_workshop_upload_names_cannot_place_a_file_elsewhere() {
     let s = Server::start(&[Model::default()], &[ids("hi")], json!({}));
     let uploads = s.dir.join("workshop/uploads");
-    for name in ["..%2F..%2Fescaped.txt", "%2Fetc%2Fcron.d%2Fx", "..%5C..%5Cwin.txt", ".bashrc", "a%00b.txt"] {
+    // (a name that points into a system folder, /etc/cron.d/x, is refused outright since the sensitive-path rule)
+    let a = Req::new("POST", &s.base, "/v1/workshop/uploads?name=%2Fetc%2Fcron.d%2Fx").key(Some(KEY)).raw("application/octet-stream", b"data").send();
+    assert_eq!(a.status, 400, "{}", a.text);
+    for name in ["..%2F..%2Fescaped.txt", "..%5C..%5Cwin.txt", ".bashrc", "a%00b.txt"] {
         let a = Req::new("POST", &s.base, &format!("/v1/workshop/uploads?name={name}")).key(Some(KEY)).raw("application/octet-stream", b"data").send();
         assert_eq!(a.status, 200, "{name}: {}", a.text);
         let path = std::path::PathBuf::from(a.json()["path"].as_str().unwrap());

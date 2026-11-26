@@ -469,6 +469,10 @@ fn main() {
         let tp = Instant::now();
         let mut logits = Vec::new();
         let todo = &ids[reused..];
+        // a STOP while the prompt is read ends the request there (a long prompt can take minutes on a slow path):
+        // nothing is generated and DONE says "stop"; the state keeps what was read, and the history says so
+        let mut stopped = false;
+        let mut stop_asked = || matches!(rx.try_recv(), Ok(ref c) if c.trim() == "STOP");
         if let Some(pad) = pad {
             // runs of text in chunks as below, each picture row in place of its pad token
             let (mut i, mut row) = (0usize, 0usize);
@@ -483,6 +487,7 @@ fn main() {
                     i += run;
                 }
                 out(&format!("PP {i} {} {}", ids.len(), tp.elapsed().as_millis()));
+                if stop_asked() { stopped = true; break; }
             }
             history.extend_from_slice(todo);
         } else if batch > 1 {
@@ -494,6 +499,7 @@ fn main() {
                 history.extend_from_slice(&todo[i..end]);
                 i = end;
                 out(&format!("PP {} {} {}", reused + i, ids.len(), tp.elapsed().as_millis()));
+                if i < todo.len() && stop_asked() { stopped = true; break; }
             }
         } else {
             for (i, &t) in todo.iter().enumerate() {
@@ -502,12 +508,14 @@ fn main() {
                 if (i + 1) % 16 == 0 || i + 1 == todo.len() {
                     out(&format!("PP {} {} {}", reused + i + 1, ids.len(), tp.elapsed().as_millis()));
                 }
+                if i + 1 < todo.len() && stop_asked() { stopped = true; break; }
             }
         }
         let prompt_ms = tp.elapsed().as_millis();
         let force: Option<Vec<u32>> = std::env::var("AM2_DEBUG_FORCE").ok().map(|v| v.split(',').filter_map(|t| t.parse().ok()).collect());
         let td = Instant::now();
-        let (mut n, mut finish) = (0usize, "length");
+        let (mut n, mut finish) = (0usize, if stopped { "stop" } else { "length" });
+        let max_new = if stopped { 0 } else { max_new };
         if on_graph || batch <= 1 || force.is_some() {
             lookup = 0;
         }

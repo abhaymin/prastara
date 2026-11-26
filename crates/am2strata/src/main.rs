@@ -620,6 +620,7 @@ async fn main() -> Result<()> {
         .route("/api/models/load", post(web::load_model))
         .route("/api/models/unload", post(web::unload_model))
         .route("/api/queue", get(web::queue))
+        .route("/api/queue/{id}/cancel", post(web::queue_cancel))
         .route("/api/gpus", get(web::gpus))
         .route("/api/machine", get(web::machine))
         .route("/api/cluster", get(cluster::status))

@@ -716,8 +716,16 @@ async fn library_call(args: &[&str]) -> Result<Value, String> {
 
 /// `GET /v1/workshop/library`: every recipe (Soup's catalogue, ported, and Prastara's own) with its abilities and
 /// whether this Workshop trains it.
+/// The Workshop command, when it is there to run: else the library answers 501 not_available (a feature this
+/// install has not got, not a server error).
+fn library_missing() -> Option<Response> {
+    exe().filter(|p| p.exists()).is_none().then(|| error(StatusCode::NOT_IMPLEMENTED, "not_available",
+        "the am2strata-workshop command is not installed beside the server (or AM2STRATA_WORKSHOP_EXE names no file)"))
+}
+
 pub async fn library_get(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(r) = admin(&s, &headers) { return r; }
+    if let Some(r) = library_missing() { return r; }
     match library_call(&["list"]).await {
         Ok(v) => Json(json!({"recipes": v["recipes"], "sources": v["sources"]})).into_response(),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", e),
@@ -734,6 +742,7 @@ pub async fn library_post(State(s): State<AppState>, headers: HeaderMap, Json(re
     let Some(name) = req["name"].as_str().and_then(safe_name) else {
         return error(StatusCode::BAD_REQUEST, "invalid_request_error", "give the recipe's \"name\"");
     };
+    if let Some(r) = library_missing() { return r; }
     let dir = Workshop::fresh(&w.out_dir.join("recipes"), &name, "");
     match library_call(&["init", &name, "--out", &dir.display().to_string()]).await {
         Ok(_) => Json(json!({"folder": dir.display().to_string(), "config": dir.join("soup.yaml").display().to_string(),

@@ -177,6 +177,7 @@ const ROUTES: &[Row] = &[
     row("POST", "/api/models/load", Owner).json(r#"{"model": "mock-a"}"#),
     row("POST", "/api/models/unload", Owner),
     row("GET", "/api/queue", Owner),
+    row("POST", "/api/queue/{id}/cancel", Owner).at("/api/queue/999999/cancel").ok(404).note("a job that has ended"),
     row("GET", "/api/gpus", Owner),
     row("GET", "/api/machine", Owner),
     row("GET", "/api/cluster", Owner),
@@ -270,6 +271,12 @@ const ROUTES: &[Row] = &[
     row("DELETE", "/v1/workshop/jobs/{id}", Owner).at("/v1/workshop/jobs/999").ok(409).note("no such job to cancel"),
     row("GET", "/v1/workshop/files", Owner),
     row("POST", "/v1/workshop/uploads", Owner).at("/v1/workshop/uploads?name=regress.txt").raw("application/octet-stream", "hello"),
+    row("PUT", "/v1/workshop/upload", Owner).at("/v1/workshop/upload?name=regress.bin").raw("application/octet-stream", "hello")
+        .note("streamed to disk"),
+    row("POST", "/v1/workshop/upload-folder", Owner).at("/v1/workshop/upload-folder?name=regress-folder"),
+    row("GET", "/v1/workshop/browse", Owner),
+    row("GET", "/v1/workshop/library", Owner).note("501 not_available here: the Workshop command is pinned to nowhere"),
+    row("POST", "/v1/workshop/library", Owner).json(r#"{"name": "no-such-recipe"}"#).ok(400),
     row("GET", "/v1/workshop/dataset", Owner).at("/v1/workshop/dataset?path=/nope/x.jsonl").ok(400).note("outside the Workshop's folders"),
     row("POST", "/v1/workshop/dataset", Owner).json(r#"{"path": "/nope/x.jsonl"}"#).ok(400),
     // ------------------------------------------------------------------------------------------- HTTPS, Computer
@@ -439,7 +446,9 @@ fn not_installed(a: &Answer) -> bool {
 /// THE WALK: every row, every kind of caller. All mismatches are reported together.
 #[test]
 fn every_route_answers_each_caller_as_its_row_says() {
-    let s = Server::start(&[client_model(json!({"api_monitor": true}))], &[ids("Thinking.\n</think>\n\nhello")], json!({}));
+    // the Workshop command pinned to nowhere: its library routes answer the same whatever is built beside the server
+    let s = Server::start(&[client_model(json!({"api_monitor": true}))], &[ids("Thinking.\n</think>\n\nhello")],
+                          json!({"env": {"AM2STRATA_WORKSHOP_EXE": "/nonexistent/am2strata-workshop"}}));
     let wrong: std::cell::RefCell<Vec<String>> = Default::default();
     let mut checks = 0;
     for r in rows() {

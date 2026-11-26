@@ -485,6 +485,14 @@ impl Engine {
         }
     }
 
+    /// Stop the request running now (a cancel from the Monitor): the engine ends it at its next look, while
+    /// reading the prompt too, and sends DONE as for a stop, so the request finishes with what it has.
+    pub async fn stop(&self) {
+        let mut stdin = self.inner.stdin.lock().await;
+        let _ = stdin.write_all(strata_protocol::STOP.as_bytes()).await;
+        let _ = stdin.flush().await;
+    }
+
     /// Can this engine take requests? Not once a request found it gone or out of step, nor once its process has
     /// exited (killed for memory, a crash). An engine being shut down counts as usable until it is gone.
     pub fn usable(&self) -> bool {

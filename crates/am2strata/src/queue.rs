@@ -153,6 +153,8 @@ struct State {
     switch_s: std::collections::HashMap<String, f64>,
     /// the client of the job that ran last (fairness between clients)
     last_client: String,
+    /// waiting jobs asked to leave (they go at their next look at the queue)
+    cancelled: std::collections::HashSet<u64>,
 }
 
 pub struct Queue {
@@ -211,11 +213,15 @@ pub struct TooLong {
     pub waited_s: u64,
     /// refused because MAX_WAITING jobs already wait
     pub full: bool,
+    /// taken out of the queue by a cancel (the Monitor, the Workshop's Activity, POST /api/queue/{id}/cancel)
+    pub cancelled: bool,
 }
 
 impl std::fmt::Display for TooLong {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        if self.full {
+        if self.cancelled {
+            write!(f, "cancelled while it waited its turn (after {} s)", self.waited_s)
+        } else if self.full {
             write!(f, "{MAX_WAITING} jobs are already waiting for their turn; try again later")
         } else {
             write!(f, "waited {} s at place {} of the queue (queue_max_wait_s); try again later", self.waited_s, self.position)
@@ -231,7 +237,8 @@ impl Queue {
     pub fn with_batch_wait(max_wait: Option<Duration>, batch_wait: Duration) -> Arc<Queue> {
         Arc::new(Queue {
             state: Mutex::new(State { queue: VecDeque::new(), running: None, resident: Resident::None, batched: 0, next: 1,
-                                      costs: Default::default(), switch_s: Default::default(), last_client: String::new() }),
+                                      costs: Default::default(), switch_s: Default::default(), last_client: String::new(),
+                                      cancelled: Default::default() }),
             changed: Notify::new(),
             max_wait,
             batch_wait,
@@ -268,7 +275,8 @@ impl Queue {
                                                                         label: String::new(), since: t.since, priority: t.priority,
                                                                         client: t.client.clone() }).collect(),
                               running: None, resident: s.resident.clone(), batched: s.batched, next: 0,
-                              costs: Default::default(), switch_s: Default::default(), last_client: s.last_client.clone() };
+                              costs: Default::default(), switch_s: Default::default(), last_client: s.last_client.clone(),
+                              cancelled: Default::default() };
         let mut out = Vec::new();
         while let Some(id) = Self::choose(&sim, batch_wait) {
             let pos = sim.queue.iter().position(|t| t.id == id).unwrap();
@@ -339,7 +347,7 @@ impl Queue {
         let id = {
             let mut s = self.state.lock().unwrap();
             if s.queue.len() >= MAX_WAITING {
-                return Err(TooLong { position: s.queue.len() + 1, waited_s: 0, full: true });
+                return Err(TooLong { position: s.queue.len() + 1, waited_s: 0, full: true, cancelled: false });
             }
             let id = s.next;
             s.next += 1;
@@ -357,6 +365,10 @@ impl Queue {
             notified.as_mut().enable();
             {
                 let mut s = self.state.lock().unwrap();
+                if s.cancelled.remove(&id) {
+                    // its Waiting guard takes it out of the queue as this returns
+                    return Err(TooLong { position: 0, waited_s: since.elapsed().as_secs(), full: false, cancelled: true });
+                }
                 if Self::choose(&s, self.batch_wait) == Some(id) {
                     let pos = s.queue.iter().position(|t| t.id == id).unwrap();
                     let t = s.queue.remove(pos).unwrap();
@@ -378,7 +390,7 @@ impl Queue {
                 }
                 if let Some(max) = self.max_wait {
                     if since.elapsed() >= max {
-                        return Err(TooLong { position, waited_s: since.elapsed().as_secs(), full: false });
+                        return Err(TooLong { position, waited_s: since.elapsed().as_secs(), full: false, cancelled: false });
                     }
                 }
             }
@@ -389,6 +401,20 @@ impl Queue {
                 None => notified.await,
             }
         }
+    }
+
+    /// Cancel a job: one waiting leaves the queue ("waiting"); for the one running, the caller stops its work
+    /// ("running", with its kind); None when no such job is here (it ended already).
+    pub fn cancel(&self, id: u64) -> Option<(&'static str, String)> {
+        let mut s = self.state.lock().unwrap();
+        if let Some(t) = s.queue.iter().find(|t| t.id == id) {
+            let kind = t.kind.clone();
+            s.cancelled.insert(id);
+            drop(s);
+            self.changed.notify_waiters();
+            return Some(("waiting", kind));
+        }
+        s.running.as_ref().filter(|r| r.0 == id).map(|r| ("running", r.2.clone()))
     }
 
     /// What the running job left resident (the manager says so after a load, an unload or a media job).
@@ -447,6 +473,25 @@ impl Queue {
 #[cfg(test)]
 mod priority_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_waiting_job_can_be_cancelled_and_a_running_one_is_named() {
+        let q = Queue::new(None);
+        let first = q.enter(Need::Any, "chat", "first", |_| {}).await.unwrap();
+        let q2 = q.clone();
+        let waiter = tokio::spawn(async move { q2.enter(Need::Any, "chat", "second", |_| {}).await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let snap = q.snapshot();
+        let id = snap["waiting"][0]["id"].as_u64().unwrap();
+        assert_eq!(q.cancel(id).map(|c| c.0), Some("waiting"));
+        let r = waiter.await.unwrap();
+        assert!(r.as_ref().is_err_and(|e| e.cancelled), "the waiting job is told it was cancelled");
+        assert_eq!(q.waiting(), 0, "and it left the queue");
+        let running = q.snapshot()["running"]["id"].as_u64().unwrap();
+        assert_eq!(q.cancel(running), Some(("running", "chat".to_string())));
+        assert_eq!(q.cancel(9999), None);
+        drop(first);
+    }
 
     async fn run_with(q: Arc<Queue>, jobs: Vec<(&'static str, Priority, &'static str)>, first: &str) -> Vec<&'static str> {
         let blocker = CLIENT.scope(first.to_string(), q.enter(Need::Any, "block", "", |_| {})).await.unwrap();

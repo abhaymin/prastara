@@ -996,3 +996,4 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 /* Monitor: why a request is slow (the engine's path, the rate, the time left) */
 .state-why { margin: var(--st-s-2) 0 0; font-size: var(--st-fs-sm); color: var(--st-ink-soft); line-height: var(--st-lh-body); }
 .state-why b { color: var(--st-ink); }
+.req-cancel { height: 32px; min-width: 32px; padding: 0 var(--st-s-3); margin-left: var(--st-s-2); font-size: 12px; vertical-align: middle; }

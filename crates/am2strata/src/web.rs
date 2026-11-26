@@ -287,6 +287,29 @@ pub async fn queue(State(s): State<AppState>, headers: HeaderMap) -> Response {
     Json(s.mgr.queue.snapshot()).into_response()
 }
 
+/// POST /api/queue/{id}/cancel: a waiting job leaves the queue; the running chat is stopped where it is (while its
+/// prompt is read too), and finishes with what it has. Other running work (a load, a media job) is not stopped here.
+pub async fn queue_cancel(State(s): State<AppState>, headers: HeaderMap, axum::extract::Path(id): axum::extract::Path<u64>) -> Response {
+    if !authorized(&s, &headers) {
+        return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
+    }
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("requests can be cancelled");
+    }
+    match s.mgr.queue.cancel(id) {
+        Some(("waiting", kind)) => Json(json!({"id": id, "cancelled": "waiting", "kind": kind})).into_response(),
+        Some((_, kind)) if kind == "chat" => match s.mgr.current().await {
+            Some(l) => {
+                l.engine.stop().await;
+                Json(json!({"id": id, "cancelled": "running", "kind": kind})).into_response()
+            }
+            None => error(StatusCode::CONFLICT, "invalid_request_error", "no model is loaded to stop"),
+        },
+        Some((_, kind)) => error(StatusCode::CONFLICT, "invalid_request_error", format!("a running {kind} job is not stopped from here")),
+        None => error(StatusCode::NOT_FOUND, "not_found_error", format!("no job {id} in the queue: it has ended")),
+    }
+}
+
 /// GET /metrics/prometheus.
 pub async fn prometheus(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !authorized(&s, &headers) {

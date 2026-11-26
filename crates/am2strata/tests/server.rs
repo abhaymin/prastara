@@ -3335,3 +3335,40 @@ fn a_streaming_api_chat_follows_its_video_to_the_end() {
     let text = r.text().unwrap();
     assert!(!text.contains("is ready: /v1/media"), "{text}");
 }
+
+/// Cancel from the Monitor (POST /api/queue/{id}/cancel): a waiting chat leaves the queue and is told so; the running
+/// one is stopped where it is and finishes early with what it has.
+#[test]
+fn a_running_chat_can_be_stopped_and_a_waiting_one_cancelled() {
+    let long: Vec<u32> = (0..80).flat_map(|_| ids("word ")).collect();
+    let s = Server::start(&[Model::default()], &[long], json!({"delay_ms": 150}));
+    let chat = |base: String| std::thread::spawn(move || {
+        let t0 = Instant::now();
+        let r = reqwest::blocking::Client::new().post(format!("{base}/v1/chat/completions")).bearer_auth(common::KEY)
+            .json(&json!({"model": "mock-a", "max_tokens": 200, "messages": [{"role": "user", "content": "go"}]}))
+            .timeout(Duration::from_secs(60)).send().unwrap();
+        let code = r.status().as_u16();
+        (code, r.json::<Value>().unwrap_or(Value::Null), t0.elapsed())
+    });
+    let first = chat(s.base.clone());
+    std::thread::sleep(Duration::from_millis(800));
+    let second = chat(s.base.clone());
+    std::thread::sleep(Duration::from_millis(400));
+    let (_, q) = s.get("/api/queue", true);
+    let running = match q["running"]["id"].as_u64() {
+        Some(r) => r,
+        None => { let (c, j, t) = first.join().unwrap(); panic!("a chat runs: {q}; the first chat: {c} {j} after {t:?}") }
+    };
+    let waiting = q["waiting"][0]["id"].as_u64().expect("a chat waits");
+    let (code, c) = s.post(&format!("/api/queue/{waiting}/cancel"), &json!({}));
+    assert_eq!((code, c["cancelled"].as_str()), (200, Some("waiting")), "{c}");
+    let (code2, j2, _) = second.join().unwrap();
+    assert_ne!(code2, 200, "the cancelled chat is not answered: {j2}");
+    assert!(j2.to_string().contains("cancelled"), "{j2}");
+    let (code, c) = s.post(&format!("/api/queue/{running}/cancel"), &json!({}));
+    assert_eq!((code, c["cancelled"].as_str()), (200, Some("running")), "{c}");
+    let (code1, j1, took) = first.join().unwrap();
+    assert_eq!(code1, 200, "{j1}");
+    assert!(took < Duration::from_secs(8), "stopped early, not after the whole reply (160 tokens at 150 ms): {took:?}");
+    assert_eq!(s.post("/api/queue/999999/cancel", &json!({})).0, 404, "a job that has ended");
+}

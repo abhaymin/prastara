@@ -1171,17 +1171,45 @@ function render(m) {
 
 // Recent requests' top rows: what runs now and what waits (each chat waiting in the queue gets its own row), and the
 // requests a cluster worker is answering now, so a second chat is visible while the first one, or a media job, runs
+// what each queue kind is, in plain words (the Monitor's rows show it on hover)
+const QUEUE_KINDS = {chat: "a chat request", optimise: "tuning a model's run settings (Settings › Models › Tune)",
+  switch: "loading another model", unload: "unloading the model", media: "a media job on the GPU", remove: "removing a model",
+  clear: "clearing saved prompt snapshots"};
+// when a waiting job starts: while a prompt is read, from the time left on it (the queue's own estimate learns
+// only from finished jobs, so it says "2 s" for a 20-minute read), plus what the queue counts for the jobs ahead
+function queueStarts(q, w) {
+  const eta = promptEta(lastMetrics?.live), first = (q.waiting || [])[0];
+  if (eta && first && first.eta_s != null && w.eta_s != null) return eta.left + Math.max(0, w.eta_s - first.eta_s);
+  return w.eta_s;
+}
+async function queueCancel(id, btn) {
+  if (btn) btn.disabled = true;
+  try {
+    const r = await fetch(`api/queue/${id}/cancel`, {method: "POST", headers: headers(true), body: "{}"});
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.error?.message || `HTTP ${r.status}`);
+    toast("success", j.cancelled === "running" ? "Stopped" : "Cancelled", j.cancelled === "running" ? "the request ends with what it has" : "it left the queue");
+  } catch (e) { toast("error", "Could not cancel", e.message); if (btn) btn.disabled = false; }
+}
+document.addEventListener("click", (e) => { const b = e.target.closest("[data-q-cancel]"); if (b) queueCancel(b.dataset.qCancel, b); });
 function renderNow(q, remote) {
   q = q || {};
   const label = (x) => x.label || (x.kind === "chat" ? "a chat" : x.kind ? `a ${x.kind} job` : "a request");
   const need = (n) => !n ? "" : n === "gpu" ? "the GPU" : n === "any" ? "" : n.text_model || "";
   const rows = [];
-  if (q.running) rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span> <span class="st-badge st-badge--reading">${esc(q.running.kind || "")}</span></td>
-    <td class="req-model" title="${esc(label(q.running))}">${esc(label(q.running))}</td><td colspan="6" class="muted">${esc(need(q.running.need))}</td><td class="num">${fmt(q.running.running_s)} s</td></tr>`);
+  const cancel = (x, word) => x.kind === "chat" || word === "Cancel" ? ` <button class="st-btn st-btn--secondary req-cancel" data-q-cancel="${esc(x.id)}">${word}</button>` : "";
+  if (q.running) {
+    const lv = lastMetrics?.live, eta = promptEta(lv);
+    const doing = lv && lv.state === "reading" && lv.prompt_total
+      ? `prompt ${fmt(lv.prompt_read)} of ${fmt(lv.prompt_total)}${eta ? ` · about ${wsDur(eta.left)} left` : ""}`
+      : lv && lv.state === "generating" ? `writing · ${fmt(lv.generated)} tokens at ${fmt(lv.tok_s, 1)} tok/s` : need(q.running.need);
+    rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span> <span class="st-badge st-badge--reading" title="${esc(QUEUE_KINDS[q.running.kind] || "")}">${esc(q.running.kind || "")}</span></td>
+    <td class="req-model" title="${esc(label(q.running))}">${esc(label(q.running))}</td><td colspan="6" class="muted">${esc(doing)}${cancel(q.running, "Stop")}</td><td class="num">${fmt(q.running.running_s)} s</td></tr>`);
+  }
   for (const r of Array.isArray(remote) ? remote : []) rows.push(`<tr><td class="muted">now</td><td><span class="st-badge st-badge--generating">Running</span></td>
     <td class="req-model">${esc(r.model || "–")} <span class="st-badge st-badge--reading">${esc(r.machine || "")}</span></td><td colspan="6" class="muted">answered by ${esc(r.machine || "a worker")}</td><td class="num">${fmt(r.elapsed_s)} s</td></tr>`);
-  for (const w of Array.isArray(q.waiting) ? q.waiting : []) rows.push(`<tr><td class="muted">#${esc(w.position)}</td><td><span class="st-badge st-badge--queued">Waiting</span> <span class="st-badge st-badge--reading">${esc(w.kind || "")}</span></td>
-    <td class="req-model" title="${esc(label(w))}">${esc(label(w))}</td><td colspan="6" class="muted">${esc([w.client, need(w.need) && `needs ${need(w.need)}`, w.eta_s != null ? `about ${fmt(w.eta_s)} s to go` : ""].filter(Boolean).join(" · "))}</td><td class="num">${fmt(w.waiting_s)} s</td></tr>`);
+  for (const w of Array.isArray(q.waiting) ? q.waiting : []) rows.push(`<tr><td class="muted">#${esc(w.position)}</td><td><span class="st-badge st-badge--queued">Waiting</span> <span class="st-badge st-badge--reading" title="${esc(QUEUE_KINDS[w.kind] || "")}">${esc(w.kind || "")}</span></td>
+    <td class="req-model" title="${esc(label(w))}">${esc(label(w))}</td><td colspan="6" class="muted">${esc([w.client, need(w.need) && `needs ${need(w.need)}`, queueStarts(q, w) != null ? `starts in ~${wsDur(queueStarts(q, w))}` : ""].filter(Boolean).join(" · "))}${cancel(w, "Cancel")}</td><td class="num">${fmt(w.waiting_s)} s</td></tr>`);
   $("req-now").innerHTML = rows.join("");
 }
 
@@ -5265,18 +5293,21 @@ async function wsCtxRefresh() {
         if (eta) ahead = eta.left;
         items.push({what: q.running.kind, state: reading ? "reading" : "running", time: wsDur(q.running.running_s || 0),
           cls: reading ? "st-badge--reading" : "st-badge--generating", pct: reading ? (100 * lv.prompt_read) / lv.prompt_total : null,
+          id: q.running.id, act: q.running.kind === "chat" ? "Stop" : "",
           line: `${q.running.label || need(q.running)}` + (reading ? ` · prompt ${fmt(lv.prompt_read)} of ${fmt(lv.prompt_total)}${eta ? ` · about ${wsDur(eta.left)} left` : ""}`
             : typical(q.running) ? ` · usually about ${wsDur(typical(q.running))}` : "")});
       }
       for (const w of q.waiting || []) {
-        items.push({what: w.kind, state: "waiting", time: ahead ? `starts in ~${wsDur(ahead)}` : "next", cls: "st-badge--queued",
-          line: w.label || need(w) || ""});
+        const at = queueStarts(q, w) ?? ahead;
+        items.push({what: w.kind, state: "waiting", time: at ? `starts in ~${wsDur(at)}` : "next", cls: "st-badge--queued",
+          line: w.label || need(w) || "", id: w.id, act: "Cancel"});
         ahead += typical(w) || 0;
       }
       $("ws-ctx-count").textContent = items.length ? `${items.length} in the queue` : "";
       $("ws-ctx-activity").innerHTML = (items.length ? items.map((a) => `<div class="ws-act"><div class="ws-act__top"><b>${esc(a.what)}</b>` +
           `<span class="st-badge ${a.cls}">${a.state}</span><span class="muted">${esc(a.time)}</span></div><p>${esc(a.line)}</p>` +
-          (a.pct != null ? `<div class="st-progress" data-tone="info"><div class="st-progress__bar" style="width:${a.pct.toFixed(1)}%"></div></div>` : "") + `</div>`).join("")
+          (a.pct != null ? `<div class="st-progress" data-tone="info"><div class="st-progress__bar" style="width:${a.pct.toFixed(1)}%"></div></div>` : "") +
+          (a.act ? `<div><button class="st-btn st-btn--secondary req-cancel" data-q-cancel="${esc(a.id)}">${a.act}</button></div>` : "") + `</div>`).join("")
         : '<p class="muted small">Nothing in the queue.</p>') +
         `<p class="muted small">Loaded: ${esc(q.resident?.text_model || "no model")}</p>`;
     }
