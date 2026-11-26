@@ -122,9 +122,12 @@ impl QMat {
         if n == 0 {
             return Vec::new();
         }
+        // on a device: every token's rounded input in one product (one upload, one wait), not one round trip per token;
+        // each token's row is computed as matvec computes it alone, so the values are the same
         #[cfg(feature = "gpu")]
-        if self.gpu.is_some() {
-            return xs.iter().map(|x| self.mul(x)).collect();
+        if let Some(g) = &self.gpu {
+            let flat: Vec<f32> = xs.iter().flat_map(|x| self.vdt.round_trip(x)).collect();
+            return g.matvec(&flat).chunks_exact(self.rows).map(|c| c.to_vec()).collect();
         }
         let Some(fast) = self.fast() else {
             return self.matmul_dequant(xs);
@@ -2585,6 +2588,24 @@ mod tests {
         assert_eq!(h, EXP_SWEEP_HASH, "exp_f32's bits changed on this machine: {h:#x}");
     }
     const EXP_SWEEP_HASH: u64 = 0xcf06_e9bd_8437_6dda; // measured on x86-64 Linux; must hold on every machine
+
+    /// A prompt chunk of a MoE model (tokens grouped per expert, each chosen expert's matrices applied once to all the
+    /// tokens that chose it) gives every token's logits exactly as token by token does, with and without the loop.
+    #[test]
+    fn moe_chunk_equals_token_by_token_exactly() {
+        use crate::testgguf::{tmp, Spec};
+        let toks: Vec<u32> = (0..23).map(|i| (i * 37 + 5) % 256).collect();
+        for (name, spec) in [("tiny-qwen3moe", Spec::tiny_qwen3moe()),
+                             ("tiny-qwen3moe-loop", Spec { loop_: Some((1, 3, 2)), seed: 0x5EED_0005, ..Spec::tiny_qwen3moe() })] {
+            let (m, _) = Model::load(&tmp(name, &spec), None).unwrap();
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            let mut st = m.new_state();
+            let mut chunk = m.forward_batch_all(&mut st, &toks[..16]);
+            chunk.extend(m.forward_batch_all(&mut st, &toks[16..]));
+            assert!(one == chunk, "{name}: a chunk's logits are token by token's, bit for bit");
+        }
+    }
 
     /// A rows x cols matrix of `ty` with random bytes and finite f16 scales where the type keeps them.
     fn random_qmat(ty: &str, rows: usize, cols: usize, next: &mut dyn FnMut() -> u64) -> QMat {

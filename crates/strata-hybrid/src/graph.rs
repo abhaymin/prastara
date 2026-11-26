@@ -608,6 +608,40 @@ mod tests {
         assert!(a < 2e-3 && b < 2e-3, "{a} {b}");
     }
 
+    /// Prompt chunks of a MoE model on a device: matrix by matrix (each matrix once per chunk, one wait per product, not
+    /// one per token) bit for bit what token by token gives; on the graph (each chosen expert once per chunk, gathered
+    /// and scattered) within float rounding of the graph token by token.
+    #[test]
+    fn moe_chunks_on_a_device_equal_token_by_token() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        let toks: Vec<u32> = (0..23).map(|i| (i * 37 + 5) % 256).collect();
+        let p = testgguf::tmp("tiny-qwen3moe", &Spec::tiny_qwen3moe());
+        for share in [1.0, 0.5] {
+            let m = placed(&p, &dev, share);
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            let mut st = m.new_state();
+            let s0 = strata_gpu::stats::snapshot();
+            let chunk = m.forward_batch_all(&mut st, &toks);
+            let syncs = (strata_gpu::stats::snapshot() - s0).syncs;
+            assert!(one == chunk, "matrix by matrix, {share} of the experts on the device: a chunk is token by token, bit for bit");
+            let gr = Graph::new(&m, 64).unwrap();
+            let mut st = m.new_state();
+            let gone: Vec<Vec<f32>> = toks.iter().map(|&t| gr.forward(&m, &mut st, t)).collect();
+            let mut st = m.new_state();
+            let s1 = strata_gpu::stats::snapshot();
+            let gchunk = gr.forward_batch_all(&m, &mut st, &toks);
+            let gsyncs = (strata_gpu::stats::snapshot() - s1).syncs;
+            let d = max_diff(&gone, &gchunk);
+            eprintln!("{share} of the experts on the device: a chunk of {} tokens: {syncs} syncs matrix by matrix, {gsyncs} on the graph; \
+                       graph chunk vs graph tokens {d:.2e}", toks.len());
+            assert!(d < 1e-4, "{d}");
+            // the graph waits once per MoE layer per chunk (twice with CPU experts) and once for the logits
+            assert!(gsyncs <= 2 * m.moes().count() as u64 + 1, "{gsyncs}");
+        }
+    }
+
     /// Softmax-routed experts on the graph: all on the device, none (the CPU computes them, the activations cross), and
     /// some of each; also with the loop.
     #[test]
