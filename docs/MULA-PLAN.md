@@ -208,3 +208,50 @@ contexts, and Mula refining itself on Prastara's own tasks.
     loop and experts on the native Metal backend (refused there with a message), and a device-side expert dispatch
     (an indexed product) that would drop the one wait per MoE layer when all experts are on the card.
 
+- **M8, the kernels (2026-11-26, branch `engine/kernels`):** the looped 8B in Q8_0 on one card decoded at 8.7 tok/s,
+  about 110 ms of device time per token where its ~11.6 GB of weight reads need ~26 ms at the card's 448 GB/s, and read
+  prompts no faster than it decoded. The Q8_0 product read its 34-byte blocks a byte at a time (95 GB/s), and a chunk
+  ran the decode product once per token.
+  - **Measured on cuda:1** (RTX 5060 Ti 16 GB, ~448 GB/s; the live server's model on the other card; load average 8-10).
+    `cargo run --release --example kbench -- cuda:1` (strata-gpu) gives GB/s of weights for one vector and GFLOP/s for
+    chunks of 32/128/512 tokens; `kbench -- cuda:1 attn` times decode attention.
+
+    | Product | Decode GB/s before -> after | 128-token chunk GFLOP/s before -> after | 512 tokens after |
+    |---|---|---|---|
+    | Q8_0 4096 x 4096 | 95 -> 400-658 (L2) | 184 -> 5240-5420 | 7280-7440 |
+    | Q8_0 12288 x 4096 | 95 -> 400 | 183 -> 6010-6400 | 5640-5910 |
+    | Q8_0 4096 x 12288 | 95 -> 390-397 | 183 -> 5190-5300 | 7660-7740 |
+    | Q8_0 151936 x 4096 | 97 -> 424 | | |
+    | Q4_K 4096 x 4096 | 245 -> 310-358 | 1000 -> 5960-6270 | 6750-6820 |
+    | Q4_K 12288 x 4096 | 267 -> 377-384 | 995 -> 6700-6880 | 7100-7150 |
+    | Q4_K 4096 x 12288 | 271 -> 368-377 | 1080 -> 5460-5860 | 7530-7550 |
+    | Q4_K 151936 x 4096 | 228 -> 403 | | |
+
+    Decode attention (32 heads of 128, 8 KV heads), µs per layer: 128 positions 18 -> 12, 1024: 112 -> 18, 4096:
+    457 -> 63.
+  - **What changed:** Q8_0 is repacked on upload (values first, f16 scales apart; the same bytes on the card). Decode
+    products load 16 bytes per unit, a warp per row, one warp reduction per row (`mv_fast`), 90-95% of the card's
+    bandwidth on the large shapes. Chunks of 8+ tokens take a tiled matmul (`mm`: a 64-row x 64-token tile, the
+    weights dequantized once into shared memory). Per layer now: norm, q/k/v in one kernel (V straight into its
+    cache), q/k norms + RoPE + K into its cache in one, attention (flash decoding: runs of positions per KV head, then
+    a merge; one kernel with a running maximum for chunks), o + residual, norm, gate/up + SiLU in one, down + residual.
+  - **Synthetic models** (`testgguf.rs write_kernel_bench_models`: Qwen3-8B's shapes, 8 layers, 151936 vocabulary;
+    512-token prompt in 128-token chunks, 64 new tokens, after a warm-up request):
+
+    | Model | Prompt tok/s before -> after | Decode tok/s before -> after | Launches per decoded token |
+    |---|---|---|---|
+    | Q8_0, 2.3 GB on the card | 58 -> 1790 | 38.8 -> 153 | 170 -> 74 |
+    | Q4_K, 1.2 GB | 306 -> 2016 | 146 -> 250 | 170 -> 74 |
+    | Q8_0 looped (blocks 2..6, 2 passes: 12 layer passes) | 39 -> 1208 | 28.9 -> 116 | 256 -> 112 |
+
+    On the Q8_0 one, nsys shows 5.8 ms of kernels per decoded token (~395 GB/s of weights over the whole token) and
+    0.5 ms between tokens (the logits' read, sampling, the next token's uploads). Prompt reading is 11.7x decode.
+  - **For the looped 8B** (48 layer passes, ~11.6 GB read per token) this predicts about 30 ms per token, ~33 tok/s
+    decode, and ~300 tok/s prompt reading (the owner measures it with the live model unloaded).
+  - **Parity:** every kernel test green on cuda:1 (the tiled kernel within 2.6e-7 relative; each fused kernel equal to
+    the kernels it replaces); a new graph test runs tiny Q8_0 and Q4_K models against the CPU path on the same model
+    dequantized to F32 (9.1e-4 / 9.4e-4, the same best token at every step); the other graph tests unchanged.
+  - **Not yet:** the tiled matmul runs on the FP32 units at 5-7.7 TFLOP/s (about a third of their peak); tensor cores
+    (CubeCL's cmma) would make prompt reading several times faster again. Q6_K, Q5_K, F16 and the IQ kinds keep the
+    older kernels (Q4_K_M models store some matrices as Q6_K). Activations and the KV cache stay f32 (an f16 cache
+    would halve attention's reads). One host sync per token remains, with the full logits read back.
