@@ -838,13 +838,20 @@ pub fn moe_combine(slots: &Array<f32>, routes: &Array<f32>, x: &mut Array<f32>, 
 // ------------------------------------------------------------------ the fast products (docs/MULA-PLAN.md M8: bandwidth)
 // Decode (one vector, or a few) reads every weight once per token, so its speed is the card's bandwidth: these load 16
 // bytes per unit per load (coalesced across the warp), keep x in L1 (16-byte loads too), and sum a row's warp with one
-// reduction at the end.
+// reduction at the end. Prompt chunks (many vectors) go through `mm`: a tile of weights dequantized once into shared
+// memory and reused for a tile of tokens, so the weights are read once per 64 tokens, not once per token.
 //
 // Q8_0 is repacked when it is uploaded (Gpu::upload): its 34-byte blocks are not 4-byte aligned, so the values go first
 // (rows * cols bytes, 16-byte aligned rows) and the f16 scales after them in a buffer of their own.
 
 /// Rows per cube of the fast decode kernels: a warp of 32 units per row.
 pub const MV_ROWS: u32 = 4;
+/// Units per cube of [`mm`]: 16 x 16, each a 4 x 4 tile of the output.
+pub const MM_CUBE: u32 = 256;
+/// The output tile of [`mm`]: rows x tokens, and the columns per step.
+pub const MM_M: u32 = 64;
+pub const MM_N: u32 = 64;
+pub const MM_K: u32 = 64;
 
 type V4 = Vector<u32, Const<4>>;
 type F4 = Vector<f32, Const<4>>;
@@ -981,5 +988,134 @@ pub fn mv_fast(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, y: &mut Array<f32>
     let total = warp_sum(acc, plane, comptime![MV_ROWS * 32]);
     if lane == 0 && row < rows {
         put(y, y_off + t * rows + row, total, add);
+    }
+}
+
+/// Y = W X for a chunk of tokens: y[t * rows + r] = W[r] . x[t]. A cube takes MM_M rows x MM_N tokens; per step of
+/// MM_K columns it dequantizes the weights' tile once into shared memory (k-major, 4 rows per cell) and loads the tokens'
+/// tile beside it (k-major, 4 tokens per cell), then each unit adds a 4 x 4 tile of products (4 rows, 4 tokens). The
+/// weights are read once per MM_N tokens. `k` is Q8_0 (repacked: `w` the values as words, `wd` the scales) or Q4_K
+/// (`w` the blocks as words, `wh` the same as 16-byte loads for the headers). cols % MM_K == 0.
+#[cube(launch_unchecked)]
+pub fn mm(w: &Array<u32>, wh: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, y: &mut Array<f32>, rows: u32, cols: u32, tokens: u32,
+          y_off: u32, #[comptime] k: u32, #[comptime] add: bool) {
+    let tid = UNIT_POS;
+    let r0 = CUBE_POS_X * MM_M;
+    let t0 = CUBE_POS_Y * MM_N;
+    let mut ws = SharedMemory::<F4>::new(comptime![(MM_K * MM_M / 4) as usize]);
+    let mut xs = SharedMemory::<F4>::new(comptime![(MM_K * MM_N / 4) as usize]);
+    // this unit's loads: rows 4 lq.. (and tokens 4 lq..) at columns 4 lk..
+    let lq = tid % 16;
+    let lk = tid / 16;
+    // its output tile: rows 4 tm.., tokens 4 tn..
+    let tm = tid % 16;
+    let tn = tid / 16;
+    let mut a0 = F4::empty().fill(0.0);
+    let mut a1 = F4::empty().fill(0.0);
+    let mut a2 = F4::empty().fill(0.0);
+    let mut a3 = F4::empty().fill(0.0);
+    let steps = cols / MM_K;
+    let c4 = cols / 4;
+    for st in 0..steps {
+        let k0 = st * MM_K;
+        // the weights' tile: 4 values (columns k0 + 4 lk..) of each of 4 rows, stored as 4 cells of 4 rows
+        let mut c0 = F4::empty().fill(0.0);
+        let mut c1 = F4::empty().fill(0.0);
+        let mut c2 = F4::empty().fill(0.0);
+        let mut c3 = F4::empty().fill(0.0);
+        #[unroll]
+        for i in 0..4u32 {
+            let row = r0 + 4 * lq + i;
+            let mut v0 = f32::new(0.0);
+            let mut v1 = f32::new(0.0);
+            let mut v2 = f32::new(0.0);
+            let mut v3 = f32::new(0.0);
+            if row < rows {
+                if comptime![k == kind::Q8_0] {
+                    let wv = w[((row * cols + k0) / 4 + lk) as usize];
+                    let d = q8_scale(wd, row * (cols / 32) + (k0 + 4 * lk) / 32);
+                    v0 = d * i8f(wv, 0u32);
+                    v1 = d * i8f(wv, 1u32);
+                    v2 = d * i8f(wv, 2u32);
+                    v3 = d * i8f(wv, 3u32);
+                } else {
+                    // Q4_K: chunk c (32 bytes) of block bk: low nibbles are group 2c, high ones 2c + 1; columns 4 lk..
+                    // are word lk % 8 of the chunk, low nibbles for lk < 8
+                    let blk = row * (cols / 256) + k0 / 256;
+                    let c = (k0 % 256) / 64;
+                    let g = 2 * c + lk / 8;
+                    let h = wh[(blk * 9) as usize];
+                    let wv = w[(blk * 36 + 4 + c * 8 + lk % 8) as usize];
+                    let dd = half_bits(h[0] & 0xffff) * f32::cast_from(k4_scale(h[1], h[2], h[3], g, false));
+                    let dm = half_bits(h[0] >> 16) * f32::cast_from(k4_scale(h[1], h[2], h[3], g, true));
+                    let sh = (lk / 8) * 4;
+                    v0 = dd * f32::cast_from((wv >> sh) & 0x0f) - dm;
+                    v1 = dd * f32::cast_from((wv >> (sh + 8)) & 0x0f) - dm;
+                    v2 = dd * f32::cast_from((wv >> (sh + 16)) & 0x0f) - dm;
+                    v3 = dd * f32::cast_from((wv >> (sh + 24)) & 0x0f) - dm;
+                }
+            }
+            c0[i as usize] = v0;
+            c1[i as usize] = v1;
+            c2[i as usize] = v2;
+            c3[i as usize] = v3;
+        }
+        let at = (4 * lk) * (MM_M / 4) + lq;
+        ws[at as usize] = c0;
+        ws[(at + MM_M / 4) as usize] = c1;
+        ws[(at + 2 * MM_M / 4) as usize] = c2;
+        ws[(at + 3 * MM_M / 4) as usize] = c3;
+        // the tokens' tile: 4 values (columns k0 + 4 lk..) of each of 4 tokens, transposed into 4 cells of 4 tokens
+        let mut e0 = F4::empty().fill(0.0);
+        let mut e1 = F4::empty().fill(0.0);
+        let mut e2 = F4::empty().fill(0.0);
+        let mut e3 = F4::empty().fill(0.0);
+        #[unroll]
+        for i in 0..4u32 {
+            let tok = t0 + 4 * lq + i;
+            let mut xv = F4::empty().fill(0.0);
+            if tok < tokens {
+                xv = x[(tok * c4 + k0 / 4 + lk) as usize];
+            }
+            e0[i as usize] = xv[0];
+            e1[i as usize] = xv[1];
+            e2[i as usize] = xv[2];
+            e3[i as usize] = xv[3];
+        }
+        let at = (4 * lk) * (MM_N / 4) + lq;
+        xs[at as usize] = e0;
+        xs[(at + MM_N / 4) as usize] = e1;
+        xs[(at + 2 * MM_N / 4) as usize] = e2;
+        xs[(at + 3 * MM_N / 4) as usize] = e3;
+        sync_cube();
+        #[unroll]
+        for kk in 0..MM_K {
+            let av = ws[(kk * (MM_M / 4) + tm) as usize];
+            let bv = xs[(kk * (MM_N / 4) + tn) as usize];
+            a0 += av * F4::empty().fill(bv[0]);
+            a1 += av * F4::empty().fill(bv[1]);
+            a2 += av * F4::empty().fill(bv[2]);
+            a3 += av * F4::empty().fill(bv[3]);
+        }
+        sync_cube();
+    }
+    let r = r0 + 4 * tm;
+    let tb = t0 + 4 * tn;
+    #[unroll]
+    for i in 0..4u32 {
+        if r + i < rows {
+            if tb < tokens {
+                put(y, y_off + tb * rows + r + i, a0[i as usize], add);
+            }
+            if tb + 1 < tokens {
+                put(y, y_off + (tb + 1) * rows + r + i, a1[i as usize], add);
+            }
+            if tb + 2 < tokens {
+                put(y, y_off + (tb + 2) * rows + r + i, a2[i as usize], add);
+            }
+            if tb + 3 < tokens {
+                put(y, y_off + (tb + 3) * rows + r + i, a3[i as usize], add);
+            }
+        }
     }
 }

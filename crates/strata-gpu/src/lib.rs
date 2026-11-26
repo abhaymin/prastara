@@ -193,23 +193,33 @@ macro_rules! native {
 /// From this many rows a Q4_K or Q6_K product takes `matvec_q4k` / `matvec_q6k` (a variable so a test can force either kernel).
 pub static WIDE_ROWS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(kernels::WIDE_ROWS);
 
+/// From this many tokens a Q8_0 or Q4_K product of a chunk takes the tiled kernel (`kernels::mm`), below it the decode
+/// kernel once per token (a variable so a test can force either kernel).
+pub static MM_TOKENS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(8);
 /// Whether Q4_K products take the fast decode kernel (`kernels::mv_q4_k`); off, the older kernels (for comparisons).
 pub static FAST_Q4K: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
-/// Queues y[y_off..] (+)= W x for `tokens` vectors with a fast kernel (Weights::fast), once per vector. `ylen`: the
-/// values in y's buffer.
+/// Queues y[y_off..] (+)= W x for `tokens` vectors with a fast kernel (Weights::fast): the tiled one for a chunk, else
+/// the decode one (once per vector). `ylen`: the values in y's buffer.
 macro_rules! fast {
     ($c:expr, $R:ident, $w:expr, $hx:expr, $n:expr, $hy:expr, $ylen:expr, $tokens:expr, $y_off:expr, $add:expr) => {{
         let w: &Weights = $w;
         let k = w.geometry.2;
         stats::launch(1);
+        let tiled = $tokens >= MM_TOKENS.load(std::sync::atomic::Ordering::Relaxed) && w.cols % kernels::MM_K == 0;
         let words = w.value_words();
         unsafe {
             let y = ArrayArg::from_raw_parts($hy, $ylen);
             let x4 = ArrayArg::from_raw_parts($hx, $n / 4);
             let wd = ArrayArg::from_raw_parts(w.scales.as_ref().unwrap_or(&w.handle).cube(), 1);
+            if tiled {
+                let count = CubeCount::Static(w.rows.div_ceil(kernels::MM_M), ($tokens as u32).div_ceil(kernels::MM_N), 1);
+                kernels::mm::launch_unchecked::<$R>($c, count, CubeDim::new_1d(kernels::MM_CUBE), ArrayArg::from_raw_parts(w.handle.cube(), words),
+                    ArrayArg::from_raw_parts(w.handle.cube(), words / 4), wd, x4, y, w.rows, w.cols, $tokens as u32, $y_off, k, $add);
+            } else {
                 kernels::mv_fast::launch_unchecked::<$R>($c, mv_count(w.rows, 0, 0, $tokens as u32), CubeDim::new_1d(kernels::MV_ROWS * 32),
                     ArrayArg::from_raw_parts(w.handle.cube(), words / 4), wd, x4, y, w.rows, w.cols, $y_off, k, w.plane, $add);
+            }
         }
     }};
 }
