@@ -240,6 +240,23 @@ impl ChatTokenizer {
         Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.len())
     }
 
+    /// One user message wrapped in the chat template, up to and with the generation prompt (where the answer starts),
+    /// as token ids.
+    pub fn prompt_ids(&self, user: &str) -> Result<Vec<u32>> {
+        let text = self.render(&[json!({"role": "user", "content": user})], true)?;
+        Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.get_ids().to_vec())
+    }
+
+    /// The ids that end an answer: the template's `eos_token` and the usual end-of-turn markers the vocabulary has.
+    pub fn stop_ids(&self) -> Vec<u32> {
+        let mut names: Vec<String> = self.vars.get("eos_token").and_then(Value::as_str).map(str::to_string).into_iter().collect();
+        names.extend(["<|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end_of_text|>", "</s>", "<end_of_turn>"].map(String::from));
+        let mut ids: Vec<u32> = names.iter().filter_map(|n| self.tok.token_to_id(n)).collect();
+        ids.sort();
+        ids.dedup();
+        ids
+    }
+
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.tok.decode(ids, false).map_err(|e| anyhow!("tokenizer: {e}"))
     }

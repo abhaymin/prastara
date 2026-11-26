@@ -53,7 +53,7 @@ fn trained(_base: &std::path::Path, dev: &Device, cfg: &LoraConfig) -> (TinyLlam
 fn merged_plain_logits(merged: &std::path::Path, tok: &Tensor, cfg: &LoraConfig, dev: &Device) -> Tensor {
     // load whatever shard(s) the merge wrote; single-shard base => one file here
     let mut base = BTreeMap::new();
-    for sf in strata_workshop::safetensors_io::shards(&merged.join("model-00001-of-00001.safetensors")) {
+    for sf in strata_workshop::model::weight_files(merged).unwrap() {
         for (k, v) in candle_core::safetensors::load(&sf, dev).unwrap() {
             base.insert(k, v);
         }
@@ -94,8 +94,9 @@ fn train_then_merge_is_a_checkpoint_and_logits_match() -> Result<(), Box<dyn std
     // the merged base sits on disk next to the original fixture
     let merged = temp_dir("merged");
     merge::merge(&base, &adapter_dir, &merged).unwrap();
-    let merged_shard = merged.join("model-00001-of-00001.safetensors");
-    assert!(merged_shard.exists(), "the merge wrote a shard under the base's name");
+    let merged_shard = merged.join("model.safetensors");
+    assert!(merged_shard.exists(), "a model under 5 GB is one model.safetensors");
+    assert!(!merged.join("model.safetensors.index.json").exists());
 
     // gate 2: the merged base's plain forward reproduces the adapter model's logits within tolerance.
     let tok = Tensor::from_vec(vec![3u32, 1, 9, 15, 7], (5,), &dev)?;
@@ -119,7 +120,7 @@ fn untargeted_tensors_are_byte_identical_to_the_base() -> Result<(), Box<dyn std
 
     // read both the original base shard and the merged shard as tensors; untargeted names must match exactly.
     let orig: BTreeMap<String, Tensor> = candle_core::safetensors::load(base.join("model-00001-of-00001.safetensors"), &dev)?.into_iter().collect();
-    let post: BTreeMap<String, Tensor> = candle_core::safetensors::load(merged.join("model-00001-of-00001.safetensors"), &dev)?.into_iter().collect();
+    let post: BTreeMap<String, Tensor> = candle_core::safetensors::load(merged.join("model.safetensors"), &dev)?.into_iter().collect();
 
     for (name, t) in &orig {
         if targeted_names().contains(name) {
@@ -171,5 +172,47 @@ fn rslora_scaling_is_the_one_that_reproduces_logits() -> Result<(), Box<dyn std:
     assert!(max_abs(&adapted_logits, &plain_wrong) > 1e-4, "gate 2 must fail at a wrong scaling (diff {})", max_abs(&adapted_logits, &plain_wrong));
 
     let _ = std::fs::remove_dir_all(&base);
+    Ok(())
+}
+
+/// A merge written in several shards: the index maps every tensor to its file name (what transformers reads; it used
+/// to hold objects), the files load back together, and the result is the same as a one-file merge, tensor for tensor.
+#[test]
+fn a_sharded_merge_has_a_correct_index_and_loads() -> Result<(), Box<dyn std::error::Error>> {
+    let dev = Device::Cpu;
+    let cfg = LoraConfig { r: 8, lora_alpha: 16.0, use_rslora: true, target_modules: vec!["q_proj".into(), "k_proj".into(), "v_proj".into(), "o_proj".into()] };
+    let base = temp_dir("base-sharded");
+    Fixture { shard_count: 3, ..Fixture::default() }.write(&base)?;
+    let (_model, adapter_dir) = trained(&base, &dev, &cfg);
+
+    let one = temp_dir("merged-one");
+    merge::merge(&base, &adapter_dir, &one)?;
+    let split = temp_dir("merged-split");
+    let mut m = Merger::new(&base, &adapter_dir, &split);
+    m.set_shard_bytes(2_000);
+    m.run()?;
+
+    let index: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(split.join("model.safetensors.index.json"))?)?;
+    let map = index["weight_map"].as_object().ok_or("no weight_map")?;
+    let mut files = std::collections::BTreeSet::new();
+    for (name, file) in map {
+        let f = file.as_str().ok_or_else(|| format!("weight_map[{name}] is {file}, not a file name"))?;
+        assert!(split.join(f).exists(), "{name} -> {f}");
+        files.insert(split.join(f));
+    }
+    assert!(files.len() > 1, "split into several shards");
+    assert!(index["metadata"]["total_size"].as_u64().unwrap_or(0) > 0);
+    let st = unsafe { candle_core::safetensors::MmapedSafetensors::multi(&files.into_iter().collect::<Vec<_>>()) }?;
+    let whole: BTreeMap<String, Tensor> = candle_core::safetensors::load(one.join("model.safetensors"), &dev)?.into_iter().collect();
+    assert_eq!(map.len(), whole.len());
+    for (name, t) in &whole {
+        let got = st.load(name, &dev)?;
+        assert_eq!(t.flatten_all()?.to_vec1::<f32>()?, got.flatten_all()?.to_vec1::<f32>()?, "{name}");
+    }
+    // and the trainer's own loader reads the sharded folder
+    strata_workshop::model::LlamaModel::load(&split, strata_workshop::model::BaseDtype::F32, &dev)?;
+    for d in [&base, &one, &split] {
+        let _ = std::fs::remove_dir_all(d);
+    }
     Ok(())
 }

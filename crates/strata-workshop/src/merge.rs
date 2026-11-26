@@ -3,8 +3,7 @@
 //! The base is opened with [`crate::safetensors_io`] (each shard mmap'd, never the whole model loaded at once). Every
 //! base weight gets each trained adapter's delta `scaling * B @ A` added to it (PEFT folds the adapter into the base on
 //! export); everything else — norms, MLP, embeddings, and untargeted projections — is copied back byte for byte. The
-//! shards come out under the base's own names with the same split they had going in (plus an index file when the base
-//! was sharded), so a merged checkpoint drops straight into the engine.
+//! output is written by the streaming writer, so a merged checkpoint drops straight into transformers and the engine.
 //!
 //! * **Scaling** (`LoraConfig::scaling`): `alpha / r`, or `alpha / sqrt(r)` with rsLoRA, read from `adapter_config.json`.
 //! * **Name mapping** ([`peft_to_base_name`]): drop `base_model.model.` and the `.lora_A.weight`/`.lora_B.weight` suffix,
@@ -13,6 +12,8 @@
 //! * **Fused MoE experts** ([`add_expert_delta`]): a 3-D `[E, d1, d2]` target takes the expert einsum `einsum("o r e, e r i -> e*")`, per-expert
 //!   `scaling * B_e @ A_e`. PEFT has two layouts (`-> e i o` by default, `-> e o i` after `_did_swap_in_out_features`) and the fold picks the one
 //!   whose output shape matches the parameter's own `[E, d1, d2]`, refusing a square target its layouts are indistinguishable on.
+//! * **Output** ([`crate::st_writer`]): written a tensor at a time in ~5 GB shards, `model.safetensors` or
+//!   `model-0000i-of-0000n.safetensors` with an index whose `weight_map` names each tensor's file.
 //! * **Report** ([`MergeReport`]): per tensor the relative-norm delta `|ΔW|/|W|` — targeted tensors are > 0, untargeted
 //!   ones are exactly 0 (their bytes never left disk).
 
@@ -21,10 +22,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Result};
 use candle_core::{Device, Tensor};
-use serde_json::{json, Value};
+use serde_json::Value;
 
 use crate::checkpoint;
 use crate::safetensors_io::{Dtype, Shard};
+use crate::st_writer::{self, StWriter, TensorSpec};
 
 /// One base weight and what it became after the merge: same shape, plus how big its relative change was.
 #[derive(Debug, Clone)]
@@ -50,11 +52,11 @@ struct Adapter {
 }
 
 /// A base weight read from a shard: its name, dtype, shape, and the raw bytes straight off the mmap.
-struct BaseTensor {
+struct BaseTensor<'s> {
     name: String,
     dtype: Dtype,
     shape: Vec<usize>,
-    bytes: Vec<u8>,
+    bytes: &'s [u8],
 }
 
 /// Merge `adapter_dir`'s adapter into every base shard under `base_dir`, writing the result to `out_dir`. Scaling is read
@@ -64,11 +66,12 @@ pub struct Merger<'a> {
     adapter_dir: &'a Path,
     out_dir: &'a Path,
     scaling_override: Option<f32>,
+    shard_bytes: u64,
 }
 
 impl<'a> Merger<'a> {
     pub fn new(base_dir: &'a Path, adapter_dir: &'a Path, out_dir: &'a Path) -> Self {
-        Self { base_dir, adapter_dir, out_dir, scaling_override: None }
+        Self { base_dir, adapter_dir, out_dir, scaling_override: None, shard_bytes: st_writer::SHARD_BYTES }
     }
 
     /// Force a scaling factor instead of the one in `adapter_config.json` (used by the rsLoRA gate to prove the default
@@ -78,93 +81,62 @@ impl<'a> Merger<'a> {
         self
     }
 
+    /// The largest output shard (default [`st_writer::SHARD_BYTES`], about 5 GB).
+    pub fn set_shard_bytes(&mut self, n: u64) -> &mut Self {
+        self.shard_bytes = n;
+        self
+    }
+
     pub fn run(self) -> Result<MergeReport> {
         let scaling = match self.scaling_override {
             Some(s) => s,
             None => load_scaling(self.adapter_dir)?,
         };
-        // The whole model is never resident at once: enumerate the base shards in order and read every weight off its mmap,
-        // tagged with the shard it came from so the output reproduces the same split. Only the tiny adapter (already on the
-        // CPU) is fully materialised into Rust.
+        // The whole model is never resident at once: one tensor at a time is read off its shard's mmap and written out.
+        // Only the tiny adapter (already on the CPU) is fully materialised into Rust.
         // `model.safetensors`, or the `model-0000i-of-0000n` shards, as the folder has them
         let shard_files = crate::model::weight_files(self.base_dir)?;
-        let n_shards = shard_files.len();
 
         let adapters = load_adapters(self.adapter_dir)?;
-        let mut shards: Vec<Vec<BaseTensor>> = (0..n_shards).map(|_| Vec::new()).collect();
-        for (i, sf) in shard_files.iter().enumerate() {
+        // every output tensor keeps its name, dtype and shape: the writer plans ~5 GB shards from the list, then each
+        // tensor is read off its shard's mmap, folded when targeted, and written before the next is read
+        let mut specs = Vec::new();
+        for sf in &shard_files {
+            let shard = Shard::open(sf)?;
+            specs.extend(shard.tensors().map(|t| TensorSpec::new(t.name(), t.dtype(), t.shape())));
+        }
+        st_writer::prepare_out(self.base_dir, self.out_dir)?;
+        let mut writer = StWriter::create(self.out_dir, specs, self.shard_bytes)?;
+        let mut report: Vec<TensorDelta> = Vec::new();
+        for sf in &shard_files {
             let shard = Shard::open(sf)?;
             for t in shard.tensors() {
-                shards[i].push(BaseTensor {
-                    name: t.name().to_string(),
-                    dtype: t.dtype(),
-                    shape: t.shape().to_vec(),
-                    bytes: shard.bytes(t).to_vec(),
-                });
-            }
-        }
-
-        std::fs::create_dir_all(self.out_dir)?;
-        let mut report: Vec<TensorDelta> = Vec::new();
-        // weight-map entries for a multi-shard index (name -> file, dtype, shape, in-shard offset span).
-        let mut weight_map: serde_json::Map<String, Value> = serde_json::Map::new();
-
-        for (i, in_shard) in shards.into_iter().enumerate() {
-            let fname = shard_files[i].file_name().and_then(|n| n.to_str()).ok_or_else(|| anyhow!("a shard without a file name"))?.to_string();
-
-            // pack: for each weight either copy its mmap bytes unchanged (untargeted) or rewrite with the folded delta.
-            let mut payload: Vec<u8> = Vec::new();
-            let mut header: serde_json::Map<String, Value> = serde_json::Map::new();
-            for wt in in_shard {
-                let (data, rel_norm): (Vec<u8>, f64) = match adapters.get(&wt.name) {
-                    None => (wt.bytes.clone(), 0.0), // untouched: the mmap bytes go back out verbatim
-                    Some(ad) => match wt.shape.len() {
-                        2 => {
-                            let o = wt.shape[0];
-                            let in_ = wt.shape[1];
-                            let r = ad.a.len().div_ceil(in_);
-                            let base = to_f32s(&wt.name, wt.dtype, &wt.bytes)?;
-                            let (w, delta) = add_delta_2d(&base, &ad.a, &ad.b, o, in_, r, scaling);
-                            (from_f32s(wt.dtype, &w), rel_norm(&base, &delta))
-                        }
-                        3 => {
-                            let e = wt.shape[0];
-                            let d1 = wt.shape[1];
-                            let d2 = wt.shape[2];
-                            let base = to_f32s(&wt.name, wt.dtype, &wt.bytes)?;
-                            let (w, delta) = add_expert_delta(&wt.name, &base, &ad.a, &ad.b, e, d1, d2, scaling)?;
-                            (from_f32s(wt.dtype, &w), rel_norm(&base, &delta))
-                        }
-                        other => return Err(anyhow!("{}: base weight of rank {other} is not a LoRA target", wt.name)),
-                    },
+                let wt = BaseTensor { name: t.name().to_string(), dtype: t.dtype(), shape: t.shape().to_vec(), bytes: shard.bytes(t) };
+                let rel_norm = match adapters.get(&wt.name) {
+                    None => {
+                        writer.write(&wt.name, wt.bytes)?; // untouched: the mmap bytes go back out verbatim
+                        0.0
+                    }
+                    Some(ad) => {
+                        let base = to_f32s(&wt.name, wt.dtype, wt.bytes)?;
+                        let (w, delta) = match wt.shape.len() {
+                            2 => {
+                                let (o, in_) = (wt.shape[0], wt.shape[1]);
+                                let r = ad.a.len().div_ceil(in_);
+                                add_delta_2d(&base, &ad.a, &ad.b, o, in_, r, scaling)
+                            }
+                            3 => add_expert_delta(&wt.name, &base, &ad.a, &ad.b, wt.shape[0], wt.shape[1], wt.shape[2], scaling)?,
+                            other => return Err(anyhow!("{}: base weight of rank {other} is not a LoRA target", wt.name)),
+                        };
+                        writer.write(&wt.name, &from_f32s(wt.dtype, &w))?;
+                        rel_norm(&base, &delta)
+                    }
                 };
-                let n = data.len();
-                let start = payload.len();
-                payload.extend_from_slice(&data);
-                header.insert(wt.name.clone(), json!({
-                    "dtype": wt.dtype.as_str(),
-                    "shape": wt.shape,
-                    "data_offsets": [start, start + n],
-                }));
                 report.push(TensorDelta { name: wt.name.clone(), shape: wt.shape.clone(), delta_rel_norm: rel_norm });
-                if n_shards > 1 {
-                    weight_map.insert(wt.name.clone(), json!({
-                        "dtype": wt.dtype.as_str(),
-                        "shape": wt.shape,
-                        "data_offsets": [start, start + n],
-                        "file": fname.clone(),
-                    }));
-                }
             }
-
-            let out = write_shard(&payload, &header)?;
-            std::fs::write(self.out_dir.join(fname.clone()), out)?;
         }
+        writer.finish()?;
 
-        if n_shards > 1 {
-            let index = json!({ "format": "PT", "total": weight_map.len(), "weight_map": weight_map });
-            std::fs::write(self.out_dir.join("model.safetensors.index.json"), serde_json::to_string_pretty(&index)?)?;
-        }
         // what makes the folder a model again: config.json, the tokenizer and its template, copied as they are
         for e in std::fs::read_dir(self.base_dir)?.flatten() {
             let (path, name) = (e.path(), e.file_name().to_string_lossy().to_string());
@@ -356,19 +328,6 @@ fn apply_scaling(alpha: f32, r: u64, use_rslora: bool) -> f32 {
 fn load_adapters(adapter_dir: &Path) -> Result<HashMap<String, Adapter>> {
     let adps = candle_core::safetensors::load(adapter_dir.join(checkpoint::ADAPTER_FILE), &Device::Cpu)?;
     build_adapters(&adps)
-}
-
-/// Write one safetensors shard and return its raw bytes. `header` is the JSON map of name -> {dtype, shape, data_offsets},
-/// already carrying each tensor's offset in the contiguous payload; a u64 length prefix precedes the header. Matches the
-/// reader in [`crate::safetensors_io`] byte for byte, so an untouched tensor round-trips unchanged.
-fn write_shard(payload: &[u8], header: &serde_json::Map<String, Value>) -> Result<Vec<u8>> {
-    let header_json = json!(header).to_string();
-    let mut out = Vec::with_capacity(8 + header_json.len() + payload.len());
-    // safetensors layout: u64 (LE) length of the JSON header that follows, then the header, then the tensor bytes.
-    out.extend_from_slice((header_json.len() as u64).to_le_bytes().as_slice());
-    out.extend_from_slice(header_json.as_bytes());
-    out.extend_from_slice(payload);
-    Ok(out)
 }
 
 /// A weight's bytes as f32 values: F32 as stored, F16 and BF16 widened (exactly). Real Hugging Face models are mostly

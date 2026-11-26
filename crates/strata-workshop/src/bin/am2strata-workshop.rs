@@ -5,6 +5,7 @@
 //! am2strata-workshop convert <hf-folder> --out <model.gguf> [--outtype f16|f32] [--pre-tokenizer NAME]
 //! am2strata-workshop quantize <in.gguf> --out <out.gguf> --type q8_0|q6_k|q5_k|q4_k|q4_0|f16
 //! am2strata-workshop merge <base-hf-folder> <adapter-folder> --out <merged-hf-folder>
+//! am2strata-workshop abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N|N:P] [--scale 1.0] [--check N] --out <dir>
 //! am2strata-workshop train --model <hf-folder> --data <chat.jsonl> --out <adapter-folder> [--soup soup.yaml] [...]
 //! am2strata-workshop find-lr --model <hf-folder> --data <chat.jsonl> [--steps 40]
 //! am2strata-workshop profile (--model <hf-folder> | --preset llama-2-7b) [--data <chat.jsonl>] [...]
@@ -60,6 +61,36 @@ enum Cmd {
         /// how many times the loop runs (2 to 16)
         #[arg(long, default_value_t = 2)]
         passes: usize,
+    },
+    /// abliteration: remove the direction the model writes into its residual stream before refusing (from the mean
+    /// residuals of two prompt lists, one prompt per line) from every o_proj, down_proj and the embeddings; the copy
+    /// is marked private and stays on this PC
+    Abliterate {
+        model: PathBuf,
+        /// prompts the model refuses, one per line
+        #[arg(long)]
+        harmful: PathBuf,
+        /// ordinary prompts, one per line
+        #[arg(long)]
+        harmless: PathBuf,
+        /// the block the direction is read after: auto (the most separating one between 30 and 70 % deep), N, or N:P
+        /// for pass P of a loop
+        #[arg(long, default_value = "auto")]
+        layer: String,
+        /// how much of the direction to remove (1.0: all of it)
+        #[arg(long, default_value_t = 1.0)]
+        scale: f32,
+        /// answer N held-out prompts of each list before and after and count refusals (slow on big models: no cache)
+        #[arg(long, default_value_t = 0)]
+        check: usize,
+        /// cpu (the default), or cuda:N; several split the blocks
+        #[arg(long, value_delimiter = ',')]
+        devices: Vec<String>,
+        /// hold the model as f32, f16 or bf16 while reading (default: f32 for an f32 checkpoint, else bf16)
+        #[arg(long)]
+        base_dtype: Option<String>,
+        #[arg(long)]
+        out: PathBuf,
     },
     /// a long-context copy of a model folder: YaRN positions to --length, every --full-every-th layer full
     /// attention, the rest a --window of the last tokens (weights linked; it still needs long-context training)
@@ -487,6 +518,11 @@ impl Out {
                                      v["output"].as_str().unwrap_or(""), human(v["bytes"].as_u64().unwrap_or(0))),
             Some("error") => eprintln!("error: {}", v["message"].as_str().unwrap_or("")),
             Some("info") => println!("{}", serde_json::to_string_pretty(&v["info"]).unwrap_or_default()),
+            Some("layers") => {
+                println!("  {}", v["message"].as_str().unwrap_or(""));
+                println!("{}", serde_json::to_string(&v["layers"]).unwrap_or_default());
+            }
+            Some("check") => println!("  {} : {}", v["which"].as_str().unwrap_or(""), v["result"]),
             Some("profile") | Some("plan") | Some("find-lr") | Some("library") => {
                 for l in v["lines"].as_array().into_iter().flatten() {
                     println!("{}", l.as_str().unwrap_or(""));
@@ -731,6 +767,27 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                              "trainable_parameters": plan.estimate.trainable_params, "cache_disk_bytes": plan.estimate.cache_disk_bytes}}));
             Ok((model.clone(), "info".into(), json!({})))
         }
+        Cmd::Abliterate { model, harmful, harmless, layer, scale, check, devices, base_dtype, out: dst } => {
+            use strata_workshop::abliterate;
+            out.event(json!({"event": "start", "what": format!("abliterate {} into {}", model.display(), dst.display())}));
+            let read = |p: &Path| abliterate::read_prompts(p).map_err(|e| format!("{e:#}"));
+            let mut o = abliterate::Options::new(model, read(harmful)?, read(harmless)?, dst);
+            o.layer = abliterate::LayerChoice::parse(layer).map_err(|e| e.to_string())?;
+            o.scale = *scale;
+            o.check = *check;
+            o.devices = devices.clone();
+            o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
+            if let Ok(cfg) = ModelConfig::load(model) {
+                // the model while reading, and the largest tensor while writing
+                let held = cfg.total_params() * if o.base_dtype == Some(BaseDtype::F32) { 4 } else { 2 };
+                fits(held + (cfg.vocab_size * cfg.hidden_size) as u64 * 4, "abliteration")?;
+            }
+            let r = abliterate::run(&o, &mut |v| out.event(v)).map_err(|e| format!("{e:#}"))?;
+            let extra = json!({"layer": r.chosen.site.block, "pass": r.chosen.site.pass, "separation": r.chosen.separation,
+                               "changed": r.ortho.changed.len(), "untied": r.ortho.untied, "private": true,
+                               "before": r.before.as_ref().map(|c| c.to_json()), "after": r.after.as_ref().map(|c| c.to_json())});
+            Ok((dst.clone(), "hf-model".into(), extra))
+        }
         other => plain(run_tools(other, out)),
     }
 }
@@ -795,7 +852,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))

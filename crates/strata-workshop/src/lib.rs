@@ -29,5 +29,7 @@ pub mod profile;
 pub mod quantize_gguf;
 pub mod safetensors_io;
 pub mod soup;
+pub mod st_writer;
+pub mod abliterate;
 pub mod train;
 pub mod testmodel;

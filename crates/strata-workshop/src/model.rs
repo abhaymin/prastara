@@ -1301,7 +1301,14 @@ impl LlamaModel {
         Ok(Tensor::from_vec(m, (seq, seq), dev)?)
     }
 
-    fn run_blocks(&self, mut x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx) -> Result<Tensor> {
+    fn run_blocks(&self, x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx) -> Result<Tensor> {
+        self.run_blocks_seen(x, range, ctx, None)
+    }
+
+    /// [`run_blocks`](Self::run_blocks), handing `seen` the residual stream after every block of every pass, in the
+    /// order they run: `(block, pass, state)`, pass 0 being the base's own pass and 1.. the loop's extra passes (the
+    /// state there is the pass's own, before its gate mixes it in).
+    fn run_blocks_seen(&self, mut x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx, mut seen: Option<&mut dyn FnMut(usize, usize, &Tensor) -> Result<()>>) -> Result<Tensor> {
         let seq = x.dim(0)?;
         if seq == 0 {
             bail!("an empty token sequence");
@@ -1343,13 +1350,18 @@ impl LlamaModel {
         }
         for i in range.clone() {
             x = step(i, &x)?;
+            if let Some(f) = seen.as_mut() {
+                f(i, 0, &x)?;
+            }
             match self.cfg.loop_ {
                 Some(l) if i + 1 == l.end && range.start <= l.start => {
                     for (p, g) in self.loop_gates.iter().enumerate() {
-                        let _ = p;
                         let mut y = x.clone();
                         for j in l.start..l.end {
                             y = step(j, &y)?;
+                            if let Some(f) = seen.as_mut() {
+                                f(j, p + 1, &y)?;
+                            }
                         }
                         let y = move_to(&y, x.device())?;
                         x = (&x + (y - &x)?.broadcast_mul(g.as_tensor())?)?;
@@ -1380,6 +1392,20 @@ impl LlamaModel {
     /// Run `h` through the blocks in `range` as plain inference (they must carry no adapter); the result is detached.
     pub fn frozen_blocks(&self, h: &Tensor, range: std::ops::Range<usize>) -> Result<Tensor> {
         Ok(self.run_blocks(h.clone(), range, &Ctx::eval())?.detach())
+    }
+
+    /// The residual stream at the last token after every block, and after every block of each extra loop pass, in the
+    /// order they run: `(block, pass, [hidden] f32 on the CPU)`. Plain inference, no adapter involved (abliteration
+    /// reads its refusal direction from these).
+    pub fn residuals(&self, tokens: &[u32]) -> Result<Vec<(usize, usize, Tensor)>> {
+        let mut out = Vec::new();
+        let last = tokens.len().checked_sub(1).ok_or_else(|| anyhow!("an empty token sequence"))?;
+        let mut keep = |b: usize, p: usize, x: &Tensor| -> Result<()> {
+            out.push((b, p, x.get(last)?.to_dtype(DType::F32)?.to_device(&Device::Cpu)?.detach()));
+            Ok(())
+        };
+        self.run_blocks_seen(self.embed_tokens(tokens)?, 0..self.cfg.num_hidden_layers, &Ctx::eval(), Some(&mut keep))?;
+        Ok(out)
     }
 
     /// From that hidden state through the trained blocks to the final norm: `[seq, hidden]`.
