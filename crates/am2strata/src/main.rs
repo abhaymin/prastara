@@ -596,7 +596,9 @@ async fn main() -> Result<()> {
     // desktop computer use: the mode and preset from the run config (off by default; the backend is this platform's)
     let _ = mgr.computer.set(Arc::new(computer::Computers::new(computer::settings::Config::from_config(&first.cfg.rest, &expand(&args.data_dir)))));
     // the Workshop: convert, quantize and merge jobs (workshop.rs)
-    workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest).set_server(&host, port, state.api_key.clone());
+    let ws = workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest);
+    ws.set_server(&host, port, state.api_key.clone());
+    ws.set_manager(mgr.clone());
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the Prastara web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -706,6 +708,7 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/upload", axum::routing::put(workshop::upload_put).layer(axum::extract::DefaultBodyLimit::disable()))
         .route("/v1/workshop/upload-folder", axum::routing::post(workshop::upload_folder_post))
         .route("/v1/workshop/browse", get(workshop::browse_get))
+        .route("/v1/workshop/estimate", axum::routing::post(workshop::estimate_post))
         .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
         // remote models: the owner's page and its API (remote/api.rs), linked from nowhere

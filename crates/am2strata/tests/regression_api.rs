@@ -275,6 +275,8 @@ const ROUTES: &[Row] = &[
         .note("streamed to disk"),
     row("POST", "/v1/workshop/upload-folder", Owner).at("/v1/workshop/upload-folder?name=regress-folder"),
     row("GET", "/v1/workshop/browse", Owner),
+    row("POST", "/v1/workshop/estimate", Owner).json(r#"{"model": "/nope", "data": "/nope/x.jsonl"}"#)
+        .note("501 not_available here: the Workshop command is pinned to nowhere"),
     row("GET", "/v1/workshop/library", Owner).note("501 not_available here: the Workshop command is pinned to nowhere"),
     row("POST", "/v1/workshop/library", Owner).json(r#"{"name": "no-such-recipe"}"#).ok(400),
     row("GET", "/v1/workshop/dataset", Owner).at("/v1/workshop/dataset?path=/nope/x.jsonl").ok(400).note("outside the Workshop's folders"),

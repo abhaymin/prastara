@@ -222,6 +222,20 @@ if [ "$1" = "--json" ] && [ "$2" = "library" ]; then
   echo '{"event":"library","recipes":[{"name":"qwen3-8b-sft","abilities":["text"],"workshop":{"status":"trains"}}],"sources":[{"name":"Soup"}]}'
   exit 0
 fi
+if [ "$1" = "--json" ] && [ "$2" = "profile" ]; then
+  echo "$@" > "$here/profile-args.txt"
+  echo '{"event":"profile","fits_ram":true,"fits_gpu":[{"index":0,"fits":true}],"lines":["fits"]}'
+  exit 0
+fi
+if [ "$1" = "--json" ] && [ "$2" = "train" ]; then
+  echo "$@" > "$here/train-args.txt"
+  echo '{"event":"start","what":"train"}'
+  echo '{"event":"progress","done":1,"total":2,"step":1,"loss":3.5,"lr":0.0002,"eta":1,"message":"loss 3.5"}'
+  echo '{"event":"log","message":"held-out loss 2.8 at step 1","step":1,"eval_loss":2.8}'
+  echo '{"event":"progress","done":2,"total":2,"step":2,"loss":1.9,"lr":0.0001,"eta":0,"message":"loss 1.9"}'
+  echo '{"event":"done","output":"x","kind":"adapter","bytes":10,"seconds":0.1}'
+  exit 0
+fi
 echo "$@" > "$here/args.txt"
 printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/env.txt"
 out=""; prev=""
@@ -438,4 +452,53 @@ fn sensitive_paths_are_never_read_written_uploaded_or_listed() {
     let names: Vec<&str> = b["entries"].as_array().unwrap().iter().filter_map(|e| e["name"].as_str()).collect();
     assert!(names.contains(&"model") && !names.contains(&"server.pem") && !names.contains(&".ssh"), "{names:?}");
     assert_eq!(s.get(&format!("/v1/workshop/browse?path={}", urlencode(ws.join(".ssh").to_str().unwrap())), true).0, 400);
+}
+
+/// Training from the Workshop page: the request's settings become the train command's arguments (a GPU run in
+/// bf16 by default), the estimate runs `profile` with the same ones, the job keeps the loss curve, and bad
+/// requests are refused before anything runs.
+#[cfg(unix)]
+#[test]
+fn training_runs_from_the_workshop_with_an_estimate_and_its_loss_curve() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-train-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let model = s.dir.join("workshop/base-model");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("config.json"), "{}").unwrap();
+    let data = s.dir.join("workshop/datasets/d.jsonl");
+    std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+    std::fs::write(&data, "{}\n").unwrap();
+    let req = json!({"kind": "train", "model": model, "data": data, "devices": "cpu", "rank": 16, "epochs": 1, "targets": "q_proj,v_proj",
+                     "gradient_checkpointing": true});
+    // the estimate
+    let (code, est) = s.post("/v1/workshop/estimate", &req);
+    assert_eq!(code, 200, "{est}");
+    assert_eq!(est["fits_ram"], true);
+    let pa = std::fs::read_to_string(tools.join("profile-args.txt")).unwrap();
+    assert!(pa.contains("--rank 16") && pa.contains("--targets q_proj,v_proj") && pa.contains("--gradient-checkpointing"), "{pa}");
+    // refused before anything runs
+    for (bad, why) in [(json!({"kind": "train", "data": data}), "no model"), (json!({"kind": "train", "model": model, "data": data, "devices": "cuda:x"}), "bad devices"),
+                       (json!({"kind": "train", "model": model, "data": data, "rank": 0}), "rank 0"),
+                       (json!({"kind": "train", "model": model, "data": data, "targets": "q_proj,evil"}), "unknown target")] {
+        assert_eq!(s.post("/v1/workshop/jobs", &bad).0, 400, "{why}");
+    }
+    // the run: its curve kept, its adapter in the Workshop's adapters folder
+    let (code, j) = s.post("/v1/workshop/jobs", &req);
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let (_, d) = s.get(&format!("/v1/workshop/jobs/{}", j["id"]), true);
+    let pts = d["points"].as_array().expect("the loss curve");
+    assert_eq!(pts.len(), 3, "{pts:?}");
+    assert_eq!((pts[0]["loss"].as_f64(), pts[1]["eval_loss"].as_f64(), pts[2]["loss"].as_f64()), (Some(3.5), Some(2.8), Some(1.9)));
+    assert!(done["output"].as_str().unwrap().contains("/workshop/adapters/base-model-d"), "{done}");
+    let ta = std::fs::read_to_string(tools.join("train-args.txt")).unwrap();
+    assert!(ta.contains("--out") && !ta.contains("--devices"), "a CPU run: {ta}");
+    // on GPUs: the 16-bit base by default
+    let gpu = json!({"kind": "train", "model": model, "data": data, "devices": "cuda:0,cuda:1"});
+    let (code, _) = s.post("/v1/workshop/estimate", &gpu);
+    assert_eq!(code, 200);
+    let pa = std::fs::read_to_string(tools.join("profile-args.txt")).unwrap();
+    assert!(pa.contains("--devices cuda:0,cuda:1") && pa.contains("--base-dtype bf16"), "{pa}");
+    let _ = std::fs::remove_dir_all(&tools);
 }

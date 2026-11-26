@@ -1001,3 +1001,25 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .slow-note { max-width: 920px; margin: 0 auto var(--st-s-2); padding: var(--st-s-2) var(--st-s-4); border-radius: var(--st-r-md);
   background: var(--st-warn-tint); color: var(--st-warn-text); font-size: var(--st-fs-sm); line-height: var(--st-lh-body); }
 .slow-note[hidden] { display: none; }
+/* Workshop › Train */
+.ws-fieldset { border: 0; padding: 0; margin: 0; min-width: 0; }
+.ws-fieldset legend { margin-bottom: 6px; }
+.ws-devs { grid-template-columns: repeat(3, minmax(0, 1fr)); max-width: 30rem; }
+.ws-chips { display: flex; flex-wrap: wrap; gap: var(--st-s-2); }
+.ws-chips label { display: inline-flex; align-items: center; gap: 6px; height: 36px; padding: 0 var(--st-s-3); border: 1px solid var(--st-line);
+  border-radius: var(--st-r-pill); font-size: var(--st-fs-sm); cursor: pointer; }
+.ws-chips label:has(input:checked) { border-color: var(--st-accent); background: var(--st-accent-tint); }
+.ws-chips input { accent-color: var(--st-accent); }
+.ws-actions__note { margin-right: auto; align-self: center; }
+.ws-est { display: flex; flex-direction: column; gap: var(--st-s-2); }
+.ws-est ul { margin: 0; padding-left: 1.1rem; font-size: var(--st-fs-sm); color: var(--st-ink-soft); display: flex; flex-direction: column; gap: 4px; }
+.ws-est__fit { display: flex; flex-wrap: wrap; gap: var(--st-s-2); }
+.ws-curve__head { display: flex; align-items: baseline; gap: var(--st-s-3); }
+.ws-chart { width: 100%; height: 220px; display: block; }
+.ws-chart text { font-family: var(--st-font); font-size: 11px; fill: var(--st-ink-muted); }
+.ws-chart .grid { stroke: var(--st-line-soft); stroke-width: 1; }
+.ws-chart .loss { fill: none; stroke: var(--st-accent); stroke-width: 2.5; stroke-linejoin: round; stroke-linecap: round; }
+.ws-chart .eval { fill: var(--st-warn); }
+.ws-legend { display: flex; gap: var(--st-s-4); font-size: 12px; color: var(--st-ink-soft); }
+.ws-legend i { display: inline-block; width: 14px; height: 3px; margin-right: 6px; vertical-align: middle; background: var(--st-accent); }
+.ws-legend i.e { width: 8px; height: 8px; border-radius: 50%; background: var(--st-warn); }

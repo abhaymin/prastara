@@ -43,7 +43,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 6] = ["convert", "quantize", "merge", "loop", "strata", "datagen"];
+const KINDS: [&str; 7] = ["convert", "quantize", "merge", "loop", "train", "strata", "datagen"];
 
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -62,6 +62,8 @@ pub struct Job {
     pub pid: Option<u32>,
     /// the last progress event (datagen): {"done", "total", "message"}
     pub progress: Option<Value>,
+    /// a training run's curve: {"step", "loss", "lr"} per step and {"step", "eval_loss"} per held-out measure
+    pub points: Vec<Value>,
 }
 
 impl Job {
@@ -72,6 +74,7 @@ impl Job {
                            "result": self.result, "progress": self.progress});
         if with_log {
             v["log"] = json!(self.log);
+            v["points"] = json!(self.points);
         } else {
             v["last"] = json!(self.log.last());
         }
@@ -90,12 +93,20 @@ pub struct Workshop {
     gate: tokio::sync::Mutex<()>,
     /// this server's own address and key, for jobs that call its API (datagen)
     server: Mutex<Option<(String, Option<String>)>>,
+    /// the model manager, for a training run on the GPUs: it takes them from the chat model for the run
+    mgr: Mutex<Option<Arc<crate::manager::Manager>>>,
 }
 
 static WORKSHOP: std::sync::OnceLock<Arc<Workshop>> = std::sync::OnceLock::new();
 
 pub fn get() -> Option<Arc<Workshop>> {
     WORKSHOP.get().cloned()
+}
+
+/// A file or folder's name without its extension, for default output names.
+pub fn stem_of(p: &str) -> String {
+    let p = std::path::Path::new(p.trim_end_matches('/'));
+    p.file_stem().and_then(|x| x.to_str()).unwrap_or("model").to_string()
 }
 
 fn now() -> u64 {
@@ -164,10 +175,15 @@ impl Workshop {
         }).collect();
         let (models_dir, packs_dir) = (models_dir.to_path_buf(), data_dir.join("packs"));
         WORKSHOP.get_or_init(|| Arc::new(Workshop { roots, out_dir, models_dir, packs_dir, jobs: Mutex::new(vec![]), next: Mutex::new(1),
-                                                    gate: tokio::sync::Mutex::new(()), server: Mutex::new(None) })).clone()
+                                                    gate: tokio::sync::Mutex::new(()), server: Mutex::new(None),
+                                                    mgr: Mutex::new(None) })).clone()
     }
 
     /// Where this server answers (bound to `host`:`port`), so a datagen job can use its chat API.
+    pub fn set_manager(&self, m: Arc<crate::manager::Manager>) {
+        *self.mgr.lock().unwrap() = Some(m);
+    }
+
     pub fn set_server(&self, host: &str, port: u16, key: Option<String>) {
         let h = match host {
             "" | "0.0.0.0" | "::" | "[::]" => "127.0.0.1".to_string(),
@@ -246,6 +262,67 @@ impl Workshop {
     fn default_output(&self, input: &Path, suffix: &str) -> PathBuf {
         let stem = input.file_stem().and_then(|s| s.to_str()).unwrap_or("model");
         self.out_dir.join(format!("{stem}{suffix}"))
+    }
+
+    /// A training request's settings as `am2strata-workshop` run arguments (shared by `train` and the estimate):
+    /// `model` (an HF folder), `data` (a dataset), and optional `rank`, `alpha`, `epochs`, `lr`, `max_len`,
+    /// `train_layers`, `targets` (comma-separated projections), `devices` ("cpu", "cuda:0" or "cuda:0,cuda:1"),
+    /// `gradient_checkpointing`, `base_dtype` (f32, f16, bf16; bf16 by default on GPUs), `val_split`, `max_steps`.
+    pub fn train_args(&self, req: &Value) -> Result<Vec<String>, String> {
+        let s = |k: &str| req[k].as_str().filter(|v| !v.is_empty());
+        let model = self.allowed(s("model").ok_or("training needs \"model\": a Hugging Face model folder")?, true)?;
+        if !model.join("config.json").exists() {
+            return Err(format!("{} has no config.json: training takes a Hugging Face model folder", model.display()));
+        }
+        let data = self.dataset_path(s("data").ok_or("training needs \"data\": a .jsonl dataset")?)?;
+        if !data.exists() {
+            return Err(format!("{} does not exist", data.display()));
+        }
+        let mut a: Vec<String> = vec!["--model".into(), model.display().to_string(), "--data".into(), data.display().to_string()];
+        let devices = s("devices").unwrap_or("cpu");
+        let ok = devices == "cpu" || devices.split(',').all(|d| d.strip_prefix("cuda:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())));
+        if !ok {
+            return Err(format!("\"devices\" is cpu, cuda:0 or cuda:0,cuda:1 (got {devices:?})"));
+        }
+        if devices != "cpu" {
+            a.extend(["--devices".into(), devices.into()]);
+            if s("base_dtype").is_none() {
+                a.extend(["--base-dtype".into(), "bf16".into()]);
+            }
+        }
+        for (k, flag, lo, hi) in [("rank", "--rank", 1.0, 512.0), ("alpha", "--alpha", 0.0, 4096.0), ("epochs", "--epochs", 0.01, 100.0),
+                                  ("lr", "--lr", 1e-8, 1.0), ("max_len", "--max-len", 16.0, 1_048_576.0), ("train_layers", "--train-layers", 1.0, 1024.0),
+                                  ("val_split", "--val-split", 0.0, 0.5), ("max_steps", "--max-steps", 1.0, 10_000_000.0)] {
+            match &req[k] {
+                Value::Null => {}
+                v => {
+                    let n = v.as_f64().filter(|n| (lo..=hi).contains(n)).ok_or_else(|| format!("\"{k}\" is a number from {lo} to {hi}"))?;
+                    a.extend([flag.into(), n.to_string()]);
+                }
+            }
+        }
+        if let Some(t) = s("targets") {
+            const ALL: [&str; 7] = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"];
+            if !t.split(',').all(|x| ALL.contains(&x.trim())) {
+                return Err(format!("\"targets\" are some of {}", ALL.join(",")));
+            }
+            a.extend(["--targets".into(), t.replace(' ', "")]);
+        }
+        if let Some(b) = s("base_dtype") {
+            if !["f32", "f16", "bf16"].contains(&b) {
+                return Err("\"base_dtype\" is f32, f16 or bf16".into());
+            }
+            a.extend(["--base-dtype".into(), b.into()]);
+        }
+        if req["gradient_checkpointing"] == true {
+            a.push("--gradient-checkpointing".into());
+        }
+        Ok(a)
+    }
+
+    /// Whether a training request runs on GPUs (it then takes them from the chat model for the run).
+    pub fn train_on_gpu(req: &Value) -> bool {
+        req["devices"].as_str().is_some_and(|d| d != "cpu" && !d.is_empty())
     }
 
     /// Check a request and turn it into the command's arguments and its output path.
@@ -330,6 +407,22 @@ impl Workshop {
                 }
                 Ok((kind.into(), vec!["loop".into(), input.display().to_string(), "--out".into(), output.display().to_string(),
                                       "--start".into(), start.to_string(), "--end".into(), end.to_string(), "--passes".into(), passes.to_string()], output))
+            }
+            "train" => {
+                let mut args = vec!["train".to_string()];
+                args.extend(self.train_args(req)?);
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => {
+                        let stem = |k: &str| s(k).map(|p| crate::workshop::stem_of(p)).unwrap_or_default();
+                        Self::fresh(&self.out_dir.join("adapters"), &format!("{}-{}", stem("model"), stem("data")), "")
+                    }
+                };
+                if output.exists() {
+                    return Err(format!("{} already exists", output.display()));
+                }
+                args.extend(["--out".into(), output.display().to_string()]);
+                Ok((kind.into(), args, output))
             }
             "strata" => {
                 let input = self.allowed(s("input").ok_or("strata needs \"input\": a .gguf")?, true)?;
@@ -418,7 +511,7 @@ impl Workshop {
         };
         let id = { let mut n = self.next.lock().unwrap(); let id = *n; *n += 1; id };
         let job = Job { id, kind, args, request: req, output, state: "queued", queued_at: now(), started_at: None,
-                        finished_at: None, log: vec![], error: None, result: None, pid: None, progress: None };
+                        finished_at: None, log: vec![], error: None, result: None, pid: None, progress: None, points: vec![] };
         self.jobs.lock().unwrap().push(job.clone());
         let me = self.clone();
         tokio::spawn(async move { me.run(id, exe).await });
@@ -466,6 +559,27 @@ impl Workshop {
             });
             return;
         }
+        // a training run on the GPUs takes them from the chat model, the way a media job does: it waits its turn in the
+        // queue, the model is unloaded, chats wait until the run ends, and the model that was loaded comes back after
+        let mut lease = None;
+        if job.kind == "train" && Self::train_on_gpu(&job.request) {
+            let mgr = self.mgr.lock().unwrap().clone();
+            if let Some(m) = mgr {
+                let before = m.queue.resident();
+                self.update(id, |j| j.log.push("waiting for the GPUs: the chat model is unloaded for the run and loaded again after".into()));
+                match m.gpu_exclusive_needing(true, "train", &format!("training #{id}"), 4.0).await {
+                    Ok(pass) => lease = Some((m, pass, before)),
+                    Err(e) => {
+                        self.update(id, |j| { j.state = "failed"; j.error = Some(format!("{e:#}")); j.finished_at = Some(now()); });
+                        return;
+                    }
+                }
+                if self.job(id).is_some_and(|j| j.state == "cancelled") {
+                    Self::give_back(lease.take());
+                    return;
+                }
+            }
+        }
         let mut cmd = tokio::process::Command::new(&exe);
         cmd.arg("--json").args(&job.args).stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped()).kill_on_drop(true);
@@ -486,6 +600,7 @@ impl Workshop {
             Ok(c) => c,
             Err(e) => {
                 self.update(id, |j| { j.state = "failed"; j.error = Some(format!("{}: {e}", exe.display())); j.finished_at = Some(now()); });
+                Self::give_back(lease);
                 return;
             }
         };
@@ -511,9 +626,23 @@ impl Workshop {
                 let ev: Value = serde_json::from_str(&l).unwrap_or(json!({"event": "log", "message": l}));
                 me.update(id, |j| match ev["event"].as_str() {
                     Some("start") => j.log.push(ev["what"].as_str().unwrap_or("").to_string()),
-                    Some("log") => j.log.push(ev["message"].as_str().unwrap_or("").to_string()),
+                    Some("log") => {
+                        j.log.push(ev["message"].as_str().unwrap_or("").to_string());
+                        if ev["eval_loss"].is_number() {
+                            j.points.push(json!({"step": ev["step"], "eval_loss": ev["eval_loss"]}));
+                        }
+                    }
                     Some("done") => j.result = Some(ev.clone()),
                     Some("progress") => {
+                        if ev["loss"].is_number() {
+                            j.points.push(json!({"step": ev["step"], "loss": ev["loss"], "lr": ev["lr"]}));
+                            // a long run keeps every other point of its first half once it has many
+                            if j.points.len() > 4000 {
+                                let half = j.points.len() / 2;
+                                let mut k = 0;
+                                j.points.retain(|_| { k += 1; k > half || k % 2 == 0 });
+                            }
+                        }
                         if let Some(m) = ev["message"].as_str().filter(|m| !m.is_empty()) {
                             j.log.push(format!("[{}/{}] {m}", ev["done"], ev["total"]));
                         }
@@ -549,6 +678,20 @@ impl Workshop {
             }
         });
         tracing::info!("workshop: job {id} finished: {}", self.job(id).map(|j| j.state).unwrap_or("?"));
+        Self::give_back(lease);
+    }
+
+    /// The GPUs back to chats after a training run: the turn ends, and the model that was loaded before is loaded again.
+    fn give_back(lease: Option<(Arc<crate::manager::Manager>, crate::queue::Pass, crate::queue::Resident)>) {
+        let Some((m, pass, before)) = lease else { return };
+        drop(pass);
+        if let crate::queue::Resident::Text(model) = before {
+            tokio::spawn(async move {
+                if let Err(e) = m.load(&model).await {
+                    tracing::warn!("workshop: {model} could not be loaded again after the training run: {e:#}");
+                }
+            });
+        }
     }
 
     pub fn job(&self, id: u64) -> Option<Job> {
@@ -712,6 +855,34 @@ async fn library_call(args: &[&str]) -> Result<Value, String> {
         return Err(String::from_utf8_lossy(&o.stderr).trim().to_string());
     }
     events.into_iter().find(|e| e["event"] == "library" || e["event"] == "done").ok_or_else(|| "no answer from the library".into())
+}
+
+/// `POST /v1/workshop/estimate` with a training request's settings: what the run needs against this machine
+/// (`am2strata-workshop profile`): memory part by part and per GPU, whether it fits, a rough time, and its lines.
+pub async fn estimate_post(State(s): State<AppState>, headers: HeaderMap, Json(req): Json<Value>) -> Response {
+    let w = match admin(&s, &headers) { Ok(w) => w, Err(r) => return r };
+    if crate::foreign_origin(&s, &headers) {
+        return crate::not_own_page("training can be estimated");
+    }
+    if let Some(r) = library_missing() { return r; }
+    let args = match w.train_args(&req) {
+        Ok(a) => a,
+        Err(e) => return error(StatusCode::BAD_REQUEST, "invalid_request_error", e),
+    };
+    let exe = exe().unwrap_or_default();
+    let o = match tokio::process::Command::new(exe).arg("--json").arg("profile").args(&args).output().await {
+        Ok(o) => o,
+        Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", format!("am2strata-workshop: {e}")),
+    };
+    let text = String::from_utf8_lossy(&o.stdout);
+    let events: Vec<Value> = text.lines().filter_map(|l| serde_json::from_str(l).ok()).collect();
+    if let Some(e) = events.iter().find(|e| e["event"] == "error") {
+        return error(StatusCode::BAD_REQUEST, "invalid_request_error", e["message"].as_str().unwrap_or("the estimate failed").to_string());
+    }
+    match events.into_iter().find(|e| e["event"] == "profile") {
+        Some(v) => Json(v).into_response(),
+        None => error(StatusCode::BAD_REQUEST, "invalid_request_error", String::from_utf8_lossy(&o.stderr).trim().to_string()),
+    }
 }
 
 /// `GET /v1/workshop/library`: every recipe (Soup's catalogue, ported, and Prastara's own) with its abilities and

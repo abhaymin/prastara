@@ -4791,7 +4791,7 @@ function wsJobCard(x) {
   const size = x.result?.bytes ? fmtBytes(x.result.bytes) : "";
   const acts = [];
   if (x.state === "queued" || running) acts.push(`<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>`);
-  if (x.state === "done" && ["merge", "convert", "quantize", "loop"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
+  if (x.state === "done" && ["merge", "convert", "quantize", "loop", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
   if (x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
   if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
   const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
@@ -4800,7 +4800,7 @@ function wsJobCard(x) {
       <span class="st-badge ${badge}">${esc(x.state)}</span><span class="ws-job__time">${esc(time)}</span></div>
     <div class="ws-job__name" title="${esc(out || inp)}"><span>${esc(name)}</span><span class="muted">${esc(size)}</span></div>
     ${bar}${line && !x.error ? `<div class="ws-job__line" title="${esc(line)}">${esc(line)}</div>` : ""}
-    ${x.error ? `<div class="ws-job__err" title="${esc(x.error)}">${esc(x.error)}</div>` : ""}
+    ${x.error ? `<div class="ws-job__err" title="${esc(x.error)}">${esc(short(x.error))}</div>` : ""}
     ${acts.length ? `<div class="ws-job__actions">${acts.join("")}</div>` : ""}
     ${rows.length ? `<details><summary>Details</summary><dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${esc(v)}</dd>`).join("")}</dl>` +
       (x.last ? `<pre>${esc(x.last)}</pre>` : "") + `</details>` : ""}
@@ -4837,10 +4837,12 @@ async function refreshJobs(pushed = null) {
       const o = x.result.output;
       if (x.kind === "loop" || x.kind === "merge") wsUse("convert", "ws-c-in", o);   // a model folder → convert
       if (x.kind === "convert") wsUse("quantize", "ws-q-in", o);                    // GGUF → quantize
+      if (x.kind === "train") { $("ws-m-base").value = x.request?.model || ""; wsUse("merge", "ws-m-adapter", x.output || o); } // adapter → merge
       if (x.kind === "quantize") wsUse("install", "ws-s-in", o);                    // quantized GGUF → install
     };
     for (const b of document.querySelectorAll("[data-ws-load]")) b.onclick = () => { showTab("settings"); showSection("models"); };
     for (const b of document.querySelectorAll("[data-ws-review]")) b.onclick = () => wsReviewOpen(b.dataset.wsReview);
+    wsCurveRefresh(jobs);
     // something a job just made appears in the pickers and the overview
     const made = jobs.filter((x) => x.state === "done").map(wsJobOut).join("\n");
     if (made !== ws.made) { const first = ws.made === undefined; ws.made = made; if (!first) wsFiles(); else wsOverview(); }
@@ -4887,6 +4889,7 @@ function wsStep(id) {
   store.set("ws-step", id);
   $("ws-work").scrollTop = 0;
   if (id === "library") wsLibLoad();
+  if (id === "train") { wsCurveId = null; wsCurveRefresh(); }
   if (id === "overview") wsOverview();
 }
 function wsUse(step, inputId, path) { wsStep(step); $(inputId).value = path; wsPick.quiet = true; $(inputId).focus(); wsPick.quiet = false; }
@@ -5272,6 +5275,89 @@ async function wsUploadRun(items, folderName) {
   finally { $("ws-upload").hidden = true; wsUp.xhr = null; }
 }
 $("ws-up-cancel").onclick = () => { wsUp.cancelled = true; wsUp.xhr?.abort(); };
+
+// ------------------------------------------------------------------ Workshop › Train: the form, its estimate, the curve
+const wsTrainDev = () => $("ws-t-devs").querySelector('[aria-checked="true"]')?.dataset.dev || "cpu";
+$("ws-t-devs").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-dev]");
+  if (!b) return;
+  for (const x of $("ws-t-devs").children) x.setAttribute("aria-checked", String(x === b));
+  wsTrainEstimateSoon();
+});
+function wsTrainReq() {
+  const num = (id) => { const v = $(id).value.trim(); return v === "" ? undefined : Number(v); };
+  const targets = [...$("ws-t-targets").querySelectorAll("input:checked")].map((c) => c.value);
+  return {kind: "train", model: $("ws-t-model").value.trim(), data: $("ws-t-data").value.trim(), devices: wsTrainDev(),
+          rank: num("ws-t-rank"), epochs: num("ws-t-epochs"), lr: num("ws-t-lr"), max_len: num("ws-t-len"), train_layers: num("ws-t-layers"),
+          targets: targets.length ? targets.join(",") : undefined, gradient_checkpointing: $("ws-t-ckpt").checked,
+          output: $("ws-t-out").value.trim() || undefined};
+}
+let wsEstTimer = null, wsEstSeq = 0;
+function wsTrainEstimateSoon() { clearTimeout(wsEstTimer); wsEstTimer = setTimeout(wsTrainEstimate, 700); }
+async function wsTrainEstimate() {
+  const req = wsTrainReq();
+  if (!req.model || !req.data) return;
+  const seq = ++wsEstSeq, box = $("ws-t-estimate"), body = $("ws-t-est-body");
+  box.hidden = false;
+  body.innerHTML = '<p class="muted small">Estimating…</p>';
+  try {
+    const e = await wsFetch("v1/workshop/estimate", {method: "POST", body: JSON.stringify(req)});
+    if (seq !== wsEstSeq) return;
+    const gpus = (e.fits_gpu || []).map((g) => `<span class="st-badge ${g.fits ? "" : "st-badge--error"}">GPU ${g.index}: ${g.fits ? "fits" : "does not fit"}</span>`).join("");
+    const ram = e.fits_ram != null ? `<span class="st-badge ${e.fits_ram ? "" : "st-badge--error"}">RAM: ${e.fits_ram ? "fits" : "does not fit"}</span>` : "";
+    body.innerHTML = `<div class="ws-est"><div class="ws-est__fit">${ram}${req.devices !== "cpu" ? gpus : ""}</div>` +
+      `<ul>${(e.lines || []).map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`;
+  } catch (err) { if (seq === wsEstSeq) body.innerHTML = `<p class="msg-error">${esc(err.message)}</p>`; }
+}
+for (const id of ["ws-t-model", "ws-t-data", "ws-t-rank", "ws-t-epochs", "ws-t-lr", "ws-t-len", "ws-t-layers", "ws-t-ckpt"]) $(id).addEventListener("change", wsTrainEstimateSoon);
+$("ws-t-targets").addEventListener("change", wsTrainEstimateSoon);
+$("ws-t-est").onclick = wsTrainEstimate;
+$("ws-t-start").onclick = (e) => {
+  const req = wsTrainReq();
+  if (req.devices !== "cpu") {
+    const cards = req.devices.split(",").map((d) => `GPU ${d.split(":")[1]}`).join(" and ");
+    const model = $("model-select").selectedOptions[0]?.textContent || "the chat model";
+    if (!confirm(`This training run uses ${cards}.\n\n${model} is unloaded while it runs, chats wait, and the model is loaded again when it ends.\n\nStart it?`)) return;
+  }
+  wsSubmit(req, e.currentTarget);
+};
+// the curve of the latest training run, while the Train step shows (its points come with the job's detail)
+let wsCurveId = null, wsCurveAt = 0;
+function wsChart(points) {
+  const loss = points.filter((p) => p.loss != null), evals = points.filter((p) => p.eval_loss != null);
+  const all = [...loss.map((p) => p.loss), ...evals.map((p) => p.eval_loss)];
+  if (!all.length) return '<p class="muted small">No steps yet.</p>';
+  const steps = points.map((p) => p.step || 0), x0 = Math.min(...steps), x1 = Math.max(...steps, x0 + 1);
+  let y0 = Math.min(...all), y1 = Math.max(...all);
+  const pad = (y1 - y0) * 0.1 || 0.1; y0 -= pad; y1 += pad;
+  const W = 600, H = 220, L = 44, R = 12, T = 12, B = 26;
+  const X = (s) => L + ((s - x0) / (x1 - x0)) * (W - L - R), Y = (v) => T + (1 - (v - y0) / (y1 - y0)) * (H - T - B);
+  const ticks = [y1 - pad, (y0 + y1) / 2, y0 + pad];
+  const line = loss.map((p) => `${X(p.step).toFixed(1)},${Y(p.loss).toFixed(1)}`).join(" ");
+  return `<svg class="ws-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img" aria-label="Training loss ${fmt(loss[0]?.loss, 3)} to ${fmt(loss.at(-1)?.loss, 3)} over ${loss.length} steps">` +
+    ticks.map((t) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${Y(t)}" y2="${Y(t)}"></line><text x="4" y="${Y(t) + 4}">${fmt(t, 2)}</text>`).join("") +
+    `<text x="${L}" y="${H - 6}">step ${x0}</text><text x="${W - R - 60}" y="${H - 6}">step ${x1}</text>` +
+    (loss.length > 1 ? `<polyline class="loss" points="${line}"></polyline>` : loss.map((p) => `<circle cx="${X(p.step)}" cy="${Y(p.loss)}" r="4" fill="var(--st-accent)"></circle>`).join("")) +
+    evals.map((p) => `<circle class="eval" cx="${X(p.step)}" cy="${Y(p.eval_loss)}" r="4.5"></circle>`).join("") + `</svg>` +
+    `<div class="ws-legend"><span><i></i>training ${fmt(loss[0]?.loss, 3)} → ${fmt(loss.at(-1)?.loss, 3)}</span>` +
+    (evals.length ? `<span><i class="e"></i>held out ${fmt(evals.at(-1).eval_loss, 3)}</span>` : "") + `</div>`;
+}
+async function wsCurveRefresh(jobs) {
+  const panel = document.querySelector('[data-ws-panel="train"]');
+  if (!panel || panel.hidden) return;
+  const t = (jobs || ws.jobs).find((x) => x.kind === "train");
+  if (!t) { $("ws-t-curve").hidden = true; return; }
+  const live = t.state === "running" || t.state === "queued";
+  if (t.id === wsCurveId && !live && Date.now() - wsCurveAt < 60000) return;
+  wsCurveId = t.id; wsCurveAt = Date.now();
+  try {
+    const d = await wsFetch(`v1/workshop/jobs/${t.id}`);
+    $("ws-t-curve").hidden = false;
+    $("ws-t-curve-title").textContent = `Loss · training #${t.id}`;
+    $("ws-t-curve-note").textContent = `${t.state}${d.progress?.total ? ` · step ${d.progress.done} of ${d.progress.total}` : ""}`;
+    $("ws-t-chart").innerHTML = wsChart(d.points || []);
+  } catch (e) { /* the chart stays as it was */ }
+}
 
 // ------------------------------------------------------------------ Workshop: the context column (wide screens only)
 // This machine (GET api/system) and the queue (GET api/queue: what runs, what waits and for how long, from the

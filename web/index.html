@@ -656,12 +656,42 @@
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="train" hidden>
-          <header class="ws-panel__head"><h3>Train a LoRA adapter</h3><p class="muted">Llama, Mistral and Qwen models, on this PC's CPU or GPUs. <code>profile</code> and <code>autopilot</code> say what fits this PC.</p></header>
-          <div class="ws-panel__body">
+          <header class="ws-panel__head"><h3>Train a LoRA adapter</h3><p class="muted">Llama, Mistral and Qwen models (a looped one's gates train with the adapter), on this PC's GPUs or CPU. The estimate updates as you change a setting.</p></header>
+          <div class="ws-panel__body ws-train">
           <div class="st-card ws-block">
-            <pre class="ws-cmd">am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt; --devices cuda:0,cuda:1</pre>
-            <p class="muted small">From a terminal for now; starting a run from this page comes next. Use a dataset from Generate data, then merge the adapter.</p>
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-t-model">Model (HF folder)</label>
+                <input class="st-input mono" id="ws-t-model" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-t-data">Dataset</label>
+                <input class="st-input mono" id="ws-t-data" data-ws-pick="datasets" autocomplete="off" placeholder="~/data/chats.jsonl"></div>
+              <fieldset class="ws-field ws-field--wide ws-fieldset"><legend class="st-label">Devices</legend>
+                <div class="seg ws-devs" id="ws-t-devs" role="radiogroup" aria-label="Devices">
+                  <button type="button" role="radio" data-dev="cpu" aria-checked="false">CPU</button>
+                  <button type="button" role="radio" data-dev="cuda:0" aria-checked="false">GPU 0</button>
+                  <button type="button" role="radio" data-dev="cuda:0,cuda:1" aria-checked="true">GPU 0 + 1</button></div></fieldset>
+              <div class="ws-field"><label class="st-label" for="ws-t-rank">Rank</label><input class="st-input" id="ws-t-rank" type="number" min="1" max="512" value="16"></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-epochs">Epochs</label><input class="st-input" id="ws-t-epochs" type="number" min="0.1" max="100" step="0.1" value="1"></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-lr">Learning rate</label><input class="st-input" id="ws-t-lr" value="2e-4"></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-len">Longest example <output>tokens</output></label><input class="st-input" id="ws-t-len" type="number" min="16" value="1024"></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-layers">Trained blocks <output>from the top; empty: all</output></label><input class="st-input" id="ws-t-layers" type="number" min="1" placeholder="all"></div>
+              <fieldset class="ws-field ws-field--wide ws-fieldset"><legend class="st-label">Targets</legend>
+                <div class="ws-chips" id="ws-t-targets">
+                  <label><input type="checkbox" value="q_proj" checked> q</label><label><input type="checkbox" value="k_proj" checked> k</label>
+                  <label><input type="checkbox" value="v_proj" checked> v</label><label><input type="checkbox" value="o_proj" checked> o</label>
+                  <label><input type="checkbox" value="gate_proj" checked> gate</label><label><input type="checkbox" value="up_proj" checked> up</label>
+                  <label><input type="checkbox" value="down_proj" checked> down</label></div></fieldset>
+              <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-t-ckpt" checked> Gradient checkpointing (less memory, about a third more time)</label>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-t-out">Adapter folder <output>optional</output></label>
+                <input class="st-input mono" id="ws-t-out" placeholder="in the Workshop's adapters folder"></div>
+            </div>
+            <div class="ws-actions"><span class="muted small ws-actions__note" id="ws-t-note"></span>
+              <button type="button" class="st-btn st-btn--secondary" id="ws-t-est">Estimate</button>
+              <button type="button" class="st-btn st-btn--primary" id="ws-t-start">Start training</button></div>
           </div>
+          <div class="st-card ws-block" id="ws-t-estimate" hidden><span class="card-title">Estimate</span><div id="ws-t-est-body"></div></div>
+          <div class="st-card ws-block" id="ws-t-curve" hidden><div class="ws-curve__head"><span class="card-title" id="ws-t-curve-title">Loss</span><span class="muted small" id="ws-t-curve-note"></span></div>
+            <div id="ws-t-chart"></div></div>
+          <p class="muted small">From a terminal: <code>am2strata-workshop train --model &lt;hf-folder&gt; --data &lt;chat.jsonl&gt; --devices cuda:0,cuda:1</code>. Then merge the adapter (Package › Merge).</p>
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="merge" hidden>
