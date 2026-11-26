@@ -785,3 +785,76 @@ fn regress_and_grade_train_jobs_check_their_inputs_and_carry_their_report() {
             && args.contains("--max-steps 10") && args.contains(&format!("--data {}", prompts.display())), "{args}");
     let _ = std::fs::remove_dir_all(&tools);
 }
+
+/// Cleaning a dataset from the Workshop: its inputs, held-out files and tokenizer folder must be inside the Workshop's
+/// folders (and never a key file), its settings become the clean command's flags, the output never overwrites an
+/// input, and wrong values are refused before anything runs.
+#[cfg(unix)]
+#[test]
+fn clean_jobs_check_their_inputs_and_pass_their_settings() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-clean-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let ws = s.dir.join("workshop");
+    let ds = ws.join("datasets");
+    std::fs::create_dir_all(&ds).unwrap();
+    let (a, b, held) = (ds.join("mula-a.jsonl"), ds.join("aya-b.jsonl"), ds.join("heldout.jsonl"));
+    for p in [&a, &b, &held] {
+        std::fs::write(p, "{\"messages\":[{\"role\":\"user\",\"content\":\"q\"},{\"role\":\"assistant\",\"content\":\"a\"}]}\n").unwrap();
+    }
+    let model = ws.join("tok-model");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("tokenizer.json"), "{}").unwrap();
+    let no_tok = ws.join("no-tok");
+    std::fs::create_dir_all(&no_tok).unwrap();
+    std::fs::write(ws.join("server.pem"), "k").unwrap();
+    for (bad, why) in [
+        (json!({"kind": "clean"}), "needs \"inputs\""),
+        (json!({"kind": "clean", "inputs": []}), "needs \"inputs\""),
+        (json!({"kind": "clean", "inputs": ["/etc/passwd"]}), ".jsonl"),
+        (json!({"kind": "clean", "inputs": ["/nope/x.jsonl"]}), "does not exist"),
+        (json!({"kind": "clean", "inputs": [a, 3]}), "list of .jsonl"),
+        (json!({"kind": "clean", "inputs": {"a": 1}}), "list of .jsonl"),
+        (json!({"kind": "clean", "inputs": [a], "exclude": ["/etc/shadow.jsonl"]}), "exist"),
+        (json!({"kind": "clean", "inputs": [a], "model": no_tok}), "tokenizer.json"),
+        (json!({"kind": "clean", "inputs": [a], "model": ws.join("server.pem")}), "never touches"),
+        (json!({"kind": "clean", "inputs": [a], "model": 5}), "\"model\""),
+        (json!({"kind": "clean", "inputs": [a], "max_repeat": 2}), "\"max_repeat\""),
+        (json!({"kind": "clean", "inputs": [a], "near": "high"}), "\"near\""),
+        (json!({"kind": "clean", "inputs": [a], "max_len": 4}), "\"max_len\""),
+        (json!({"kind": "clean", "inputs": [a], "cap_per_language": 0}), "\"cap_per_language\""),
+        (json!({"kind": "clean", "inputs": [a], "dedupe": "fuzzy"}), "\"dedupe\""),
+        (json!({"kind": "clean", "inputs": [a], "lang_match": "yes"}), "\"lang_match\""),
+        (json!({"kind": "clean", "inputs": [a], "output": "/tmp/x.txt"}), ".jsonl"),
+        (json!({"kind": "clean", "inputs": [a], "output": "/etc/out.jsonl"}), "/etc/out.jsonl"),
+        (json!({"kind": "clean", "inputs": [a, b], "output": b}), "one of the inputs"),
+        (json!({"kind": "clean", "inputs": [a], "report": ds.join("card.txt")}), ".md"),
+        (json!({"kind": "clean", "inputs": [a], "cap_only": [b]}), "not one of the inputs"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{bad}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap_or("").contains(why), "{bad}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "clean", "inputs": [a, b], "exclude": [held], "model": model, "max_len": 1024,
+        "min_answer_tokens": 8, "min_answer_ratio": 0.05, "max_repeat": 0.5, "dedupe": "near", "near": 0.8, "lang_match": true,
+        "cap_per_language": 1500, "cap_only": [b], "seed": 7}));
+    assert_eq!(code, 202, "{j}");
+    let out = j["output"].as_str().unwrap().to_string();
+    assert!(out.ends_with("/workshop/datasets/mula-a-clean.jsonl"), "{out}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    for want in [format!("clean {} {}", a.display(), b.display()), format!("--exclude {}", held.display()), format!("--model {}", model.display()),
+                 "--max-len 1024".into(), "--min-answer-tokens 8".into(), "--min-answer-ratio 0.05".into(), "--max-repeat 0.5".into(),
+                 "--dedupe near".into(), "--near 0.8".into(), "--lang-match".into(), "--cap-per-language 1500".into(), format!("--cap-only {}", b.display()), "--seed 7".into(), format!("--out {out}")] {
+        assert!(args.contains(&want), "{want:?} not in {args}");
+    }
+    // the cleaned file is a dataset like any other: listed, and not written over by the next run
+    let (_, f) = s.get("/v1/workshop/files", true);
+    assert!(f["datasets"].as_array().unwrap().iter().any(|d| d["path"] == out.as_str()), "{f}");
+    let (_, j2) = s.post("/v1/workshop/jobs", &json!({"kind": "clean", "inputs": [a]}));
+    assert!(j2["output"].as_str().unwrap().ends_with("mula-a-clean-2.jsonl"), "{j2}");
+    wait_state(&s, j2["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    assert!(!args.contains("--model") && !args.contains("--lang-match") && !args.contains("--exclude"), "{args}");
+    std::fs::remove_dir_all(&tools).ok();
+}

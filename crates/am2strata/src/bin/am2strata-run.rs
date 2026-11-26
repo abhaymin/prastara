@@ -163,6 +163,8 @@ enum Cmd {
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
     /// | regress <hf-folder> [<adapter>] --suite suite.json [--passes 1,2] [--against <report>] (the regression report card)
     /// | grade-train <hf-folder> --data prompts.jsonl --suite suite.json [--grader code|judge] [--samples 4] [--rounds 1]
+    /// | clean <in.jsonl> [--input more.jsonl] [--tokenizer <hf-folder>] [--max-len 1024] [--min-answer-tokens 4] [--max-repeat 0.5]
+    ///   [--dedupe near|exact|off] [--lang-match] [--exclude held-out.jsonl] [--cap-per-language N] (a dataset cleaned, with its card)
     /// | jobs | job <id> | cancel <id> | files
     Workshop {
         action: String,
@@ -1438,6 +1440,38 @@ struct DatagenOpts {
     /// regress, grade-train: cpu (default), cuda:0 or cuda:0,cuda:1 (a GPU run takes the GPUs from the chat model)
     #[arg(long)]
     devices: Option<String>,
+    /// clean: more datasets to clean (repeat it), beside the first
+    #[arg(long = "input")]
+    inputs: Vec<String>,
+    /// clean: a Hugging Face model folder whose tokenizer measures the rows
+    #[arg(long)]
+    tokenizer: Option<String>,
+    /// clean: the training length, the shortest answer (tokens), the share of the prompt it must reach, the most
+    /// repetition (0-1), duplicates (near, exact, off) and how alike a near-copy is (0-1)
+    #[arg(long)]
+    max_len: Option<u64>,
+    #[arg(long)]
+    min_answer_tokens: Option<u64>,
+    #[arg(long)]
+    min_answer_ratio: Option<f64>,
+    #[arg(long)]
+    max_repeat: Option<f64>,
+    #[arg(long)]
+    dedupe: Option<String>,
+    #[arg(long)]
+    near: Option<f64>,
+    /// clean: the answer must be in the prompt's script or the language a translation asks for
+    #[arg(long)]
+    lang_match: bool,
+    /// clean: held-out rows to keep out (repeat it)
+    #[arg(long)]
+    exclude: Vec<String>,
+    /// clean: at most this many rows per language
+    #[arg(long)]
+    cap_per_language: Option<u64>,
+    /// clean: the inputs the cap draws from (repeat it); the others are kept whole
+    #[arg(long)]
+    cap_only: Vec<String>,
     /// dataset: the first record to show, and how many
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -1524,6 +1558,20 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "samples": dg.samples, "rounds": dg.rounds, "passes": dg.passes.clone(), "temperature": dg.temperature,
                                    "devices": dg.devices.clone(), "output": out.clone().map(abs)})
             }
+            "clean" => {
+                const USE: &str = "clean <in.jsonl> [--input more.jsonl] [--tokenizer <hf-folder>] [--max-len 1024] [--lang-match] [--exclude held-out.jsonl] [--cap-per-language N]";
+                let mut inputs: Vec<String> = first.clone().into_iter().chain(dg.inputs.iter().cloned()).map(abs).collect();
+                inputs.dedup();
+                if inputs.is_empty() {
+                    return Err(USE.into());
+                }
+                serde_json::json!({"kind": "clean", "inputs": inputs, "model": dg.tokenizer.clone().map(abs), "max_len": dg.max_len,
+                                   "min_answer_tokens": dg.min_answer_tokens, "min_answer_ratio": dg.min_answer_ratio, "max_repeat": dg.max_repeat,
+                                   "dedupe": dg.dedupe.clone(), "near": dg.near, "lang_match": dg.lang_match,
+                                   "exclude": dg.exclude.iter().cloned().map(abs).collect::<Vec<_>>(), "cap_per_language": dg.cap_per_language,
+                                   "cap_only": dg.cap_only.iter().cloned().map(abs).collect::<Vec<_>>(),
+                                   "seed": dg.seed, "output": out.clone().map(abs)})
+            }
             "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
                                            "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),
             "datagen" => {
@@ -1599,7 +1647,7 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 for l in j["log"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
                 return Ok(());
             }
-            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, datagen, upload, dataset, jobs, job, cancel, files")),
+            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, datagen, clean, upload, dataset, jobs, job, cancel, files")),
         };
         let mut body = body;
         if let Some(o) = body.as_object_mut() { o.retain(|_, v| !v.is_null()); }

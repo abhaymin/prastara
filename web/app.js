@@ -4806,8 +4806,8 @@ async function wsFiles() {
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", regress: "test", "grade-train": "grade"};
-const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.model || r.seeds || (r.sources || [])[0] || ""; };
+const WS_STEP_OF = {datagen: "data", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", regress: "test", "grade-train": "grade"};
+const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.model || r.seeds || (r.sources || [])[0] || (r.inputs || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
   const now = Date.now() / 1000, p = x.progress, running = x.state === "running";
@@ -4830,7 +4830,7 @@ function wsJobCard(x) {
   const acts = [];
   if (x.state === "queued" || running) acts.push(`<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>`);
   if (x.state === "done" && ["merge", "convert", "quantize", "loop", "upcycle", "export-moe", "abliterate", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
-  if (x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
+  if ((x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) || (x.kind === "clean" && x.state === "done")) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
   if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
   const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
   return `<article class="ws-job" data-state="${esc(x.state)}">
@@ -5140,6 +5140,22 @@ $("ws-datagen").onclick = (e) => {
     if (body.recipe === "code") body.check_code = $("ws-d-check").checked;
   }
   wsSubmit(body, e.currentTarget);
+};
+
+// ------------------------------------------------------------------ Workshop: cleaning a dataset
+const wsLines = (id) => $(id).value.split("\n").map((x) => x.trim()).filter(Boolean);
+$("ws-c-add-btn").onclick = () => {
+  const p = $("ws-c-add").value.trim();
+  if (!p) return;
+  if (!wsLines("ws-c-inputs").includes(p)) { const box = $("ws-c-inputs"); box.value = (box.value.trim() ? box.value.trim() + "\n" : "") + p; }
+  $("ws-c-add").value = "";
+};
+$("ws-clean").onclick = (e) => {
+  const n = (id) => { const v = $(id).value.trim(); return v === "" ? "" : Number(v); };
+  wsSubmit({kind: "clean", inputs: wsLines("ws-c-inputs"), exclude: wsLines("ws-c-exclude"), model: $("ws-c-model").value.trim(),
+    max_len: n("ws-c-maxlen"), min_answer_tokens: n("ws-c-min"), min_answer_ratio: n("ws-c-ratio"), max_repeat: n("ws-c-repeat"),
+    dedupe: $("ws-c-dedupe").value, near: n("ws-c-near"), lang_match: $("ws-c-lang").checked, cap_per_language: n("ws-c-cap"),
+    seed: n("ws-c-seed"), output: $("ws-c-out").value.trim()}, e.currentTarget);
 };
 
 // ------------------------------------------------------------------ Workshop: the model library (recipes)

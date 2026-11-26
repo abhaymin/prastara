@@ -28,6 +28,12 @@
 //!     `"output"`? (a .jsonl), `"count"`?, `"per_chunk"`?, `"chunk_chars"`?, `"temperature"`?, `"min_score"`? (1-5: a judge pass), `"topic"`?, `"language"`?, `"model"`? (the one to write with; default the loaded one) — training data written by the
 //!     loaded model, through this server's own chat API (its address and key reach the command in its environment,
 //!     never on its command line)
+//!   - clean: `"inputs"` (datasets, .jsonl), `"output"`? (a .jsonl; default `datasets/<first>-clean.jsonl`),
+//!     `"model"`? (an HF folder: its tokenizer measures the rows), `"max_len"`?, `"min_answer_tokens"`?,
+//!     `"min_answer_ratio"`?, `"max_repeat"`? (0-1), `"dedupe"`? (exact | near | off), `"near"`? (0-1),
+//!     `"lang_match"`?, `"exclude"`? (held-out .jsonl files to keep out), `"cap_per_language"`?, `"cap_only"`? (the
+//!     inputs the cap draws from), `"seed"`?,
+//!     `"report"`? (the card, .md) — the dataset cleaned for training, with a card of the count per rule
 //!   - regress: `"model"` (an HF model folder), `"adapter"`? (an adapter folder), `"suite"` (a suite .json whose data
 //!     files must be inside the Workshop's folders too), `"passes"`? ([1, 2] or "1,2": a looped model at each),
 //!     `"against"`? (earlier reports, paths or a list), `"devices"`?, `"max_prompt_tokens"`?, `"judge_model"`?,
@@ -62,7 +68,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 12] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen", "regress", "grade-train"];
+const KINDS: [&str; 13] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen", "clean", "regress", "grade-train"];
 
 /// What `export-moe` writes as: the converter's two float types and the quantizer's.
 const EXPORT_TYPES: [&str; 7] = ["q4_k", "q8_0", "q6_k", "q5_k", "q4_0", "f16", "f32"];
@@ -640,6 +646,90 @@ impl Workshop {
                     if let Some(v) = s(k) {
                         args.extend([format!("--{k}"), v.chars().take(200).collect()]);
                     }
+                }
+                Ok((kind.into(), args, output))
+            }
+            "clean" => {
+                let list = |k: &str| -> Result<Vec<PathBuf>, String> {
+                    match &req[k] {
+                        Value::Null => Ok(vec![]),
+                        Value::String(p) if p.is_empty() => Ok(vec![]),
+                        Value::String(p) => Ok(vec![self.dataset_path(p)?]),
+                        Value::Array(a) if a.len() <= 500 => a.iter().map(|v| v.as_str().filter(|p| !p.is_empty())
+                            .ok_or_else(|| format!("\"{k}\" is a list of .jsonl paths")).and_then(|p| self.dataset_path(p))).collect(),
+                        _ => Err(format!("\"{k}\" is a list of .jsonl paths")),
+                    }
+                };
+                let inputs = list("inputs")?;
+                if inputs.is_empty() {
+                    return Err("clean needs \"inputs\": the datasets (.jsonl) to clean".into());
+                }
+                let exclude = list("exclude")?;
+                let cap_only = list("cap_only")?;
+                if let Some(c) = cap_only.iter().find(|c| !inputs.contains(c)) {
+                    return Err(format!("\"cap_only\": {} is not one of the inputs", c.display()));
+                }
+                let mut args = vec!["clean".to_string()];
+                args.extend(inputs.iter().map(|p| p.display().to_string()));
+                if let Some(m) = s("model") {
+                    let m = self.allowed(m, true)?;
+                    if !m.join("tokenizer.json").exists() {
+                        return Err(format!("{} has no tokenizer.json: \"model\" is a Hugging Face model folder", m.display()));
+                    }
+                    args.extend(["--model".into(), m.display().to_string()]);
+                } else if !matches!(req["model"], Value::Null | Value::String(_)) {
+                    return Err("\"model\" is the path of a Hugging Face model folder".into());
+                }
+                for p in &exclude {
+                    args.extend(["--exclude".into(), p.display().to_string()]);
+                }
+                for p in &cap_only {
+                    args.extend(["--cap-only".into(), p.display().to_string()]);
+                }
+                let num = |k: &str, lo: f64, hi: f64| -> Result<Option<f64>, String> {
+                    match &req[k] {
+                        Value::Null => Ok(None),
+                        v => v.as_f64().filter(|n| (lo..=hi).contains(n)).map(Some).ok_or_else(|| format!("\"{k}\" is a number from {lo} to {hi}")),
+                    }
+                };
+                for (k, flag, lo, hi, int) in [("max_len", "--max-len", 16.0, 1_048_576.0, true), ("min_answer_tokens", "--min-answer-tokens", 0.0, 100_000.0, true),
+                                               ("min_answer_ratio", "--min-answer-ratio", 0.0, 10.0, false), ("max_repeat", "--max-repeat", 0.0, 1.0, false),
+                                               ("near", "--near", 0.0, 1.0, false), ("cap_per_language", "--cap-per-language", 1.0, 100_000_000.0, true),
+                                               ("seed", "--seed", 0.0, 1e15, true)] {
+                    if let Some(n) = num(k, lo, hi)? {
+                        args.extend([flag.into(), if int { (n as u64).to_string() } else { n.to_string() }]);
+                    }
+                }
+                match &req["dedupe"] {
+                    Value::Null => {}
+                    Value::String(d) if ["exact", "near", "off"].contains(&d.as_str()) => args.extend(["--dedupe".into(), d.clone()]),
+                    _ => return Err("\"dedupe\" is exact, near or off".into()),
+                }
+                match &req["lang_match"] {
+                    Value::Null | Value::Bool(false) => {}
+                    Value::Bool(true) => args.push("--lang-match".into()),
+                    _ => return Err("\"lang_match\" is true or false".into()),
+                }
+                let output = match s("output") {
+                    Some(o) if !o.ends_with(".jsonl") => return Err("\"output\" is a .jsonl file".into()),
+                    Some(o) => self.allowed(o, false)?,
+                    None => {
+                        let from = inputs[0].file_stem().and_then(|x| x.to_str()).unwrap_or("data");
+                        Self::fresh(&self.out_dir.join("datasets"), &format!("{from}-clean"), ".jsonl")
+                    }
+                };
+                if inputs.contains(&output) || exclude.contains(&output) {
+                    return Err(format!("{}: the output cannot be one of the inputs", output.display()));
+                }
+                if self.busy(&output) {
+                    return Err(format!("{}: a job is writing it", output.display()));
+                }
+                args.extend(["--out".into(), output.display().to_string()]);
+                if let Some(r) = s("report") {
+                    if !r.ends_with(".md") {
+                        return Err("\"report\" is a .md file".into());
+                    }
+                    args.extend(["--report".into(), self.allowed(r, false)?.display().to_string()]);
                 }
                 Ok((kind.into(), args, output))
             }

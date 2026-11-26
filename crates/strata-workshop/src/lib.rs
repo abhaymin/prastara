@@ -14,6 +14,7 @@
 pub const QLORA_READY: bool = false;
 
 pub mod chatdata;
+pub mod clean;
 pub mod checkpoint;
 pub mod convert;
 pub mod dataset;

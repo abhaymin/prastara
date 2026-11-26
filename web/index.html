@@ -507,6 +507,7 @@
           <button type="button" role="tab" data-ws-step="overview" aria-selected="false"><span>Overview</span><i class="ws-dot" data-ws-dot="overview" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Data</p>
           <button type="button" role="tab" data-ws-step="data" aria-selected="false"><span>Generate data</span><i class="ws-dot" data-ws-dot="data" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="clean" aria-selected="false"><span>Clean data</span><i class="ws-dot" data-ws-dot="clean" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="review" aria-selected="false"><span>Review data</span><i class="ws-dot" data-ws-dot="review" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="library" aria-selected="false"><span>Model library</span><i class="ws-dot" data-ws-dot="library" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Build</p>
@@ -593,6 +594,52 @@
               </details>
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-datagen">Generate dataset</button></div>
+          </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="clean" hidden>
+          <header class="ws-panel__head"><h3>Clean a dataset</h3><p class="muted">Make datasets fit to train on: drop duplicates and near-copies, answers that repeat themselves, are too short, empty, only echo the prompt, are in the wrong script or carry template junk, and prompts too long for the training length. Rows of a held-out test set are kept out. A card beside the file counts what each rule dropped, with examples.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block ws-clean">
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide">
+                <label class="st-label" for="ws-c-inputs">Datasets <output>.jsonl files, one per line</output></label>
+                <textarea class="st-input mono" id="ws-c-inputs" rows="4" placeholder="~/data/mula-indic.jsonl&#10;~/data/aya-hin.jsonl"></textarea>
+                <div class="ws-data__row">
+                  <input class="st-input mono" id="ws-c-add" data-ws-pick="datasets" autocomplete="off" placeholder="Pick a dataset to add" aria-label="Dataset to add">
+                  <button type="button" class="st-btn st-btn--secondary" id="ws-c-add-btn">Add</button>
+                </div>
+              </div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-model">Tokenizer <output>optional: the model you will train, to count in its tokens</output></label>
+                <input class="st-input mono" id="ws-c-model" data-ws-pick="hf" autocomplete="off" placeholder="~/models/Qwen3-8B"></div>
+              <div class="ws-field"><label class="st-label" for="ws-c-maxlen">Training length (tokens)</label>
+                <input class="st-input" id="ws-c-maxlen" type="number" min="16" step="256" value="1024"></div>
+              <div class="ws-field"><label class="st-label" for="ws-c-min">Shortest answer (tokens)</label>
+                <input class="st-input" id="ws-c-min" type="number" min="0" step="1" value="4"></div>
+              <div class="ws-field"><label class="st-label" for="ws-c-repeat">Most repetition <output>share of repeated 3-grams</output></label>
+                <input class="st-input" id="ws-c-repeat" type="number" min="0" max="1" step="0.05" value="0.5"></div>
+              <div class="ws-field"><label class="st-label" for="ws-c-dedupe">Duplicates</label>
+                <select class="st-input" id="ws-c-dedupe">
+                  <option value="near" selected>Exact and near-copies</option><option value="exact">Exact only</option><option value="off">Keep them</option></select></div>
+              <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-c-lang" checked> The answer must be in the prompt's script, or the language a translation asks for</label>
+              <div class="ws-field"><label class="st-label" for="ws-c-cap">Most rows per language <output>optional</output></label>
+                <input class="st-input" id="ws-c-cap" type="number" min="1" step="100" placeholder="no cap"></div>
+              <details class="ws-more ws-field--wide small"><summary>More options</summary>
+                <div class="ws-form">
+                  <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-exclude">Held-out sets to keep out <output>.jsonl files, one per line</output></label>
+                    <textarea class="st-input mono" id="ws-c-exclude" rows="2" placeholder="~/regress/heldout.jsonl"></textarea></div>
+                  <div class="ws-field"><label class="st-label" for="ws-c-ratio">Answer at least <output>times the prompt's length</output></label>
+                    <input class="st-input" id="ws-c-ratio" type="number" min="0" max="10" step="0.01" value="0"></div>
+                  <div class="ws-field"><label class="st-label" for="ws-c-near">Near-copy likeness <output>0 to 1</output></label>
+                    <input class="st-input" id="ws-c-near" type="number" min="0" max="1" step="0.05" value="0.8"></div>
+                  <div class="ws-field"><label class="st-label" for="ws-c-seed">Shuffle seed</label>
+                    <input class="st-input" id="ws-c-seed" type="number" min="0" step="1" value="7"></div>
+                  <div class="ws-field ws-field--wide"><label class="st-label" for="ws-c-out">Output file <output>optional</output></label>
+                    <input class="st-input mono" id="ws-c-out" placeholder="in the Workshop's datasets folder"></div>
+                </div>
+              </details>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-clean">Clean dataset</button></div>
           </div>
           </div>
         </section>
