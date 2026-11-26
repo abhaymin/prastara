@@ -535,7 +535,7 @@ impl<'a> Graph<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     //! The graph against the CPU path, on a device: AM2_TEST_DEVICE (default cuda:1) when it opens, else the tests say so
     //! and pass. Each fixture's logits token by token, a chunk at a time and a chunk then tokens, on the device, equal
     //! the CPU path's token by token within TOL, with the same best token at every step.
@@ -549,7 +549,7 @@ mod tests {
     const TOL: f32 = 3e-3;
 
     /// One placement at a time: the devices are opened once per process (gpu.rs DEVICES).
-    static ONE: Mutex<()> = Mutex::new(());
+    pub(crate) static ONE: Mutex<()> = Mutex::new(());
 
     fn device() -> Option<String> {
         let d = std::env::var("AM2_TEST_DEVICE").unwrap_or_else(|_| "cuda:1".into());

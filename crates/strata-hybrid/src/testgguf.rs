@@ -57,7 +57,7 @@ impl Rng {
 }
 
 fn ggml_type(ty: &str) -> u32 {
-    match ty { "F32" => 0, "Q8_0" => 8, "Q4_K" => 12, _ => panic!("testgguf: {ty}") }
+    match ty { "F32" => 0, "Q5_0" => 6, "Q8_0" => 8, "Q4_K" => 12, _ => panic!("testgguf: {ty}") }
 }
 
 /// Writes the model to `path`.
@@ -166,6 +166,197 @@ pub fn write(s: &Spec, path: &Path) {
     w.finish().unwrap();
 }
 
+/// A synthetic Inkling 2 (`inkling2` / `inkling2_loop`, model/inkling.rs): the same tensor names, shapes and metadata
+/// keys as the real file and the Workshop's TinyInkling, random weights at sizes where the activations stay O(1).
+#[derive(Clone)]
+pub struct InkSpec {
+    pub n_embd: usize,
+    pub n_head: usize,
+    pub n_kv: usize,
+    pub head_dim: usize,
+    pub n_layer: usize,
+    /// the padded vocabulary (the matrices' rows) and the real one (the logits kept)
+    pub vocab: usize,
+    pub vocab_unpadded: usize,
+    pub n_expert: usize,
+    pub top_k: usize,
+    pub ffn: usize,
+    /// the looped core: layers start..end, passes; None writes `inkling2`
+    pub loop_: Option<(usize, usize, usize)>,
+    /// per layer: a windowed layer (true) or full attention
+    pub swa: Vec<bool>,
+    pub n_swa: usize,
+    pub extent: usize,
+    pub n_rel: usize,
+    pub n_conv: usize,
+    pub rank: usize,
+    pub block: usize,
+    /// the encodings: attention and dense matrices, the vocabulary, the experts' gate/up and down, the controllers
+    pub ty: &'static str,
+    pub ty_vocab: &'static str,
+    pub ty_gate_up: &'static str,
+    pub ty_down: &'static str,
+    pub ty_ctrl: &'static str,
+    pub seed: u64,
+    /// the matrices quantized and written back as F32 (Spec's `dequantized`): the reference for the device's kernels
+    pub dequantized: bool,
+}
+
+impl InkSpec {
+    /// 6 layers, the loop over 2..4 three times, blocks of 2, a 16-token window and a 24-position bias (shorter than
+    /// the tests' prompts, so the ring and the extent are crossed), everything F32.
+    pub fn tiny() -> InkSpec {
+        InkSpec { n_embd: 128, n_head: 4, n_kv: 2, head_dim: 32, n_layer: 6, vocab: 256, vocab_unpadded: 250, n_expert: 8, top_k: 2, ffn: 64,
+                  loop_: Some((2, 4, 3)), swa: vec![true, true, true, false, true, false], n_swa: 16, extent: 24, n_rel: 16, n_conv: 4,
+                  rank: 32, block: 2, ty: "F32", ty_vocab: "F32", ty_gate_up: "F32", ty_down: "F32", ty_ctrl: "F32", seed: 0x1_4C1D,
+                  dequantized: false }
+    }
+}
+
+/// Writes the Inkling model to `path`.
+pub fn write_inkling(s: &InkSpec, path: &Path) {
+    let mut rng = Rng(s.seed | 1);
+    let a = if s.loop_.is_some() { "inkling2_loop" } else { "inkling2" };
+    let nl = s.n_layer;
+    let mut kv: Vec<(String, Kv)> = vec![
+        ("general.architecture".into(), Kv::Str(a.into())),
+        ("general.name".into(), Kv::Str(format!("synthetic-{a}"))),
+        (format!("{a}.block_count"), Kv::U32(nl as u32)),
+        (format!("{a}.context_length"), Kv::U32(1 << 20)),
+        (format!("{a}.embedding_length"), Kv::U32(s.n_embd as u32)),
+        (format!("{a}.feed_forward_length"), Kv::U32(s.ffn as u32)),
+        (format!("{a}.attention.head_count"), Kv::Ints(vec![s.n_head as i32; nl])),
+        (format!("{a}.attention.head_count_kv"), Kv::Ints(vec![s.n_kv as i32; nl])),
+        (format!("{a}.attention.layer_norm_rms_epsilon"), Kv::F32(1e-6)),
+        (format!("{a}.expert_count"), Kv::U32(s.n_expert as u32)),
+        (format!("{a}.expert_used_count"), Kv::U32(s.top_k as u32)),
+        (format!("{a}.attention.key_length"), Kv::U32(s.head_dim as u32)),
+        (format!("{a}.attention.value_length"), Kv::U32(s.head_dim as u32)),
+        (format!("{a}.vocab_size"), Kv::U32(s.vocab as u32)),
+        (format!("{a}.vocab_size_unpadded"), Kv::U32(s.vocab_unpadded as u32)),
+        (format!("{a}.expert_feed_forward_length"), Kv::U32(s.ffn as u32)),
+        (format!("{a}.rope.dimension_count"), Kv::U32(0)),
+        (format!("{a}.attention.sliding_window"), Kv::U32(s.n_swa as u32)),
+        (format!("{a}.attention.sliding_window_pattern"), Kv::Bools(s.swa.clone())),
+        (format!("{a}.shortconv.l_cache"), Kv::U32(s.n_conv as u32)),
+        (format!("{a}.expert_weights_scale"), Kv::F32(8.0)),
+        (format!("{a}.activation.situ_beta"), Kv::F32(4.0)),
+        (format!("{a}.activation.situ_linear_beta"), Kv::F32(25.0)),
+        (format!("{a}.attn_res.block_size"), Kv::U32(s.block as u32)),
+        (format!("{a}.final_logit_softcapping"), Kv::F32(30.0)),
+        (format!("{a}.attention.relative_length"), Kv::U32(s.n_rel as u32)),
+        (format!("{a}.attention.relative_extent"), Kv::U32(s.extent as u32)),
+        (format!("{a}.attention.qk_clip"), Kv::F32((s.head_dim as f32).sqrt() * 4.0)),
+        (format!("{a}.attention.relative_clip"), Kv::F32(8.0)),
+        // a small floor, so the log scale of the full layers moves within the tests' prompts
+        (format!("{a}.attention.log_scale_floor"), Kv::U32(8)),
+        (format!("{a}.attention.log_scale_alpha"), Kv::F32(0.1)),
+        ("tokenizer.ggml.eos_token_id".into(), Kv::U32(1)),
+    ];
+    if let Some((start, end, passes)) = s.loop_ {
+        kv.push((format!("{a}.loop.start"), Kv::U32(start as u32)));
+        kv.push((format!("{a}.loop.end"), Kv::U32(end as u32)));
+        kv.push((format!("{a}.loop.count"), Kv::U32(passes as u32)));
+        kv.push((format!("{a}.loop.gate_rank"), Kv::U32(s.rank as u32)));
+    }
+    // (name, numpy shape, type, fill): fill > 0 a uniform of that scale, 0 a norm (1 + noise), < 0 a uniform of -fill
+    // around 1 (clip scales)
+    let (d, q, kvd) = (s.n_embd, s.n_head * s.head_dim, s.n_kv * s.head_dim);
+    let sc = |cols: usize| 1.0 / (cols as f32).sqrt();
+    let mut ts: Vec<(String, Vec<usize>, &str, f32)> = vec![
+        ("token_embd.weight".into(), vec![s.vocab, d], s.ty_vocab, 1.0),
+        ("token_embd_norm.weight".into(), vec![d], "F32", 0.0),
+        ("output.weight".into(), vec![s.vocab, d], s.ty_vocab, sc(d)),
+        ("output_norm.weight".into(), vec![d], "F32", 0.0),
+        ("output_res_query.weight".into(), vec![d], "F32", 0.3),
+    ];
+    for l in 0..nl {
+        let p = |n: &str| format!("blk.{l}.{n}");
+        let swa = s.swa[l];
+        for (n, rows) in [("attn_q", q), ("attn_k", kvd), ("attn_v", kvd), ("attn_gate", q), ("attn_sink_proj", s.n_head), ("attn_rel", s.n_rel * s.n_head)] {
+            ts.push((p(&format!("{n}.weight")), vec![rows, d], s.ty, sc(d)));
+        }
+        ts.push((p("attn_output.weight"), vec![d, q], s.ty, sc(q)));
+        ts.push((p("attn_q_clip.weight"), vec![s.n_head, s.head_dim], "F32", -0.3));
+        ts.push((p("attn_rel_clip.weight"), vec![s.n_head, s.n_rel], "F32", -0.3));
+        ts.push((p("attn_rel_bias.weight"), vec![if swa { s.n_swa } else { s.extent }, s.n_rel], "F32", 0.5));
+        for (n, ch) in [("attn_k_conv", kvd), ("attn_v_conv", kvd), ("attn_post_conv", d), ("ffn_post_conv", d)] {
+            ts.push((p(&format!("{n}.weight")), vec![ch, s.n_conv], "F32", 0.5));
+        }
+        if swa {
+            ts.push((p("attn_norm.weight"), vec![d], "F32", 0.0));
+        } else {
+            for n in ["attn_q_inp_norm", "attn_k_inp_norm", "attn_v_inp_norm"] {
+                ts.push((p(&format!("{n}.weight")), vec![d], "F32", 0.0));
+            }
+            for n in ["attn_k_conv_proj", "attn_v_conv_proj"] {
+                ts.push((p(&format!("{n}.weight")), vec![s.n_conv * s.n_kv, d], s.ty, sc(d)));
+            }
+        }
+        if l > 0 {
+            ts.push((p("attn_res_query.weight"), vec![if swa { 1 } else { 3 }, d], "F32", 0.3));
+        }
+        ts.push((p("ffn_res_query.weight"), vec![d], "F32", 0.3));
+        ts.push((p("ffn_norm.weight"), vec![d], "F32", 0.0));
+        ts.push((p("ffn_gate_inp.weight"), vec![s.n_expert, d], "F32", 3.0 * sc(d)));
+        ts.push((p("exp_probs_b.bias"), vec![s.n_expert], "F32", 0.05));
+        ts.push((p("ffn_gate_up_exps.weight"), vec![s.n_expert, 2 * s.ffn, d], s.ty_gate_up, sc(d)));
+        ts.push((p("ffn_down_exps.weight"), vec![s.n_expert, d, s.ffn], s.ty_down, sc(s.ffn)));
+        if s.loop_.is_some_and(|(a, b, _)| (a..b).contains(&l)) {
+            ts.push((p("loop_msg_query.weight"), vec![4, d], "F32", 0.3));
+            for c in ["q", "k", "v", "ffn"] {
+                ts.push((p(&format!("loop_{c}_ctrl_down.weight")), vec![s.rank, 2 * d], s.ty_ctrl, sc(2 * d)));
+                ts.push((p(&format!("loop_{c}_ctrl_gain.weight")), vec![d, s.rank], s.ty_ctrl, sc(s.rank)));
+                ts.push((p(&format!("loop_{c}_ctrl_forget.weight")), vec![d, s.rank], s.ty_ctrl, sc(s.rank)));
+            }
+        }
+    }
+    if s.dequantized {
+        ts.iter_mut().for_each(|t| if t.2 != "F32" { t.2 = Box::leak(format!("F32:{}", t.2).into_boxed_str()) });
+    }
+    let specs: Vec<TensorSpec> = ts.iter().map(|(n, shape, ty, _)| {
+        let count: usize = shape.iter().product();
+        let ty = if ty.starts_with("F32") { "F32" } else { ty };
+        let (be, bb) = strata_gguf::block_geometry(ty).unwrap();
+        TensorSpec { name: n.clone(), shape: shape.iter().map(|&v| v as u64).collect(), ggml_type: ggml_type(ty), nbytes: (count as u64 / be) * bb }
+    }).collect();
+    let kvr: Vec<(&str, Kv)> = kv.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+    let mut w = Writer::create_typed(path, &kvr, specs).unwrap();
+    for (_, shape, ty, fill) in &ts {
+        let n: usize = shape.iter().product();
+        let vals: Vec<f32> = (0..n).map(|_| {
+            let u = rng.unit();
+            if *fill == 0.0 { 1.0 + 0.1 * u } else if *fill < 0.0 { 1.0 + fill * u } else { u * fill * 1.7 }
+        }).collect();
+        if *ty == "F32" {
+            w.tensor_data(&vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        } else if let Some(q) = ty.strip_prefix("F32:") {
+            let mut out = Vec::new();
+            strata_pack::quantize::quantize(q, &vals, &mut out).unwrap();
+            let mut back = vec![0f32; n];
+            strata_pack::quants::dequantize_into(q, &out, &mut back).unwrap();
+            w.tensor_data(&back.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        } else {
+            let mut out = Vec::new();
+            strata_pack::quantize::quantize(ty, &vals, &mut out).unwrap();
+            w.tensor_data(&out).unwrap();
+        }
+        w.end_tensor().unwrap();
+    }
+    w.finish().unwrap();
+}
+
+/// An Inkling fixture as a file in the test process's temp dir.
+pub fn tmp_inkling(name: &str, s: &InkSpec) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("am2-testgguf-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("{name}.gguf"));
+    if !p.exists() {
+        write_inkling(s, &p);
+    }
+    p
+}
+
 /// The fixtures as files in a temp dir of their own (one per test process and name).
 pub fn tmp(name: &str, s: &Spec) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("am2-testgguf-{}", std::process::id()));
@@ -220,4 +411,30 @@ fn write_kernel_bench_models() {
         }
         eprintln!("{} {:.2} GB", p.display(), std::fs::metadata(&p).unwrap().len() as f64 / 1e9);
     }
+}
+
+/// The Inkling speed run's model (docs/INKLING-PLAN.md I8): the real Inkling 2 Mini's shapes and encodings (2304 wide,
+/// 24 heads of 128, 8 KV heads, 24 layers with the loop over 6..18 three times, blocks of 6, a 1024-token window and
+/// bias, 8 experts of 1152 per token, a 201,024-row vocabulary; Q8_0 attention, vocabulary and controllers, Q4_K
+/// gate/up and Q5_0 down) with 32 experts per layer instead of 128: a token reads what a real token reads, and the
+/// whole model fits a card beside another (about 4.9 GB).
+///   AM2_WRITE_FIXTURES=<dir> cargo test --release write_inkling_speed_model -- --ignored
+#[test]
+#[ignore]
+fn write_inkling_speed_model() {
+    let dir = std::path::PathBuf::from(std::env::var("AM2_WRITE_FIXTURES").expect("AM2_WRITE_FIXTURES=<dir>"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bench-inkling2-2304x32e.gguf");
+    if !p.exists() {
+        write_inkling(&inkling_speed_spec(), &p);
+    }
+    eprintln!("{} {:.2} GB", p.display(), std::fs::metadata(&p).unwrap().len() as f64 / 1e9);
+}
+
+pub fn inkling_speed_spec() -> InkSpec {
+    let swa: Vec<bool> = (0..24).map(|l| l % 6 != 5).collect();
+    InkSpec { n_embd: 2304, n_head: 24, n_kv: 8, head_dim: 128, n_layer: 24, vocab: 201024, vocab_unpadded: 200058, n_expert: 32, top_k: 8,
+              ffn: 1152, loop_: Some((6, 18, 3)), swa, n_swa: 1024, extent: 1024, n_rel: 16, n_conv: 4, rank: 64, block: 6, ty: "Q8_0",
+              ty_vocab: "Q8_0", ty_gate_up: "Q4_K", ty_down: "Q5_0", ty_ctrl: "Q8_0", seed: 0x1_4C20,
+              dequantized: false }
 }

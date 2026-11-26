@@ -861,13 +861,13 @@ pub const MM_M: u32 = 64;
 pub const MM_N: u32 = 64;
 pub const MM_K: u32 = 64;
 
-type V4 = Vector<u32, Const<4>>;
-type F4 = Vector<f32, Const<4>>;
+pub(crate) type V4 = Vector<u32, Const<4>>;
+pub(crate) type F4 = Vector<f32, Const<4>>;
 
 /// The sum of `v` over each warp of 32 units, valid in the warp's unit 0: a plane reduction where the device's planes
 /// are 32 wide (CUDA), else through shared memory (the whole cube must call it).
 #[cube]
-fn warp_sum(v: f32, #[comptime] plane: bool, #[comptime] cube: u32) -> f32 {
+pub(crate) fn warp_sum(v: f32, #[comptime] plane: bool, #[comptime] cube: u32) -> f32 {
     let mut out = v;
     if comptime![plane] {
         out = plane_sum(v);
@@ -914,6 +914,21 @@ fn dot_u4x4(w: u32, x: F4, #[comptime] hi: bool) -> f32 {
     u4f(w, comptime![s]) * x[0] + u4f(w, comptime![s + 8]) * x[1] + u4f(w, comptime![s + 16]) * x[2] + u4f(w, comptime![s + 24]) * x[3]
 }
 
+/// Value `j` (0..31) of a Q5_0 block from its nibble byte word `w` (byte `byte`, the high nibble when `hi`) and its
+/// fifth bits `qh`, as f32 (minus 16).
+#[cube]
+fn q5f(w: u32, qh: u32, #[comptime] byte: u32, #[comptime] hi: bool, #[comptime] j: u32) -> f32 {
+    let sh = if comptime![hi] { comptime![byte * 8 + 4] } else { comptime![byte * 8] };
+    f32::cast_from(((w >> sh) & 15) | (((qh >> j) & 1) << 4)) - 16.0
+}
+
+/// The 4 values of Q5_0 nibble word `w` (values j0.. of the block) against x.
+#[cube]
+fn dot_q5x4(w: u32, qh: u32, x: F4, #[comptime] j0: u32, #[comptime] hi: bool) -> f32 {
+    q5f(w, qh, 0u32, hi, j0) * x[0] + q5f(w, qh, 1u32, hi, comptime![j0 + 1]) * x[1] + q5f(w, qh, 2u32, hi, comptime![j0 + 2]) * x[2]
+        + q5f(w, qh, 3u32, hi, comptime![j0 + 3]) * x[3]
+}
+
 /// The f16 scale of block `b` of a repacked Q8_0 matrix (two per word).
 #[cube]
 fn q8_scale(wd: &Array<u32>, b: u32) -> f32 {
@@ -925,7 +940,7 @@ fn q8_scale(wd: &Array<u32>, b: u32) -> f32 {
 /// blocks: 9 loads of 16 bytes; `wd` unused): 8 units per block, each one 16-byte load of nibbles (16 values of two
 /// groups), 4 blocks at a time.
 #[cube]
-fn row_part(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, row: u32, cols: u32, t: u32, lane: u32, #[comptime] k: u32) -> f32 {
+pub(crate) fn row_part(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, row: u32, cols: u32, t: u32, lane: u32, #[comptime] k: u32) -> f32 {
     let mut acc = f32::new(0.0);
     if comptime![k == kind::Q8_0] {
         let nc = cols / 16;
@@ -939,6 +954,25 @@ fn row_part(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, row: u32, cols: u32, 
             let xo = xb + c * 4;
             let s = dot_i8x4(q[0], x[xo as usize]) + dot_i8x4(q[1], x[(xo + 1) as usize])
                 + dot_i8x4(q[2], x[(xo + 2) as usize]) + dot_i8x4(q[3], x[(xo + 3) as usize]);
+            acc += d * s;
+            c += 32;
+        }
+    } else if comptime![k == kind::Q5_0] {
+        // repacked (Gpu::upload): `w` each block's 16 nibble bytes (byte i: value i low, value i + 16 high), `wd` per
+        // block its fifth bits, then its f16 scale: a unit per block, 32 blocks at a time
+        let nb = cols / 32;
+        let xb = t * (cols / 4);
+        let mut c = lane;
+        while c < nb {
+            let blk = row * nb + c;
+            let q = w[blk as usize];
+            let qh = wd[(blk * 2) as usize];
+            let d = half_bits(wd[(blk * 2 + 1) as usize] & 0xffff);
+            let xo = xb + c * 8;
+            let s = dot_q5x4(q[0], qh, x[xo as usize], 0u32, false) + dot_q5x4(q[1], qh, x[(xo + 1) as usize], 4u32, false)
+                + dot_q5x4(q[2], qh, x[(xo + 2) as usize], 8u32, false) + dot_q5x4(q[3], qh, x[(xo + 3) as usize], 12u32, false)
+                + dot_q5x4(q[0], qh, x[(xo + 4) as usize], 16u32, true) + dot_q5x4(q[1], qh, x[(xo + 5) as usize], 20u32, true)
+                + dot_q5x4(q[2], qh, x[(xo + 6) as usize], 24u32, true) + dot_q5x4(q[3], qh, x[(xo + 7) as usize], 28u32, true);
             acc += d * s;
             c += 32;
         }
