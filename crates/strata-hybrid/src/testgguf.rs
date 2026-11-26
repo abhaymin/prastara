@@ -192,6 +192,8 @@ pub struct InkSpec {
     pub ty_down: &'static str,
     pub ty_ctrl: &'static str,
     pub seed: u64,
+    /// the matrices quantized and written back as F32 (Spec's `dequantized`): the reference for the device's kernels
+    pub dequantized: bool,
 }
 
 impl InkSpec {
@@ -200,7 +202,8 @@ impl InkSpec {
     pub fn tiny() -> InkSpec {
         InkSpec { n_embd: 128, n_head: 4, n_kv: 2, head_dim: 32, n_layer: 6, vocab: 256, vocab_unpadded: 250, n_expert: 8, top_k: 2, ffn: 64,
                   loop_: Some((2, 4, 3)), swa: vec![true, true, true, false, true, false], n_swa: 16, extent: 24, n_rel: 16, n_conv: 4,
-                  rank: 32, block: 2, ty: "F32", ty_vocab: "F32", ty_gate_up: "F32", ty_down: "F32", ty_ctrl: "F32", seed: 0x1_4C1D }
+                  rank: 32, block: 2, ty: "F32", ty_vocab: "F32", ty_gate_up: "F32", ty_down: "F32", ty_ctrl: "F32", seed: 0x1_4C1D,
+                  dequantized: false }
     }
 }
 
@@ -302,8 +305,12 @@ pub fn write_inkling(s: &InkSpec, path: &Path) {
             }
         }
     }
+    if s.dequantized {
+        ts.iter_mut().for_each(|t| if t.2 != "F32" { t.2 = Box::leak(format!("F32:{}", t.2).into_boxed_str()) });
+    }
     let specs: Vec<TensorSpec> = ts.iter().map(|(n, shape, ty, _)| {
         let count: usize = shape.iter().product();
+        let ty = if ty.starts_with("F32") { "F32" } else { ty };
         let (be, bb) = strata_gguf::block_geometry(ty).unwrap();
         TensorSpec { name: n.clone(), shape: shape.iter().map(|&v| v as u64).collect(), ggml_type: ggml_type(ty), nbytes: (count as u64 / be) * bb }
     }).collect();
@@ -317,6 +324,12 @@ pub fn write_inkling(s: &InkSpec, path: &Path) {
         }).collect();
         if *ty == "F32" {
             w.tensor_data(&vals.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
+        } else if let Some(q) = ty.strip_prefix("F32:") {
+            let mut out = Vec::new();
+            strata_pack::quantize::quantize(q, &vals, &mut out).unwrap();
+            let mut back = vec![0f32; n];
+            strata_pack::quants::dequantize_into(q, &out, &mut back).unwrap();
+            w.tensor_data(&back.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
         } else {
             let mut out = Vec::new();
             strata_pack::quantize::quantize(ty, &vals, &mut out).unwrap();
@@ -416,5 +429,6 @@ pub fn inkling_speed_spec() -> InkSpec {
     let swa: Vec<bool> = (0..24).map(|l| l % 6 != 5).collect();
     InkSpec { n_embd: 2304, n_head: 24, n_kv: 8, head_dim: 128, n_layer: 24, vocab: 201024, vocab_unpadded: 200058, n_expert: 32, top_k: 8,
               ffn: 1152, loop_: Some((6, 18, 3)), swa, n_swa: 1024, extent: 1024, n_rel: 16, n_conv: 4, rank: 64, block: 6, ty: "Q8_0",
-              ty_vocab: "Q8_0", ty_gate_up: "Q4_K", ty_down: "Q5_0", ty_ctrl: "Q8_0", seed: 0x1_4C20 }
+              ty_vocab: "Q8_0", ty_gate_up: "Q4_K", ty_down: "Q5_0", ty_ctrl: "Q8_0", seed: 0x1_4C20,
+              dequantized: false }
 }

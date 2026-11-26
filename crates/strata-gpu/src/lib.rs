@@ -150,9 +150,14 @@ impl Weights {
         unsafe { ArrayArg::from_raw_parts(self.scales.as_ref().unwrap_or(&self.handle).cube(), 1) }
     }
 
-    /// The words of `handle`: a repacked Q8_0 matrix's values, or the whole matrix.
+    /// The words of `handle`: a repacked Q8_0 matrix's values (a byte each), a repacked Q5_0 one's (a nibble each), or
+    /// the whole matrix.
     fn value_words(&self) -> usize {
-        if self.scales.is_some() { self.rows as usize * self.cols as usize / 4 } else { self.bytes.div_ceil(4) }
+        match (&self.scales, self.geometry.2) {
+            (Some(_), kernels::kind::Q5_0) => self.rows as usize * self.cols as usize / 8,
+            (Some(_), _) => self.rows as usize * self.cols as usize / 4,
+            _ => self.bytes.div_ceil(4),
+        }
     }
 }
 
@@ -216,7 +221,7 @@ macro_rules! fast {
         let w: &Weights = $w;
         let k = w.geometry.2;
         stats::launch(1);
-        let tiled = $tokens >= MM_TOKENS.load(std::sync::atomic::Ordering::Relaxed) && w.cols % kernels::MM_K == 0;
+        let tiled = $tokens >= MM_TOKENS.load(std::sync::atomic::Ordering::Relaxed) && w.cols % kernels::MM_K == 0 && k != kernels::kind::Q5_0;
         let words = w.value_words();
         unsafe {
             let y = ArrayArg::from_raw_parts($hy, $ylen);
@@ -405,6 +410,21 @@ impl Gpu {
                 qs.extend_from_slice(&b[2..]);
             }
             ds.resize(ds.len().div_ceil(4) * 4, 0);
+            let (hq, hd) = with_client!(self, c, R, (c.create_from_slice(&qs), c.create_from_slice(&ds)));
+            return Ok(Weights { handle: Mem::Cube(hq), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry,
+                                bytes: data.len(), wide_fits: false, scales: Some(Mem::Cube(hd)), plane });
+        }
+        if geometry.2 == kernels::kind::Q5_0 {
+            // the nibbles first (16 bytes a block, one 16-byte load), then per block its fifth bits and its f16 scale
+            // (two words): the fast kernels' layout (kernels.rs row_part), 24 bytes per 32 values instead of 22
+            let blocks = data.len() / 22;
+            let mut qs = Vec::with_capacity(blocks * 16);
+            let mut ds = Vec::with_capacity(blocks * 8);
+            for b in data.chunks_exact(22) {
+                ds.extend_from_slice(&b[2..6]);
+                ds.extend_from_slice(&[b[0], b[1], 0, 0]);
+                qs.extend_from_slice(&b[6..]);
+            }
             let (hq, hd) = with_client!(self, c, R, (c.create_from_slice(&qs), c.create_from_slice(&ds)));
             return Ok(Weights { handle: Mem::Cube(hq), rows: rows as u32, cols: cols as u32, row_bytes: row_bytes as u32, geometry,
                                 bytes: data.len(), wide_fits: false, scales: Some(Mem::Cube(hd)), plane });

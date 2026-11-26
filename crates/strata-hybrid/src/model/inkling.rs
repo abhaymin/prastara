@@ -171,6 +171,33 @@ fn dump(name: &str, slot: usize, v: &[f32]) {
     }
 }
 
+/// Whether K, V and the attention mask are rounded to f16 as llama.cpp keeps them (the default); AM2_INK_F32_CACHE=1
+/// keeps them f32, on the CPU path and the device graph alike: the graph's parity tests use it to separate the
+/// arithmetic from the f16 roundings, which turn the paths' last-bit differences into a few 1e-3 now and then.
+pub(crate) fn f16_cache() -> bool {
+    match F16_CACHE.load(Ordering::Relaxed) {
+        0 => {
+            let on = !std::env::var("AM2_INK_F32_CACHE").is_ok_and(|v| v == "1");
+            F16_CACHE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+        v => v == 1,
+    }
+}
+
+/// 0: not read yet, 1: f16, 2: f32.
+static F16_CACHE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// Tests: the f16 roundings on or off (hold CACHE_MODE meanwhile).
+#[cfg(test)]
+pub(crate) fn set_f16_cache(on: bool) {
+    F16_CACHE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+}
+
+/// Tests that run either path hold this, so that one switching the roundings does not change another's run.
+#[cfg(test)]
+pub(crate) static CACHE_MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A matrix's values as f32 (the device graph uploads the small ones this way).
 pub(crate) fn f32s(q: &QMat) -> Vec<f32> {
     q.all_f32()
@@ -372,8 +399,10 @@ impl Inkling {
         dump("Rcur", slot, &r);
         let sinks = ly.sink.mul(in_q);
         // the cache holds f16 values (llama.cpp's default cache type)
-        f16_round(&mut kc);
-        f16_round(&mut vc);
+        if f16_cache() {
+            f16_round(&mut kc);
+            f16_round(&mut vc);
+        }
         st.k.extend_from_slice(&kc);
         st.v.extend_from_slice(&vc);
         let n = st.k.len() / kgqa;
@@ -393,7 +422,9 @@ impl Inkling {
                 let dist = pos - t;
                 // the bias less the sink is the attention mask, which llama.cpp keeps in f16
                 let mut bias = [if dist < extent { table[dist] } else { 0.0 } - sinks[h]];
-                f16_round(&mut bias);
+                if f16_cache() {
+                    f16_round(&mut bias);
+                }
                 dot(qh, &kcache[(t * n_kv + kh) * hd..(t * n_kv + kh + 1) * hd]) * scale + bias[0]
             }).collect();
             // a softmax with one more logit of zero: the sink, which takes its share and gives nothing
@@ -527,6 +558,7 @@ mod tests {
 
     #[test]
     fn the_cpu_path_runs_a_synthetic_inkling_consistently() {
+        let _mode = super::CACHE_MODE.lock().unwrap_or_else(|e| e.into_inner());
         let p = tmp_inkling("tiny-inkling-cpu", &InkSpec::tiny());
         let (m, _) = Model::load(&p, None).unwrap();
         let ink = m.ink.as_ref().unwrap();

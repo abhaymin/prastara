@@ -66,7 +66,7 @@ Order of work, each with its gate:
 | I6b | The loop: 3 passes over the core, one KV cache and one convolution state per slot, the controllers' messages | the dumps for every slot, then teacher-forced logits on the tiny model |
 | I6c | The real file, memory capped | teacher-forced parity with the oracle |
 | I6v | **Done 2026-11-25 (below).** The image encoder in Rust: the ViT with a CLS token, learned positions resized bilinearly, 2D RoPE, patch merge, the two-layer projector; `GENI` in `strata-hybrid` (embedding rows skip the token norm) | the rows against mtmd's rows for the golden image; the golden image question |
-| I8 | The GPU path: Q5_0 kernels, the new blocks on the device, two cards | the same tokens, and no slower than the bridge's 24 tok/s |
+| I8 | The GPU path: Q5_0 kernels, the new blocks on the device, two cards. **Built and gated on synthetic models 2026-11-26 (below): 34.5 tok/s decode on the real shape, one card; the real file not run yet** | the same tokens, and no slower than the bridge's 24 tok/s |
 | I7 | Packing for the native engine | as above |
 | I9 | Remove the bridge: the crate, the routing, the config entries, the docs | the server suites pass with no `strata-llama` in the workspace; the model loads from a fresh install |
 
@@ -302,6 +302,77 @@ Open before I6 is called passed:
 
 I8 is a device graph: the whole token on the devices (the core's passes on one card, the prelude, the last layers and
 the output on the other is the first split to measure), instead of about a thousand round trips per token.
+
+## I8: the device graph (2026-11-26, branch `engine/inkling-graph`)
+
+`crates/strata-hybrid/src/graph_inkling.rs` with its kernels in `crates/strata-gpu/src/ink.rs`: `inkling2` and
+`inkling2_loop` as one queue of kernels on the device that holds the attention and dense matrices, instead of a round
+trip per product. main.rs takes it through `AnyGraph` (`graph=auto` with `--devices`, as for the other models; GENI's
+picture rows run on it too). graph.rs and model.rs are untouched but for the dispatch (`pub(crate)` on two modules).
+
+- **On the device:** depth mixing (up to four queries per launch), the loop's messages and controllers, the short
+  convolutions with each slot's state on the device (zeroed at position 0), clipping and the log scale, attention with
+  the relative bias and the sink (flash decoding: splits of 64 positions, 256 in a chunk, then a merge) over each slot's
+  cache (a ring of the window + one chunk for a windowed slot, the context for a full one), the gate, the F32 router
+  and the sigmoid top-k with its bias, SiTU fused into the gate/up product (eight experts of a token in two launches),
+  the soft cap. K, V and the mask are rounded to f16 as the CPU path keeps them.
+- **Experts** where placement put them (gpu.rs; the expert profile's order; a Kosha pack's records): on the graph's
+  device; on another device with only the activations crossing (one read per layer and device: written, not run on
+  two cards yet); on the CPU with only the activations crossing. **One wait per layer evaluation** (the router's
+  choice, and the layer's input in the same read when experts are off the device) and one for the logits: 49 a token
+  on the real shape, not one; a chunk of up to 128 tokens waits as often as one token.
+- **Q5_0 on the fast kernels** (strata-gpu): repacked at upload (nibbles, then fifth bits and scale per block: 24
+  bytes per 32 values instead of 22) and read by the fast decode kernels; the tiled chunk kernel does not take it yet
+  (a chunk runs the decode kernel per token). `every_kernel_matches_the_cpu` passes on cuda:1 for it.
+
+**Gates (cuda:1, synthetic fixtures; testgguf `InkSpec`):** the CPU path is the oracle
+(`the_cpu_path_runs_a_synthetic_inkling_consistently`: 6 layers, the loop over 2-3 three times, a 16-token window and a
+24-position bias table crossed by a 40-token prompt; chunk = token by token, rollback, the loop moves the logits).
+`inkling_on_the_graph_equals_the_cpu`: token by token, a chunk, a chunk then tokens and a chunk's last, with all, half
+and none of the experts on the device, `inkling2_loop` and `inkling2`, the same best token at every step:
+
+| | f32 K/V/mask on both (`AM2_INK_F32_CACHE=1`) | f16 (the default) |
+|---|---|---|
+| `inkling2_loop` | 2.4e-5 | 3.2e-3 (limit 5e-3) |
+| `inkling2` | 5.4e-6 | 5.3e-4 |
+
+With f16 a last-bit difference sometimes rounds a K, V or mask value the other way (2^-11 of it) and the loop's passes
+carry it on; with f32 on both the gap is the sums' order, so the f32 run is the strict gate (graph.rs's 3e-3).
+Also: Q8_0 attention/vocabulary/controllers, Q8_0 gate/up and Q5_0 down against the CPU on the dequantized copy 1.8e-5;
+picture rows between tokens 1.0e-5; a Kosha pack built with a profile (am2pack) places exactly the profile's hottest
+half of the experts on the device and the graph matches the CPU on the pack; 11 waits a token and a chunk (10 slots).
+
+**Speed (`inkling_speed`, ignored):** a synthetic model with the real shapes and encodings (2304 wide, 24 x 128 heads,
+8 KV heads, 24 layers, loop 6..18 x3, 1024 window and bias, 8 of 32 experts of 1152, 201,024 vocabulary; Q8_0, Q4_K
+gate/up, Q5_0 down: 5.4 GB, 4.5 GiB on cuda:1): a token reads what a real token reads. Prompt 512, then decode at
+~576 positions:
+
+| | prompt tok/s | decode tok/s | waits / launches per decode token |
+|---|---|---|---|
+| matrix by matrix (`--no-graph`), before the Q5_0 kernel | 5.9 (token by token) | 4.6 | 1,073 / 1,073 |
+| matrix by matrix, with it | 8.9 | 8.9 | 1,073 / 1,073 |
+| graph, every expert on the device | 165 | 34.5 | 49 / 1,789 |
+| graph, half the experts on the CPU | 23 | 4.8 | 49 / 1,933 |
+
+Where a decode token's 29 ms go (nsys): the GPU is busy ~18.5 ms (experts 6.5: Q4_K gate/up at ~350 GB/s, Q5_0 down at
+~240 GB/s, its 1,152 columns are 36 blocks for 32 lanes; dense products 7.7; attention 1.5; mixing 1.3); the rest is
+gaps at the 49 waits and CubeCL's ~6.7 us of host time per launch. The CPU's experts are the CPU path's own kernels
+(about 1 ms per expert product), not the graph.
+
+**Estimate, the real file on two 16 GB cards** (`--devices cuda:0=11,cuda:1=11`, 32K context): the caches 2.4 GiB on
+cuda:0 (f32), the dense matrices 1.2 GiB, the 3,072 experts (14.6 GiB with the Q5_0 repack) split about evenly, none
+on the CPU. One card's token measures 29 ms; the second card's experts add a read there per layer evaluation (about
+0.15-0.2 ms each, 48 a token): **about 25-27 tokens/s decode** (the bridge: 24) and well over 100 tokens/s prompt.
+
+**Open:**
+- the real file on the GPUs (not run here: the live server holds them): teacher-forced parity with the CPU path and
+  the oracle, tokens/s, then drop `--no-graph` from `configs/strata-inkling-2-mini-uncensored-ad-q4_k.json`;
+- experts on a second device are written but not run on two cards;
+- one wait per token: the experts would have to read the router's choice on the device (a layer's experts in one
+  buffer, an indexed product);
+- K and V are f32 on the device (2 GiB at 32K): f16 halves it; the Q5_0 tiled chunk kernel; Q5_0/Q4_K lane use at
+  this width; fewer launches (the controllers' four down products, the clips, the norms);
+- native Metal refuses (CubeCL's wgpu backend has the kernels).
 
 ## I6v: pictures on the Rust engine (2026-11-25)
 

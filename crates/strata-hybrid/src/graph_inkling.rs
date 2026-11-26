@@ -77,7 +77,8 @@ struct GLayer<'a> {
     res_query: Option<Buf>,
     ffn_query: Buf,
     ffn_norm: Buf,
-    router: Mat<'a>,
+    /// the router, kept in F32 (as the file keeps it): rows x cols
+    router: Buf,
     probs_b: Option<Buf>,
     experts: Vec<Where<'a>>,
     /// a looped layer's message queries and controllers (Q, K, V, FFN)
@@ -169,7 +170,7 @@ pub fn ink_kv_need(m: &Model, max_ctx: usize) -> u64 {
         2 * kvd * ring(ink, l, max_ctx) as u64 * 4 + (2 * kvd + 2 * m.n_embd as u64) * past as u64 * 4
     }).sum::<u64>()
         // the small matrices uploaded here (sink, router, controllers, tables), roughly
-        + ink.layers.iter().map(|l| (l.router.data.len() + l.sink.data.len() + l.rel_bias.data.len()) as u64 * 2).sum::<u64>()
+        + ink.layers.iter().map(|l| (l.router.rows * l.router.cols * 4 + l.sink.data.len() + l.rel_bias.rows * l.rel_bias.cols * 4) as u64).sum::<u64>()
         + ink.loops.iter().flat_map(|lp| lp.ctrl.iter()).map(|c| (c.down.data.len() + c.gain.data.len() + c.forget.data.len()) as u64 * 2).sum::<u64>()
 }
 
@@ -219,7 +220,7 @@ impl<'a> InkGraph<'a> {
                 k_conv: g.buffer(&ly.k_conv), v_conv: g.buffer(&ly.v_conv), post_conv: g.buffer(&ly.post_conv), ffn_conv: g.buffer(&ly.ffn_conv),
                 norms: ly.norms.iter().map(|n| g.buffer(n)).collect(),
                 res_query: ly.res_query.as_ref().map(|q| g.buffer(q)), ffn_query: g.buffer(&ly.ffn_query), ffn_norm: g.buffer(&ly.ffn_norm),
-                router: small(g, &ly.router, dev)?,
+                router: g.buffer(&f32s(&ly.router)),
                 probs_b: ly.probs_b.as_ref().map(|b| g.buffer(b)),
                 experts,
                 msg_query: lp.map(|lp| g.buffer(&lp.msg_query)),
@@ -330,7 +331,7 @@ impl<'a> InkGraph<'a> {
                     Some((b, n_bank, out)) => {
                         let slot = n_phys + (pass - 1) * (end - start) + (ip - start);
                         let mq = self.layers[ip].msg_query.as_ref().expect("a looped layer's message queries");
-                        let msgs: Vec<Buf> = (0..4).map(|j| g.ink_mix(b, 0, nt * d, *n_bank, out, mq, j, d, nt)).collect();
+                        let msgs = g.ink_mix_n(b, 0, nt * d, *n_bank, out, mq, 0, 4, d, nt);
                         cur = self.layer(m, &cx, slot, ip, cur, &mut nb, Some(&msgs));
                     }
                 }
@@ -339,7 +340,7 @@ impl<'a> InkGraph<'a> {
         for il in end..n_phys {
             cur = self.layer(m, &cx, il, il, cur, &mut nb, None);
         }
-        let xo = g.ink_mix(&blk, 0, nt * d, nb, &cur, &self.out_query, 0, d, nt);
+        let xo = g.ink_mix_n(&blk, 0, nt * d, nb, &cur, &self.out_query, 0, 1, d, nt).pop().expect("a mix");
         st.pos = base + nt;
         let h = g.rms_norm(&xo, &self.out_norm, m.eps);
         let (h, n_out) = if all || nt == 1 { (h, nt) } else { (g.row(&h, (nt - 1) * d, d), 1) };
@@ -355,7 +356,8 @@ impl<'a> InkGraph<'a> {
     fn control(&self, cur: &Buf, msg: &Buf, c: &GCtrl, d: usize, nt: usize) -> Buf {
         let g = self.g;
         let h = g.mv_tokens(&c.down, &g.ink_cat_norm(cur, msg, d), nt as u32);
-        g.ink_ctrl_out(cur, msg, &g.mv_tokens(&c.gain, &h, nt as u32), &g.mv_tokens(&c.forget, &h, nt as u32))
+        let (gain, forget) = g.ink_mv2(&c.gain, &c.forget, &h, nt);
+        g.ink_ctrl_out(cur, msg, &gain, &forget)
     }
 
     /// One layer at cache slot `slot` (physical layer `il`), as inkling.rs `layer`, for the run's tokens.
@@ -372,8 +374,8 @@ impl<'a> InkGraph<'a> {
         let n = nt as u32;
 
         let mut inputs: Vec<Buf> = match &gl.res_query {
-            Some(q) if ly.swa => vec![g.ink_mix(cx.blk, 0, nt * d, *nb, &inp_sa, q, 0, d, nt); 3],
-            Some(q) => (0..3).map(|j| g.ink_mix(cx.blk, 0, nt * d, *nb, &inp_sa, q, j, d, nt)).collect(),
+            Some(q) if ly.swa => vec![g.ink_mix_n(cx.blk, 0, nt * d, *nb, &inp_sa, q, 0, 1, d, nt).pop().expect("a mix"); 3],
+            Some(q) => g.ink_mix_n(cx.blk, 0, nt * d, *nb, &inp_sa, q, 0, 3, d, nt),
             None => vec![inp_sa.clone(); 3],
         };
         if let Some(ms) = msgs {
@@ -388,23 +390,30 @@ impl<'a> InkGraph<'a> {
         };
         let (in_q, in_k, in_v) = (&normed[0], &normed[1], &normed[2]);
 
-        let q = g.mv_tokens(gl.wq, in_q, n);
+        // q, k and v in one launch when they read the same input; the gate, the relative features and the sinks too
+        let (q, k, v) = if ly.swa && msgs.is_none() {
+            let v = g.scratch(nt * kvd);
+            let (q, k) = g.qkv(gl.wq, gl.wk, gl.wv, in_q, n, &v, 0);
+            (q, k, v)
+        } else {
+            (g.mv_tokens(gl.wq, in_q, n), g.mv_tokens(gl.wk, in_k, n), g.mv_tokens(gl.wv, in_v, n))
+        };
+        let sinks = g.scratch(nt * nh);
+        let (gt, r) = g.qkv(gl.gate, gl.rel, &gl.sink, in_q, n, &sinks, 0);
         let kd = gl.k_proj.map(|p| g.mv_tokens(p, in_k, n));
         let vd = gl.v_proj.map(|p| g.mv_tokens(p, in_v, n));
-        let kc = g.ink_conv(&g.mv_tokens(gl.wk, in_k, n), &gl.k_conv, kd.as_ref(), &sl.hist, 0, kvd, nc, nt);
-        let vc = g.ink_conv(&g.mv_tokens(gl.wv, in_v, n), &gl.v_conv, vd.as_ref(), &sl.hist, kvd * past, kvd, nc, nt);
-        let r = g.mv_tokens(gl.rel, in_q, n);
+        let kc = g.ink_conv(&k, &gl.k_conv, kd.as_ref(), &sl.hist, 0, kvd, nc, nt);
+        let vc = g.ink_conv(&v, &gl.v_conv, vd.as_ref(), &sl.hist, kvd * past, kvd, nc, nt);
         let tau = (!ly.swa).then_some(cx.taus);
         g.ink_clip(&q, Some(&gl.q_clip), tau, hd, nh, ink.qk_clip, false);
-        g.ink_clip(&kc, None, None, hd, nkv, ink.qk_clip, true);
-        g.ink_rmsn_rows(&vc, hd, m.eps, true);
+        let f16 = crate::model::inkling::f16_cache();
+        g.ink_clip(&kc, None, None, hd, nkv, ink.qk_clip, f16);
+        g.ink_rmsn_rows(&vc, hd, m.eps, f16);
         g.ink_clip(&r, Some(&gl.rel_clip), tau, ink.n_rel, nh, ink.rel_clip, false);
-        let sinks = g.mv_tokens(&gl.sink, in_q, n);
-        g.ink_kv_put(&kc, &sl.kc, base, kvd, sl.wring);
-        g.ink_kv_put(&vc, &sl.vc, base, kvd, sl.wring);
+        g.ink_kv_put2(&kc, &vc, &sl.kc, &sl.vc, base, kvd, sl.wring);
         let (extent, win) = if ly.swa { (ink.n_swa, ink.n_swa) } else { (ink.extent, 0) };
-        let att = g.ink_attend(&q, &sl.kc, &sl.vc, &r, &gl.rel_bias, &sinks, base, nt, nh, nkv, hd, ink.n_rel, extent, win, sl.wring);
-        g.ink_sig_mul(&att, &g.mv_tokens(gl.gate, in_q, n));
+        let att = g.ink_attend(&q, &sl.kc, &sl.vc, &r, &gl.rel_bias, &sinks, base, nt, nh, nkv, hd, ink.n_rel, extent, win, sl.wring, f16);
+        g.ink_sig_mul(&att, &gt);
         let cur = g.ink_conv(&g.mv_tokens(gl.wo, &att, n), &gl.post_conv, None, &sl.hist, 2 * kvd * past, d, nc, nt);
 
         // the first layer of a block starts a new residual stream; the one before it joins the mixed blocks
@@ -415,7 +424,7 @@ impl<'a> InkGraph<'a> {
             g.add_into(&inp_sa, &cur);
         }
         let ffn_inp = cur;
-        let mut x = g.ink_mix(cx.blk, 0, nt * d, *nb, &ffn_inp, &gl.ffn_query, 0, d, nt);
+        let mut x = g.ink_mix_n(cx.blk, 0, nt * d, *nb, &ffn_inp, &gl.ffn_query, 0, 1, d, nt).pop().expect("a mix");
         if let Some(ms) = msgs {
             x = self.control(&x, &ms[3], &gl.ctrl[3], d, nt);
         }
@@ -432,7 +441,7 @@ impl<'a> InkGraph<'a> {
         let (g, ink) = (self.g, self.ink);
         let ly = gl.l;
         let (k, d, n_e) = (ly.top_k, m.n_embd, gl.experts.len());
-        let logits = g.mv_tokens(&gl.router, x, nt as u32);
+        let logits = g.ink_mv_f32(&gl.router, x, n_e, d);
         let ws = if ink.w_scale != 0.0 { ink.w_scale } else { 1.0 };
         let routes = g.ink_route(&logits, gl.probs_b.as_ref(), n_e, k, ws);
         // the one wait of the layer: the choice, and the input when some experts are off the device
@@ -457,16 +466,28 @@ impl<'a> InkGraph<'a> {
         }
         let slots = g.scratch(nt * k * d);
         let idx = |us: &[usize], f: &dyn Fn(usize) -> usize| us.iter().map(|&ts| f(ts) as f32).collect::<Vec<f32>>();
-        // the device's experts, queued
-        for (e, us) in users.iter().enumerate().filter(|(_, us)| !us.is_empty()) {
+        // the device's experts, queued: one token's in two launches when the kernels take them
+        let mut batched = false;
+        if nt == 1 {
+            let here: Vec<(usize, &Weights, &Weights)> = users.iter().enumerate().filter(|(_, us)| !us.is_empty())
+                .filter_map(|(e, _)| match gl.experts[e] { Where::Here(gu, dn) => Some((e, gu, dn)), _ => None }).collect();
+            let (gus, dns): (Vec<&Weights>, Vec<&Weights>) = here.iter().map(|h| (h.1, h.2)).unzip();
+            if !here.is_empty() && g.ink_experts8_take(&gus, &dns) {
+                let offs: Vec<usize> = here.iter().map(|h| users[h.0][0] * d).collect();
+                g.ink_experts8(&gus, &dns, x, &slots, &offs, ink.situ_beta, ink.situ_lb);
+                batched = true;
+            }
+        }
+        for (e, us) in users.iter().enumerate().filter(|(_, us)| !us.is_empty() && !batched) {
             if let Where::Here(gu, dn) = gl.experts[e] {
                 let n = us.len();
                 let xin = if nt == 1 { x.clone() } else { g.gather_rows(x, &g.buffer(&idx(us, &|ts| ts / k)), d) };
-                let o = g.mv_tokens(dn, &g.ink_situ(&g.mv_tokens(gu, &xin, n as u32), ly.gate_up.0[e].rows / 2, ink.situ_beta, ink.situ_lb), n as u32);
+                let mid = g.ink_gate_up_situ(gu, &xin, n, ink.situ_beta, ink.situ_lb);
                 if n == 1 {
-                    g.copy(&o, &slots, 0, us[0] * d, d);
+                    // straight into its (token, slot) row
+                    g.mv_into(dn, &mid, &slots, us[0] * d, 1);
                 } else {
-                    g.scatter_rows(&o, &g.buffer(&idx(us, &|ts| ts)), &slots, d);
+                    g.scatter_rows(&g.mv_tokens(dn, &mid, n as u32), &g.buffer(&idx(us, &|ts| ts)), &slots, d);
                 }
             }
         }
@@ -485,7 +506,7 @@ impl<'a> InkGraph<'a> {
                     };
                     let xin = o2.buffer(&us.iter().flat_map(|&ts| xv[ts / k * d..(ts / k + 1) * d].iter().copied()).collect::<Vec<f32>>());
                     let n = us.len() as u32;
-                    let o = o2.mv_tokens(dn, &o2.ink_situ(&o2.mv_tokens(gu, &xin, n), ly.gate_up.0[e].rows / 2, ink.situ_beta, ink.situ_lb), n);
+                    let o = o2.mv_tokens(dn, &o2.ink_gate_up_situ(gu, &xin, n as usize, ink.situ_beta, ink.situ_lb), n);
                     o2.scatter_rows(&o, &o2.buffer(&idx(us, &|ts| ts)), &others[at].1, d);
                     others[at].2.extend_from_slice(us);
                 }
@@ -511,9 +532,7 @@ impl<'a> InkGraph<'a> {
                 g.scatter_rows(&g.buffer(&rows), &g.buffer(&idx(&us, &|ts| ts)), &slots, d);
             }
         }
-        let acc = g.ink_zeros(nt * d);
-        g.moe_combine(&slots, &routes, &acc, k as u32);
-        acc
+        g.ink_combine(&slots, &routes, k, d)
     }
 
     /// The graph's device.
@@ -593,8 +612,13 @@ mod tests {
     use crate::testgguf::{tmp_inkling, InkSpec};
     use std::path::Path;
 
-    /// graph.rs's: the CPU keeps K and V in f16, as this graph does, so the gap here is the sums' order.
+    /// graph.rs's tolerance: with K, V and the mask kept f32 on both paths (AM2_INK_F32_CACHE), the gap is the sums'
+    /// order alone (about 2e-5 on these fixtures).
     const TOL: f32 = 3e-3;
+    /// With the f16 roundings (the default, llama.cpp's), a last-bit difference sometimes rounds a K, V or mask value
+    /// the other way (2^-11 of it), and the loop's three passes over the core carry that on: up to about 3.2e-3 on the
+    /// looped fixture (5e-4 without the loop), the best token the same at every step.
+    const TOL_F16: f32 = 5e-3;
 
     fn device() -> Option<String> {
         let d = std::env::var("AM2_TEST_DEVICE").unwrap_or_else(|_| "cuda:1".into());
@@ -639,6 +663,7 @@ mod tests {
 
     /// The CPU's logits token by token against the graph's four ways. -> (the worst difference, experts on / all).
     fn check(name: &str, cpu: &Model, m: &Model) -> (f32, (usize, usize)) {
+        let tol = if crate::model::inkling::f16_cache() { TOL_F16 } else { TOL };
         let toks = tokens();
         let mut st = cpu.new_state();
         let want: Vec<Vec<f32>> = toks.iter().map(|&t| cpu.forward(&mut st, t)).collect();
@@ -662,24 +687,77 @@ mod tests {
             assert_eq!(argmax(a), argmax(b), "{name}: token {i}'s best logit");
         }
         let worst = d.iter().copied().fold(0.0, f32::max);
-        assert!(worst < TOL, "{name}: {d:?}");
+        assert!(worst < tol, "{name}: {d:?}");
         (worst, gr.experts_on())
     }
 
     #[test]
     fn inkling_on_the_graph_equals_the_cpu() {
         let _one = crate::graph::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _mode = crate::model::inkling::CACHE_MODE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(dev) = device() else { return };
-        for (name, spec) in [("tiny inkling2_loop", InkSpec::tiny()), ("tiny inkling2", InkSpec { loop_: None, seed: 0x1_4C1E, ..InkSpec::tiny() })] {
-            let p = tmp_inkling(&name.replace(' ', "-"), &spec);
-            let (cpu, _) = Model::load(&p, None).unwrap();
-            let (_, on) = check(name, &cpu, &placed(&p, &dev, 1.0));
-            assert_eq!(on.0, on.1, "every expert on the device");
-            let (_, on) = check(&format!("{name}, half the experts on the device"), &cpu, &placed(&p, &dev, 0.5));
-            assert!(on.0 > 0 && on.0 < on.1, "{on:?}");
-            let (_, on) = check(&format!("{name}, the experts on the CPU"), &cpu, &placed(&p, &dev, 0.0));
-            assert_eq!(on.0, 0);
+        // the arithmetic first (K, V and the mask f32 on both paths), then the f16 roundings both paths make
+        for f16 in [false, true] {
+            crate::model::inkling::set_f16_cache(f16);
+            let cache = if f16 { "f16 cache" } else { "f32 cache" };
+            for (name, spec) in [("tiny inkling2_loop", InkSpec::tiny()), ("tiny inkling2", InkSpec { loop_: None, seed: 0x1_4C1E, ..InkSpec::tiny() })] {
+                let p = tmp_inkling(&name.replace(' ', "-"), &spec);
+                let (cpu, _) = Model::load(&p, None).unwrap();
+                let (_, on) = check(&format!("{name}, {cache}"), &cpu, &placed(&p, &dev, 1.0));
+                assert_eq!(on.0, on.1, "every expert on the device");
+                let (_, on) = check(&format!("{name}, {cache}, half the experts on the device"), &cpu, &placed(&p, &dev, 0.5));
+                assert!(on.0 > 0 && on.0 < on.1, "{on:?}");
+                let (_, on) = check(&format!("{name}, {cache}, the experts on the CPU"), &cpu, &placed(&p, &dev, 0.0));
+                assert_eq!(on.0, 0);
+            }
         }
+    }
+
+    /// The fast kernels' encodings on the graph (Q8_0 attention, vocabulary and controllers, Q8_0 experts' gate/up
+    /// through the fused SiTU kernel, Q5_0 down through the repacked one): against the CPU path on the same model
+    /// dequantized to F32, so only the products' arithmetic differs (the CPU rounds a quantized product's input to 8
+    /// bits, ggml's way; an F32 one it does not); K, V and the mask f32 on both, so the f16 roundings do not hide it.
+    #[test]
+    fn a_quantized_inkling_on_the_graph_equals_the_cpu() {
+        let _one = crate::graph::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _mode = crate::model::inkling::CACHE_MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        let spec = InkSpec { ty: "Q8_0", ty_vocab: "Q8_0", ty_gate_up: "Q8_0", ty_down: "Q5_0", ty_ctrl: "Q8_0", seed: 0x1_4C21, ..InkSpec::tiny() };
+        let q = tmp_inkling("tiny-inkling-q", &spec);
+        let f = tmp_inkling("tiny-inkling-q-as-f32", &InkSpec { dequantized: true, ..spec });
+        crate::model::inkling::set_f16_cache(false);
+        let (cpu, _) = Model::load(&f, None).unwrap();
+        // every expert on the device: the CPU's own experts round their input to 8 bits (ggml's way), which the
+        // F32 copy does not, and the experts' weight of 8 carries that far (the F32 fixtures check the CPU's experts)
+        check("tiny inkling2_loop Q8_0/Q5_0, every expert on the device", &cpu, &placed(&q, &dev, 1.0));
+        crate::model::inkling::set_f16_cache(true);
+    }
+
+    /// GENI's picture rows (no token norm) on the graph, between tokens, as the CPU path reads them.
+    #[test]
+    fn picture_rows_on_the_graph_equal_the_cpu() {
+        let _one = crate::graph::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _mode = crate::model::inkling::CACHE_MODE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        crate::model::inkling::set_f16_cache(false);
+        let p = tmp_inkling("tiny-inkling2_loop", &InkSpec::tiny());
+        let (cpu, _) = Model::load(&p, None).unwrap();
+        let m = placed(&p, &dev, 0.5);
+        let gr = InkGraph::new(&m, 256).unwrap();
+        let rows: Vec<Vec<f32>> = (0..6).map(|r| (0..cpu.n_embd).map(|j| (((r * 31 + j * 7) % 23) as f32 - 11.0) / 9.0).collect()).collect();
+        let (mut a, mut b) = (cpu.new_state(), m.new_state());
+        let mut want = vec![cpu.forward(&mut a, 3)];
+        let mut got = vec![gr.forward(&m, &mut b, 3)];
+        for r in &rows {
+            want.push(cpu.forward_embd(&mut a, r.clone()));
+            got.push(gr.forward_embd(&m, &mut b, r.clone()));
+        }
+        want.push(cpu.forward(&mut a, 9));
+        got.push(gr.forward(&m, &mut b, 9));
+        let d = max_diff(&got, &want);
+        eprintln!("picture rows on the graph: max |graph - cpu| {d:.2e}");
+        crate::model::inkling::set_f16_cache(true);
+        assert!(d < TOL, "{d}");
     }
 
     /// One wait per layer evaluation (the router's choice, with the input when experts are off the device) and one
@@ -714,6 +792,7 @@ mod tests {
     #[test]
     fn a_kosha_pack_places_its_experts_by_the_profile_on_the_graph() {
         let _one = crate::graph::tests::ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let _mode = crate::model::inkling::CACHE_MODE.lock().unwrap_or_else(|e| e.into_inner());
         let Some(dev) = device() else { return };
         let gguf = tmp_inkling("tiny-inkling2_loop", &InkSpec::tiny());
         let dir = gguf.parent().unwrap().to_path_buf();
@@ -730,6 +809,7 @@ mod tests {
         if !kosha.exists() {
             am2pack::build(&am2pack::BuildOptions { model: gguf.clone(), profile: Some(prof_path.clone()), out: kosha.clone(), ..Default::default() }, &mut |_| {}).unwrap();
         }
+        crate::model::inkling::set_f16_cache(false);
         let (cpu, _) = Model::load(&kosha, None).unwrap();
         assert!(!cpu.file_order.is_empty(), "the experts come from the pack's records");
         // a budget for the core and half the experts
@@ -747,6 +827,7 @@ mod tests {
         assert_eq!(on.len() as u64, half, "half the experts on the device");
         assert_eq!(on, ranked[..half as usize], "the profile's hottest");
         let (_, n) = check("tiny inkling2_loop from a Kosha pack, by its profile", &cpu, &m);
+        crate::model::inkling::set_f16_cache(true);
         assert_eq!(n.0 as u64, half);
     }
 
@@ -766,10 +847,11 @@ mod tests {
         let t0 = std::time::Instant::now();
         let (summary, _, _) = crate::gpu::place(&mut m, &[(dev.clone(), 7 << 30)], None, reserve).unwrap();
         eprintln!("placed in {:.1} s: {summary}", t0.elapsed().as_secs_f64());
-        let prompt: Vec<u32> = (0..512).map(|i| (i * 7919 + 13) % 200000).collect();
+        let n_prompt = std::env::var("AM2_INK_BENCH_PROMPT").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize).max(130);
+        let prompt: Vec<u32> = (0..n_prompt as u32).map(|i| (i * 7919 + 13) % 200000).collect();
         let per = |s: strata_gpu::stats::Stats, n: usize| (s.syncs as f64 / n as f64, s.launches as f64 / n as f64);
-        // matrix by matrix: a short prompt and a few tokens (each product a round trip)
-        {
+        // matrix by matrix: a short prompt and a few tokens (each product a round trip); AM2_INK_BENCH_GRAPH=1 skips it
+        if std::env::var_os("AM2_INK_BENCH_GRAPH").is_none() {
             let mut st = m.new_state();
             let t = std::time::Instant::now();
             let s0 = strata_gpu::stats::snapshot();
@@ -789,7 +871,8 @@ mod tests {
             let _ = s0;
             eprintln!("INK_BENCH matrix-by-matrix all experts on the device: prompt {pp:.1} tok/s (token by token), decode {tg:.1} tok/s, {sy:.0} syncs and {la:.0} launches per token");
         }
-        for share in [1.0, 0.5] {
+        let shares: &[f64] = if std::env::var_os("AM2_INK_BENCH_GRAPH").is_some() { &[1.0] } else { &[1.0, 0.5] };
+        for &share in shares {
             if share < 1.0 {
                 let (_, mut ex) = m.matrices_mut();
                 let mut keys: Vec<(usize, usize)> = ex.keys().copied().collect();
@@ -816,7 +899,7 @@ mod tests {
             let pp = prompt.len() as f64 / t.elapsed().as_secs_f64();
             let (psy, pla) = per(strata_gpu::stats::snapshot() - s0, prompt.len());
             let mut tk = argmax(&l) as u32;
-            let n = 64;
+            let n = std::env::var("AM2_INK_BENCH_DECODE").ok().and_then(|v| v.parse().ok()).unwrap_or(64usize);
             let t = std::time::Instant::now();
             let s1 = strata_gpu::stats::snapshot();
             for _ in 0..n {
