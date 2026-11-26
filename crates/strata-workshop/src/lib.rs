@@ -30,6 +30,7 @@ pub mod library;
 pub mod lora;
 pub mod merge;
 pub mod model;
+pub mod moe_init;
 pub mod naming;
 pub mod profile;
 pub mod quantize_gguf;

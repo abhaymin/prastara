@@ -38,7 +38,7 @@ fn max_diff(a: &[Vec<f32>], b: &[Vec<f32>]) -> f32 {
 
 fn upcycled(tag: &str, src: &Path, experts: usize, top_k: usize) -> PathBuf {
     let out = scratch(tag);
-    make_upcycled(src, &out, MoeSpec { experts, top_k }).unwrap();
+    make_upcycled(src, &out, MoeSpec::full(experts, top_k)).unwrap();
     out
 }
 
@@ -85,24 +85,24 @@ fn upcycle_marks_a_linked_copy_and_counts_the_parameters() {
     // hidden 32, intermediate 64, 3 blocks: a feed-forward is 3·32·64 = 6144, a router 10·32
     let base = parsed.total_params();
     assert_eq!(m.params(&parsed), (base + 3 * (9 * 6144 + 320), base + 3 * 320));
-    assert_eq!(MoeSpec { experts: 10, top_k: 2 }.params(&parsed).1, base + 3 * (6144 + 320));
+    assert_eq!(MoeSpec::full(10, 2).params(&parsed).1, base + 3 * (6144 + 320));
     // upcycling twice, an MoE input, and a top-k above the experts are refused
-    assert!(make_upcycled(&out, &scratch("twice"), MoeSpec { experts: 4, top_k: 1 }).is_err());
-    assert!(make_upcycled(&fixture(), &scratch("k"), MoeSpec { experts: 4, top_k: 5 }).is_err());
+    assert!(make_upcycled(&out, &scratch("twice"), MoeSpec::full(4, 1)).is_err());
+    assert!(make_upcycled(&fixture(), &scratch("k"), MoeSpec::full(4, 5)).is_err());
     let moe_in = scratch("moe-in");
     std::fs::create_dir_all(&moe_in).unwrap();
     let mut c = cfg.clone();
     c.as_object_mut().unwrap().remove("prastara_moe");
     c["num_experts"] = serde_json::json!(8);
     std::fs::write(moe_in.join("config.json"), c.to_string()).unwrap();
-    let e = make_upcycled(&moe_in, &scratch("moe-out"), MoeSpec { experts: 4, top_k: 1 }).unwrap_err();
+    let e = make_upcycled(&moe_in, &scratch("moe-out"), MoeSpec::full(4, 1)).unwrap_err();
     assert!(format!("{e:#}").contains("mixture-of-experts"), "{e:#}");
     // the Qwen3-8B shape of the plan: 57.2 B in all, 8.2 B active (top-1), 13.6 B (top-2)
     let q8b = ModelConfig::from_json(&serde_json::json!({"model_type": "qwen3", "vocab_size": 151936, "hidden_size": 4096, "intermediate_size": 12288,
         "num_hidden_layers": 36, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "tie_word_embeddings": false})).unwrap();
-    let (t, a) = MoeSpec { experts: 10, top_k: 1 }.params(&q8b);
+    let (t, a) = MoeSpec::full(10, 1).params(&q8b);
     assert!((57.0e9..57.4e9).contains(&(t as f64)) && (8.1e9..8.3e9).contains(&(a as f64)), "{t} {a}");
-    assert!((13.5e9..13.7e9).contains(&(MoeSpec { experts: 10, top_k: 2 }.params(&q8b).1 as f64)));
+    assert!((13.5e9..13.7e9).contains(&(MoeSpec::full(10, 2).params(&q8b).1 as f64)));
     for d in [out, moe_in] {
         let _ = std::fs::remove_dir_all(d);
     }

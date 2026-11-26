@@ -27,7 +27,7 @@ use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
 use serde_json::{json, Value};
 
-use crate::model::{BaseDtype, Family, LoraSpec, ModelConfig, Target};
+use crate::model::{BaseDtype, Family, LoraSpec, ModelConfig, MoeSpec, Target};
 
 /// Share of a raw matrix-product benchmark that training really reaches on the CPU (the rest goes to memory traffic
 /// and small operations), by how the base is held. Measured on a 12-block, 27 M-parameter model (docs/DEPLOYMENT.md):
@@ -112,9 +112,19 @@ pub fn graph_floats_per_token(cfg: &ModelConfig, lora: &LoraSpec, seq: usize) ->
     // three LoRA terms, its gate/up/activation and its own down projection, then the weighted gather
     let moe = cfg.moe.map_or(0.0, |m| {
         let k = m.top_k as f64;
-        3.0 * m.experts as f64 + k * (h + 2.0 * lora.r as f64 + 3.0 * 2.0 * i + 3.0 * i + lora.r as f64 + 3.0 * h) + 2.0 * k * h
+        if m.fine(cfg) {
+            // fine-grained (moe_ffn_grouped): the router's logits, softmax and z-loss, and per chosen expert its gathered
+            // input, its slice's gate and up (frozen product, LoRA rank product and sum each), the activation, its
+            // down (frozen, LoRA, sum, out-scale), then the weighted gather
+            let (fe, r) = (m.ff_e(cfg) as f64, m.rank(lora.r) as f64);
+            4.0 * m.experts as f64 + k * (h + 2.0 * (r + 3.0 * fe) + 3.0 * fe + r + 4.0 * h) + 2.0 * k * h
+        } else {
+            3.0 * m.experts as f64 + k * (h + 2.0 * lora.r as f64 + 3.0 * 2.0 * i + 3.0 * i + lora.r as f64 + 3.0 * h) + 2.0 * k * h
+        }
     });
-    10.0 * h + 11.5 * q + 8.5 * kv + 4.0 * i + table + adapters + moe
+    // the dense gate/up/activation (4·I): a fine-grained block computes only its chosen slices (counted above)
+    let dense_mlp = if cfg.moe.is_some_and(|m| m.fine(cfg)) { 0.0 } else { 4.0 * i };
+    10.0 * h + 11.5 * q + 8.5 * kv + dense_mlp + table + adapters + moe
 }
 
 fn chunked_above() -> usize {
@@ -197,7 +207,12 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let tokens = p.avg_tokens.clamp(2, seq) as f64;
     let q = (cfg.num_attention_heads * cfg.head_dim) as f64;
     // an upcycled block: gate and up once, the down projection once per chosen expert, and the router
-    let moe_fwd = cfg.moe.map_or(0.0, |m| 2.0 * ((m.top_k - 1) * cfg.hidden_size * cfg.intermediate_size + m.experts * cfg.hidden_size) as f64);
+    let moe_fwd = cfg.moe.map_or(0.0, |m| if m.fine(cfg) {
+        // the chosen k slices of gate, up and down instead of the dense feed-forward, and the router
+        2.0 * (3 * m.top_k * cfg.hidden_size * m.ff_e(cfg) + m.experts * cfg.hidden_size) as f64 - 2.0 * (3 * cfg.hidden_size * cfg.intermediate_size) as f64
+    } else {
+        2.0 * ((m.top_k - 1) * cfg.hidden_size * cfg.intermediate_size + m.experts * cfg.hidden_size) as f64
+    });
     let block_fwd = 2.0 * (cfg.block_params() - cfg.block_small_params()) as f64 + 4.0 * q * tokens + moe_fwd;
     let head_fwd = 2.0 * (cfg.vocab_size * cfg.hidden_size) as f64;
     let passes = p.examples as f64 * p.epochs;
@@ -670,3 +685,56 @@ pub fn preset(name: &str) -> Option<ModelConfig> {
 }
 
 pub const PRESETS: [&str; 5] = ["llama-2-7b", "mistral-7b", "llama-3.1-8b", "qwen2.5-7b", "qwen2.5-0.5b"];
+
+/// One way to train an upcycled model's experts, with what it costs on each card.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MoeScheme {
+    pub expert_rank: usize,
+    pub shared_a: bool,
+    pub max_len: usize,
+    pub trainable_params: u64,
+    /// the busiest card's need, CUDA's own overhead included
+    pub card_bytes: u64,
+    /// within `card_total` with [`MOE_CARD_MARGIN_BYTES`] to spare
+    pub fits: bool,
+}
+
+/// What a planned upcycled run keeps free on each card (the owner's ~1.5 GB).
+pub const MOE_CARD_MARGIN_BYTES: u64 = 1_500_000_000;
+/// A 16 GB-class card's memory when no card is found here (the RTX 5060 Ti's 16,311 MiB).
+pub const DEFAULT_CARD_BYTES: u64 = 16_311 << 20;
+
+/// The settings an upcycled run is planned with: rank 16 on the attention (the feed-forward is the experts'),
+/// gradient checkpointing, a bf16 base, 4 conversations per step, the blocks split over `devices`.
+pub fn moe_profile(cfg: &ModelConfig, max_len: usize, devices: usize) -> ProfileInput {
+    ProfileInput { cfg: cfg.clone(), lora: LoraSpec { r: 16, alpha: 32.0, targets: Target::ALL.to_vec(), ..Default::default() }, base_dtype: BaseDtype::BF16,
+                   max_len, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: max_len / 2, checkpointing: true, devices }
+}
+
+/// The expert-training schemes for the upcycled `cfg` on `devices` cards of `card_total` bytes: expert ranks 16 to 2
+/// (and 0: the router only), A per expert or shared per group, 1,024 and 512 tokens; the largest first.
+pub fn moe_schemes(cfg: &ModelConfig, devices: usize, card_total: u64) -> Vec<MoeScheme> {
+    let Some(m0) = cfg.moe else { return Vec::new() };
+    let mut out = Vec::new();
+    for max_len in [1024, 512] {
+        for r in [16, 8, 4, 2, 0] {
+            for shared in [false, true] {
+                if r == 0 && shared {
+                    continue;
+                }
+                let mut c = cfg.clone();
+                c.moe = Some(MoeSpec { expert_rank: Some(r), shared_a: shared, ..m0 });
+                let e = estimate(&moe_profile(&c, max_len, devices));
+                let card = card_bytes(&e);
+                out.push(MoeScheme { expert_rank: r, shared_a: shared, max_len, trainable_params: e.trainable_params, card_bytes: card,
+                                     fits: card + MOE_CARD_MARGIN_BYTES <= card_total });
+            }
+        }
+    }
+    out
+}
+
+/// The scheme to default to: the first that fits, preferring 1,024 tokens, then the higher rank, then unshared.
+pub fn moe_default_scheme(cfg: &ModelConfig, devices: usize, card_total: u64) -> Option<MoeScheme> {
+    moe_schemes(cfg, devices, card_total).into_iter().find(|s| s.fits && s.expert_rank > 0)
+}

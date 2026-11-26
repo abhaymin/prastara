@@ -6,6 +6,7 @@
 //! am2strata-workshop quantize <in.gguf> --out <out.gguf> --type q8_0|q6_k|q5_k|q4_k|q4_0|f16
 //! am2strata-workshop merge <base-hf-folder> <adapter-folder> --out <merged-hf-folder>
 //! am2strata-workshop upcycle <hf-folder> --experts 10 --top-k 1 --out <dir>
+//! am2strata-workshop upcycle <hf-folder> --experts 120 --expert-ff 1024 --top-k 5 [--split cluster|contiguous] [--calib chat.jsonl] [--dense-start-check] --out <dir>
 //! am2strata-workshop export-moe <upcycled-folder> [--adapter <dir>] --out <model.gguf> [--type q4_k|q8_0|f16|f32]
 //! am2strata-workshop abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N|N:P] [--scale 1.0] [--check N] --out <dir>
 //! am2strata-workshop train --model <hf-folder> --data <chat.jsonl> --out <adapter-folder> [--soup soup.yaml] [...]
@@ -80,6 +81,42 @@ enum Cmd {
         /// experts each token is routed to (1: Switch-style, the active size of the dense base)
         #[arg(long, default_value_t = 1)]
         top_k: usize,
+        /// fine-grained experts of this many of the dense feed-forward's neurons (e.g. 1024 of Qwen3-8B's 12,288: 12
+        /// groups, --experts a multiple of 12); without it every expert is the whole feed-forward
+        #[arg(long)]
+        expert_ff: Option<usize>,
+        /// how the neurons are grouped: cluster (by co-activation on --calib, MoEfication) or contiguous
+        #[arg(long, default_value = "cluster")]
+        split: String,
+        /// the experts' LoRA rank (0: train the router only); fine-grained default: the largest that fits the cards
+        #[arg(long)]
+        expert_rank: Option<usize>,
+        /// one LoRA A per neuron group shared by its copies (each copy its own B); with --expert-rank given
+        #[arg(long)]
+        shared_a: bool,
+        /// calibration conversations (JSONL) for the split and the router's start
+        #[arg(long)]
+        calib: Option<PathBuf>,
+        /// calibration tokens in all
+        #[arg(long, default_value_t = 4096)]
+        calib_tokens: usize,
+        /// each calibration conversation cut at this many tokens
+        #[arg(long, default_value_t = 512)]
+        calib_max_len: usize,
+        /// measure the held-out loss of the dense model and of the upcycled one at its start (needs --calib)
+        #[arg(long)]
+        dense_start_check: bool,
+        /// held-out answer tokens for --dense-start-check
+        #[arg(long, default_value_t = 2048)]
+        check_tokens: usize,
+        /// the calibration's device: cpu (default) or cuda:N
+        #[arg(long, default_value = "cpu")]
+        device: String,
+        /// how the base is held while calibrating: bf16 (default), f16 or f32
+        #[arg(long, default_value = "bf16")]
+        base_dtype: String,
+        #[arg(long, default_value_t = 42)]
+        seed: u64,
         /// print the sizes, the export sizes and what training it takes on this machine's GPUs, and stop
         #[arg(long)]
         estimate: bool,
@@ -1151,39 +1188,100 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             out.event(json!({"event": "log", "message": format!("{} prompts written to {}", got.len(), dst.display())}));
             Ok((dst.clone(), "prompts".into(), json!({"prompts": got.len()})))
         }
-        Cmd::Upcycle { model, out: dst, experts, top_k, estimate } => {
-            use strata_workshop::model::{make_upcycled, MoeSpec};
-            let m = MoeSpec { experts: *experts, top_k: *top_k };
-            m.check().map_err(|e| format!("{e:#}"))?;
+        Cmd::Upcycle { model, out: dst, experts, top_k, expert_ff, split, expert_rank, shared_a, calib, calib_tokens, calib_max_len, dense_start_check,
+                       check_tokens, device, base_dtype, seed, estimate } => {
+            use strata_workshop::model::{make_upcycled, MoeSpec, MoeSplit};
+            use strata_workshop::moe_init;
             let dense = ModelConfig::load(model).map_err(|e| format!("{e:#}"))?;
             if dense.moe.is_some() {
                 return Err(format!("{} is already upcycled", model.display()));
             }
+            let mut m = MoeSpec { expert_ff: expert_ff.filter(|f| *f < dense.intermediate_size), split: MoeSplit::from_s(split).map_err(|e| e.to_string())?,
+                                  expert_rank: *expert_rank, shared_a: *shared_a, ..MoeSpec::full(*experts, *top_k) };
+            m.check_with(&dense).map_err(|e| format!("{e:#}"))?;
+            let fine = m.fine(&dense);
             let mut cfg = dense.clone();
             cfg.moe = Some(m);
+            let machine = Machine::detect_memory();
+            let cards = machine.gpus.len().max(1);
+            let card_total = machine.gpus.iter().map(|g| g.total_bytes).min().unwrap_or(profile::DEFAULT_CARD_BYTES);
+            // fine-grained without --expert-rank: the largest scheme that fits the cards with the margin
+            if fine && expert_rank.is_none() {
+                if let Some(s) = profile::moe_default_scheme(&cfg, cards, card_total) {
+                    m.expert_rank = Some(s.expert_rank);
+                    m.shared_a = s.shared_a;
+                    cfg.moe = Some(m);
+                }
+            }
             let (total, active) = m.params(&dense);
             let sizes: serde_json::Map<String, Value> = ["q4_k", "q8_0", "f16"].iter().filter_map(|t| {
                 let ty = strata_workshop::export_moe::ExportType::from_s(t).ok()?;
                 Some((t.to_string(), json!(strata_workshop::export_moe::export_bytes(&cfg, ty).ok()?)))
             }).collect();
-            let mut lines = vec![format!("{experts} experts x top-{top_k}: {} parameters in all, {} active per token (the dense base has {})",
+            let shape = match m.expert_ff.filter(|_| fine) {
+                Some(fe) => format!("{experts} experts of {fe} neurons ({} groups x {} copies) x top-{top_k}", m.groups(&dense), experts / m.groups(&dense)),
+                None => format!("{experts} experts x top-{top_k}"),
+            };
+            let mut lines = vec![format!("{shape}: {} parameters in all, {} active per token (the dense base has {})",
                                          params_label(total), params_label(active), params_label(dense.total_params())),
                                  format!("export sizes: q4_k {}, q8_0 {}, f16 {}", human(sizes["q4_k"].as_u64().unwrap_or(0)),
                                          human(sizes["q8_0"].as_u64().unwrap_or(0)), human(sizes["f16"].as_u64().unwrap_or(0)))];
-            let (train_lines, train) = moe_training_plan(&cfg);
+            let (train_lines, mut train) = moe_training_plan(&cfg);
             lines.extend(train_lines);
+            let mut calib_json = Value::Null;
+            let mut opts = moe_init::InitOptions { calib: calib.clone(), calib_tokens: *calib_tokens, max_len: *calib_max_len, seed: *seed,
+                                               base_dtype: BaseDtype::from_s(base_dtype).map_err(|e| e.to_string())?,
+                                               // opened only when the calibration runs (an estimate touches no card)
+                                               device: candle_core::Device::Cpu,
+                                               check_tokens: if *dense_start_check { *check_tokens } else { 0 }, ..Default::default() };
+            if fine {
+                lines.push(format!("not exact at the start: a token uses {} of the {} feed-forward neurons (top-{top_k} x {}), so the upcycled model starts as an approximation of the dense one{}",
+                                   top_k * m.ff_e(&dense), dense.intermediate_size, m.ff_e(&dense),
+                                   if *dense_start_check { "; --dense-start-check measures how far" } else { " (--dense-start-check measures how far)" }));
+                let schemes = profile::moe_schemes(&cfg, cards, card_total);
+                lines.push(format!("expert training schemes on {cards} card(s) of {} (fits = with {} to spare):", human(card_total), human(profile::MOE_CARD_MARGIN_BYTES)));
+                for sc in &schemes {
+                    lines.push(format!("  expert rank {:>2}{} at {:>4} tokens: {} trainable, {} on the busiest card{}", sc.expert_rank,
+                                       if sc.shared_a { ", A shared per group" } else { "                    " }, sc.max_len, params_label(sc.trainable_params),
+                                       human(sc.card_bytes), if sc.fits { "  fits" } else { "" }));
+                }
+                lines.push(format!("this upcycle: expert rank {}{}", m.rank(16), if m.shared_a { ", A shared per group" } else { "" }));
+                train["schemes"] = json!(schemes.iter().map(|s| json!({"expert_rank": s.expert_rank, "shared_a": s.shared_a, "max_len": s.max_len,
+                    "trainable_parameters": s.trainable_params, "card_bytes": s.card_bytes, "fits": s.fits})).collect::<Vec<_>>());
+                if calib.is_some() {
+                    let gflops = profile::measure_cpu_gflops() * 0.5;
+                    let (secs, ram) = moe_init::estimate(&dense, m, &opts, if device == "cpu" { gflops } else { 2000.0 });
+                    lines.push(format!("calibration ({} split, {} tokens{}): about {} and {} of memory", m.split.as_str(), calib_tokens,
+                                       if *dense_start_check { format!(", check on {check_tokens} held-out tokens") } else { String::new() },
+                                       profile::human_seconds(secs), human(ram)));
+                    calib_json = json!({"seconds": secs, "ram_bytes": ram});
+                } else if m.split == MoeSplit::Cluster {
+                    lines.push("--split cluster needs --calib FILE.jsonl (calibration conversations); --split contiguous works without".into());
+                }
+            }
             if *estimate {
                 out.event(json!({"event": "estimate", "kind": "upcycle", "lines": lines, "total_parameters": total, "active_parameters": active,
-                                 "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train}));
+                                 "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train, "moe": m.to_json(), "calibration": calib_json}));
                 return Ok((dst.clone(), "info".into(), json!({})));
             }
-            out.event(json!({"event": "start", "what": format!("upcycle {} to {experts} experts, top-{top_k}, as {}", model.display(), dst.display())}));
-            make_upcycled(model, dst, m).map_err(|e| format!("{e:#}"))?;
+            out.event(json!({"event": "start", "what": format!("upcycle {} to {shape}, as {}", model.display(), dst.display())}));
+            let mut init = Value::Null;
+            if fine && (calib.is_some() || *dense_start_check) {
+                if let Some(json) = calib_json.as_object() {
+                    fits(json["ram_bytes"].as_u64().unwrap_or(0), "calibrating the upcycle")?;
+                }
+                opts.device = finetune::open_devices(std::slice::from_ref(device)).map_err(|e| format!("{e:#}"))?.remove(0);
+                let r = moe_init::upcycle(model, dst, m, &opts, &mut |l| out.event(json!({"event": "log", "message": l}))).map_err(|e| format!("{e:#}"))?;
+                lines.extend(r.lines());
+                init = moe_init::report_json(&r);
+            } else {
+                make_upcycled(model, dst, m).map_err(|e| format!("{e:#}"))?;
+            }
             for l in &lines {
                 out.event(json!({"event": "log", "message": l}));
             }
-            Ok((dst.clone(), "hf-model".into(), json!({"experts": experts, "top_k": top_k, "total_parameters": total, "active_parameters": active,
-                                                         "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train})))
+            Ok((dst.clone(), "hf-model".into(), json!({"experts": experts, "top_k": top_k, "moe": m.to_json(), "total_parameters": total, "active_parameters": active,
+                                                         "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train, "init": init})))
         }
         Cmd::ExportMoe { model, adapter, out: dst, ty, pre_tokenizer, estimate } => {
             use strata_workshop::export_moe::{export_moe_with, export_needs, ExportType};

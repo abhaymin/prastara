@@ -24,7 +24,7 @@ use serde_json::Value as Json;
 use strata_pack::gguf_write::{Kv, TensorSpec, Writer};
 
 use crate::convert::{long_context_kv, loop_parts, qwen3_header, tensor_f32};
-use crate::model::{moe_expert_stem, moe_router_name, ModelConfig, MoeSpec, Target, LOOP_FILE, MOE_TARGETS};
+use crate::model::{moe_expert_stem, moe_group_stem, moe_router_name, ModelConfig, MoeSpec, Target, LOOP_FILE, MOE_INIT_FILE, MOE_TARGETS};
 use crate::quantize_gguf::{encode, resolve, type_id, type_nbytes, PureType};
 use crate::safetensors_io::{Shard, TensorDesc};
 
@@ -72,7 +72,11 @@ pub struct ExportReport {
 struct Adapter {
     shard: Shard,
     file: PathBuf,
+    /// the shared (attention) adapters' scaling
     scaling: f32,
+    /// the experts' scaling and rank (their own rank when `expert_rank` is set)
+    expert_scaling: f32,
+    expert_rank: usize,
 }
 
 impl Adapter {
@@ -81,14 +85,18 @@ impl Adapter {
             .with_context(|| format!("{}: no adapter_config.json", dir.display()))?)?;
         let r = cfg["r"].as_f64().ok_or_else(|| anyhow!("adapter_config.json has no r"))?;
         let alpha = cfg["lora_alpha"].as_f64().ok_or_else(|| anyhow!("adapter_config.json has no lora_alpha"))?;
-        let scaling = if cfg["use_rslora"].as_bool() == Some(true) { alpha / r.sqrt() } else { alpha / r } as f32;
+        let rs = cfg["use_rslora"].as_bool() == Some(true);
+        let scale = |r: f64| if rs { alpha / r.max(1.0).sqrt() } else { alpha / r.max(1.0) } as f32;
+        let scaling = scale(r);
+        let expert_rank = moe.rank(r as usize);
+        let expert_scaling = scale(expert_rank as f64);
         match MoeSpec::from_json(&cfg["prastara_moe"])? {
             Some(m) if m == moe => {}
             Some(m) => bail!("{}: the adapter was trained for {} experts top-{}, the model is {} top-{}", dir.display(), m.experts, m.top_k, moe.experts, moe.top_k),
             None => bail!("{}: not an upcycled model's adapter (no prastara_moe in adapter_config.json); train it on the upcycled folder", dir.display()),
         }
         let file = dir.join("adapter_model.safetensors");
-        Ok(Adapter { shard: Shard::open(&file)?, file, scaling })
+        Ok(Adapter { shard: Shard::open(&file)?, file, scaling, expert_scaling, expert_rank })
     }
 
     fn get(&self, name: &str) -> Result<Option<(Vec<usize>, Vec<f32>)>> {
@@ -100,7 +108,13 @@ impl Adapter {
 
     /// `w += s · B A` for the adapter at `stem` (`…lora_A.weight` / `…lora_B.weight`), when it has one.
     fn fold(&self, stem: &str, w: &mut [f32], out: usize, in_: usize) -> Result<bool> {
-        let (Some((sa, a)), Some((sb, b))) = (self.get(&format!("{stem}.lora_A.weight"))?, self.get(&format!("{stem}.lora_B.weight"))?) else {
+        self.fold_pair(&format!("{stem}.lora_A.weight"), &format!("{stem}.lora_B.weight"), self.scaling, w, out, in_)
+    }
+
+    /// `w += s · B A` with A and B named (an expert's A may be its group's, shared).
+    fn fold_pair(&self, a_name: &str, b_name: &str, scaling: f32, w: &mut [f32], out: usize, in_: usize) -> Result<bool> {
+        let stem = b_name.trim_end_matches(".lora_B.weight");
+        let (Some((sa, a)), Some((sb, b))) = (self.get(a_name)?, self.get(b_name)?) else {
             return Ok(false);
         };
         let r = sa[0];
@@ -108,7 +122,7 @@ impl Adapter {
             bail!("{stem}: adapter shapes {sa:?} and {sb:?} do not fit a [{out}, {in_}] weight");
         }
         let delta = Tensor::from_vec(b, (out, r), &Device::Cpu)?.matmul(&Tensor::from_vec(a, (r, in_), &Device::Cpu)?)?;
-        let delta = (delta * self.scaling as f64)?.flatten_all()?.to_vec1::<f32>()?;
+        let delta = (delta * scaling as f64)?.flatten_all()?.to_vec1::<f32>()?;
         w.iter_mut().zip(delta).for_each(|(x, d)| *x += d);
         Ok(true)
     }
@@ -149,6 +163,24 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
         }
     }
     let (h, ff, layers, e_n) = (cfg.hidden_size, cfg.intermediate_size, cfg.num_hidden_layers, moe.experts);
+    // fine-grained: expert e is the slice of group e mod G (the neurons perm[g·fe ..]); the router's start for a
+    // block the adapter did not train
+    let (fe, groups, out_scale) = (moe.ff_e(&cfg), moe.groups(&cfg), moe.out_scale(&cfg) as f32);
+    let init = if moe.fine(&cfg) {
+        let f = dir.join(MOE_INIT_FILE);
+        anyhow::ensure!(f.exists(), "{d}: a fine-grained upcycled folder without {MOE_INIT_FILE} (run `am2strata-workshop upcycle` again)");
+        candle_core::safetensors::load(&f, &Device::Cpu)?
+    } else {
+        Default::default()
+    };
+    let perm_of = |b: usize| -> Result<Option<Vec<u32>>> {
+        if !moe.fine(&cfg) {
+            return Ok(None);
+        }
+        let p = init.get(&format!("perm.{b}")).ok_or_else(|| anyhow!("{MOE_INIT_FILE}: no perm.{b}"))?.to_dtype(candle_core::DType::U32)?.to_vec1::<u32>()?;
+        anyhow::ensure!(p.len() == ff, "{MOE_INIT_FILE}: perm.{b} has {} entries, the intermediate size is {ff}", p.len());
+        Ok(Some(p))
+    };
     let arch = "qwen3moe";
     let ad = adapter.map(|a| Adapter::open(a, moe)).transpose()?;
 
@@ -192,10 +224,11 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
         plan.push((format!("blk.{b}.ffn_gate_inp.weight"), vec![e_n as u64, h as u64], Source::Router(b)));
         for (role, (g, k)) in [("ffn_gate_exps", "mlp.gate_proj"), ("ffn_up_exps", "mlp.up_proj"), ("ffn_down_exps", "mlp.down_proj")].into_iter().enumerate() {
             let (i, desc) = need(&hf(&format!("{k}.weight")))?;
-            let shape = if role == 2 { vec![e_n as u64, h as u64, ff as u64] } else { vec![e_n as u64, ff as u64, h as u64] };
-            if desc.shape() != [shape[1] as usize, shape[2] as usize] {
-                bail!("{d}: {k} of block {b} has shape {:?}, the config says {:?}", desc.shape(), &shape[1..]);
+            let dense = if role == 2 { [h, ff] } else { [ff, h] };
+            if desc.shape() != dense {
+                bail!("{d}: {k} of block {b} has shape {:?}, the config says {dense:?}", desc.shape());
             }
+            let shape = if role == 2 { vec![e_n as u64, h as u64, fe as u64] } else { vec![e_n as u64, fe as u64, h as u64] };
             plan.push((format!("blk.{b}.{g}.weight"), shape, Source::Experts(b, role, i, desc)));
         }
     }
@@ -224,7 +257,7 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
     let mut kv = qwen3_header(dir, &c, arch, total, ty.file_type(), pre_tokenizer)?;
     kv.push((format!("{arch}.expert_count"), Kv::U32(e_n as u32)));
     kv.push((format!("{arch}.expert_used_count"), Kv::U32(moe.top_k as u32)));
-    kv.push((format!("{arch}.expert_feed_forward_length"), Kv::U32(ff as u32)));
+    kv.push((format!("{arch}.expert_feed_forward_length"), Kv::U32(fe as u32)));
     kv.extend(loop_kv);
     kv.extend(long_context_kv(arch, yarn, &cfg.layer_sliding, cfg.sliding_window));
     // the config's max_position_embeddings is the stretched length already (convert_qwen3 does the same)
@@ -262,24 +295,53 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
             Source::Router(b) => {
                 let v = match &ad {
                     Some(a) => match a.get(&moe_router_name(*b))? {
-                        Some((s, v)) if s == [e_n, h] => v,
+                        Some((s, v)) if s == [e_n, h] => Some(v),
                         Some((s, _)) => bail!("{}: shape {s:?}, the model has {e_n} experts of hidden size {h}", moe_router_name(*b)),
-                        None => vec![0.0; e_n * h],
+                        None => None,
                     },
-                    None => vec![0.0; e_n * h],
+                    None => None,
+                };
+                // untrained: a full-width block's zero router (identical experts), a fine-grained one's start
+                let v = match (v, init.get(&format!("router.{b}"))) {
+                    (Some(v), _) => v,
+                    (None, Some(r)) => r.to_dtype(candle_core::DType::F32)?.flatten_all()?.to_vec1::<f32>()?,
+                    (None, None) if moe.fine(&cfg) => bail!("{MOE_INIT_FILE}: no router.{b}"),
+                    (None, None) => vec![0.0; e_n * h],
                 };
                 w.tensor_data(&encode(&v, t))?;
             }
             Source::Experts(b, role, i, desc) => {
                 let w0 = base(*i, desc)?;
-                let (o, inn) = (desc.shape()[0], desc.shape()[1]);
                 let has_router = ad.as_ref().is_some_and(|a| a.shard.get(&moe_router_name(*b)).is_some());
+                let perm = perm_of(*b)?;
+                let target = MOE_TARGETS[*role];
                 for e in 0..e_n {
-                    let mut v = w0.clone();
-                    if let (Some(a), true) = (&ad, has_router) {
-                        if !a.fold(&moe_expert_stem(*b, e, MOE_TARGETS[*role]), &mut v, o, inn)? {
-                            bail!("block {b} has a router in the adapter but expert {e} has no {} adapter", MOE_TARGETS[*role].as_str());
+                    // the expert's own weights: the whole matrix, or its group's slice (gate/up rows, down columns)
+                    let (mut v, o, inn) = match &perm {
+                        None => (w0.clone(), desc.shape()[0], desc.shape()[1]),
+                        Some(p) => {
+                            let idx = &p[(e % groups) * fe..(e % groups + 1) * fe];
+                            if *role == 2 {
+                                let w0 = &w0;
+                                let v: Vec<f32> = (0..h).flat_map(|r| idx.iter().map(move |&n| w0[r * ff + n as usize])).collect();
+                                (v, h, fe)
+                            } else {
+                                (idx.iter().flat_map(|&n| w0[n as usize * h..(n as usize + 1) * h].iter().copied()).collect(), fe, h)
+                            }
                         }
+                    };
+                    if let (Some(a), true) = (&ad, has_router) {
+                        if a.expert_rank > 0 {
+                            let stem = moe_expert_stem(*b, e, target);
+                            let a_name = if moe.shared_a { format!("{}.lora_A.weight", moe_group_stem(*b, e % groups, target)) } else { format!("{stem}.lora_A.weight") };
+                            if !a.fold_pair(&a_name, &format!("{stem}.lora_B.weight"), a.expert_scaling, &mut v, o, inn)? {
+                                bail!("block {b} has a router in the adapter but expert {e} has no {} adapter", target.as_str());
+                            }
+                        }
+                    }
+                    // fine-grained: each chosen expert's output times top-k, folded into its down projection
+                    if *role == 2 && out_scale != 1.0 {
+                        v.iter_mut().for_each(|x| *x *= out_scale);
                     }
                     w.tensor_data(&encode_par(&v, t, inn))?;
                 }
@@ -328,7 +390,7 @@ pub fn export_needs(cfg: &ModelConfig, ty: ExportType, adapter_bytes: u64) -> Re
 /// show. Counts each tensor as `export_moe` writes it (metadata excluded: a few MB at most).
 pub fn export_bytes(cfg: &ModelConfig, ty: ExportType) -> Result<u64> {
     let moe = cfg.moe.ok_or_else(|| anyhow!("not an upcycled config"))?;
-    let (h, ff, e) = (cfg.hidden_size, cfg.intermediate_size, moe.experts);
+    let (h, ff, e) = (cfg.hidden_size, moe.ff_e(cfg), moe.experts);
     let mat = |rows: usize, cols: usize| type_nbytes(resolve(ty.target(), cols), rows * cols);
     let (q, kv) = (cfg.num_attention_heads * cfg.head_dim, cfg.num_key_value_heads * cfg.head_dim);
     let block = mat(q, h) + 2 * mat(kv, h) + mat(h, q) + (e * h * 4) as u64 + 2 * mat(e * ff, h) + mat(e * h, ff) + cfg.block_small_params() * 4;
