@@ -266,6 +266,15 @@ async function loadHealth() {
   }
 }
 
+// a model whose replies usually take over two minutes is labelled with that time in the model list
+let replyTime = {};
+const slowLabel = (id) => replyTime[id] >= 120 ? ` · slow: replies take ~${wsDur(replyTime[id]).replace(/ \d+ s$/, "")}` : "";
+function slowNote() {
+  const id = $("model-select").value, t = replyTime[id], el = $("slow-note");
+  el.hidden = !(t >= 120);
+  if (!el.hidden) el.textContent = `Replies on this model usually take ~${wsDur(t).replace(/ \d+ s$/, "")} here (it runs on a slow engine path). ` +
+    "Most of that is reading the prompt: turning off web, browser and tool instructions makes it much shorter.";
+}
 // The installed models (GET api/models).  The list is shown when there is more than one to choose from; choosing
 // one switches the server to it, which stops the model in memory first and starts a new chat.
 async function loadModels() {
@@ -275,6 +284,12 @@ async function loadModels() {
     const r = await fetch("api/models", {headers: headers()});
     if (r.ok) models = (await r.json()).models || [];
   } catch (e) { return; }
+  // how long a reply usually takes on each model (the queue's learnt chat times): a slow one says so in the list
+  try {
+    const q = await fetch("api/queue", {headers: headers()});
+    if (q.ok) replyTime = Object.fromEntries(Object.entries((await q.json()).learnt_s || {})
+      .filter(([k]) => k.startsWith("chat:")).map(([k, v]) => [k.slice(5), v]));
+  } catch (e) { /* no times: no labels */ }
   // nothing loaded (a media job stopped it): the server's default, which a request loads; never the first in the list,
   // which a chat would load by name (it loaded the Rust CPU edition of the default model on 2026-11-09)
   // the owner's remote models and mixes (when the server has them on), grouped by provider after the local ones
@@ -287,12 +302,13 @@ async function loadModels() {
   sel.innerHTML = models.map((m) =>
     `<option value="${esc(m.id)}"${!remoteModel && pick && m.id === pick.id ? " selected" : ""}${m.status === "unavailable" ? " disabled" : ""}>` +
     `${esc(m.display_name && m.display_name !== m.id ? `${m.display_name} (${m.id})` : m.id)}` +
-    `${m.status === "unavailable" ? " - unavailable" : ""}</option>`).join("") +
+    `${m.status === "unavailable" ? " - unavailable" : ""}${slowLabel(m.id)}</option>`).join("") +
     Object.entries(groups).map(([g, list]) => `<optgroup label="${esc(g)}">` + list.map((m) =>
       `<option value="${esc(m.id)}" data-remote="1"${m.id === remoteModel ? " selected" : ""}>${esc(m.id)}</option>`).join("") + `</optgroup>`).join("");
   sel.hidden = models.length + far.length < 2;
   sel.dataset.current = (models.find((m) => m.current) || {}).id || "";
   installed = models;
+  slowNote();
   if (!$("gpus-line").dataset.loaded) { $("gpus-line").dataset.loaded = "1"; loadGpus(); }
   renderModels();
   // a tune started elsewhere (the API, another tab) is followed too
@@ -962,6 +978,7 @@ $("models-list").addEventListener("click", async (e) => {
     loadModels(); loadHealth();
   }
 });
+$("model-select").addEventListener("change", slowNote);
 $("model-select").onchange = async () => {
   const sel = $("model-select"), name = sel.value, before = sel.dataset.current;
   if (running.size) { toast("warn", "Still writing", "Stop the answers first."); sel.value = remoteModel || before; return; }

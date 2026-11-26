@@ -997,3 +997,7 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .state-why { margin: var(--st-s-2) 0 0; font-size: var(--st-fs-sm); color: var(--st-ink-soft); line-height: var(--st-lh-body); }
 .state-why b { color: var(--st-ink); }
 .req-cancel { height: 32px; min-width: 32px; padding: 0 var(--st-s-3); margin-left: var(--st-s-2); font-size: 12px; vertical-align: middle; }
+/* chat: a note above the box when the chosen model's replies usually take minutes */
+.slow-note { max-width: 920px; margin: 0 auto var(--st-s-2); padding: var(--st-s-2) var(--st-s-4); border-radius: var(--st-r-md);
+  background: var(--st-warn-tint); color: var(--st-warn-text); font-size: var(--st-fs-sm); line-height: var(--st-lh-body); }
+.slow-note[hidden] { display: none; }
