@@ -1203,8 +1203,8 @@ impl Model {
         let loop_ = match u("loop.count") {
             Ok(passes) => {
                 let (start, end, passes) = (u("loop.start")? as usize, u("loop.end")? as usize, passes as usize);
-                if !matches!(arch.as_str(), "qwen3" | "llama") {
-                    return Err(format!("{arch}: a loop runs on qwen3 and llama models here"));
+                if !matches!(arch.as_str(), "qwen3" | "qwen3moe" | "llama") {
+                    return Err(format!("{arch}: a loop runs on qwen3, qwen3moe and llama models here"));
                 }
                 if start >= end || end > n_layer || !(2..=16).contains(&passes) {
                     return Err(format!("{arch}: invalid loop: blocks {start}..{end} of {n_layer}, {passes} passes"));
