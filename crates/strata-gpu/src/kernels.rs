@@ -991,6 +991,167 @@ pub fn mv_fast(w: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, y: &mut Array<f32>
     }
 }
 
+/// y[t * rows + r] = silu(G[r] . x[t]) * (U[r] . x[t]): the gated feed-forward's two products and its gate in one
+/// kernel (the same arithmetic as `silu_gate`), a warp per row of both.
+#[cube(launch_unchecked)]
+pub fn mv_glu(wg: &Array<V4>, dg: &Array<u32>, wu: &Array<V4>, du: &Array<u32>, x: &Array<F4>, y: &mut Array<f32>, rows: u32, cols: u32,
+              #[comptime] k: u32, #[comptime] plane: bool) {
+    let lane = UNIT_POS % 32;
+    let row = (CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X) * MV_ROWS + UNIT_POS / 32;
+    let t = CUBE_POS_Z;
+    let mut pg = f32::new(0.0);
+    let mut pu = f32::new(0.0);
+    if row < rows {
+        pg = row_part(wg, dg, x, row, cols, t, lane, k);
+        pu = row_part(wu, du, x, row, cols, t, lane, k);
+    }
+    let g = warp_sum(pg, plane, comptime![MV_ROWS * 32]);
+    let u = warp_sum(pu, plane, comptime![MV_ROWS * 32]);
+    if lane == 0 && row < rows {
+        y[(t * rows + row) as usize] = u * (g / (f32::new(1.0) + f32::exp(-g)));
+    }
+}
+
+/// Three products of the same x in one launch (attention's q, k and v): the first cubes take W0's rows, the next W1's,
+/// the last W2's; y2 at `off2` (V straight into its cache). t = CUBE_POS_Z.
+#[cube(launch_unchecked)]
+pub fn mv3(w0: &Array<V4>, d0: &Array<u32>, w1: &Array<V4>, d1: &Array<u32>, w2: &Array<V4>, d2: &Array<u32>, x: &Array<F4>,
+           y0: &mut Array<f32>, y1: &mut Array<f32>, y2: &mut Array<f32>, rows0: u32, rows1: u32, rows2: u32, off2: u32, cols: u32,
+           #[comptime] k: u32, #[comptime] plane: bool) {
+    let lane = UNIT_POS % 32;
+    let cube = CUBE_POS_X + CUBE_POS_Y * CUBE_COUNT_X;
+    let t = CUBE_POS_Z;
+    let c0 = rows0.div_ceil(MV_ROWS);
+    let c1 = rows1.div_ceil(MV_ROWS);
+    // the branch is the same for the whole cube, so the reductions in it are reached by all its units
+    if cube < c0 {
+        let row = cube * MV_ROWS + UNIT_POS / 32;
+        let mut acc = f32::new(0.0);
+        if row < rows0 {
+            acc = row_part(w0, d0, x, row, cols, t, lane, k);
+        }
+        let total = warp_sum(acc, plane, comptime![MV_ROWS * 32]);
+        if lane == 0 && row < rows0 {
+            y0[(t * rows0 + row) as usize] = total;
+        }
+    } else if cube < c0 + c1 {
+        let row = (cube - c0) * MV_ROWS + UNIT_POS / 32;
+        let mut acc = f32::new(0.0);
+        if row < rows1 {
+            acc = row_part(w1, d1, x, row, cols, t, lane, k);
+        }
+        let total = warp_sum(acc, plane, comptime![MV_ROWS * 32]);
+        if lane == 0 && row < rows1 {
+            y1[(t * rows1 + row) as usize] = total;
+        }
+    } else {
+        let row = (cube - c0 - c1) * MV_ROWS + UNIT_POS / 32;
+        let mut acc = f32::new(0.0);
+        if row < rows2 {
+            acc = row_part(w2, d2, x, row, cols, t, lane, k);
+        }
+        let total = warp_sum(acc, plane, comptime![MV_ROWS * 32]);
+        if lane == 0 && row < rows2 {
+            y2[(off2 + t * rows2 + row) as usize] = total;
+        }
+    }
+}
+
+/// Attention's q and k after their products, in one launch: each head (CUBE_POS_X: the n_head heads of q, then the n_kv
+/// of k) of each token (CUBE_POS_Y) RMS-normed by its weights when `norm` (Qwen3's q/k norms; the same arithmetic as
+/// `rms_norm`), then rotated by the token's (cos, sin) pairs as `rope` rotates; q in place, k into its cache at
+/// k_off + (token * n_kv + head) * hd (what kv_append did).
+#[cube(launch_unchecked)]
+pub fn qk_rope(q: &mut Array<f32>, k: &Array<f32>, qn: &Array<f32>, kn: &Array<f32>, tab: &Array<f32>, cache: &mut Array<f32>,
+               hd: u32, n_rot: u32, neox: u32, n_head: u32, n_kv: u32, k_off: u32, eps: f32, #[comptime] norm: bool) {
+    let head = CUBE_POS_X;
+    let tok = CUBE_POS_Y;
+    let is_q = head < n_head;
+    let mut src = u32::new(0);
+    if is_q {
+        src = (tok * n_head + head) * hd;
+    } else {
+        src = (tok * n_kv + head - n_head) * hd;
+    }
+    let mut v = SharedMemory::<f32>::new(512usize);
+    let mut j = UNIT_POS;
+    while j < hd {
+        let mut a = f32::new(0.0);
+        if is_q {
+            a = q[(src + j) as usize];
+        } else {
+            a = k[(src + j) as usize];
+        }
+        v[j as usize] = a;
+        j += CUBE;
+    }
+    if comptime![norm] {
+        let mut sum = SharedMemory::<f32>::new(CUBE as usize);
+        let mut acc = f32::new(0.0);
+        let mut j = UNIT_POS;
+        while j < hd {
+            acc += v[j as usize] * v[j as usize];
+            j += CUBE;
+        }
+        sum[UNIT_POS as usize] = acc;
+        sync_cube();
+        let mut stride = u32::new(64);
+        while stride > 0 {
+            if UNIT_POS < stride {
+                sum[UNIT_POS as usize] = sum[UNIT_POS as usize] + sum[(UNIT_POS + stride) as usize];
+            }
+            sync_cube();
+            stride /= 2;
+        }
+        let kk = f32::new(1.0) / f32::sqrt(sum[0usize] / f32::cast_from(hd) + eps);
+        let mut j = UNIT_POS;
+        while j < hd {
+            let mut wv = f32::new(0.0);
+            if is_q {
+                wv = qn[j as usize];
+            } else {
+                wv = kn[j as usize];
+            }
+            v[j as usize] = v[j as usize] * kk * wv;
+            j += CUBE;
+        }
+    }
+    sync_cube();
+    // the values past n_rot stay as they are; the pairs below it rotate
+    let mut j = UNIT_POS;
+    while j < hd {
+        let mut out = v[j as usize];
+        if j < n_rot {
+            let mut p = j / 2;
+            let mut a = j - j % 2;
+            let mut b = a + 1;
+            let mut second = j % 2 == 1;
+            if neox == 1 {
+                let half = n_rot / 2;
+                p = j % half;
+                a = p;
+                b = p + half;
+                second = j >= half;
+            }
+            let c = tab[(tok * n_rot + p * 2) as usize];
+            let s = tab[(tok * n_rot + p * 2 + 1) as usize];
+            let x0 = v[a as usize];
+            let x1 = v[b as usize];
+            if second {
+                out = x0 * s + x1 * c;
+            } else {
+                out = x0 * c - x1 * s;
+            }
+        }
+        if is_q {
+            q[(src + j) as usize] = out;
+        } else {
+            cache[(k_off + src + j) as usize] = out;
+        }
+        j += CUBE;
+    }
+}
+
 /// Y = W X for a chunk of tokens: y[t * rows + r] = W[r] . x[t]. A cube takes MM_M rows x MM_N tokens; per step of
 /// MM_K columns it dequantizes the weights' tile once into shared memory (k-major, 4 rows per cell) and loads the tokens'
 /// tile beside it (k-major, 4 tokens per cell), then each unit adds a 4 x 4 tile of products (4 rows, 4 tokens). The
@@ -1117,5 +1278,80 @@ pub fn mm(w: &Array<u32>, wh: &Array<V4>, wd: &Array<u32>, x: &Array<F4>, y: &mu
                 put(y, y_off + (tb + 3) * rows + r + i, a3[i as usize], add);
             }
         }
+    }
+}
+
+/// Attention in one kernel (scores, softmax and the blend of V, with a running maximum as flash attention keeps it), for
+/// each query head (CUBE_POS_X) of each token (CUBE_POS_Y) of a chunk at positions base..: token `tok` sees positions
+/// 0..=base + tok. Four warps split the positions; a warp's 32 units split the head's values (`per` each, hd = 32 per),
+/// one plane sum per position. The warps' partial results are merged at the end. The scale is scales[tok] for a chunk
+/// (`chunk`), else `scale`. Needs 32-wide planes (CUDA).
+#[cube(launch_unchecked)]
+pub fn attend_rows(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, o: &mut Array<f32>, scales: &Array<f32>, base: u32, n_kv: u32,
+                   group: u32, n_head: u32, scale: f32, #[comptime] per: u32, #[comptime] chunk: bool) {
+    let head = CUBE_POS_X;
+    let tok = CUBE_POS_Y;
+    let kh = head / group;
+    let hd = comptime![per * 32];
+    let lane = UNIT_POS % 32;
+    let warp = UNIT_POS / 32;
+    let n = base + tok + 1;
+    let mut sc = scale;
+    if comptime![chunk] {
+        sc = scales[tok as usize];
+    }
+    let qo = (tok * n_head + head) * hd;
+    let mut qv = Array::<f32>::new(comptime![per as usize]);
+    let mut acc = Array::<f32>::new(comptime![per as usize]);
+    #[unroll]
+    for i in 0..per {
+        qv[i as usize] = q[(qo + lane + 32 * i) as usize];
+        acc[i as usize] = f32::new(0.0);
+    }
+    let mut m = f32::new(-1.0e30);
+    let mut l = f32::new(0.0);
+    let mut t = warp;
+    while t < n {
+        let ko = (t * n_kv + kh) * hd;
+        let mut d = f32::new(0.0);
+        #[unroll]
+        for i in 0..per {
+            d += qv[i as usize] * k[(ko + lane + 32 * i) as usize];
+        }
+        let s = plane_sum(d) * sc;
+        let m2 = f32::max(m, s);
+        let c = f32::exp(m - m2);
+        let p = f32::exp(s - m2);
+        l = l * c + p;
+        #[unroll]
+        for i in 0..per {
+            acc[i as usize] = acc[i as usize] * c + p * v[(ko + lane + 32 * i) as usize];
+        }
+        m = m2;
+        t += 4;
+    }
+    let mut sm = SharedMemory::<f32>::new(4usize);
+    let mut sl = SharedMemory::<f32>::new(4usize);
+    let mut sa = SharedMemory::<f32>::new(comptime![(4 * per * 32) as usize]);
+    if lane == 0 {
+        sm[warp as usize] = m;
+        sl[warp as usize] = l;
+    }
+    #[unroll]
+    for i in 0..per {
+        sa[(warp * hd + lane + 32 * i) as usize] = acc[i as usize];
+    }
+    sync_cube();
+    let top = f32::max(f32::max(sm[0usize], sm[1usize]), f32::max(sm[2usize], sm[3usize]));
+    let e0 = f32::exp(sm[0usize] - top);
+    let e1 = f32::exp(sm[1usize] - top);
+    let e2 = f32::exp(sm[2usize] - top);
+    let e3 = f32::exp(sm[3usize] - top);
+    let total = sl[0usize] * e0 + sl[1usize] * e1 + sl[2usize] * e2 + sl[3usize] * e3;
+    let mut j = UNIT_POS;
+    while j < hd {
+        let s = sa[j as usize] * e0 + sa[(hd + j) as usize] * e1 + sa[(2 * hd + j) as usize] * e2 + sa[(3 * hd + j) as usize] * e3;
+        o[(qo + j) as usize] = s / total;
+        j += 128;
     }
 }

@@ -378,11 +378,7 @@ impl<'a> Graph<'a> {
             self.attention(m, &layer.attn, kv, &tab, scales.as_ref(), &x, base, nt);
             let h = g.rms_norm(&x, &layer.ffn_norm, m.eps);
             match &layer.ffn {
-                Ffn::Dense { gate, up, down } => {
-                    let (u, gv) = (g.mv_tokens(up, &h, nt as u32), g.mv_tokens(gate, &h, nt as u32));
-                    g.silu_gate(&gv, &u);
-                    g.add_into(&g.mv_tokens(down, &u, nt as u32), &x);
-                }
+                Ffn::Dense { gate, up, down } => g.mv_add(down, &g.glu(gate, up, &h, nt as u32), &x, nt as u32),
                 Ffn::Moe(e) => self.moe(m, e, &h, &x, nt),
             }
         }
@@ -400,32 +396,19 @@ impl<'a> Graph<'a> {
         let g = self.g;
         let n = nt as u32;
         let h = g.rms_norm(x, &a.norm, m.eps);
-        let (mut q, mut k, v) = (g.mv_tokens(a.q, &h, n), g.mv_tokens(a.k, &h, n), g.mv_tokens(a.v, &h, n));
-        if let Some(w) = &a.q_norm {
-            q = g.rms_norm(&q, w, m.eps);
-        }
-        if let Some(w) = &a.k_norm {
-            k = g.rms_norm(&k, w, m.eps);
-        }
+        // q, k and v in one kernel where it can (v straight into its cache), then q/k norms, RoPE and k into its cache in
+        // one more (strata-gpu lib.rs qkv, qk_rope)
         let row = (a.n_kv * a.hd) as usize;
+        let (q, k) = g.qkv(a.q, a.k, a.v, &h, n, &kv.vc, base * row);
+        let q = g.qk_rope(&q, &k, a.q_norm.as_ref(), a.k_norm.as_ref(), tab, &kv.kc, base * row, a.hd, self.n_rot, self.neox, n, m.eps);
         let att = match scales {
             None => {
-                g.rope(tab, &q, a.hd, self.n_rot, self.neox);
-                g.rope(tab, &k, a.hd, self.n_rot, self.neox);
-                g.kv_append(&k, &kv.kc, base * row);
-                g.kv_append(&v, &kv.vc, base * row);
                 let ts = m.temp_scale_at(base);
                 g.attend(&q, &kv.kc, &kv.vc, &kv.s, base as u32 + 1, a.n_head, a.n_kv, a.hd, ts / (a.hd as f32).sqrt())
             }
-            Some(sc) => {
-                g.rope_tokens(tab, &q, a.hd, self.n_rot, self.neox, n);
-                g.rope_tokens(tab, &k, a.hd, self.n_rot, self.neox, n);
-                g.kv_append(&k, &kv.kc, base * row);
-                g.kv_append(&v, &kv.vc, base * row);
-                g.attend_tokens(&q, &kv.kc, &kv.vc, sc, base as u32, n, a.n_head, a.n_kv, a.hd)
-            }
+            Some(sc) => g.attend_tokens(&q, &kv.kc, &kv.vc, sc, base as u32, n, a.n_head, a.n_kv, a.hd),
         };
-        g.add_into(&g.mv_tokens(a.o, &att, n), x);
+        g.mv_add(a.o, &att, x, n);
     }
 
     /// x += the routed experts of `h` (nt tokens): routing on the device, one read of the choice, the experts on the device
@@ -459,9 +442,7 @@ impl<'a> Graph<'a> {
             }
             let n = us.len() as u32;
             let xin = if nt == 1 { h.clone() } else { g.gather_rows(h, &g.buffer(&us.iter().map(|&ts| (ts / k) as f32).collect::<Vec<_>>()), dim) };
-            let (u, gv) = (g.mv_tokens(up, &xin, n), g.mv_tokens(gate, &xin, n));
-            g.silu_gate(&gv, &u);
-            let o = g.mv_tokens(down, &u, n);
+            let o = g.mv_tokens(down, &g.glu(gate, up, &xin, n), n);
             if n == 1 {
                 g.copy(&o, &slots, 0, us[0] * dim, dim);
             } else {

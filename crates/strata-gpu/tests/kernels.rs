@@ -339,3 +339,84 @@ fn the_computed_sign_table_is_the_cpus() {
         assert_eq!(i | parity, strata_pack::grids::KSIGNS_IQ2XS[i as usize] as u32, "entry {i}");
     }
 }
+
+/// The graph's fused kernels (strata-gpu lib.rs: mv_add, mv_into, glu, qkv, qk_rope) against the kernels they replace,
+/// for Q8_0 and Q4_K, one vector and a few at once: the same values within float rounding.
+#[test]
+fn the_fused_kernels_match_the_unfused_ones() {
+    let only = std::env::var("STRATA_GPU_TEST_ONLY").ok();
+    let devices: Vec<_> = list().into_iter().filter(|d| d.name != "cpu" && only.as_deref().is_none_or(|o| o == d.name)).collect();
+    let mut rng = Rng(0x5151_7777_aaaa_0001);
+    let (cols, ffn, hd, n_head, n_kv) = (512usize, 768usize, 64usize, 8usize, 2usize);
+    let close = |got: &[f32], want: &[f32], what: &str| {
+        let scale = want.iter().fold(1e-6f32, |m, v| m.max(v.abs()));
+        let worst = got.iter().zip(want).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        eprintln!("{what}: worst {worst:.2e} (values up to {scale:.2})");
+        assert!(got.len() == want.len() && worst <= 1e-5 * scale.max(1.0), "{what}: worst {worst}");
+    };
+    for d in &devices {
+        let g = Gpu::open(&d.name).unwrap();
+        for ty in ["Q8_0", "Q4_K"] {
+            let up = |rows: usize, c: usize, rng: &mut Rng| g.upload(ty, &weights(ty, rows, c, rng), rows, c).unwrap();
+            let (wg, wu, wd) = (up(ffn, cols, &mut rng), up(ffn, cols, &mut rng), up(cols, ffn, &mut rng));
+            let (wq, wk, wv) = (up(n_head * hd, cols, &mut rng), up(n_kv * hd, cols, &mut rng), up(n_kv * hd, cols, &mut rng));
+            // 67: a chunk, which takes the tiled kernel (its residual and its offset into the cache)
+            for tokens in [1u32, 3, 67] {
+                let t = tokens as usize;
+                let xv: Vec<f32> = (0..cols * t).map(|_| rng.unit()).collect();
+                let x = g.buffer(&xv);
+                let what = |k: &str| format!("{} {ty} tokens={tokens} {k}", d.name);
+                // the gated feed-forward
+                let (gv, uv) = (g.read(&g.mv_tokens(&wg, &x, tokens)), g.read(&g.mv_tokens(&wu, &x, tokens)));
+                let want: Vec<f32> = gv.iter().zip(&uv).map(|(g, u)| u * (g / (1.0 + (-g).exp()))).collect();
+                let h = g.glu(&wg, &wu, &x, tokens);
+                close(&g.read(&h), &want, &what("glu"));
+                // the residual added in the product
+                let res: Vec<f32> = (0..cols * t).map(|_| rng.unit()).collect();
+                let y = g.buffer(&res);
+                let dv = g.read(&g.mv_tokens(&wd, &h, tokens));
+                g.mv_add(&wd, &h, &y, tokens);
+                close(&g.read(&y), &res.iter().zip(&dv).map(|(a, b)| a + b).collect::<Vec<_>>(), &what("mv_add"));
+                // q, k and v in one kernel, v into its cache at an offset
+                let row = n_kv * hd;
+                let at = 5 * row;
+                let vc = g.buffer(&vec![0f32; (8 + t) * row]);
+                let (q, k) = g.qkv(&wq, &wk, &wv, &x, tokens, &vc, at);
+                close(&g.read(&q), &g.read(&g.mv_tokens(&wq, &x, tokens)), &what("qkv q"));
+                close(&g.read(&k), &g.read(&g.mv_tokens(&wk, &x, tokens)), &what("qkv k"));
+                let mut want = vec![0f32; (8 + t) * row];
+                want[at..at + t * row].copy_from_slice(&g.read(&g.mv_tokens(&wv, &x, tokens)));
+                close(&g.read(&vc), &want, &what("qkv v in its cache"));
+                // q/k norms, RoPE (both layouts, part of the head rotated) and k into its cache, against the kernels in turn
+                for (neox, n_rot) in [(false, hd as u32), (true, hd as u32), (true, 32)] {
+                    let tab: Vec<f32> = (0..t).flat_map(|p| (0..n_rot as usize / 2).flat_map(move |i| {
+                        let a = (p + 3) as f32 * 0.37 / (1.0 + i as f32); [a.cos(), a.sin()] })).collect();
+                    let tab = g.buffer(&tab);
+                    let (qn, kn) = (g.buffer(&(0..hd).map(|_| 1.0 + 0.2 * rng.unit()).collect::<Vec<_>>()),
+                                    g.buffer(&(0..hd).map(|_| 1.0 + 0.2 * rng.unit()).collect::<Vec<_>>()));
+                    for norm in [false, true] {
+                        let (n1, n2) = if norm { (Some(&qn), Some(&kn)) } else { (None, None) };
+                        let (q0, k0) = (g.read(&q), g.read(&k));
+                        // the kernels in turn
+                        let (mut qa, mut ka) = (g.buffer(&q0), g.buffer(&k0));
+                        if norm {
+                            qa = g.rms_norm(&qa, &qn, 1e-6);
+                            ka = g.rms_norm(&ka, &kn, 1e-6);
+                        }
+                        g.rope_tokens(&tab, &qa, hd as u32, n_rot, neox, tokens);
+                        g.rope_tokens(&tab, &ka, hd as u32, n_rot, neox, tokens);
+                        let kc_want = g.buffer(&vec![0f32; (8 + t) * row]);
+                        g.kv_append(&ka, &kc_want, at);
+                        // the one kernel
+                        let (qb, kb) = (g.buffer(&q0), g.buffer(&k0));
+                        let kc = g.buffer(&vec![0f32; (8 + t) * row]);
+                        let qo = g.qk_rope(&qb, &kb, n1, n2, &tab, &kc, at, hd as u32, n_rot, neox, tokens, 1e-6);
+                        let tag = what(&format!("qk_rope neox={neox} n_rot={n_rot} norm={norm}"));
+                        close(&g.read(&qo), &g.read(&qa), &format!("{tag} q"));
+                        close(&g.read(&kc), &g.read(&kc_want), &format!("{tag} k in its cache"));
+                    }
+                }
+            }
+        }
+    }
+}

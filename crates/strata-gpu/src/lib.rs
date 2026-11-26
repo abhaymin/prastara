@@ -140,6 +140,16 @@ impl Weights {
                                   && FAST_Q4K.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// The values as 16-byte loads, for the fast kernels.
+    fn v4<R: Runtime>(&self) -> ArrayArg<R> {
+        unsafe { ArrayArg::from_raw_parts(self.handle.cube(), self.value_words() / 4) }
+    }
+
+    /// A repacked Q8_0 matrix's scales (anything for the other kinds: the kernels do not read it).
+    fn sc<R: Runtime>(&self) -> ArrayArg<R> {
+        unsafe { ArrayArg::from_raw_parts(self.scales.as_ref().unwrap_or(&self.handle).cube(), 1) }
+    }
+
     /// The words of `handle`: a repacked Q8_0 matrix's values, or the whole matrix.
     fn value_words(&self) -> usize {
         if self.scales.is_some() { self.rows as usize * self.cols as usize / 4 } else { self.bytes.div_ceil(4) }
@@ -518,6 +528,101 @@ impl Gpu {
         })
     }
 
+    /// Whether a decode kernel (not the tiled one) takes `tokens` vectors of these fast matrices of one kind and width:
+    /// the fused kernels below are decode kernels.
+    fn fused(&self, ws: &[&Weights], tokens: u32) -> bool {
+        tokens < MM_TOKENS.load(std::sync::atomic::Ordering::Relaxed)
+            && ws.iter().all(|w| w.fast() && w.geometry.2 == ws[0].geometry.2 && w.cols == ws[0].cols)
+    }
+
+    /// y += W x for `tokens` vectors, queued: the residual added in the product's own kernel when it is a fast one.
+    pub fn mv_add(&self, w: &Weights, x: &Buf, y: &Buf, tokens: u32) {
+        if w.fast() {
+            with_client!(self, c, R, fast!(c, R, w, x.handle.cube(), x.len, y.handle.cube(), y.len, tokens, 0u32, true));
+            return;
+        }
+        self.add_into(&self.mv_tokens(w, x, tokens), y);
+    }
+
+    /// W x for `tokens` vectors written at y[off..], queued (V straight into its cache).
+    pub fn mv_into(&self, w: &Weights, x: &Buf, y: &Buf, off: usize, tokens: u32) {
+        if w.fast() {
+            with_client!(self, c, R, fast!(c, R, w, x.handle.cube(), x.len, y.handle.cube(), y.len, tokens, off as u32, false));
+            return;
+        }
+        self.kv_append(&self.mv_tokens(w, x, tokens), y, off);
+    }
+
+    /// silu(G x) * (U x) for `tokens` vectors, queued: one kernel for both products and the gate when it can.
+    pub fn glu(&self, gate: &Weights, up: &Weights, x: &Buf, tokens: u32) -> Buf {
+        if !self.fused(&[gate, up], tokens) || gate.rows != up.rows {
+            let (u, g) = (self.mv_tokens(up, x, tokens), self.mv_tokens(gate, x, tokens));
+            self.silu_gate(&g, &u);
+            return u;
+        }
+        stats::launch(1);
+        let y = self.scratch(tokens as usize * up.rows as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::mv_glu::launch_unchecked::<R>(c, mv_count(up.rows, 0, 0, tokens), CubeDim::new_1d(kernels::MV_ROWS * 32), gate.v4(), gate.sc(),
+                up.v4(), up.sc(), ArrayArg::from_raw_parts(x.handle.cube(), x.len / 4), y.arg(), up.rows, up.cols, up.geometry.2, up.plane);
+        });
+        y
+    }
+
+    /// Attention's three products of x for `tokens` vectors, queued: -> (q, k); v is written into `vc` at `v_off`. One
+    /// kernel for the three when it can.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qkv(&self, q: &Weights, k: &Weights, v: &Weights, x: &Buf, tokens: u32, vc: &Buf, v_off: usize) -> (Buf, Buf) {
+        if !self.fused(&[q, k, v], tokens) {
+            let (qy, ky) = (self.mv_tokens(q, x, tokens), self.mv_tokens(k, x, tokens));
+            self.mv_into(v, x, vc, v_off, tokens);
+            return (qy, ky);
+        }
+        stats::launch(1);
+        let (qy, ky) = (self.scratch(tokens as usize * q.rows as usize), self.scratch(tokens as usize * k.rows as usize));
+        with_client!(self, c, R, unsafe {
+            kernels::mv3::launch_unchecked::<R>(c, mv_count(q.rows, k.rows, v.rows, tokens), CubeDim::new_1d(kernels::MV_ROWS * 32), q.v4(), q.sc(),
+                k.v4(), k.sc(), v.v4(), v.sc(), ArrayArg::from_raw_parts(x.handle.cube(), x.len / 4), qy.arg(), ky.arg(), vc.arg(), q.rows, k.rows,
+                v.rows, v_off as u32, q.cols, q.geometry.2, q.plane);
+        });
+        (qy, ky)
+    }
+
+    /// Attention's q and k after their products, for `tokens` tokens, queued: each head RMS-normed by `qn` / `kn` when
+    /// given, rotated by `tab` (each token's (cos, sin) pairs), and k written into its cache `kc` at `k_off`. -> q. One
+    /// kernel on CubeCL (heads of at most 512 values); the norm, rope and append kernels in turn elsewhere.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qk_rope(&self, q: &Buf, k: &Buf, qn: Option<&Buf>, kn: Option<&Buf>, tab: &Buf, kc: &Buf, k_off: usize, hd: u32, n_rot: u32,
+                   neox: bool, tokens: u32, eps: f32) -> Buf {
+        if self.is_native() || hd > 512 || qn.is_some() != kn.is_some() {
+            let (mut q, mut k) = (q.clone(), k.clone());
+            if let Some(w) = qn {
+                q = self.rms_norm(&q, w, eps);
+            }
+            if let Some(w) = kn {
+                k = self.rms_norm(&k, w, eps);
+            }
+            if tokens == 1 {
+                self.rope(tab, &q, hd, n_rot, neox);
+                self.rope(tab, &k, hd, n_rot, neox);
+            } else {
+                self.rope_tokens(tab, &q, hd, n_rot, neox, tokens);
+                self.rope_tokens(tab, &k, hd, n_rot, neox, tokens);
+            }
+            self.kv_append(&k, kc, k_off);
+            return q;
+        }
+        stats::launch(1);
+        let (n_head, n_kv) = (q.len as u32 / hd / tokens, k.len as u32 / hd / tokens);
+        let norm = qn.is_some();
+        let (qn, kn) = (qn.unwrap_or(tab), kn.unwrap_or(tab));
+        with_client!(self, c, R, unsafe {
+            kernels::qk_rope::launch_unchecked::<R>(c, CubeCount::Static(n_head + n_kv, tokens, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(),
+                qn.arg(), kn.arg(), tab.arg(), kc.arg(), hd, n_rot, neox as u32, n_head, n_kv, k_off as u32, eps, norm);
+        });
+        q.clone()
+    }
+
     /// y = x * w / sqrt(mean(x^2) + eps), queued.
     /// The norm of each row of `w.len` values: one vector, a chunk's tokens, or each head (q/k norms).
     pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
@@ -580,6 +685,9 @@ impl Gpu {
     /// values. `s` is scratch for n_head * n scores.
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
+        if let Some(per) = self.flash(hd) {
+            return self.attend_rows(q, k, v, q, n - 1, 1, n_head, n_kv, per, scale, false);
+        }
         stats::launch(3);
         native!(self, m, Buf { handle: Mem::Mtl(m.attend(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), s.handle.mtl(), n, n_head, n_kv, hd, scale)),
                                len: (n_head * hd) as usize });
@@ -589,6 +697,32 @@ impl Gpu {
             kernels::attn_scores::launch_unchecked::<R>(c, CubeCount::Static(n, n_head, 1), CubeDim::new_1d(kernels::CUBE), q.arg(), k.arg(), s.arg(), n, n_kv, group, hd, scale);
             kernels::attn_softmax::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), n);
             kernels::attn_blend::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), s.arg(), v.arg(), o.arg(), n, n_kv, group, hd, n_head);
+        });
+        o
+    }
+
+    /// Whether attention takes kernels::attend_rows (heads of 32, 64, 128 or 256 values, a device with 32-wide planes,
+    /// AM2_FLASH not 0): -> the values per unit.
+    fn flash(&self, hd: u32) -> Option<u32> {
+        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *OFF.get_or_init(|| std::env::var("AM2_FLASH").is_ok_and(|v| v == "0")) || self.is_native() || !matches!(hd, 32 | 64 | 128 | 256) {
+            return None;
+        }
+        let plane = with_client!(self, c, R, {
+            let p = c.properties();
+            p.hardware.plane_size_min == 32 && p.hardware.plane_size_max == 32 && p.features.plane.contains(cubecl::ir::features::Plane::Ops)
+        });
+        plane.then_some(hd / 32)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attend_rows(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, per: u32, scale: f32,
+                   chunk: bool) -> Buf {
+        stats::launch(1);
+        let o = self.scratch((tokens * n_head * per * 32) as usize);
+        with_client!(self, c, R, unsafe {
+            kernels::attend_rows::launch_unchecked::<R>(c, CubeCount::Static(n_head, tokens, 1), CubeDim::new_1d(128), q.arg(), k.arg(), v.arg(), o.arg(),
+                scales.arg(), base, n_kv, n_head / n_kv, n_head, scale, per, chunk);
         });
         o
     }
@@ -625,6 +759,9 @@ impl Gpu {
     pub fn attend_tokens(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Buf {
         native!(self, m, { stats::launch(1); Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
                                                                 n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize } });
+        if let Some(per) = self.flash(hd) {
+            return self.attend_rows(q, k, v, scales, base, tokens, n_head, n_kv, per, 0.0, true);
+        }
         stats::launch(3);
         let n = base + tokens;
         let rows = tokens * n_head;
