@@ -32,10 +32,16 @@
 //!     files must be inside the Workshop's folders too), `"passes"`? ([1, 2] or "1,2": a looped model at each),
 //!     `"against"`? (earlier reports, paths or a list), `"devices"`?, `"max_prompt_tokens"`?, `"judge_model"`?,
 //!     `"output"`? (a folder; default `reports/<model>[-<adapter>]`) — the regression suite: report.json, report.md and
-//!     a regressions list (a GPU run takes the GPUs as training does)
+//!     a regressions list (a GPU run takes the GPUs as training does). `"engine_gguf"`? (a .gguf of the model, its
+//!     adapter merged in) answers the generation tests through the Rust engine, with `"engine_args"`? (only
+//!     `--devices`, `--max-context`, `--threads`, `--kv`, `--expert-ram-gib`, `--no-graph`, `--graph`,
+//!     `--resident-experts`; `--devices cuda:…` makes it a GPU run). A GPU run whose judge is a local model on the GPUs
+//!     is refused at once: the judge's chats would wait for the run and the run for the judge; judge with a remote
+//!     (assist) model or a CPU model
 //!   - grade-train: `"model"`, `"adapter"`?, `"data"` (prompts, .jsonl), `"grader"`? (code | judge), `"samples"`?,
 //!     `"rounds"`?, `"suite"`, `"temperature"`?, `"max_tokens"`?, `"min_score"`?, `"lr"`?, `"epochs"`?, `"max_steps"`?,
-//!     `"rank"`?, `"passes"`?, `"devices"`?, `"output"`? (a folder; default `grade-train/<model>-<data>`) — rounds of
+//!     `"rank"`?, `"passes"`?, `"devices"`?, `"engine_gguf"`?, `"engine_args"`? (as for regress: the starting model's
+//!     samples), `"output"`? (a folder; default `grade-train/<model>-<data>`) — rounds of
 //!     sampling, grading, best-of-N fine-tuning and the suite, promoting an adapter only when nothing regressed
 //! - `POST /v1/workshop/uploads?name=notes.pdf` (the file as the body) saves a document into `<data>/workshop/uploads`.
 //! - `GET /v1/workshop/dataset?path=…&offset=&limit=` pages through a dataset's records (with its card);
@@ -133,6 +139,66 @@ pub fn stem_of(p: &str) -> String {
 
 fn now() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Whether a model's run config puts it on a GPU: its `gpu` list, `--devices` naming a GPU (the Rust engine), or GPU
+/// layers (`--n-gpu-layers` / `-ngl` above 0).
+pub fn model_uses_gpu(cfg: &strata_engine::RunConfig) -> bool {
+    let val = |k: &str| cfg.args.iter().position(|a| a == k).and_then(|i| cfg.args.get(i + 1));
+    !cfg.gpus().is_empty()
+        || val("--devices").is_some_and(|d| d.split(',').any(|x| !x.trim().starts_with("cpu")))
+        || ["--n-gpu-layers", "-ngl", "--gpu-layers"].iter().any(|k| val(k).and_then(|v| v.parse::<i64>().ok()).is_some_and(|n| n != 0))
+}
+
+/// Whether `--engine-args` put the engine on a GPU.
+pub fn engine_args_on_gpu(args: &str) -> bool {
+    let a: Vec<&str> = args.split_whitespace().collect();
+    a.iter().position(|x| *x == "--devices").and_then(|i| a.get(i + 1)).is_some_and(|d| d.split(',').any(|x| !x.trim().starts_with("cpu")))
+}
+
+/// `engine_args` for a regression run's Rust engine: only the flags that place and size it (`--devices`,
+/// `--max-context`, `--threads`, `--kv`, `--expert-ram-gib`, `--no-graph`, `--graph`, `--resident-experts`), each value
+/// checked; nothing that names a file or another machine.
+pub fn check_engine_args(args: &str) -> Result<Vec<String>, String> {
+    let a: Vec<&str> = args.split_whitespace().collect();
+    if args.len() > 400 || a.len() > 24 {
+        return Err("\"engine_args\" is too long".into());
+    }
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < a.len() {
+        let flag = a[i];
+        let val = a.get(i + 1).copied();
+        let need = |ok: bool, what: &str| -> Result<String, String> {
+            match val {
+                Some(v) if ok => Ok(v.to_string()),
+                _ => Err(format!("\"engine_args\": {flag} takes {what}")),
+            }
+        };
+        let num = |lo: f64, hi: f64| val.and_then(|v| v.parse::<f64>().ok()).is_some_and(|n| (lo..=hi).contains(&n));
+        let v = match flag {
+            "--no-graph" | "--graph" | "--resident-experts" => None,
+            "--devices" => Some(need(val.is_some_and(|d| d.split(',').all(|x| {
+                let (dev, gib) = x.split_once('=').map_or((x, None), |(d, g)| (d, Some(g)));
+                let dev_ok = dev == "cpu" || dev.split_once(':').is_some_and(|(k, n)| ["cuda", "hip", "wgpu", "vulkan", "metal"].contains(&k)
+                    && !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+                dev_ok && gib.is_none_or(|g| g.parse::<f64>().is_ok_and(|g| g > 0.0 && g <= 1024.0))
+            })), "devices such as cuda:0=14,cuda:1=14")?),
+            "--max-context" => Some(need(num(256.0, 1_048_576.0), "a context of 256 to 1048576 tokens")?),
+            "--threads" => Some(need(num(1.0, 1024.0), "a thread count")?),
+            "--expert-ram-gib" => Some(need(num(0.0, 4096.0), "a size in GiB")?),
+            "--kv" => Some(need(val.is_some_and(|k| !k.is_empty() && k.len() <= 16 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')), "a cache type such as f16 or q8")?),
+            other => return Err(format!("\"engine_args\": {other} is not taken here (only --devices, --max-context, --threads, --kv, --expert-ram-gib, \
+                                         --no-graph, --graph, --resident-experts)")),
+        };
+        out.push(flag.to_string());
+        if let Some(v) = v {
+            out.push(v);
+            i += 1;
+        }
+        i += 1;
+    }
+    Ok(out)
 }
 
 /// The `am2strata-workshop` command: AM2STRATA_WORKSHOP_EXE, else beside this server's binary.
@@ -345,6 +411,50 @@ impl Workshop {
     /// Whether a training request runs on GPUs (it then takes them from the chat model for the run).
     pub fn train_on_gpu(req: &Value) -> bool {
         req["devices"].as_str().is_some_and(|d| d != "cpu" && !d.is_empty())
+            // a regression run's answers through the Rust engine on a GPU take the GPUs too
+            || req["engine_args"].as_str().is_some_and(|a| engine_args_on_gpu(a))
+    }
+
+    /// The Rust engine for a job's answers (regress, grade-train): AM2STRATA_HYBRID_EXE (the job inherits it), else
+    /// beside this server, else the engine a run config of this server names; None leaves it to the command (beside it
+    /// or on the PATH).
+    fn engine_exe(&self) -> Option<PathBuf> {
+        if std::env::var_os("AM2STRATA_HYBRID_EXE").is_some() {
+            return None;
+        }
+        let name = if cfg!(windows) { "am2strata-hybrid.exe" } else { "am2strata-hybrid" };
+        if let Some(p) = std::env::current_exe().ok().map(|e| e.with_file_name(name)).filter(|p| p.is_file()) {
+            return Some(p);
+        }
+        let mgr = self.mgr.lock().unwrap().clone()?;
+        mgr.models().into_iter().map(|m| m.cfg.exe).find(|e| e.file_name().and_then(|n| n.to_str()) == Some(name) && e.is_file())
+    }
+
+    /// Why a GPU run's judge cannot be served (None: it can): the judge is a local model on the GPUs the run takes, so
+    /// its chat would wait for the run and the run for the judge. A remote (assist) model or a CPU model can judge.
+    pub async fn judge_conflict(&self, req: &Value) -> Option<String> {
+        let kind = req["kind"].as_str()?;
+        if !matches!(kind, "regress" | "grade-train") || !Self::train_on_gpu(req) {
+            return None;
+        }
+        let suite: Value = req["suite"].as_str().and_then(|p| std::fs::read_to_string(crate::expand_path(p)).ok()).and_then(|t| serde_json::from_str(&t).ok())?;
+        let judged = suite["tests"].as_array().is_some_and(|t| t.iter().any(|x| x["kind"] == "judge")) || (kind == "grade-train" && req["grader"] == "judge");
+        if !judged {
+            return None;
+        }
+        let mgr = self.mgr.lock().unwrap().clone()?;
+        let named = req["judge_model"].as_str().or(suite["judge_model"].as_str()).filter(|n| !n.is_empty()).map(str::to_string);
+        let id = match named {
+            Some(n) => n,
+            None => match mgr.current().await {
+                Some(l) => l.entry.id.clone(),
+                None => mgr.default_id.clone(),
+            },
+        };
+        let entry = mgr.entry(&id)?; // not a local model: a remote one (or unknown, which the command reports)
+        model_uses_gpu(&entry.cfg).then(|| format!("the judge {id} runs on the GPUs this run takes: it could not answer until the run ends, \
+            and the run would wait for it. Judge with a remote (assist) model or a model that runs on the CPU (\"judge_model\"), \
+            or run the model under test on the CPU"))
     }
 
     /// Check a request and turn it into the command's arguments and its output path.
@@ -698,6 +808,36 @@ impl Workshop {
                         return Err("\"judge_model\" is a model name".into());
                     }
                     args.extend(["--judge-model".into(), m.into()]);
+                } else if !req["judge_model"].is_null() && !req["judge_model"].is_string() {
+                    return Err("\"judge_model\" is a model name".into());
+                }
+                // the answers through the Rust engine on a GGUF of the model (its adapter merged in)
+                match (&req["engine_gguf"], &req["engine_args"]) {
+                    (Value::Null, Value::Null) => {}
+                    (Value::String(g), a) if !g.is_empty() => {
+                        if !g.ends_with(".gguf") {
+                            return Err("\"engine_gguf\" is a .gguf file of the model".into());
+                        }
+                        let g = self.allowed(g, true)?;
+                        if !g.is_file() {
+                            return Err(format!("{}: \"engine_gguf\" is a .gguf file", g.display()));
+                        }
+                        args.extend(["--engine-gguf".into(), g.display().to_string()]);
+                        match a {
+                            Value::Null => {}
+                            Value::String(t) if t.trim().is_empty() => {}
+                            Value::String(t) => args.extend(["--engine-args".into(), check_engine_args(t)?.join(" ")]),
+                            _ => return Err("\"engine_args\" is a string of engine flags, e.g. \"--devices cuda:0=14 --max-context 8192\"".into()),
+                        }
+                        if let Some(e) = self.engine_exe() {
+                            args.extend(["--engine-exe".into(), e.display().to_string()]);
+                        }
+                    }
+                    (Value::String(_) | Value::Null, _) if req["engine_gguf"].as_str().is_none_or(str::is_empty) && !req["engine_args"].is_null() => {
+                        return Err("\"engine_args\" goes with \"engine_gguf\"".into());
+                    }
+                    (Value::String(_), _) => {}
+                    _ => return Err("\"engine_gguf\" is the path of a .gguf file".into()),
                 }
                 let stem = |p: &Path| p.file_name().and_then(|x| x.to_str()).unwrap_or("model").to_string();
                 if kind == "regress" {
@@ -812,6 +952,11 @@ impl Workshop {
         }
         // a training run on the GPUs takes them from the chat model, the way a media job does: it waits its turn in the
         // queue, the model is unloaded, chats wait until the run ends, and the model that was loaded comes back after
+        // a judge on the GPUs this run takes would wait for the run while the run waits for it: refused at once
+        if let Some(why) = self.judge_conflict(&job.request).await {
+            self.update(id, |j| { j.state = "failed"; j.error = Some(why); j.finished_at = Some(now()); });
+            return;
+        }
         let mut lease = None;
         if matches!(job.kind.as_str(), "train" | "abliterate" | "regress" | "grade-train") && Self::train_on_gpu(&job.request) {
             let mgr = self.mgr.lock().unwrap().clone();

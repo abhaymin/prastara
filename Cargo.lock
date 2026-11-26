@@ -4020,6 +4020,7 @@ dependencies = [
  "sha2",
  "strata-gguf",
  "strata-pack",
+ "strata-protocol",
  "strata-template",
  "thiserror 2.0.21",
  "tokenizers 0.21.4",

@@ -19,7 +19,7 @@ use serde_json::{json, Value};
 use crate::chatdata::ChatTokenizer;
 use crate::finetune::{self, TrainSettings};
 use crate::model::{BaseDtype, LlamaModel};
-use crate::regress::{self, CodeRunner, CodeTask, Generator, Judge, JudgeItem, Sampling};
+use crate::regress::{self, Answer, CodeRunner, CodeTask, Generator, Judge, JudgeItem, Sampling};
 
 /// A prompt to answer, with what its grader needs.
 #[derive(Debug, Clone)]
@@ -105,6 +105,10 @@ pub struct Options {
     pub devices: Vec<String>,
     pub base_dtype: Option<BaseDtype>,
     pub max_prompt_tokens: usize,
+    /// sample (and run the suite's generation tests) through the Rust engine on this GGUF: the starting model, with
+    /// `adapter` merged in when there is one. A round whose adapter is newer than the GGUF falls back to the Workshop's
+    /// model (the GGUF does not hold it).
+    pub engine: Option<crate::engine::EngineSpec>,
 }
 
 impl Options {
@@ -115,7 +119,7 @@ impl Options {
         train.lora.alpha = 32.0;
         train.save_steps = 0;
         Options { model, adapter: None, prompts, samples: 4, rounds: 1, suite: suite.into(), out: out.into(), temperature: 0.8, top_p: 0.95, max_tokens: 512,
-                  seed: 1, passes: vec![], train, devices: vec![], base_dtype: None, max_prompt_tokens: 4096 }
+                  seed: 1, passes: vec![], train, devices: vec![], base_dtype: None, max_prompt_tokens: 4096, engine: None }
     }
 }
 
@@ -148,6 +152,8 @@ fn regress_opts(o: &Options, adapter: Option<&Path>, out: PathBuf, against: Vec<
     r.devices = o.devices.clone();
     r.base_dtype = o.base_dtype;
     r.max_prompt_tokens = o.max_prompt_tokens;
+    // the engine's GGUF is the starting model: only for that one
+    r.engine = o.engine.clone().filter(|_| adapter == o.adapter.as_deref());
     r
 }
 
@@ -184,13 +190,34 @@ pub fn run(o: &Options, grader: &dyn Grader, judge: Option<&dyn Judge>, emit: &m
         let mut samples = String::new();
         {
             let tok = ChatTokenizer::load(&o.model, None)?;
-            let devs = finetune::open_devices(&o.devices)?;
-            let dtype = o.base_dtype.unwrap_or(if devs.iter().any(|d| !d.is_cpu()) { BaseDtype::BF16 } else { BaseDtype::F32 });
-            let mut model = LlamaModel::load_on(&o.model, dtype, &devs)?;
-            if let Some(a) = &promoted {
-                model.load_adapter(a)?;
+            let mut holder: Option<LlamaModel> = None;
+            let mut engine_gen = None;
+            let use_engine = o.engine.as_ref().filter(|_| promoted == o.adapter);
+            if let Some(spec) = use_engine {
+                let mut spec = spec.clone();
+                spec.log.get_or_insert_with(|| dir.join("engine.log"));
+                let cfg = crate::model::ModelConfig::load(&o.model)?;
+                crate::engine::check_gguf_matches(&spec.gguf, &cfg)?;
+                emit(json!({"event": "log", "message": format!("round {round}: sampling through the Rust engine ({})", spec.gguf.display())}));
+                engine_gen = Some(crate::engine::EngineGenerator::new(crate::engine::Engine::start(&spec, None)?, &tok, o.max_prompt_tokens));
+            } else {
+                if o.engine.is_some() {
+                    emit(json!({"event": "log", "message": format!("round {round}: the engine's GGUF does not hold the promoted adapter: sampling with the Workshop's model")}));
+                }
+                let devs = finetune::open_devices(&o.devices)?;
+                let dtype = o.base_dtype.unwrap_or(if devs.iter().any(|d| !d.is_cpu()) { BaseDtype::BF16 } else { BaseDtype::F32 });
+                let mut model = LlamaModel::load_on(&o.model, dtype, &devs)?;
+                if let Some(a) = &promoted {
+                    model.load_adapter(a)?;
+                }
+                holder = Some(model);
             }
-            let gen = Generator::new(&model, &tok, o.max_prompt_tokens);
+            let workshop_gen = holder.as_ref().map(|m| Generator::new(m, &tok, o.max_prompt_tokens));
+            let gen: &dyn Answer = match (&engine_gen, &workshop_gen) {
+                (Some(e), _) => e,
+                (None, Some(w)) => w,
+                _ => unreachable!("one answerer"),
+            };
             let total = o.prompts.len() * o.samples;
             for (pi, p) in o.prompts.iter().enumerate() {
                 let Some(ids) = gen.prompt(&p.text)? else {

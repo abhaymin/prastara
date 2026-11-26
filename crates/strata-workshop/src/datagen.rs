@@ -305,6 +305,11 @@ impl Model {
     /// One answer (its content; thinking is not part of it). `think: false` asks a thinking model to answer
     /// straight away (its chat template's `enable_thinking`), so a short budget is not spent before the answer.
     pub fn ask(&self, system: &str, user: &str, temperature: f64, max_tokens: u32, think: bool) -> Result<String> {
+        self.ask_within(system, user, temperature, max_tokens, think, None)
+    }
+
+    /// [`Model::ask`] that gives up after `timeout` (None: the client's 600 s).
+    pub fn ask_within(&self, system: &str, user: &str, temperature: f64, max_tokens: u32, think: bool, timeout: Option<std::time::Duration>) -> Result<String> {
         let mut body = json!({"model": self.name, "temperature": temperature, "max_tokens": max_tokens,
                               "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]});
         if !think {
@@ -312,6 +317,7 @@ impl Model {
         }
         let send = |body: &Value| -> Result<(bool, Value)> {
             let mut rb = self.client.post(format!("{}/v1/chat/completions", self.url)).json(body);
+            if let Some(t) = timeout { rb = rb.timeout(t); }
             if let Some(k) = &self.key { rb = rb.bearer_auth(k); }
             let r = rb.send().with_context(|| format!("{} does not answer", self.url))?;
             let ok = r.status().is_success();

@@ -289,6 +289,8 @@ enum Cmd {
         /// run even when the memory estimate says a device is too small
         #[arg(long)]
         force: bool,
+        #[command(flatten)]
+        engine: EngineOpts,
     },
     /// training by grading, in rounds: N sampled answers per prompt, graded (code: run with its tests; judge: 1-5
     /// through the server's API), the best of each prompt fine-tuned on, the suite run, and the adapter promoted only
@@ -349,6 +351,8 @@ enum Cmd {
         max_prompt_tokens: usize,
         #[arg(long)]
         judge_model: Option<String>,
+        #[command(flatten)]
+        engine: EngineOpts,
     },
     /// fine-tune a LoRA adapter on chat data (CPU; Llama, Mistral, Qwen2, Qwen3 decoders; a 4-bit base is not done)
     Train {
@@ -784,6 +788,38 @@ fn training_event(out: &Out, e: Event) {
     }
 }
 
+/// The Rust engine for regress and grade-train answers.
+#[derive(clap::Args, Debug, Clone)]
+struct EngineOpts {
+    /// answer the generation tests (code, qa, judge, repeat, samples) and samples through Prastara's Rust engine on this
+    /// GGUF of the model (an adapter merged in); loss tests keep the Workshop's model
+    #[arg(long)]
+    engine_gguf: Option<PathBuf>,
+    /// the engine binary (default: AM2STRATA_HYBRID_EXE, am2strata-hybrid beside this command, or on the PATH)
+    #[arg(long)]
+    engine_exe: Option<PathBuf>,
+    /// more engine arguments as one string, e.g. "--devices cuda:0=14 --max-context 8192"
+    #[arg(long, allow_hyphen_values = true)]
+    engine_args: Option<String>,
+}
+
+impl EngineOpts {
+    fn spec(&self) -> Result<Option<strata_workshop::engine::EngineSpec>, String> {
+        let Some(gguf) = &self.engine_gguf else {
+            if self.engine_exe.is_some() || self.engine_args.is_some() {
+                return Err("--engine-exe and --engine-args go with --engine-gguf".into());
+            }
+            return Ok(None);
+        };
+        if !gguf.is_file() {
+            return Err(format!("--engine-gguf {}: no such file", gguf.display()));
+        }
+        let exe = strata_workshop::engine::find_exe(self.engine_exe.as_deref()).map_err(|e| format!("{e:#}"))?;
+        let args = self.engine_args.as_deref().unwrap_or("").split_whitespace().map(str::to_string).collect();
+        Ok(Some(strata_workshop::engine::EngineSpec::new(exe, gguf.clone(), args)))
+    }
+}
+
 /// The judge for a suite's judge tests: the server's model (`--judge-model`, the suite's `judge_model`, or the loaded
 /// one), when the suite has such tests and the server answers; otherwise None (those tests then report why).
 fn judge_for(s: &strata_workshop::regress::Suite, want: Option<&str>, out: &Out) -> Option<datagen::Model> {
@@ -1007,7 +1043,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             Ok((r.out, "gguf".into(), json!({"experts": r.moe.experts, "top_k": r.moe.top_k, "total_parameters": r.total_params,
                                               "active_parameters": r.active_params, "trained_blocks": r.trained_blocks})))
         }
-        Cmd::Regress { model, adapter, passes, suite, out: dst, against, devices, base_dtype, max_prompt_tokens, judge_model, force } => {
+        Cmd::Regress { model, adapter, passes, suite, out: dst, against, devices, base_dtype, max_prompt_tokens, judge_model, force, engine } => {
             use strata_workshop::regress;
             out.event(json!({"event": "start", "what": format!("the suite {} on {}{} into {}", suite.display(), model.display(),
                 adapter.as_ref().map_or(String::new(), |a| format!(" with {}", a.display())), dst.display())}));
@@ -1019,6 +1055,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
             o.max_prompt_tokens = *max_prompt_tokens;
             o.force = *force;
+            o.engine = engine.spec()?;
             let s = regress::Suite::load(suite).map_err(|e| format!("{e:#}"))?;
             let judge = judge_for(&s, judge_model.as_deref(), out);
             install_term_handler();
@@ -1036,7 +1073,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                 "summary": r.results.iter().map(|t| json!({"test": t.test, "passes": t.passes, "metric": t.metric, "value": t.value, "n": t.items.len(), "error": t.error})).collect::<Vec<_>>()})))
         }
         Cmd::GradeTrain { model, adapter, data, samples, grader, rounds, suite, out: dst, temperature, top_p, max_tokens, min_score, seed, passes, devices, base_dtype,
-                          lr, epochs, max_steps, rank, train_layers, max_len, accumulation, max_prompt_tokens, judge_model } => {
+                          lr, epochs, max_steps, rank, train_layers, max_len, accumulation, max_prompt_tokens, judge_model, engine } => {
             use strata_workshop::{gradetrain, regress};
             let code = match grader.as_str() { "code" => true, "judge" => false, g => return Err(format!("--grader {g:?}: code or judge")) };
             out.event(json!({"event": "start", "what": format!("grade and train {} on {} ({rounds} round(s), {samples} samples each, graded by {grader}) into {}",
@@ -1063,6 +1100,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             o.train.max_len = *max_len;
             o.train.accumulation = *accumulation;
             o.train.validate().map_err(|e| e.to_string())?;
+            o.engine = engine.spec()?;
             let s = regress::Suite::load(suite).map_err(|e| format!("{e:#}"))?;
             let judge = judge_for(&s, judge_model.as_deref(), out);
             let judge_ref = judge.as_ref().map(|j| j as &dyn regress::Judge);
