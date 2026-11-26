@@ -5305,7 +5305,11 @@ async function wsTrainEstimate() {
     if (seq !== wsEstSeq) return;
     const gpus = (e.fits_gpu || []).map((g) => `<span class="st-badge ${g.fits ? "" : "st-badge--error"}">GPU ${g.index}: ${g.fits ? "fits" : "does not fit"}</span>`).join("");
     const ram = e.fits_ram != null ? `<span class="st-badge ${e.fits_ram ? "" : "st-badge--error"}">RAM: ${e.fits_ram ? "fits" : "does not fit"}</span>` : "";
-    body.innerHTML = `<div class="ws-est"><div class="ws-est__fit">${ram}${req.devices !== "cpu" ? gpus : ""}</div>` +
+    // the GPUs are checked against what is free now; the chat model gives its share back for the run
+    const chat = $("model-select").selectedOptions[0]?.textContent;
+    const note = req.devices !== "cpu" && (e.fits_gpu || []).some((g) => !g.fits)
+      ? `<p class="small">The GPU check is against the memory free now, with ${esc(chat || "the chat model")} loaded. It is unloaded for the run, which frees its share of each card: compare the run's need on the busiest card (the line "split over the devices") with each card's total.</p>` : "";
+    body.innerHTML = `<div class="ws-est"><div class="ws-est__fit">${ram}${req.devices !== "cpu" ? gpus : ""}</div>${note}` +
       `<ul>${(e.lines || []).map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`;
   } catch (err) { if (seq === wsEstSeq) body.innerHTML = `<p class="msg-error">${esc(err.message)}</p>`; }
 }
