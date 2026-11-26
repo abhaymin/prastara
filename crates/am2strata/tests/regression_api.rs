@@ -510,7 +510,7 @@ fn every_route_answers_each_caller_as_its_row_says() {
 fn every_workshop_job_kind_answers_each_caller_as_its_row_says() {
     let s = Server::start(&[client_model(json!({}))], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": "/nonexistent/am2strata-workshop"}}));
     // (kind, the owner's minimal body, what it is refused for)
-    let rows: [(&str, &str, &str); 11] = [
+    let rows: [(&str, &str, &str); 13] = [
         ("upcycle", r#"{"kind": "upcycle", "input": "/nope/model"}"#, "no such folder"),
         ("upcycle", r#"{"kind": "upcycle", "input": "/nope/model", "experts": "ten", "top_k": []}"#, "wrongly typed shape"),
         ("export-moe", r#"{"kind": "export-moe", "input": "/nope/upcycled"}"#, "no such folder"),
@@ -522,6 +522,8 @@ fn every_workshop_job_kind_answers_each_caller_as_its_row_says() {
         ("grade-train", r#"{"kind": "grade-train", "model": "/nope/model", "suite": "/nope/suite.json", "data": "/nope/p.jsonl", "engine_args": "--devices cuda:0"}"#, "engine settings without a GGUF"),
         ("grade-train", r#"{"kind": "grade-train", "model": "/nope/model", "suite": "/nope/suite.json", "data": "/nope/p.jsonl"}"#, "no such model, suite or prompts"),
         ("grade-train", r#"{"kind": "grade-train", "model": [], "data": 4, "samples": "many", "rounds": -1, "grader": 2}"#, "wrongly typed fields"),
+        ("clean", r#"{"kind": "clean", "inputs": ["/nope/a.jsonl"], "exclude": ["/nope/held.jsonl"]}"#, "no such datasets"),
+        ("clean", r#"{"kind": "clean", "inputs": 5, "model": [], "max_repeat": "x", "dedupe": 1, "lang_match": "yes", "exclude": {}}"#, "wrongly typed fields"),
     ];
     let mut wrong = vec![];
     for (kind, body, why) in rows {

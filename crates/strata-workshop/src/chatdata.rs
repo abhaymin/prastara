@@ -240,6 +240,23 @@ impl ChatTokenizer {
         Ok(self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?.len())
     }
 
+    /// How a conversation fits a sequence-length cap, the way [`encode`](Self::encode) sees it: its full token
+    /// count, where the first scored (answer) token is, and how many tokens are scored. One render and one encode.
+    pub fn measure(&self, record: &Record) -> Result<Measure> {
+        let (text, spans) = self.render_with_spans(record)?;
+        let enc = self.tok.encode(text.as_str(), false).map_err(|e| anyhow!("tokenizer: {e}"))?;
+        let scored: Vec<bool> = enc.get_offsets().iter()
+            .map(|(start, end)| spans.iter().any(|(s, e)| *start >= *s && *start < *e && end > start)).collect();
+        // position 0 is never scored by the trainer (nothing predicts it)
+        let first_answer = scored.iter().enumerate().skip(1).find(|(_, s)| **s).map(|(i, _)| i);
+        Ok(Measure { total: scored.len(), first_answer, answer_tokens: scored.iter().skip(1).filter(|s| **s).count() })
+    }
+
+    /// The tokens of a plain text (no template, no special tokens added).
+    pub fn count_text(&self, text: &str) -> Result<usize> {
+        Ok(self.tok.encode(text, false).map_err(|e| anyhow!("tokenizer: {e}"))?.len())
+    }
+
     /// One user message wrapped in the chat template, up to and with the generation prompt (where the answer starts),
     /// as token ids.
     pub fn prompt_ids(&self, user: &str) -> Result<Vec<u32>> {
@@ -259,6 +276,23 @@ impl ChatTokenizer {
 
     pub fn decode(&self, ids: &[u32]) -> Result<String> {
         self.tok.decode(ids, false).map_err(|e| anyhow!("tokenizer: {e}"))
+    }
+}
+
+/// A conversation's length in tokens (see [`ChatTokenizer::measure`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Measure {
+    pub total: usize,
+    /// the first token the trainer scores (the prompt is everything before it); None: no answer token at all
+    pub first_answer: Option<usize>,
+    /// scored tokens: the answers and their end-of-turn markers
+    pub answer_tokens: usize,
+}
+
+impl Measure {
+    /// The trainer's rule: within `max_len` tokens at least one answer token is left (else it drops the row).
+    pub fn fits(&self, max_len: usize) -> bool {
+        self.first_answer.is_some_and(|f| f < max_len)
     }
 }
 

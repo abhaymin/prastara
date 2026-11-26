@@ -13,6 +13,7 @@
 //! am2strata-workshop profile (--model <hf-folder> | --preset llama-2-7b) [--data <chat.jsonl>] [...]
 //! am2strata-workshop autopilot --model <hf-folder> --data <chat.jsonl> [--time-budget 2h] [--ram-budget 12GB]
 //! am2strata-workshop regress --model <hf-folder> [--adapter <dir>] [--passes 1,2] --suite <suite.json> --out <report-dir> [--against <report>]
+//! am2strata-workshop clean <in.jsonl>... --out <out.jsonl> [--model <hf-folder>] [--max-len 1024] [--min-answer-tokens N] [--max-repeat R] [--dedupe exact|near|off] [--lang-match] [--exclude held-out.jsonl] [--cap-per-language N [--cap-only in.jsonl]] [--report card.md]
 //! am2strata-workshop grade-train --model <hf-folder> --data <prompts.jsonl> --samples N --grader code|judge --rounds R --suite <suite.json> --out <dir>
 //! ```
 //!
@@ -34,7 +35,7 @@ use strata_workshop::chatdata::{self, ChatTokenizer, DataFormat};
 use strata_workshop::finetune::{self, Event, FindLr, Resume, TrainSettings};
 use strata_workshop::model::{BaseDtype, ModelConfig, Target};
 use strata_workshop::profile::{self, AutopilotInput, Machine, ProfileInput};
-use strata_workshop::{convert, datagen, merge, quantize_gguf, soup};
+use strata_workshop::{clean, convert, datagen, merge, quantize_gguf, soup};
 
 #[derive(Parser)]
 #[command(name = "am2strata-workshop", about = "Convert, quantize and merge models in Rust (Prastara's Workshop)")]
@@ -217,6 +218,57 @@ enum Cmd {
         /// the model to write with (any the server lists, remote ones included); default: the loaded one
         #[arg(long)]
         model: Option<String>,
+    },
+    /// a chat dataset cleaned for training: duplicates and near-copies, answers that repeat themselves, are too short,
+    /// empty, echo the prompt, are in the wrong script or carry template junk, prompts too long for --max-len, rows of
+    /// a held-out set; seeded order, a card with the count per rule and examples
+    Clean {
+        /// the JSONL files to read (any shape the trainer reads)
+        #[arg(required = true)]
+        inputs: Vec<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
+        /// a Hugging Face model folder: its tokenizer and chat template measure the rows in tokens (else in words, and
+        /// the length rule is not checked)
+        #[arg(long)]
+        model: Option<PathBuf>,
+        #[arg(long)]
+        chat_template: Option<PathBuf>,
+        /// the trainer's sequence length: a row whose prompt alone fills it is dropped
+        #[arg(long, default_value_t = 1024)]
+        max_len: usize,
+        /// an answer needs at least this many tokens (words without --model)
+        #[arg(long, default_value_t = 4)]
+        min_answer_tokens: usize,
+        /// and at least this share of the prompt's tokens (0: no such rule)
+        #[arg(long, default_value_t = 0.0)]
+        min_answer_ratio: f64,
+        /// the most of an answer's word 3-grams that may repeat (0 to 1)
+        #[arg(long, default_value_t = 0.5)]
+        max_repeat: f64,
+        /// exact, near (exact too) or off
+        #[arg(long, default_value = "near")]
+        dedupe: String,
+        /// near-duplicates: prompt and answer at least this alike (MinHash Jaccard, 0 to 1)
+        #[arg(long, default_value_t = 0.8)]
+        near: f64,
+        /// the answer must be in the script of the prompt, its meta.language, or the language a translation asks for
+        #[arg(long)]
+        lang_match: bool,
+        /// rows to keep out (a regression test's held-out set; repeat it)
+        #[arg(long)]
+        exclude: Vec<PathBuf>,
+        /// at most this many rows per language (meta.language), drawn by the seed
+        #[arg(long)]
+        cap_per_language: Option<usize>,
+        /// the cap drops rows only from these inputs (repeat it); the others are kept whole and count towards it
+        #[arg(long)]
+        cap_only: Vec<PathBuf>,
+        #[arg(long, default_value_t = 7)]
+        seed: u64,
+        /// the card (default: <out>.card.md)
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// the model library: ready-made recipes (Soup's catalogue, ported, and Prastara's own) for text, code, tools,
     /// vision, OCR, image, speech, music and video models:
@@ -666,6 +718,7 @@ impl Out {
                 println!("  {}: refused {} of {} held-out harmful prompts and {} of the harmless; answer loss {}", v["which"].as_str().unwrap_or(""),
                          pct("harmful_refusal_rate"), r["n"], pct("harmless_refusal_rate"), r["harmless_loss"].as_f64().map_or("-".into(), |l| format!("{l:.3}")));
             }
+            Some("rule") => println!("  {}", v["message"].as_str().unwrap_or("")),
             Some("profile") | Some("plan") | Some("find-lr") | Some("library") => {
                 for l in v["lines"].as_array().into_iter().flatten() {
                     println!("{}", l.as_str().unwrap_or(""));
@@ -1249,6 +1302,40 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 std::fs::remove_file(dst).ok();
                 std::fs::remove_file(datagen::card_path(dst)).ok();
                 return Err(format!("no records kept: {why}"));
+            }
+            Ok((dst.clone(), "dataset".into()))
+        }
+        Cmd::Clean { inputs, out: dst, model, chat_template, max_len, min_answer_tokens, min_answer_ratio, max_repeat, dedupe, near,
+                     lang_match, exclude, cap_per_language, cap_only, seed, report } => {
+            let mut s = clean::Settings::new(inputs.clone(), dst.clone());
+            s.model = model.clone();
+            s.chat_template = chat_template.clone();
+            s.max_len = (*max_len).max(2);
+            s.min_answer_tokens = *min_answer_tokens;
+            s.min_answer_ratio = *min_answer_ratio;
+            s.max_repeat = *max_repeat;
+            s.dedupe = clean::Dedupe::from_s(dedupe).map_err(|e| e.to_string())?;
+            s.near = *near;
+            s.lang_match = *lang_match;
+            s.exclude = exclude.clone();
+            s.cap_per_language = *cap_per_language;
+            s.cap_only = cap_only.clone();
+            if let Some(c) = cap_only.iter().find(|c| !inputs.contains(c)) {
+                return Err(format!("--cap-only {}: not one of the inputs", c.display()));
+            }
+            s.seed = *seed;
+            s.report = report.clone();
+            if inputs.iter().chain(exclude.iter()).any(|p| p == dst) {
+                return Err(format!("{}: the output cannot be one of the inputs", dst.display()));
+            }
+            out.event(json!({"event": "start", "what": format!("clean {} file(s) into {}", inputs.len(), dst.display())}));
+            let r = clean::run(&s, |v| out.event(v)).map_err(|e| format!("{e:#}"))?;
+            out.event(json!({"event": "log", "message": format!("kept {} of {} rows; card: {}", r.kept, r.read, s.card_path().display())}));
+            if r.kept == 0 {
+                std::fs::remove_file(dst).ok();
+                std::fs::remove_file(s.card_path()).ok();
+                let why: Vec<String> = r.dropped.iter().filter(|(_, n)| **n > 0).map(|(k, n)| format!("{n} {k}")).collect();
+                return Err(format!("no rows kept: every row was dropped ({})", why.join(", ")));
             }
             Ok((dst.clone(), "dataset".into()))
         }
