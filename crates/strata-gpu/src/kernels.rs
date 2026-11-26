@@ -1355,3 +1355,103 @@ pub fn attend_rows(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, o: &mut Array
         j += 128;
     }
 }
+
+/// Decode attention split over positions (flash decoding): a cube per KV head (CUBE_POS_X) and run of `len` positions
+/// (CUBE_POS_Y), its warps taking the query heads that share that KV head (so K and V are read once for them all), a
+/// warp's units splitting the head's values (`per` each), two positions at a time. -> part[(head * splits + split) *
+/// (hd + 2)..]: the run's blend (not yet divided), its maximum and its sum, which attend_merge merges. Needs 32-wide
+/// planes.
+#[cube(launch_unchecked)]
+pub fn attend_split(q: &Array<f32>, k: &Array<f32>, v: &Array<f32>, part: &mut Array<f32>, n: u32, n_kv: u32, group: u32, scale: f32,
+                    len: u32, #[comptime] per: u32) {
+    let kh = CUBE_POS_X;
+    let split = CUBE_POS_Y;
+    let splits = CUBE_COUNT_Y;
+    let hd = comptime![per * 32];
+    let lane = UNIT_POS % 32;
+    let warps = CUBE_DIM / 32;
+    let t0 = split * len;
+    let t1 = u32::min(n, t0 + len);
+    let mut wq = UNIT_POS / 32;
+    while wq < group {
+        let head = kh * group + wq;
+        let mut qv = Array::<f32>::new(comptime![per as usize]);
+        let mut acc = Array::<f32>::new(comptime![per as usize]);
+        #[unroll]
+        for i in 0..per {
+            qv[i as usize] = q[(head * hd + lane + 32 * i) as usize];
+            acc[i as usize] = f32::new(0.0);
+        }
+        let mut m = f32::new(-1.0e30);
+        let mut l = f32::new(0.0);
+        let mut t = t0;
+        while t < t1 {
+            // positions t and t + 1 (the second masked past the run's end)
+            let two = t + 1 < t1;
+            let ka = (t * n_kv + kh) * hd;
+            let mut kb = ka;
+            if two {
+                kb = ka + n_kv * hd;
+            }
+            let mut da = f32::new(0.0);
+            let mut db = f32::new(0.0);
+            #[unroll]
+            for i in 0..per {
+                da += qv[i as usize] * k[(ka + lane + 32 * i) as usize];
+                db += qv[i as usize] * k[(kb + lane + 32 * i) as usize];
+            }
+            let sa = plane_sum(da) * scale;
+            let mut sb = plane_sum(db) * scale;
+            if !two {
+                sb = f32::new(-1.0e30);
+            }
+            let m2 = f32::max(m, f32::max(sa, sb));
+            let c = f32::exp(m - m2);
+            let pa = f32::exp(sa - m2);
+            let pb = f32::exp(sb - m2);
+            l = l * c + pa + pb;
+            #[unroll]
+            for i in 0..per {
+                acc[i as usize] = acc[i as usize] * c + pa * v[(ka + lane + 32 * i) as usize] + pb * v[(kb + lane + 32 * i) as usize];
+            }
+            m = m2;
+            t += 2;
+        }
+        let po = (head * splits + split) * (hd + 2);
+        #[unroll]
+        for i in 0..per {
+            part[(po + lane + 32 * i) as usize] = acc[i as usize];
+        }
+        if lane == 0 {
+            part[(po + hd) as usize] = m;
+            part[(po + hd + 1) as usize] = l;
+        }
+        wq += warps;
+    }
+}
+
+/// o[head * hd + j]: the runs of attend_split merged, a cube per query head.
+#[cube(launch_unchecked)]
+pub fn attend_merge(part: &Array<f32>, o: &mut Array<f32>, splits: u32, hd: u32) {
+    let head = CUBE_POS_X;
+    let base = head * splits * (hd + 2);
+    let mut top = f32::new(-1.0e30);
+    for s in 0..splits {
+        top = f32::max(top, part[(base + s * (hd + 2) + hd) as usize]);
+    }
+    let mut total = f32::new(0.0);
+    for s in 0..splits {
+        let at = base + s * (hd + 2) + hd;
+        total += part[(at + 1) as usize] * f32::exp(part[at as usize] - top);
+    }
+    let mut j = UNIT_POS;
+    while j < hd {
+        let mut acc = f32::new(0.0);
+        for s in 0..splits {
+            let at = base + s * (hd + 2);
+            acc += part[(at + j) as usize] * f32::exp(part[(at + hd) as usize] - top);
+        }
+        o[(head * hd + j) as usize] = acc / total;
+        j += CUBE;
+    }
+}

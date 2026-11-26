@@ -686,7 +686,21 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
         if let Some(per) = self.flash(hd) {
-            return self.attend_rows(q, k, v, q, n - 1, 1, n_head, n_kv, per, scale, false);
+            // flash decoding: runs of positions per KV head, then their merge
+            stats::launch(2);
+            // about 32 runs (at least 32 positions each), so that a short context and a long one both fill the card
+            let len = n.div_ceil(32).div_ceil(32).max(1) * 32;
+            let splits = n.div_ceil(len);
+            let part = self.scratch((n_head * splits * (hd + 2)) as usize);
+            let o = self.scratch((n_head * hd) as usize);
+            let warps = (n_head / n_kv).clamp(1, 8);
+            with_client!(self, c, R, unsafe {
+                kernels::attend_split::launch_unchecked::<R>(c, CubeCount::Static(n_kv, splits, 1), CubeDim::new_1d(32 * warps), q.arg(), k.arg(), v.arg(),
+                    part.arg(), n, n_kv, n_head / n_kv, scale, len, per);
+                kernels::attend_merge::launch_unchecked::<R>(c, CubeCount::Static(n_head, 1, 1), CubeDim::new_1d(kernels::CUBE), part.arg(), o.arg(),
+                    splits, hd);
+            });
+            return o;
         }
         stats::launch(3);
         native!(self, m, Buf { handle: Mem::Mtl(m.attend(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), s.handle.mtl(), n, n_head, n_kv, hd, scale)),
