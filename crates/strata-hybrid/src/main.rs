@@ -417,7 +417,8 @@ fn main() {
         Some(p) => format!(" expert_profile={}", p.ranked.len()),
         None => String::new(),
     };
-    out(&format!("INFO engine=am2strata-hybrid arch={} context={max_ctx} {} placement={placement}{packed}{prof} load_ms={}", m.arch,
+    // geni_stream=1: GENI takes rows=stream (a video's frames read as they are encoded)
+    out(&format!("INFO engine=am2strata-hybrid geni_stream=1 arch={} context={max_ctx} {} placement={placement}{packed}{prof} load_ms={}", m.arch,
                  m.summary(), t0.elapsed().as_millis()));
     let mut last_heat: Vec<u32> = Vec::new();
     out("READY");
@@ -464,10 +465,12 @@ fn main() {
         // drafted tokens per step from prompt lookup (0: off); the CPU path only, where a chunk's logits come back
         let mut lookup: usize = std::env::var("AM2_LOOKUP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
         let mut image_pad: Option<u32> = None;
+        let mut stream_rows = false;
         for kv in &parts[1..keys_end] {
             if let Some((k, v)) = kv.split_once('=') {
                 match k {
                     "image_pad" => image_pad = v.parse().ok(),
+                    "rows" => stream_rows = v == "stream",
                     "temperature" => s.temperature = v.parse().unwrap_or(0.0),
                     "top_k" => s.top_k = v.parse().unwrap_or(64),
                     "top_p" => s.top_p = v.parse().unwrap_or(1.0),
@@ -482,9 +485,27 @@ fn main() {
             out(&format!("ERR the prompt ({} tokens) and {max_new} new tokens do not fit the context of {max_ctx}", ids.len()));
             continue;
         }
-        // the pictures' rows: as many as the prompt has image_pad ids, n_embd wide
+        // the pictures' rows: as many as the prompt has image_pad ids, n_embd wide; with rows=stream the file is
+        // still being written (a video's frames, encoded one by one) and is read as each picture is reached
         let mut rows: Vec<f32> = Vec::new();
-        if geni {
+        let mut stream: Option<RowStream> = None;
+        if geni && stream_rows {
+            let Some(pad) = image_pad else {
+                out("ERR GENI: no image_pad");
+                continue;
+            };
+            if !m.takes_rows() || on_graph {
+                out(&format!("ERR GENI: {} takes no image rows{}", m.arch, if on_graph { " on the device graph" } else { "" }));
+                continue;
+            }
+            match std::fs::File::open(parts[parts.len() - 2]) {
+                Ok(f) => stream = Some(RowStream { file: f, pending: Vec::new(), want: ids.iter().filter(|&&t| t == pad).count() * m.n_embd }),
+                Err(e) => {
+                    out(&format!("ERR GENI: the embeddings file could not be read ({e})"));
+                    continue;
+                }
+            }
+        } else if geni {
             let Some(pad) = image_pad else {
                 out("ERR GENI: no image_pad");
                 continue;
@@ -528,8 +549,32 @@ fn main() {
         if let Some(pad) = pad {
             // runs of text in chunks as below, each picture row in place of its pad token
             let (mut i, mut row) = (0usize, 0usize);
+            let mut failed: Option<String> = None;
             while i < todo.len() {
                 if todo[i] == pad {
+                    if let Some(rs) = stream.as_mut() {
+                        // wait for this row: the picture may still be in the encoder
+                        let (t_wait, mut beat) = (Instant::now(), Instant::now());
+                        let limit = std::env::var("AM2_ROWS_WAIT_S").ok().and_then(|v| v.parse().ok()).unwrap_or(600u64);
+                        loop {
+                            match rs.fill(&mut rows, (row + 1) * m.n_embd) {
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(e) => { failed = Some(format!("the embeddings file could not be read ({e})")); break; }
+                            }
+                            if stop_asked() { stopped = true; break; }
+                            if t_wait.elapsed().as_secs() >= limit {
+                                failed = Some(format!("picture row {row} did not arrive within {limit} s"));
+                                break;
+                            }
+                            if beat.elapsed().as_millis() >= 1000 {
+                                out(&format!("PP {i} {} {}", ids.len(), tp.elapsed().as_millis()));
+                                beat = Instant::now();
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(5));
+                        }
+                        if stopped || failed.is_some() { break; }
+                    }
                     logits = m.forward_embd(&mut st, rows[row * m.n_embd..(row + 1) * m.n_embd].to_vec());
                     row += 1;
                     i += 1;
@@ -540,6 +585,12 @@ fn main() {
                 }
                 out(&format!("PP {i} {} {}", ids.len(), tp.elapsed().as_millis()));
                 if stop_asked() { stopped = true; break; }
+            }
+            if let Some(why) = failed {
+                out(&format!("ERR GENI: {why}"));
+                st = m.new_state();
+                history.clear();
+                continue;
             }
             history.extend_from_slice(todo);
         } else if batch > 1 {
@@ -704,5 +755,42 @@ fn main() {
         }
         // fields 6 and 7: drafted tokens kept and offered (strata-protocol's drafts_accepted / drafts_offered)
         out(&format!("DONE {n} {} {prompt_ms} {} {finish} {accepted} {drafted} 0 {reused}", ids.len(), td.elapsed().as_millis()));
+    }
+}
+
+/// A GENI embeddings file still being written (`rows=stream`): what has arrived so far, read without blocking.
+struct RowStream {
+    file: std::fs::File,
+    /// bytes of a row value cut by the end of what was written
+    pending: Vec<u8>,
+    /// the floats the whole prompt takes
+    want: usize,
+}
+
+impl RowStream {
+    /// Read what the file has gained into `rows`; true once it holds `need` floats.
+    fn fill(&mut self, rows: &mut Vec<f32>, need: usize) -> std::io::Result<bool> {
+        use std::io::Read;
+        if rows.len() >= need {
+            return Ok(true);
+        }
+        let mut buf = [0u8; 1 << 16];
+        loop {
+            let n = self.file.read(&mut buf)?;
+            if n == 0 {
+                break;
+            }
+            self.pending.extend_from_slice(&buf[..n]);
+            let whole = self.pending.len() / 4 * 4;
+            rows.extend(self.pending[..whole].chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])));
+            self.pending.drain(..whole);
+            if rows.len() >= need {
+                break;
+            }
+        }
+        if rows.len() > self.want {
+            return Err(std::io::Error::other(format!("{} values written for the {} the prompt's pictures take", rows.len(), self.want)));
+        }
+        Ok(rows.len() >= need)
     }
 }

@@ -91,11 +91,20 @@ fn parts_of(content: &Value) -> Value {
         if !part.is_object() {
             continue;
         }
-        if is_image_part(part) {
-            items.push(json!({"type": "image", "source": image_source(part)}));
+        let mut item = if is_image_part(part) {
+            json!({"type": "image", "source": image_source(part)})
         } else if is_text_part(part) && part.get("text").is_some() {
-            items.push(json!({"type": "text", "text": part.get("text").cloned().unwrap_or(json!(""))}));
+            json!({"type": "text", "text": part.get("text").cloned().unwrap_or(json!(""))})
+        } else {
+            continue;
+        };
+        // a video's frames and timestamps (the server's media.rs marks them "video_frame": "video" is what Qwen's
+        // template reads as a video): kept so the server can encode the frames
+        // as they are read and thin them to fit the context
+        if let Some(v) = part.get("video_frame").filter(|v| v.is_object()) {
+            item["video_frame"] = v.clone();
         }
+        items.push(item);
     }
     Value::Array(items)
 }

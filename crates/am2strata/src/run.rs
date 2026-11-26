@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use strata_engine::vision::normalize_image;
 use strata_engine::GenEvent;
-use strata_frontend::images::{expand_images, images_of};
+use strata_frontend::images::{expand_images, image_items, FrameTag};
 use strata_frontend::output::{Event, InklingParser, OutputParser, Reply, ReplyText};
 use strata_frontend::request::forced_call;
 use strata_frontend::Prepared;
@@ -417,29 +417,106 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             tracing::info!(model = %loaded.entry.id, "memory: {moved} older message(s) moved to the conversation's archive to fit the context");
         }
     }
-    let prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
+    let mut prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
     let mut ids = prompt.ids.clone();
-    let sources = images_of(&prep.messages);
+    let mut items = image_items(&prep.messages);
     let mut images = None;
     let mut temp: Option<PathBuf> = None;
-    if !sources.is_empty() {
+    let mut frames = FrameProgress::default();
+    let mut stream: Option<FrameStream> = None;
+    if !items.is_empty() {
         let (Some(vision), Some(pad)) = (&loaded.vision, loaded.pad) else {
             return Err(Refusal::bad(format!("{} was started without its image encoder, so it cannot read images", loaded.entry.id)));
         };
-        let mut encoded: Vec<(PathBuf, usize)> = Vec::new();
-        for src in &sources {
-            let data = media::load_source(src).await.map_err(|e| Refusal::bad(e.to_string()))?;
-            let data = normalize_image(&data).map_err(|e| Refusal::bad(e.to_string()))?;
-            let keep: Vec<PathBuf> = encoded.iter().map(|(p, _)| p.clone()).collect();
-            encoded.push(vision.encode(&data, &keep).await.map_err(|e| Refusal::bad(e.to_string()))?);
+        // first the pictures that are not video frames, and each video's first frame: its token count is every frame's
+        // (one decoder, one size). The other frames are encoded while the engine reads the prompt, when it can.
+        let mut encoded: HashMap<String, (PathBuf, usize)> = HashMap::new();
+        let mut seen_video = std::collections::HashSet::new();
+        for (src, tag) in &items {
+            if tag.is_some_and(|t| !seen_video.insert(t.video)) || encoded.contains_key(src) {
+                continue;
+            }
+            let keep: Vec<PathBuf> = encoded.values().map(|(p, _)| p.clone()).collect();
+            encoded.insert(src.clone(), encode_source(vision, src, &keep).await?);
         }
-        let counts: Vec<usize> = encoded.iter().map(|(_, n)| *n).collect();
-        ids = expand_images(&ids, pad, loaded.vision_start, &loaded.pad_literal, &counts).map_err(Refusal::bad)?;
-        let files: Vec<PathBuf> = encoded.iter().map(|(p, _)| p.clone()).collect();
-        let combined = vision.combine(&files).map_err(|e| Refusal(500, e.to_string()))?;
-        let keys = files.iter().map(|p| p.file_stem().and_then(|s| s.to_str()).unwrap_or("").chars().take(16).collect()).collect();
-        images = Some(Images { embeddings: combined.display().to_string(), pad, keys });
-        temp = Some(combined);
+        let per_video: HashMap<usize, usize> = items.iter().filter_map(|(src, tag)| Some((tag.as_ref()?.video, encoded.get(src)?.1)))
+            .fold(HashMap::new(), |mut m, (v, n)| { m.entry(v).or_insert(n); m });
+        let count_of = |src: &str, tag: &Option<FrameTag>| tag.map(|t| per_video[&t.video]).unwrap_or_else(|| encoded[src].1);
+        // the token budget: the frames (each its rows and its timestamp) and the text, with room for the answer. Too
+        // many: each video thinned evenly (a lower rate) until they fit, unless the request says "video_fit": "error"
+        let asked_room = req.get("max_tokens").or_else(|| req.get("max_completion_tokens")).and_then(Value::as_u64).map(|n| n as usize);
+        let reserve = asked_room.unwrap_or(VIDEO_ANSWER_ROOM.min(loaded.max_context / 4));
+        let thin_ok = req.get("video_fit").and_then(Value::as_str) != Some("error");
+        for round in 0.. {
+            let counts: Vec<usize> = items.iter().map(|(s, t)| count_of(s, t)).collect();
+            ids = expand_images(&prompt.ids, pad, loaded.vision_start, &loaded.pad_literal, &counts).map_err(Refusal::bad)?;
+            let need = ids.len() + CTX_SLACK + reserve;
+            let ctx = loaded.max_context;
+            let mut have: Vec<(usize, usize)> = per_video.keys().map(|&v| (v, items.iter().filter(|(_, t)| t.is_some_and(|t| t.video == v)).count())).collect();
+            have.sort();
+            if need <= ctx || have.is_empty() {
+                break;
+            }
+            let frames_now: usize = have.iter().map(|h| h.1).sum();
+            let why = format!("the video's {frames_now} frames ({} tokens each, with its timestamp) and the text make a prompt of {} tokens; \
+                               with {reserve} for the answer that is over the context of {ctx}",
+                              have.iter().map(|(v, _)| (per_video[v] + FRAME_TEXT_TOKENS).to_string()).collect::<Vec<_>>().join("/"), ids.len());
+            if !thin_ok || round >= 8 || have.iter().all(|h| h.1 <= 1) {
+                return Err(Refusal::bad(format!("{why}. Send a lower video_fps, video_max_frames or video_width, a shorter clip, or a \
+                                                 smaller max_tokens{}", if thin_ok { "" } else { " (or leave out \"video_fit\": \"error\" to thin the frames)" })));
+            }
+            // drop frames from the video with the most, one at a time, until the estimate fits
+            let mut over = need - ctx;
+            while over > 0 && have.iter().any(|h| h.1 > 1) {
+                let i = (0..have.len()).max_by_key(|&i| (have[i].1, std::cmp::Reverse(i))).unwrap();
+                have[i].1 -= 1;
+                over = over.saturating_sub(per_video[&have[i].0] + FRAME_TEXT_TOKENS);
+            }
+            for (v, k) in &have {
+                let had = media::thin_video(&mut prep.messages, *v, *k);
+                if had > *k {
+                    tracing::info!(model = %loaded.entry.id, "video {v}: {had} frames thinned to {k} to fit the context");
+                }
+            }
+            prompt = loaded.prompts.build(&prep).map_err(|e| Refusal::bad(e.0))?;
+            items = image_items(&prep.messages);
+        }
+        frames.total = items.iter().filter(|(_, t)| t.is_some()).count();
+        frames.ends = frame_ends(&ids, pad, &items);
+        let counts: Vec<usize> = items.iter().map(|(s, t)| count_of(s, t)).collect();
+        let streams = loaded.engine.info.iter().any(|l| l.split_whitespace().any(|w| w == "geni_stream=1"));
+        let pending = items.iter().any(|(s, _)| !encoded.contains_key(s));
+        if streams && pending {
+            // the engine reads the rows as they are written: the frames are encoded one by one while it reads the
+            // prompt before them, so its attention cache grows frame by frame
+            let path = vision.combine(&[]).map_err(|e| Refusal(500, e.to_string()))?;
+            stream = Some(FrameStream::start(loaded.clone(), path.clone(), items.clone(), counts, encoded, frames.encoded.clone()));
+            images = Some(Images { embeddings: path.display().to_string(), pad, keys: Vec::new(), stream: true });
+            temp = Some(path);
+        } else {
+            let mut files: Vec<PathBuf> = Vec::new();
+            for (k, (src, tag)) in items.iter().enumerate() {
+                let (file, n) = match encoded.get(src) {
+                    Some(e) => e.clone(),
+                    None => {
+                        let e = encode_source(vision, src, &files).await?;
+                        encoded.insert(src.clone(), e.clone());
+                        e
+                    }
+                };
+                if n != counts[k] {
+                    return Err(Refusal::bad(format!("a frame of the video gave {n} image tokens where its first gave {}", counts[k])));
+                }
+                if tag.is_some() {
+                    frames.encoded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                files.push(file);
+            }
+            let combined = vision.combine(&files).map_err(|e| Refusal(500, e.to_string()))?;
+            let keys = files.iter().map(|p| p.file_stem().and_then(|s| s.to_str()).unwrap_or("").chars().take(16).collect()).collect();
+            images = Some(Images { embeddings: combined.display().to_string(), pad, keys, stream: false });
+            temp = Some(combined);
+        }
     }
     let ctx = loaded.max_context;
     let room = ctx.saturating_sub(CTX_SLACK + ids.len());
@@ -507,12 +584,16 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
     let turn_at = strata_protocol::turn_at(&ids, &loaded.turn_ids);
     let prompt_tokens = ids.len();
     let mut record = mgr.monitor.begin(&loaded.entry.id, prompt_tokens, max_new);
+    if frames.total > 0 {
+        record.frames(frames.encoded.load(std::sync::atomic::Ordering::Relaxed), 0, frames.total);
+    }
     let (tx, events) = mpsc::channel(256);
     let model = loaded.entry.id.clone();
     let lc = loaded.clone();
     let mgr_task = mgr.clone();
     tokio::spawn(async move {
         let _turn = turn; // held until this request ends
+        let mut stream = stream; // the frames still being encoded: stopped and removed when the request ends
         // a prompt snapshot on the SSD that gives more of this prompt than the engine holds is read back first
         mgr_task.snapshots.before(&lc, &ids, images.is_some()).await;
         let mut cut = StopCutter { stops, held: String::new(), hit: None };
@@ -570,7 +651,18 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
             let (mut stopped, mut repeated, mut looped) = (false, false, false);
             let mut recover_prompt: Option<Vec<u32>> = None;
             let mut ended: Option<strata_protocol::Done> = None;
-            while let Some(ev) = rx.recv().await {
+            loop {
+                // a frame the encoder could not read ends the request (dropping rx tells the engine to STOP)
+                let ev = tokio::select! {
+                    biased;
+                    e = stream_error(&mut stream) => {
+                        record.fail();
+                        let _ = tx.send(RunEvent::Error(e)).await;
+                        return;
+                    }
+                    ev = rx.recv() => ev,
+                };
+                let Some(ev) = ev else { break };
                 match ev {
                     Ok(GenEvent::Token(_)) if stopped => break, // the engine went on past its stop token: STOP it
                     Ok(GenEvent::Token(t)) => {
@@ -644,6 +736,9 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
                     }
                     Ok(GenEvent::Progress { done, total }) => {
                         record.progress(done, total);
+                        if frames.total > 0 {
+                            record.frames(frames.encoded.load(std::sync::atomic::Ordering::Relaxed), frames.read(done as usize), frames.total);
+                        }
                         if tx.send(RunEvent::Ping).await.is_err() {
                             return;
                         }
@@ -781,6 +876,108 @@ pub async fn start(mgr: Arc<Manager>, loaded: Arc<Loaded>, prep: Prepared, req: 
         }
     });
     Ok(Started { events, prompt_tokens, model })
+}
+
+/// The answer's room a video's frames leave without max_tokens (thinned to fit; at most a quarter of the context).
+const VIDEO_ANSWER_ROOM: usize = 2048;
+/// About what a frame costs besides its rows: its timestamp text and the template's picture markers.
+const FRAME_TEXT_TOKENS: usize = 8;
+
+/// One picture's source, read and encoded -> (its rows' file, its tokens).
+async fn encode_source(vision: &strata_engine::Vision, src: &str, keep: &[PathBuf]) -> Result<(PathBuf, usize), Refusal> {
+    let data = media::load_source(src).await.map_err(|e| Refusal::bad(e.to_string()))?;
+    let data = normalize_image(&data).map_err(|e| Refusal::bad(e.to_string()))?;
+    vision.encode(&data, keep).await.map_err(|e| Refusal::bad(e.to_string()))
+}
+
+/// A request's video frames: how many, how many encoded, and where each one's rows end in the prompt (so the engine's
+/// prompt progress says how many it has read).
+#[derive(Default)]
+struct FrameProgress {
+    total: usize,
+    encoded: Arc<std::sync::atomic::AtomicUsize>,
+    ends: Vec<usize>,
+}
+
+impl FrameProgress {
+    fn read(&self, done: usize) -> usize {
+        self.ends.iter().filter(|&&e| e <= done).count()
+    }
+}
+
+/// The end (one past the last row) in `ids` of each video frame's run of pads; empty when the runs and the pictures do
+/// not pair up (two pictures with nothing between them).
+fn frame_ends(ids: &[u32], pad: u32, items: &[(String, Option<FrameTag>)]) -> Vec<usize> {
+    let ends: Vec<usize> = (0..ids.len()).filter(|&j| ids[j] == pad && ids.get(j + 1) != Some(&pad)).map(|j| j + 1).collect();
+    if ends.len() != items.len() {
+        return Vec::new();
+    }
+    ends.into_iter().zip(items).filter(|(_, (_, t))| t.is_some()).map(|(e, _)| e).collect()
+}
+
+/// The frames encoded in prompt order while the engine reads them (`rows=stream`): each picture's rows appended to the
+/// file the GENI line names. Aborted and the file removed when dropped.
+struct FrameStream {
+    task: tokio::task::JoinHandle<()>,
+    err: mpsc::Receiver<String>,
+    path: PathBuf,
+}
+
+impl FrameStream {
+    fn start(lc: Arc<Loaded>, path: PathBuf, items: Vec<(String, Option<FrameTag>)>, counts: Vec<usize>,
+             encoded: HashMap<String, (PathBuf, usize)>, done: Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        let (etx, err) = mpsc::channel(1);
+        let out = path.clone();
+        let task = tokio::spawn(async move {
+            let Some(vision) = lc.vision.as_ref() else { return };
+            let keep: Vec<PathBuf> = encoded.values().map(|(p, _)| p.clone()).collect();
+            let fail = |m: String| { let _ = etx.try_send(m); };
+            let mut f = match std::fs::OpenOptions::new().append(true).open(&out) {
+                Ok(f) => f,
+                Err(e) => return fail(format!("the frames' file: {e}")),
+            };
+            let t0 = std::time::Instant::now();
+            for (k, (src, tag)) in items.iter().enumerate() {
+                let (file, n) = match encoded.get(src) {
+                    Some(e) => e.clone(),
+                    None => match encode_source(vision, src, &keep).await {
+                        Ok(e) => e,
+                        Err(e) => return fail(format!("frame {} of the video could not be encoded: {}", tag.map(|t| t.frame).unwrap_or(k), e.1)),
+                    },
+                };
+                if n != counts[k] {
+                    return fail(format!("a frame of the video gave {n} image tokens where its first gave {}", counts[k]));
+                }
+                let copied = std::fs::File::open(&file).and_then(|mut r| std::io::copy(&mut r, &mut f)).and_then(|_| std::io::Write::flush(&mut f));
+                if let Err(e) = copied {
+                    return fail(format!("the frames' file: {e}"));
+                }
+                if tag.is_some() {
+                    done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            tracing::info!(model = %lc.entry.id, "{} picture(s) encoded beside the prompt read in {:.1} s", items.len(), t0.elapsed().as_secs_f64());
+        });
+        Self { task, err, path }
+    }
+}
+
+impl Drop for FrameStream {
+    fn drop(&mut self) {
+        self.task.abort();
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The next error of the frames being encoded; never, when there are none or they all went in.
+async fn stream_error(s: &mut Option<FrameStream>) -> String {
+    match s {
+        Some(st) => match st.err.recv().await {
+            Some(e) => e,
+            None => std::future::pending().await,
+        },
+        None => std::future::pending().await,
+    }
 }
 
 /// The most tool rounds a request may ask for (strata_max_rounds).

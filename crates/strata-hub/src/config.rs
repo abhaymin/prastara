@@ -15,6 +15,9 @@ pub const HYBRID_ARCHS: [(&str, &str); 9] = [("nemotron_h_moe", "Nemotron-H MoE"
                                              ("llama", "Llama / Mistral / Mixtral"), ("mistral3", "Mistral 3"), ("qwen3", "Qwen3"), ("qwen3moe", "Qwen3 MoE"),
                                              ("inkling2", "Inkling 2"), ("inkling2_loop", "Inkling 2 (looped)")];
 
+/// Architectures whose pictures the Rust engine reads, with am2strata-vision (crates/strata-hybrid/src/vision.rs).
+pub const VISION_ARCHS: [&str; 2] = ["inkling2", "inkling2_loop"];
+
 /// Architectures the Rust engine also runs, which it runs only when strata-poly and strata are not here: a release without them.
 pub const RUST_FALLBACK_ARCHS: [(&str, &str); 2] = [("qwen35moe", "Qwen3.5/3.6 MoE"), ("qwen4exp", "Qwen3.8 Flash Next")];
 
@@ -166,11 +169,20 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
             Some(e) => (json!(e), json!(models_dir)),
             None => (json!("${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-hybrid"), json!("${AM2STRATA_HOME}")),
         };
-        let cfg = json!({
+        let mut cfg = json!({
             "exe": exe, "args": args, "cwd": cwd,
             "tokenizer": pack.join("tokenizer"), "model_name": id, "display_name": display,
             "log": models_dir.join(format!("strata-{id}.log")), "pulled_by": "am2strata",
         });
+        // pictures (and a video's frames) for Inkling: its image encoder in Rust, am2strata-vision (I6v), on the CPU,
+        // beside the engine; the engine takes its rows with GENI
+        if let Some(mm) = mmproj.filter(|_| VISION_ARCHS.contains(&arch.as_str())) {
+            let vision_exe = match &bundled {
+                Some(e) => json!(e.with_file_name(format!("am2strata-vision{}", std::env::consts::EXE_SUFFIX))),
+                None => json!("${AM2STRATA_HOME}/crates/strata-hybrid/target/release/am2strata-vision"),
+            };
+            cfg["vision"] = json!({"exe": vision_exe, "mmproj": mm, "model": model, "gpu": false, "max_tokens": 1024});
+        }
         let path = models_dir.join(format!("strata-{id}.json"));
         std::fs::write(&path, pretty1(&cfg)).map_err(|e| format!("{}: {e}", path.display()))?;
         return Ok(Written { config: path, tokenizer: pack.join("tokenizer") });
@@ -270,6 +282,11 @@ mod tests {
     /// which carries a SentencePiece (llama) tokenizer: the string "general.architecture", the token model and a tokens
     /// array. Value types are the GGUF codes strata-gguf reads (string 8, array of string 9).
     fn tiny_lfm2moe_gguf(path: &Path) {
+        tiny_tokenized_gguf(path, "lfm2moe")
+    }
+
+    /// The same tiny GGUF with another architecture.
+    fn tiny_tokenized_gguf(path: &Path, arch: &str) {
         let mut b = Vec::new();
         b.extend(b"GGUF");
         b.extend(3u32.to_le_bytes());
@@ -278,7 +295,7 @@ mod tests {
         let s = |b: &mut Vec<u8>, t: &str| { b.extend((t.len() as u64).to_le_bytes()); b.extend(t.as_bytes()) };
         s(&mut b, "general.architecture");
         b.extend(8u32.to_le_bytes());
-        s(&mut b, "lfm2moe");
+        s(&mut b, arch);
         s(&mut b, "tokenizer.ggml.model");
         b.extend(8u32.to_le_bytes());
         s(&mut b, "llama");
@@ -350,6 +367,35 @@ mod tests {
         assert_eq!(cfg["engine_available"], json!(false), "the config is marked unavailable");
         assert!(cfg["engine_unavailable_reason"].as_str().unwrap().contains("lfm2moe"), "reason shown: {:?}", cfg["engine_unavailable_reason"]);
         assert!(written.config.exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Inkling's pictures go to its Rust image encoder, am2strata-vision (I6v), on the CPU; no llama.cpp encoder. A
+    /// Rust-engine model of another architecture gets no vision section.
+    #[test]
+    fn inkling_pictures_use_the_rust_encoder() {
+        let d = std::env::temp_dir().join(format!("am2-write-inkling-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("packs")).unwrap();
+        let models_dir = d.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let mm = d.join("mmproj-F16.gguf");
+        for arch in ["inkling2", "inkling2_loop", "llama"] {
+            let tiny = d.join(format!("{arch}.gguf"));
+            tiny_tokenized_gguf(&tiny, arch);
+            let g = inspect(&tiny).unwrap();
+            let w = write(&models_dir, &d.join("packs"), &tiny, &g, Some(&mm), Some(8192), arch, arch).unwrap();
+            let cfg: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&w.config).unwrap()).unwrap();
+            assert!(cfg["exe"].as_str().unwrap().ends_with("am2strata-hybrid"), "{cfg}");
+            if arch == "llama" {
+                assert!(cfg.get("vision").is_none(), "{cfg}");
+                continue;
+            }
+            let v = &cfg["vision"];
+            assert!(v["exe"].as_str().unwrap().ends_with("am2strata-vision"), "{v}");
+            assert_eq!((v["mmproj"].as_str(), v["gpu"].as_bool()), (mm.to_str(), Some(false)), "{v}");
+            assert!(!cfg.to_string().contains("llama-vision") && !cfg.to_string().contains("engine-poly"), "{cfg}");
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 

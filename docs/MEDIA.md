@@ -356,4 +356,9 @@ MP4 files with H.264 video, which is what phones and most tools make, are decode
 - a chat gets the video's keyframes only, and says so;
 - the media check, which needs every frame, says plainly to install ffmpeg or re-encode without B-frames (`ffmpeg -bf 0`).
 
-Videos made without B-frames (OpenH264, many phone and screen recorders) decode in full. With ffmpeg installed, it is used as before for every format.
+Videos made without B-frames (OpenH264, many phone and screen recorders) decode in full. With ffmpeg installed, it reads what the built-in decoder cannot (other formats, and B-frame files in full).
+
+**A video in a chat** is read frame by frame: one frame a second by default (`video_fps`, `video_max_frames` up to 256,
+`video_width`), each after its timestamp (`[00:42]`); a long video is sampled more thinly over its whole length, and
+frames that would not fit the context are thinned evenly (or refused with `"video_fit": "error"`). On the Rust engine
+the frames are encoded while the model reads the ones before them. Details: INKLING-PLAN.md, "F2: video".

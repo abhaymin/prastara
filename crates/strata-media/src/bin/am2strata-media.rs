@@ -981,7 +981,35 @@ fn rgb_to_png(rgb: &[u8], ow: usize, oh: usize, width: usize) -> Result<Vec<u8>>
     Ok(buf.into_inner())
 }
 
-/// {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>} ->
+/// The frames one every `every_s` seconds of a `total`-frame video at `fps`: the frame nearest each time 0, every_s,
+/// 2 every_s, ... At most `max`; with `fit`, a video longer than `max` steps is sampled `max` times evenly over its whole
+/// length instead of cut off (the rate lowered to fit).
+fn pick_every(total: usize, fps: f64, every_s: f64, max: usize, fit: bool) -> Vec<usize> {
+    if total == 0 || max == 0 {
+        return Vec::new();
+    }
+    let duration = total as f64 / fps;
+    let mut step = every_s;
+    if fit && (duration / step).ceil() as usize > max {
+        step = duration / max as f64;
+    }
+    let mut v: Vec<usize> = Vec::new();
+    let mut k = 0usize;
+    loop {
+        let t = k as f64 * step;
+        if t >= duration - 1e-9 || v.len() >= max {
+            break;
+        }
+        let i = ((t * fps).round() as usize).min(total - 1);
+        if v.last() != Some(&i) {
+            v.push(i);
+        }
+        k += 1;
+    }
+    v
+}
+
+/// {"op":"video_frames","file":<path>,"every_s":<f>,"max":<n>,"width":<w>[,"fit":true]} ->
 /// {"event":"frames","fps","duration_s","width","height","frames":[{"t":..,"png":"<base64>"}]}. Anything that is not an
 /// MP4/H.264 answers with {"event":"error","message":"... needs ffmpeg ...", naming the format}.
 fn video_frames(cmd: &Value) -> Result<Value> {
@@ -1020,19 +1048,11 @@ fn video_frames(cmd: &Value) -> Result<Value> {
     let width = cmd["width"].as_u64().map(|w| w as usize).unwrap_or(720).max(1);
     let every_s = cmd["every_s"].as_f64().unwrap_or(0.0);
 
-    // which frames to keep: spaced by `every_s` (>0), else evenly spread up to `max`.
+    // which frames to keep: one each `every_s` (>0; with "fit", spread wider so that `max` cover the whole video), else
+    // evenly spread up to `max`.
+    let fit = cmd["fit"].as_bool().unwrap_or(false);
     let keep: Vec<usize> = if every_s > 0.0 {
-        let mut v = Vec::new();
-        let mut last = -1.0;
-        for i in 0..total {
-            let t = i as f64 / fps;
-            if last < 0.0 || t - last >= every_s {
-                v.push(i);
-                last = t;
-                if v.len() >= max { break; }
-            }
-        }
-        v
+        pick_every(total, fps, every_s, max, fit)
     } else if total <= max {
         (0..total).collect()
     } else {
@@ -1351,6 +1371,26 @@ mod video_tests {
         assert_eq!(r["keyframes_only"], json!(true), "{r}");
         assert_eq!(r["frames"].as_array().unwrap().len(), 1, "the one keyframe: {r}");
         let _ = std::fs::remove_file(&file);
+    }
+
+    /// Frames at a rate: the one nearest each second; a cap cuts a video off, unless "fit" spreads the cap over the
+    /// whole video (a lower rate).
+    #[test]
+    fn frames_are_picked_at_the_rate_and_fit_the_cap() {
+        // 10 s at 30 fps, one a second: frames 0, 30, ..., 270
+        assert_eq!(pick_every(300, 30.0, 1.0, 64, true), (0..10).map(|k| k * 30).collect::<Vec<_>>());
+        // 29.97 fps: the frame nearest each second, no drift
+        let v = pick_every(600, 29.97, 1.0, 64, false);
+        assert_eq!(v.len(), 21);
+        assert_eq!((v[1], v[10], v[20]), (30, 300, 599));
+        // capped at 4 without fit: the first 4 seconds
+        assert_eq!(pick_every(300, 30.0, 1.0, 4, false), vec![0, 30, 60, 90]);
+        // with fit: 4 frames over the whole 10 s, one each 2.5 s
+        assert_eq!(pick_every(300, 30.0, 1.0, 4, true), vec![0, 75, 150, 225]);
+        // two frames a second of a 1.5 s clip at 10 fps
+        assert_eq!(pick_every(15, 10.0, 0.5, 64, true), vec![0, 5, 10]);
+        // a clip shorter than the step: its first frame
+        assert_eq!(pick_every(5, 10.0, 1.0, 64, true), vec![0]);
     }
 
     /// Encode a synthetic H.264 clip to an MP4, read it back with the video_frames op, and check the frame count, fps,
