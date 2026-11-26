@@ -369,5 +369,10 @@ the output on the other is the first split to measure), instead of about a thous
   `video_frames_are_thinned_to_fit_the_context`; units: `pick_every` (sampling times, the 29.97 fps drift, the cap),
   timestamps, request options, thinning; strata-hub `inkling_pictures_use_the_rust_encoder`; the real engine:
   `tests/vision.rs` `geni_streams_a_video` (ignored; a synthetic square moving and turning red to blue).
+- **Real run (CPU, 2026-11-26, `geni_streams_a_video`, 20 GB cap beside the live server):** 4 frames of 320x192 (a
+  square moving left to right, red to blue; 40 rows each), 273 prompt ids, greedy, effort 0: the rows streamed in
+  (each frame about 1 s in am2strata-vision, so well ahead of the engine), prompt 277 s (token by token under the cap),
+  40 tokens in 23 s; the thinking begins "Frame 00:00 red square at left, around x 20-", reading the timestamps and
+  the first frame right.
 - **Open:** pictures on the device graph (`--devices`): GENI is refused there, so a GPU-placed Inkling reads pictures
   only with `--no-graph`; F3 (the same path for Mula Drishti).
