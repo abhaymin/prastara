@@ -11,6 +11,58 @@ pub mod kernels;
 #[cfg(target_os = "macos")]
 pub mod native;
 
+/// What the devices were asked to do, counted for every device since the process started (AM2_PROFILE in the engine
+/// reads it per token): kernel launches, host syncs (a read that waits for the device), bytes each way, and the time
+/// the host spent waiting in those reads. Relaxed atomics: a few nanoseconds against a kernel launch's microseconds.
+pub mod stats {
+    use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+    static LAUNCHES: AtomicU64 = AtomicU64::new(0);
+    static SYNCS: AtomicU64 = AtomicU64::new(0);
+    static D2H: AtomicU64 = AtomicU64::new(0);
+    static H2D: AtomicU64 = AtomicU64::new(0);
+    static H2D_COPIES: AtomicU64 = AtomicU64::new(0);
+    static WAIT_NS: AtomicU64 = AtomicU64::new(0);
+
+    #[derive(Clone, Copy, Default, Debug, PartialEq)]
+    pub struct Stats {
+        pub launches: u64,
+        pub syncs: u64,
+        pub d2h_bytes: u64,
+        pub h2d_bytes: u64,
+        pub h2d_copies: u64,
+        pub wait_ns: u64,
+    }
+
+    impl std::ops::Sub for Stats {
+        type Output = Stats;
+        fn sub(self, o: Stats) -> Stats {
+            Stats { launches: self.launches - o.launches, syncs: self.syncs - o.syncs, d2h_bytes: self.d2h_bytes - o.d2h_bytes,
+                    h2d_bytes: self.h2d_bytes - o.h2d_bytes, h2d_copies: self.h2d_copies - o.h2d_copies, wait_ns: self.wait_ns - o.wait_ns }
+        }
+    }
+
+    pub fn snapshot() -> Stats {
+        Stats { launches: LAUNCHES.load(Relaxed), syncs: SYNCS.load(Relaxed), d2h_bytes: D2H.load(Relaxed), h2d_bytes: H2D.load(Relaxed),
+                h2d_copies: H2D_COPIES.load(Relaxed), wait_ns: WAIT_NS.load(Relaxed) }
+    }
+
+    pub(crate) fn launch(n: u64) {
+        LAUNCHES.fetch_add(n, Relaxed);
+    }
+
+    pub(crate) fn h2d(bytes: usize) {
+        H2D.fetch_add(bytes as u64, Relaxed);
+        H2D_COPIES.fetch_add(1, Relaxed);
+    }
+
+    /// A read back: it waited `t0.elapsed()` (the device's queue, then the copy).
+    pub(crate) fn d2h(bytes: usize, t0: std::time::Instant) {
+        SYNCS.fetch_add(1, Relaxed);
+        D2H.fetch_add(bytes as u64, Relaxed);
+        WAIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
 use cubecl::prelude::*;
 use cubecl::server::Handle;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -134,6 +186,7 @@ macro_rules! product {
         let cubes = w.rows.div_ceil(if wide { 32 } else { kernels::ROWS_PER_CUBE });
         let (cx, cy) = (cubes.min(65535), cubes.div_ceil(cubes.min(65535)));
         let count = CubeCount::Static(cx, cy, $tokens);
+        stats::launch(1);
         unsafe {
             let y = ArrayArg::from_raw_parts($hy, $tokens as usize * w.rows as usize);
             let (wa, xa) = (ArrayArg::from_raw_parts(w.handle.cube(), w.bytes.div_ceil(4)), ArrayArg::from_raw_parts($hx, $n));
@@ -254,6 +307,7 @@ impl Gpu {
         if data.len() != rows * row_bytes {
             return Err(format!("{} bytes for a {rows}x{cols} {ty} matrix (want {})", data.len(), rows * row_bytes));
         }
+        stats::h2d(data.len());
         native!(self, n, {
             let t = kernels::table_for(ty);
             let all: Vec<u8> = t.iter().chain(data).copied().collect();
@@ -314,18 +368,25 @@ impl Gpu {
             outs.iter().map(|b| self.read(b)).collect()
         });
         with_client!(self, c, R, {
+            stats::h2d(x.len() * 4);
             let hx = c.create_from_slice(f32::as_bytes(x));
             let outs: Vec<_> = ws.iter().map(|w| {
                 let hy = c.empty(tokens as usize * w.rows as usize * 4);
                 product!(c, R, *w, hx.clone(), x.len(), hy.clone(), tokens);
                 hy
             }).collect();
-            outs.into_iter().map(|hy| f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()).collect()
+            outs.into_iter().map(|hy| {
+                let t0 = std::time::Instant::now();
+                let v = f32::from_bytes(&c.read_one_unchecked(hy)).to_vec();
+                stats::d2h(v.len() * 4, t0);
+                v
+            }).collect()
         })
     }
 
     /// A buffer of f32 on the device.
     pub fn buffer(&self, v: &[f32]) -> Buf {
+        stats::h2d(v.len() * 4);
         native!(self, n, Buf { handle: Mem::Mtl(n.upload(f32::as_bytes(v))), len: v.len() });
         Buf { handle: Mem::Cube(with_client!(self, c, R, c.create_from_slice(f32::as_bytes(v)))), len: v.len() }
     }
@@ -350,8 +411,13 @@ impl Gpu {
 
     /// Waits for the device and reads a buffer back. Only this waits: every call below just queues its kernel.
     pub fn read(&self, b: &Buf) -> Vec<f32> {
-        native!(self, n, n.read(b.handle.mtl(), b.len));
-        with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.cube())).to_vec())
+        let t0 = std::time::Instant::now();
+        let v = (|| {
+            native!(self, n, n.read(b.handle.mtl(), b.len));
+            with_client!(self, c, R, f32::from_bytes(&c.read_one_unchecked(b.handle.cube())).to_vec())
+        })();
+        stats::d2h(b.len * 4, t0);
+        v
     }
 
     /// y = W x, queued; y stays on the device.
@@ -361,6 +427,8 @@ impl Gpu {
 
     /// y = W x for `tokens` vectors of `w.cols` values in x, queued; y (tokens * rows) stays on the device.
     pub fn mv_tokens(&self, w: &Weights, x: &Buf, tokens: u32) -> Buf {
+        #[cfg(target_os = "macos")]
+        if self.is_native() { stats::launch(1); }
         native!(self, n, Buf { handle: Mem::Mtl(n.mv(w.handle.mtl(), w.rows, w.cols, w.row_bytes, w.geometry.2, x.handle.mtl(), tokens)),
                                len: tokens as usize * w.rows as usize });
         with_client!(self, c, R, {
@@ -372,6 +440,7 @@ impl Gpu {
 
     /// y = x * w / sqrt(mean(x^2) + eps), queued.
     pub fn rms_norm(&self, x: &Buf, w: &Buf, eps: f32) -> Buf {
+        stats::launch(1);
         native!(self, n, Buf { handle: Mem::Mtl(n.rms_norm(x.handle.mtl(), w.handle.mtl(), w.len as u32, (x.len / w.len) as u32, eps)), len: x.len });
         let y = self.scratch(x.len);
         with_client!(self, c, R, unsafe {
@@ -382,6 +451,7 @@ impl Gpu {
 
     /// y += x, queued.
     pub fn add_into(&self, x: &Buf, y: &Buf) {
+        stats::launch(1);
         native!(self, m, m.add_into(x.handle.mtl(), y.handle.mtl(), x.len as u32));
         let n = x.len as u32;
         with_client!(self, c, R, unsafe {
@@ -391,6 +461,7 @@ impl Gpu {
 
     /// up *= silu(gate), queued.
     pub fn silu_gate(&self, gate: &Buf, up: &Buf) {
+        stats::launch(1);
         native!(self, m, m.silu_gate(gate.handle.mtl(), up.handle.mtl(), up.len as u32));
         let n = up.len as u32;
         with_client!(self, c, R, unsafe {
@@ -400,6 +471,7 @@ impl Gpu {
 
     /// Rotates x, `hd` values per head, by a (cos, sin) table of `n_rot / 2` pairs, queued.
     pub fn rope(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool) {
+        stats::launch(1);
         let heads = x.len as u32 / hd;
         native!(self, m, m.rope(tab.handle.mtl(), x.handle.mtl(), heads, hd, n_rot, neox));
         with_client!(self, c, R, unsafe {
@@ -409,6 +481,7 @@ impl Gpu {
 
     /// cache[at..] = x, queued.
     pub fn kv_append(&self, x: &Buf, cache: &Buf, at: usize) {
+        stats::launch(1);
         native!(self, m, m.kv_append(x.handle.mtl(), cache.handle.mtl(), x.len as u32, at as u32));
         let n = x.len as u32;
         with_client!(self, c, R, unsafe {
@@ -420,6 +493,7 @@ impl Gpu {
     /// values. `s` is scratch for n_head * n scores.
     #[allow(clippy::too_many_arguments)]
     pub fn attend(&self, q: &Buf, k: &Buf, v: &Buf, s: &Buf, n: u32, n_head: u32, n_kv: u32, hd: u32, scale: f32) -> Buf {
+        stats::launch(3);
         native!(self, m, Buf { handle: Mem::Mtl(m.attend(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), s.handle.mtl(), n, n_head, n_kv, hd, scale)),
                                len: (n_head * hd) as usize });
         let o = self.scratch((n_head * hd) as usize);
@@ -444,6 +518,7 @@ impl Gpu {
     /// RoPE over a chunk of `tokens` tokens (native Metal only): `tab` holds each token's (cos, sin) pairs in turn.
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn rope_tokens(&self, tab: &Buf, x: &Buf, hd: u32, n_rot: u32, neox: bool, tokens: u32) {
+        stats::launch(1);
         native!(self, m, m.rope_tokens(tab.handle.mtl(), x.handle.mtl(), x.len as u32 / hd / tokens, tokens, hd, n_rot, neox));
         panic!("rope_tokens needs the native Metal backend")
     }
@@ -451,6 +526,7 @@ impl Gpu {
     /// x[at .. at + n] as a buffer of its own (native Metal only).
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn row(&self, x: &Buf, at: usize, n: usize) -> Buf {
+        stats::launch(1);
         native!(self, m, Buf { handle: Mem::Mtl(m.copy_from(x.handle.mtl(), at as u32, n as u32)), len: n });
         panic!("row needs the native Metal backend")
     }
@@ -459,6 +535,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     pub fn attend_tokens(&self, q: &Buf, k: &Buf, v: &Buf, scales: &Buf, base: u32, tokens: u32, n_head: u32, n_kv: u32, hd: u32) -> Buf {
+        stats::launch(1);
         native!(self, m, Buf { handle: Mem::Mtl(m.attend_tokens(q.handle.mtl(), k.handle.mtl(), v.handle.mtl(), scales.handle.mtl(), base, tokens,
                                                                 n_head, n_kv, hd)), len: (tokens * n_head * hd) as usize });
         panic!("attend_tokens needs the native Metal backend")
@@ -469,10 +546,14 @@ impl Gpu {
         let tokens = (x.len() / w.cols as usize).max(1) as u32;
         native!(self, m, { let _ = m; let hx = self.buffer(x); let y = self.mv_tokens(w, &hx, tokens); self.read(&y) });
         with_client!(self, c, R, {
+            stats::h2d(x.len() * 4);
             let hx = c.create_from_slice(f32::as_bytes(x));
             let hy = c.empty(tokens as usize * w.rows as usize * 4);
             product!(c, R, w, hx, x.len(), hy.clone(), tokens);
-            f32::from_bytes(&c.read_one_unchecked(hy)).to_vec()
+            let t0 = std::time::Instant::now();
+            let v = f32::from_bytes(&c.read_one_unchecked(hy)).to_vec();
+            stats::d2h(v.len() * 4, t0);
+            v
         })
     }
 }
