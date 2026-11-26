@@ -24,7 +24,7 @@ use crate::kvcache::{KvStore, KvType};
 
 mod inkling;
 #[cfg(test)]
-mod loop_tests;
+pub(crate) mod loop_tests;
 pub(crate) use inkling::InkSlot;
 
 /// One weight matrix in the GGUF: `rows` output features of `cols` inputs, in its stored encoding.

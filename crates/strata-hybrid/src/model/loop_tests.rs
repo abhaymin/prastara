@@ -171,3 +171,57 @@ mod compact_cache {
         }
     }
 }
+
+/// Long context (docs/MULA-PLAN.md L5) against the Workshop's forward pass (crates/strata-workshop/tests/fixtures/
+/// tiny-qwen3-long, written by its long_context.rs): YaRN added at conversion, and the `context` copy with YaRN and
+/// two of three layers sliding over 5 tokens, over 24 tokens; token by token, a chunk at a time, and a chunk then
+/// tokens, in every cache encoding.
+pub(crate) mod long_context {
+    use super::{max_diff, rows, tokens};
+    use crate::kvcache::KvType;
+    use crate::model::{Block, Model};
+    use std::path::PathBuf;
+
+    pub fn dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../strata-workshop/tests/fixtures/tiny-qwen3-long")
+    }
+
+    pub fn want() -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(dir().join("logits.json")).unwrap()).unwrap()
+    }
+
+    /// (f32, f16, q8) worst differences from `want` over the three ways of reading.
+    fn run(m: &mut Model, toks: &[u32], want: &[Vec<f32>]) -> Vec<f32> {
+        [KvType::F32, KvType::F16, KvType::Q8].iter().map(|&kv| {
+            m.kv_type = kv;
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| m.forward(&mut st, t)).collect();
+            let mut st = m.new_state();
+            let chunk = m.forward_batch_all(&mut st, toks);
+            let mut st = m.new_state();
+            let mut mixed = m.forward_batch_all(&mut st, &toks[..9]);
+            mixed.extend(toks[9..].iter().map(|&t| m.forward(&mut st, t)));
+            assert_eq!(one, chunk, "{kv:?}: a chunk is token by token");
+            max_diff(&one, want).max(max_diff(&mixed, want))
+        }).collect()
+    }
+
+    #[test]
+    fn yarn_and_sliding_windows_run_as_the_workshop_trains_them() {
+        let w = want();
+        let toks = tokens(&w);
+        let (base, yarn, swa) = (rows(&w["base"]), rows(&w["yarn"]), rows(&w["swa"]));
+        assert!(max_diff(&yarn, &base) > 1e-2 && max_diff(&swa, &yarn) > 1e-2, "the fixture's YaRN and windows change the logits");
+        let (mut y, _) = Model::load(&dir().join("yarn.f32.gguf"), None).unwrap();
+        let dy = run(&mut y, &toks, &yarn);
+        let (mut s, _) = Model::load(&dir().join("swa.f32.gguf"), None).unwrap();
+        let windows: Vec<Option<usize>> = s.layers.iter().map(|l| match &l.parts[0].1 { Block::Attn(a) => a.window, _ => None }).collect();
+        assert_eq!(windows, vec![Some(5), Some(5), None]);
+        let ds = run(&mut s, &toks, &swa);
+        println!("YaRN: max |engine - Workshop| f32 {:.2e} f16 {:.2e} q8 {:.2e}; YaRN + windows: f32 {:.2e} f16 {:.2e} q8 {:.2e}",
+                 dy[0], dy[1], dy[2], ds[0], ds[1], ds[2]);
+        for d in [&dy, &ds] {
+            assert!(d[0] < 1e-4 && d[1] < 2e-3 && d[2] < 3e-2, "{d:?}");
+        }
+    }
+}

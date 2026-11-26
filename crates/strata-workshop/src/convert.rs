@@ -535,8 +535,24 @@ fn model_size_label(params: u64) -> String {
 
 /// Write the GGUF file. `dir` holds the HF checkpoint (config/tokenizer/shards); `out` is the destination path.
 pub fn convert(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>) -> Result<()> {
+    convert_with(dir, out, outtype, pre_tokenizer, None)
+}
+
+/// YaRN added at conversion (`am2strata-workshop convert --yarn <factor>`) to a folder that has no position scaling:
+/// the factor and the original length it stretches (Qwen's recommendation for Qwen3: 4 over 32,768, 131,072 tokens).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct AddYarn {
+    pub factor: f64,
+    pub original: usize,
+}
+
+/// `convert`, with YaRN added (Qwen3 folders only).
+pub fn convert_with(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>, yarn: Option<AddYarn>) -> Result<()> {
     if is_qwen3(dir) {
-        return convert_qwen3(dir, out, outtype, pre_tokenizer);
+        return convert_qwen3(dir, out, outtype, pre_tokenizer, yarn);
+    }
+    if yarn.is_some() {
+        bail!("--yarn is for Qwen3 folders (the Llama converter does not write position scaling)");
     }
     let hparams = HfConfig::load(dir)?;
     if !hparams.is_llama() {
@@ -845,17 +861,36 @@ type HashMapStr = std::collections::HashMap<String, u32>;
 /// is NEOX; per-head q/k norms `attn_q_norm` / `attn_k_norm`; head size in `attention.key_length`), with the loop when
 /// the folder has one. The tensors are read one at a time from the mapped shards, so the memory needed is one tensor,
 /// not the model.
-pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>) -> Result<()> {
+///
+/// Long context (docs/MULA-PLAN.md L1, L2, L5): a YaRN `rope_scaling` (or one added with `yarn`) is written as the
+/// keys llama.cpp's converter writes and the engine's `Rope::from_gguf` reads (`rope.scaling.type` yarn, `.factor`,
+/// `.original_context_length`, `.yarn_beta_fast` / `_slow`, and `.attn_factor` when the config's attention factor is
+/// not YaRN's own 0.1 ln(factor) + 1), with `context_length` the stretched length; sliding-window layers
+/// (`layer_types`, `sliding_window`, as the Workshop's `context` command writes them) as `attention.sliding_window`
+/// and the per-layer `attention.sliding_window_pattern` (true: the layer slides).
+pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Option<&str>, add_yarn: Option<AddYarn>) -> Result<()> {
     let d = dir.display();
     let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("reading config for {d}"))?)?;
     let n = |k: &str| c[k].as_f64().ok_or_else(|| anyhow!("{d}: config.{k} missing or not a number"));
     let (hidden, layers) = (n("hidden_size")? as usize, n("num_hidden_layers")? as usize);
-    let rope_type = c["rope_scaling"]["rope_type"].as_str().or_else(|| c["rope_parameters"]["rope_type"].as_str()).unwrap_or("default");
-    if rope_type != "default" {
-        bail!("{d}: rope type {rope_type:?}: the engine's long-context path (docs/MULA-PLAN.md L5) is not written yet; convert the model before the long-context step");
-    }
-    if c["layer_types"].as_array().is_some_and(|a| a.iter().any(|t| t != "full_attention")) {
-        bail!("{d}: sliding-window layers: the engine's long-context path (docs/MULA-PLAN.md L5) is not written yet");
+    // the Workshop's own reading of the config (the trainer's): YaRN and the sliding layers, checked
+    let cfg = crate::model::ModelConfig::from_json(&c).with_context(|| format!("{d}"))?;
+    let yarn = match (cfg.yarn, add_yarn) {
+        (Some(_), Some(_)) => bail!("{d} already has YaRN positions (rope_scaling); convert it without --yarn"),
+        (Some(y), None) => Some((y, cfg.max_position_embeddings)),
+        (None, Some(a)) => {
+            if a.factor <= 1.0 || a.original == 0 {
+                bail!("--yarn {}: a factor above 1 over an original length above 0", a.factor);
+            }
+            let y = crate::model::Yarn::new(a.factor, a.original);
+            Some((y, (a.factor * a.original as f64).round() as usize))
+        }
+        (None, None) => None,
+    };
+    if let Some((y, _)) = &yarn {
+        if !y.truncate {
+            bail!("{d}: rope_scaling yarn with truncate false: the engine rounds the ramp's ends as llama.cpp does");
+        }
     }
     let arch = "qwen3";
 
@@ -891,6 +926,14 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     let mut kv = qwen3_header(dir, &c, arch, total_params, outtype.file_type(), pre_tokenizer)?;
     let (loop_kv, gates) = lp.unwrap_or_default();
     kv.extend(loop_kv);
+    kv.extend(long_context_kv(arch, yarn, &cfg.layer_sliding, cfg.sliding_window));
+    if let Some((_, length)) = yarn {
+        for (k, v) in kv.iter_mut() {
+            if *k == format!("{arch}.context_length") {
+                *v = Kv::U32(length as u32);
+            }
+        }
+    }
 
     let mut specs: Vec<TensorSpec> = located.iter().map(|(g, _, t)| {
         let (ggml_type, ot) = tensor_type(t.shape(), outtype);
@@ -913,6 +956,28 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     }
     w.finish()?;
     Ok(())
+}
+
+/// The long-context keys (`convert_qwen3`): YaRN's, and the sliding layers'.
+pub(crate) fn long_context_kv(arch: &str, yarn: Option<(crate::model::Yarn, usize)>, sliding: &[bool], window: Option<usize>) -> Vec<(String, Kv)> {
+    let mut kv = vec![];
+    if let Some((y, _)) = yarn {
+        kv.push((format!("{arch}.rope.scaling.type"), Kv::Str("yarn".into())));
+        kv.push((format!("{arch}.rope.scaling.factor"), Kv::F32(y.factor as f32)));
+        kv.push((format!("{arch}.rope.scaling.original_context_length"), Kv::U32(y.original_max_position_embeddings as u32)));
+        kv.push((format!("{arch}.rope.scaling.yarn_beta_fast"), Kv::F32(y.beta_fast as f32)));
+        kv.push((format!("{arch}.rope.scaling.yarn_beta_slow"), Kv::F32(y.beta_slow as f32)));
+        // the engine (as llama.cpp) scales cos and sin by 0.1 ln(factor) + 1 itself; another factor is the ratio
+        let own = if y.factor <= 1.0 { 1.0 } else { 0.1 * y.factor.ln() + 1.0 };
+        if (y.attention_factor - own).abs() > 1e-9 {
+            kv.push((format!("{arch}.rope.scaling.attn_factor"), Kv::F32((y.attention_factor / own) as f32)));
+        }
+    }
+    if let (true, Some(w)) = (sliding.iter().any(|s| *s), window) {
+        kv.push((format!("{arch}.attention.sliding_window"), Kv::U32(w as u32)));
+        kv.push((format!("{arch}.attention.sliding_window_pattern"), Kv::Bools(sliding.to_vec())));
+    }
+    kv
 }
 
 /// The metadata a `qwen3` (or `qwen3moe`, as `arch`) GGUF starts with, as llama.cpp's `Qwen3Model` writes it: the

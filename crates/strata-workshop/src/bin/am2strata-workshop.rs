@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! am2strata-workshop info <model.gguf | hf-folder>
-//! am2strata-workshop convert <hf-folder> --out <model.gguf> [--outtype f16|f32] [--pre-tokenizer NAME]
+//! am2strata-workshop convert <hf-folder> --out <model.gguf> [--outtype f16|f32] [--pre-tokenizer NAME] [--yarn 4 [--yarn-original 32768]]
 //! am2strata-workshop quantize <in.gguf> --out <out.gguf> --type q8_0|q6_k|q5_k|q4_k|q4_0|f16
 //! am2strata-workshop merge <base-hf-folder> <adapter-folder> --out <merged-hf-folder>
 //! am2strata-workshop upcycle <hf-folder> --experts 10 --top-k 1 --out <dir>
@@ -154,6 +154,13 @@ enum Cmd {
         /// name the BPE pre-tokenizer when its hash is not a known one (e.g. "llama-bpe", "qwen2", "gpt-2")
         #[arg(long)]
         pre_tokenizer: Option<String>,
+        /// add YaRN positions (Qwen3 folders without rope_scaling): this factor over --yarn-original tokens; Qwen's
+        /// recommendation is 4 over 32768 (131,072 tokens)
+        #[arg(long)]
+        yarn: Option<f64>,
+        /// the length --yarn stretches (default: the config's max_position_embeddings, at most 32768)
+        #[arg(long)]
+        yarn_original: Option<usize>,
     },
     /// a GGUF to another type, as `llama-quantize --pure` does
     Quantize {
@@ -1136,14 +1143,28 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))
         }
-        Cmd::Convert { dir, out: dst, outtype, pre_tokenizer } => {
+        Cmd::Convert { dir, out: dst, outtype, pre_tokenizer, yarn, yarn_original } => {
             let ot = convert::OutType::from_s(outtype).map_err(|e| e.to_string())?;
             // the Llama converter holds the model in f32; the Qwen3 one streams a tensor at a time
             if !convert::is_qwen3(dir) {
                 fits(f32_bytes_of(dir), "converting this model")?;
             }
             out.event(json!({"event": "start", "what": format!("convert {} to {} ({outtype})", dir.display(), dst.display())}));
-            convert::convert(dir, dst, ot, pre_tokenizer.as_deref()).map_err(|e| e.to_string())?;
+            let add = match yarn {
+                Some(f) => {
+                    let original = match yarn_original {
+                        Some(o) => *o,
+                        None => {
+                            let c: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).map_err(|e| e.to_string())?)
+                                .map_err(|e| e.to_string())?;
+                            c["max_position_embeddings"].as_u64().map_or(32768, |m| m.min(32768) as usize)
+                        }
+                    };
+                    Some(convert::AddYarn { factor: *f, original })
+                }
+                None => None,
+            };
+            convert::convert_with(dir, dst, ot, pre_tokenizer.as_deref(), add).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "gguf".into()))
         }
         Cmd::Quantize { input, out: dst, ty } => {

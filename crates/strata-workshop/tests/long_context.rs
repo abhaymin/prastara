@@ -115,3 +115,78 @@ fn real_models_answer_a_short_prompt() {
         println!("{dir}: {}", top.join(" "));
     }
 }
+
+/// The fixture with a tokenizer (the tiny Llama's: 32 tokens, the rest of the 64 padding), ready to convert.
+fn with_tokenizer(tag: &str, edit: impl Fn(&mut serde_json::Value)) -> PathBuf {
+    let d = with_config(tag, edit);
+    let tok = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-llama-hf");
+    for f in ["tokenizer.json", "tokenizer_config.json"] {
+        std::fs::copy(tok.join(f), d.join(f)).unwrap();
+    }
+    d
+}
+
+/// The positions the engine's long-context fixture reads: longer than its window of 5.
+const LONG: [u32; 24] = [1, 7, 42, 3, 59, 5, 11, 2, 30, 17, 8, 61, 4, 23, 9, 50, 12, 6, 33, 19, 44, 2, 27, 15];
+
+fn long_logits(dir: &std::path::Path) -> Vec<Vec<f32>> {
+    LlamaModel::load(dir, BaseDtype::F32, &Device::Cpu).unwrap().forward(&LONG, &Ctx::eval()).unwrap().to_vec2().unwrap()
+}
+
+/// `convert --yarn` and a `context` copy to GGUF: the keys the engine reads (crates/strata-hybrid model.rs
+/// Rope::from_gguf, the sliding-window pattern).
+#[test]
+fn long_context_models_convert_with_their_keys() {
+    use strata_workshop::convert::{convert_with, AddYarn, OutType};
+    let base = with_tokenizer("conv-base", |_| {});
+    let g1 = base.join("yarn.gguf");
+    convert_with(&base, &g1, OutType::F32, Some("gpt-2"), Some(AddYarn { factor: 4.0, original: 32 })).unwrap();
+    let g = strata_gguf::Gguf::open(&g1).unwrap();
+    assert_eq!(g.str("qwen3.rope.scaling.type"), Some("yarn"));
+    assert_eq!(g.u64("qwen3.rope.scaling.original_context_length"), Some(32));
+    assert_eq!(g.u64("qwen3.context_length"), Some(128));
+    assert_eq!(g.metadata["qwen3.rope.scaling.factor"].as_f64(), Some(4.0));
+    assert!(!g.metadata.contains_key("qwen3.rope.scaling.attn_factor"), "YaRN's own attention factor is the engine's default");
+    assert!(!g.metadata.contains_key("qwen3.attention.sliding_window"));
+    // a context copy: its YaRN from the config, its sliding layers
+    let long = base.with_extension("long");
+    let _ = std::fs::remove_dir_all(&long);
+    strata_workshop::model::make_long_context(&base, &long, 512, Some(32), 5, 3).unwrap();
+    let g2 = base.join("long.gguf");
+    convert_with(&long, &g2, OutType::F32, Some("gpt-2"), None).unwrap();
+    let g = strata_gguf::Gguf::open(&g2).unwrap();
+    assert_eq!(g.metadata["qwen3.rope.scaling.factor"].as_f64(), Some(16.0));
+    assert_eq!(g.u64("qwen3.context_length"), Some(512));
+    assert_eq!(g.u64("qwen3.attention.sliding_window"), Some(5));
+    let pattern: Vec<bool> = g.metadata["qwen3.attention.sliding_window_pattern"].as_array().unwrap().iter().map(|v| v.as_bool().unwrap()).collect();
+    assert_eq!(pattern, vec![true, true, false]);
+    // --yarn on a model that has YaRN already is refused
+    assert!(convert_with(&long, &base.join("twice.gguf"), OutType::F32, Some("gpt-2"), Some(AddYarn { factor: 4.0, original: 32 })).is_err());
+    for d in [base, long] { let _ = std::fs::remove_dir_all(d); }
+}
+
+/// The engine's long-context fixture (crates/strata-hybrid model/loop_tests.rs `long_context`): the tiny Qwen3 with
+/// YaRN added at conversion (4 over 32), and a `context` copy (YaRN 16 over 32, layers 0 and 1 sliding over 5 tokens),
+/// as F32 GGUFs, and the Workshop's logits for both and the base over 24 tokens. --ignored writes it again.
+#[test]
+#[ignore]
+fn write_the_engines_long_context_fixture() {
+    use strata_workshop::convert::{convert, convert_with, AddYarn, OutType};
+    let fx = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-qwen3-long");
+    std::fs::create_dir_all(&fx).unwrap();
+    let base = with_tokenizer("fx-base", |_| {});
+    convert_with(&base, &fx.join("yarn.f32.gguf"), OutType::F32, Some("gpt-2"), Some(AddYarn { factor: 4.0, original: 32 })).unwrap();
+    // the Workshop's view of the same YaRN: the config's rope_scaling
+    let yarn = with_tokenizer("fx-yarn", |c| { c["rope_scaling"] = serde_json::json!({"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32}); });
+    let long = base.with_extension("long");
+    let _ = std::fs::remove_dir_all(&long);
+    strata_workshop::model::make_long_context(&base, &long, 512, Some(32), 5, 3).unwrap();
+    convert(&long, &fx.join("swa.f32.gguf"), OutType::F32, Some("gpt-2")).unwrap();
+    let (b, y, s) = (long_logits(&base), long_logits(&yarn), long_logits(&long));
+    let d = |a: &[Vec<f32>], c: &[Vec<f32>]| a.iter().flatten().zip(c.iter().flatten()).map(|(x, z)| (x - z).abs()).fold(0f32, f32::max);
+    println!("yarn moves the logits by {:.3}, the context copy by {:.3}", d(&y, &b), d(&s, &b));
+    let json = serde_json::json!({"tokens": LONG, "base": b, "yarn": y, "swa": s, "window": 5, "sliding": [true, true, false],
+                                  "note": "written by crates/strata-workshop/tests/long_context.rs write_the_engines_long_context_fixture"});
+    std::fs::write(fx.join("logits.json"), serde_json::to_string(&json).unwrap()).unwrap();
+    for d in [base, yarn, long] { let _ = std::fs::remove_dir_all(d); }
+}

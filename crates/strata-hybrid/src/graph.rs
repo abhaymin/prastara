@@ -661,6 +661,57 @@ mod tests {
         }
     }
 
+    /// Sliding-window layers on the graph (a ring of window + RING_SLACK tokens): the Workshop's long-context fixture
+    /// (YaRN, two of three layers over 5 tokens, heads of 16) against its own logits, and a synthetic windowed model
+    /// over 1,300 tokens, past the ring's end twice, against the CPU path; every cache encoding, token by token, in
+    /// chunks, and a chunk then tokens.
+    #[test]
+    fn sliding_windows_on_the_graph() {
+        let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(dev) = device() else { return };
+        let w = crate::model::loop_tests::long_context::want();
+        let toks: Vec<u32> = w["tokens"].as_array().unwrap().iter().map(|t| t.as_u64().unwrap() as u32).collect();
+        let rows = |k: &str| -> Vec<Vec<f32>> { w[k].as_array().unwrap().iter().map(|r| r.as_array().unwrap().iter().map(|x| x.as_f64().unwrap() as f32).collect()).collect() };
+        let swa = rows("swa");
+        for kv in [KvType::F32, KvType::F16, KvType::Q8] {
+            let mut m = placed(&crate::model::loop_tests::long_context::dir().join("swa.f32.gguf"), &dev, 1.0);
+            m.kv_type = kv;
+            let gr = Graph::new(&m, 64).unwrap();
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| gr.forward(&m, &mut st, t)).collect();
+            let mut st = m.new_state();
+            let chunk = gr.forward_batch_all(&m, &mut st, &toks);
+            let (a, b) = (max_diff(&one, &swa), max_diff(&chunk, &swa));
+            eprintln!("the Workshop's windowed fixture on the graph, kv {}: one={a:.2e} chunk={b:.2e}", kv.name());
+            let tol = if kv == KvType::Q8 { 3e-2 } else { 2e-3 };
+            assert!(a < tol && b < tol, "{kv:?}: {a} {b}");
+        }
+        let spec = Spec { window: 8, n_layer: 4, seed: 0x5EED_0020, ..Spec::tiny_qwen3() };
+        let p = testgguf::tmp("tiny-qwen3-swa", &spec);
+        let toks: Vec<u32> = (0..1300).map(|i| (i * 37 + 5) % 256).collect();
+        for kv in [KvType::F32, KvType::F16, KvType::Q8] {
+            let (mut cpu, _) = Model::load(&p, None).unwrap();
+            cpu.kv_type = kv;
+            let mut st = cpu.new_state();
+            let want: Vec<Vec<f32>> = toks.iter().map(|&t| cpu.forward(&mut st, t)).collect();
+            let mut m = placed(&p, &dev, 1.0);
+            m.kv_type = kv;
+            let gr = Graph::new(&m, 2048).unwrap();
+            let mut st = m.new_state();
+            let one: Vec<Vec<f32>> = toks.iter().map(|&t| gr.forward(&m, &mut st, t)).collect();
+            let mut st = m.new_state();
+            let chunk = gr.forward_batch_all(&m, &mut st, &toks);
+            let mut st = m.new_state();
+            let mut mixed = gr.forward_batch_all(&m, &mut st, &toks[..700]);
+            mixed.extend(toks[700..].iter().map(|&t| gr.forward(&m, &mut st, t)));
+            let d = [max_diff(&one, &want), max_diff(&chunk, &want), max_diff(&mixed, &want)];
+            eprintln!("a windowed model over 1300 tokens, kv {}: max |graph - cpu| one={:.2e} chunk={:.2e} mixed={:.2e}", kv.name(), d[0], d[1], d[2]);
+            // q8: the device's and the CPU's products differ in the last bits, which can move a value across a step
+            let tol = if kv == KvType::Q8 { 1e-2 } else { TOL };
+            assert!(d.iter().all(|&x| x < tol), "{kv:?} {d:?}");
+        }
+    }
+
     /// The looped fixture on the graph against the Workshop's own (f32) forward pass, which the CPU path matches
     /// within 2e-3 (model/loop_tests.rs).
     #[test]
