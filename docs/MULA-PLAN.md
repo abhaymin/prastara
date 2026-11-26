@@ -312,3 +312,45 @@ contexts, and Mula refining itself on Prastara's own tasks.
     (CubeCL's cmma) would make prompt reading several times faster again. Q6_K, Q5_K, F16 and the IQ kinds keep the
     older kernels (Q4_K_M models store some matrices as Q6_K). Activations and the KV cache stay f32 (an f16 cache
     would halve attention's reads). One host sync per token remains, with the full logits read back.
+
+## Mula-MoE 56B-A5B: fine-grained upcycling (owner 2026-11-26: "56B-A5B"; branch `workshop/moe-a5b`)
+- **Shape:** each block's dense feed-forward (12,288 neurons, 151M parameters) is split into 12 groups of 1,024
+  neurons; 120 experts = 12 groups x 10 copies; top-5. Total 57.13B (2.76B shared + 36 x 120 experts of 12.6M),
+  active 5.04B per token. `upcycle --experts 120 --expert-ff 1024 --top-k 5`; without `--expert-ff` the full-width
+  design (10 experts top-1, 57B-A8B) is unchanged.
+- **The split** (`--split cluster`, the default; `contiguous` the fallback): MoEfication. The dense model runs over
+  calibration conversations block by block, and each neuron's `|silu(gate)·up|` over the calibration tokens is its
+  feature. Balanced spherical k-means (seeded) makes groups of exactly 1,024. The permutation is stored in
+  `moe_init.safetensors` and applied to the weights once at load: nothing is copied.
+- **The router's start:** expert (copy c, group g) = `d_c + 0.01 · r_g`. `r_g` is a ridge regression of the group's
+  importance (`Σ |act|·‖down column‖`) on the block's input. `d_c` is a random direction per copy. A token takes all
+  its k experts from one copy, so it gets k different groups: its best k by `r_g`, with nearly equal weights. The
+  chosen experts' outputs are multiplied by k (folded into `ffn_down_exps` at export), so k equal weights sum k groups,
+  as the dense model sums all 12.
+- **Not exact at the start:** a token uses 5 x 1,024 of 12,288 neurons. `--dense-start-check` measures the held-out
+  loss of the dense model and of the upcycled one at the start. Only E = G = top-k (every group once) equals the dense
+  model, and that is the slicing's parity gate.
+- **Training memory** (two 16 GB cards, the calibration of the first real run: 2.8 GB CUDA overhead a card):
+  - At 1,024 tokens nothing fits with a 1.5 GB margin. Even the router alone needs 16.1 GB a card.
+  - At 512 tokens, the default is expert rank 4 with A shared per group (each copy its own B): 155M trainable,
+    15.4 GB on the busiest card.
+  - Rank 8 shared needs 16.6 GB; rank 4 unshared 16.9 GB.
+  - `upcycle --estimate` prints the whole table.
+  - Router losses: Switch's load balance over 120 experts (0.01) and ST-MoE's z-loss (0.001).
+- **Export:** `ffn_{gate,up}_exps [4096, 1024, 120]`, `ffn_down_exps [1024, 4096, 120]`, `expert_feed_forward_length`
+  1,024; Q4_K about 32.2 GB.
+- **Engine:** the qwen3moe path reads the experts' width from the tensors. The Workshop's fine-grained fixtures (a
+  shuffled split, an untrained block on its start router, a loop with a shared A) match its logits within 5e-6 with an
+  f32 KV cache. With the default f16 cache the difference is 1e-3, and 7e-3 for the looped top-3 fixture, because
+  routing near the k-th place is sensitive. A synthetic 120-expert top-5 model with a loop runs on the CPU, and the
+  graph tests cover it on a card.
+- **The real start** (2026-11-27, CPU, 22 min, peak 13.8 GB RSS):
+  - The run: `Strata-data/mula/mula-base-loop-v0.1-moe120f1024x5`, a cluster split on 4,291 tokens of 16
+    mula-train-v2 conversations (512-token cap).
+  - Neuron-to-centre similarity is 0.655 clustered against 0.635 contiguous.
+  - 95.9% of tokens pick 5 different groups. The chosen groups hold 54.5% of the feed-forward's importance: the best
+    possible is 55.1%, and any 5 groups hold 41.7%. The busiest expert gets 2.63x the even share.
+  - **Dense-start check on 2,122 held-out answer tokens:** the dense model's loss is 0.914 and the upcycled model's at
+    the start is 2.208 (+1.29 nats, perplexity x3.65). The first epoch has to win that back.
+  - `profile` at 512 tokens on two cards (rank 16 on the attention, experts rank 4 with A shared): 3,158 steps of 4
+    conversations, about 15.1 h an epoch, 15.47 GB on the busiest card.
