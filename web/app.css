@@ -992,3 +992,7 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
   .ws-jobs-toggle { top: var(--st-s-3); bottom: auto; right: var(--st-s-4); height: 32px; }
   .ws-side { top: 0; bottom: 0; }
 }
+
+/* Monitor: why a request is slow (the engine's path, the rate, the time left) */
+.state-why { margin: var(--st-s-2) 0 0; font-size: var(--st-fs-sm); color: var(--st-ink-soft); line-height: var(--st-lh-body); }
+.state-why b { color: var(--st-ink); }

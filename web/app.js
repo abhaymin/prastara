@@ -1124,6 +1124,23 @@ function mediaLabel(kind) {
 // speech counts its parts (sentences); images and video their steps
 const mediaUnit = (kind) => /speech|translation/.test(kind || "") ? "part" : "step";
 
+// prompt reading: the rate (the engine's mean, else what was read over the time so far) and the time left
+function promptEta(live) {
+  if (!live || live.state !== "reading" || !live.prompt_total) return null;
+  const rate = live.prefill_tok_s_mean || (live.elapsed_s ? live.prompt_read / live.elapsed_s : 0);
+  if (!rate) return null;
+  return {rate, left: Math.max(0, (live.prompt_total - live.prompt_read) / rate)};
+}
+// how the loaded model runs, in plain words, and why that is slow when it is (from the engine's INFO line)
+function enginePath(eng) {
+  if (!eng || !eng.version) return "";
+  const gpus = eng.devices ? String(eng.devices).split(",").filter(Boolean).length : 0;
+  if (eng.version !== "am2strata-hybrid") return `${eng.version}`;
+  if (eng.graph) return `Rust engine, the fused GPU path${gpus ? ` on ${gpus} GPU${gpus > 1 ? "s" : ""}` : ""}`;
+  const why = eng.loop || /loop/.test(eng.arch || "") ? "the fast GPU path doesn't run looped models yet"
+    : /moe|inkling/.test(eng.arch || "") ? "the fast GPU path doesn't run mixture-of-experts models yet" : "";
+  return gpus ? `Rust engine, one matrix at a time on ${gpus} GPU${gpus > 1 ? "s" : ""}${why ? ` (${why})` : ""}` : "Rust engine on the CPU";
+}
 function render(m) {
   if (m.version && $("brand-ver").textContent !== `v${m.version}`) $("brand-ver").textContent = `v${m.version}`;
   const live = m.live || {}, hw = m.hardware || {}, st = m.hardware_static || {}, eng = m.engine || {}, h = m.history || {};
@@ -1131,7 +1148,8 @@ function render(m) {
   // the header pill
   if (live.state === "reading") {
     const pct = live.prompt_total ? Math.round((100 * live.prompt_read) / live.prompt_total) : null;
-    setPill("reading", pct != null ? `Reading prompt · ${pct}%` : "Reading prompt");
+    const eta = promptEta(live);
+    setPill("reading", pct != null ? `Reading prompt · ${pct}%${eta && eta.left > 20 ? ` · ~${wsDur(eta.left)}` : ""}` : "Reading prompt");
   } else if (live.state === "generating") {
     setPill("generating", `Generating · ${fmt(live.tok_s, 1)} tok/s`);
   } else if (live.state === "media") {
@@ -1246,6 +1264,16 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
   // model state
   const on = live.queued > 0 ? "queued" : live.state;
   for (const b of document.querySelectorAll("#state-badges .st-badge")) b.classList.toggle("on", b.dataset.s === on || b.dataset.s === live.state);
+  // why it is slow: shown while a prompt is read slowly or a reply is written slowly, with the engine's path
+  {
+    const why = $("state-why"), path = enginePath(eng), eta = promptEta(live);
+    const slow = (eta && eta.rate < 50) || (live.state === "generating" && live.tok_s && live.tok_s < 15);
+    why.hidden = !(slow && path);
+    if (!why.hidden) {
+      why.innerHTML = `<b>Why it is slow:</b> ${esc(path)}.` + (eta && live.prompt_total > 2000
+        ? ` The prompt is ${fmt(live.prompt_total)} tokens; turning off web, browser and tool instructions for this model makes it much shorter.` : "");
+    }
+  }
   const prog = $("state-progress");
   let label = "Waiting for a request", detail = "", pct = 0;
   if (live.state === "reading") {
@@ -1253,7 +1281,9 @@ function renderMonitor(live, hw, st, eng, h, last, requests, totals, kept, rp) {
     prog.dataset.tone = "info";
     if (live.prompt_total) {
       pct = (100 * live.prompt_read) / live.prompt_total;
-      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%`;
+      const eta = promptEta(live);
+      detail = `${fmt(live.prompt_read)} / ${fmt(live.prompt_total)} tokens · ${fmt(pct)}%` +
+               (eta ? ` · ${fmt(eta.rate, 1)} tok/s · about ${wsDur(eta.left)} left` : "");
     } else {
       detail = `${fmt(live.prompt_tokens)} tokens`;
     }
@@ -5228,8 +5258,16 @@ async function wsCtxRefresh() {
       const typical = (x) => learnt[`${x.kind}:${need(x)}`];
       let ahead = q.running ? Math.max(0, (typical(q.running) || 0) - (q.running.running_s || 0)) : 0;
       const items = [];
-      if (q.running) items.push({what: q.running.kind, state: "running", time: wsDur(q.running.running_s || 0), cls: "st-badge--generating",
-        line: `${q.running.label || need(q.running)}${typical(q.running) ? ` · usually about ${wsDur(typical(q.running))}` : ""}`});
+      if (q.running) {
+        // a prompt being read: how far, and the time left (from the metrics the page already has)
+        const lv = lastMetrics?.live, eta = promptEta(lv);
+        const reading = lv && lv.state === "reading" && lv.prompt_total;
+        if (eta) ahead = eta.left;
+        items.push({what: q.running.kind, state: reading ? "reading" : "running", time: wsDur(q.running.running_s || 0),
+          cls: reading ? "st-badge--reading" : "st-badge--generating", pct: reading ? (100 * lv.prompt_read) / lv.prompt_total : null,
+          line: `${q.running.label || need(q.running)}` + (reading ? ` · prompt ${fmt(lv.prompt_read)} of ${fmt(lv.prompt_total)}${eta ? ` · about ${wsDur(eta.left)} left` : ""}`
+            : typical(q.running) ? ` · usually about ${wsDur(typical(q.running))}` : "")});
+      }
       for (const w of q.waiting || []) {
         items.push({what: w.kind, state: "waiting", time: ahead ? `starts in ~${wsDur(ahead)}` : "next", cls: "st-badge--queued",
           line: w.label || need(w) || ""});
@@ -5237,7 +5275,8 @@ async function wsCtxRefresh() {
       }
       $("ws-ctx-count").textContent = items.length ? `${items.length} in the queue` : "";
       $("ws-ctx-activity").innerHTML = (items.length ? items.map((a) => `<div class="ws-act"><div class="ws-act__top"><b>${esc(a.what)}</b>` +
-          `<span class="st-badge ${a.cls}">${a.state}</span><span class="muted">${esc(a.time)}</span></div><p>${esc(a.line)}</p></div>`).join("")
+          `<span class="st-badge ${a.cls}">${a.state}</span><span class="muted">${esc(a.time)}</span></div><p>${esc(a.line)}</p>` +
+          (a.pct != null ? `<div class="st-progress" data-tone="info"><div class="st-progress__bar" style="width:${a.pct.toFixed(1)}%"></div></div>` : "") + `</div>`).join("")
         : '<p class="muted small">Nothing in the queue.</p>') +
         `<p class="muted small">Loaded: ${esc(q.resident?.text_model || "no model")}</p>`;
     }
