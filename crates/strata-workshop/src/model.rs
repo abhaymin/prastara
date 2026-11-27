@@ -1635,7 +1635,28 @@ impl LlamaModel {
         for d in &self.devs {
             d.synchronize()?;
         }
+        self.trim_pools();
         Ok(())
+    }
+
+    /// Give each CUDA device's memory pool back what it holds unused (cuMemPoolTrimTo 0). Between conversations the
+    /// pool kept 12-14 GB reserved for 8-11 GB in use (fragmentation: every conversation has its own shapes), and the
+    /// upcycled 56B-A5B ran out of memory on that reserve, not on its use.
+    fn trim_pools(&self) {
+        #[cfg(feature = "cuda")]
+        for d in &self.devs {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let Device::Cuda(cd) = d else { continue };
+            let stream = cd.cuda_stream();
+            let ctx = stream.context();
+            if ctx.bind_to_thread().is_err() { continue; }
+            unsafe {
+                let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+                if sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()) == sys::CUresult::CUDA_SUCCESS {
+                    sys::cuMemPoolTrimTo(pool, 0);
+                }
+            }
+        }
     }
 
     /// The whole model spread over `devs` (e.g. two GPUs): the blocks are split into equal runs in order, the first
