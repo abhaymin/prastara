@@ -709,6 +709,31 @@ fn a_busy_local_model_overflows_to_the_remote_one_through_the_gate() {
     let _ = again.join();
 }
 
+/// A private, uncensored or abliterated model's chats never leave this machine: no overflow while it is busy.
+#[test]
+fn a_busy_uncensored_model_never_overflows_to_a_remote_one() {
+    let (port, mock) = mock_providers();
+    let mut block = remote_block(port);
+    block["overflow"] = json!("openai/busy-model");
+    let long = ids(&format!("Thinking.\n</think>\n\n{}", "slow ".repeat(30)));
+    let s = start(port, json!({"remote": block, "uncensored": true}), &vec![long; 4], json!({"delay_ms": 150}));
+    let base = s.base.clone();
+    let busy = std::thread::spawn(move || {
+        let _ = reqwest::blocking::Client::new().post(format!("{base}/v1/chat/completions")).bearer_auth(KEY)
+            .json(&json!({"model": "mock-a", "messages": [{"role": "user", "content": "go"}]})).timeout(Duration::from_secs(60)).send();
+    });
+    let t0 = Instant::now();
+    while s.get("/api/queue", true).1["running"].is_null() && t0.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    for body in [json!({"model": "mock-a", "messages": [user("hi PRIVWORD")]}), json!({"messages": [user("hi NOMODELWORD")]})] {
+        let (code, h, text) = call(&s, KEY, "/v1/chat/completions", &body);
+        assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, ""), "{text}");
+    }
+    assert!(!mock.bodies().iter().any(|b| { let b = b.to_string(); b.contains("PRIVWORD") || b.contains("NOMODELWORD") }), "nothing left this machine");
+    let _ = busy.join();
+}
+
 #[test]
 fn the_mix_sends_work_away_while_the_local_model_is_busy() {
     let (port, _mock) = mock_providers();

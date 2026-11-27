@@ -763,7 +763,8 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
     };
     let parsed = serde_json::from_slice::<Value>(&bytes).ok();
     // "strata_local_only": answered by this PC alone, never a worker (a private-data job's requests)
-    if parsed.as_ref().is_some_and(|v| v["strata_local_only"] == true) {
+    // and every chat with a private, uncensored or abliterated model (its data never leaves this machine)
+    if parsed.as_ref().is_some_and(|v| v["strata_local_only"] == true || s.mgr.local_only_model(v["model"].as_str())) {
         return next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))).await;
     }
     let model = parsed.as_ref().and_then(|v| v["model"].as_str().map(str::to_string))

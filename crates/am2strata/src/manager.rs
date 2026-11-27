@@ -423,6 +423,20 @@ impl Manager {
         self.models.read().unwrap().clone()
     }
 
+    /// Whether a request for `model` (None: the loaded text model) is for a private, uncensored or abliterated model
+    /// (the marks [`crate::minor_safety::applies`] reads): such a chat is answered on this machine only, never by a
+    /// cluster worker and never by a remote model, not even as overflow.
+    pub fn local_only_model(&self, model: Option<&str>) -> bool {
+        let id = match model {
+            Some(m) => m.to_string(),
+            None => match self.queue.resident() {
+                crate::queue::Resident::Text(id) => id,
+                _ => return false,
+            },
+        };
+        self.entry(&id).is_some_and(|e| crate::minor_safety::applies(&e.id, &e.cfg))
+    }
+
     pub fn entry(&self, id: &str) -> Option<ModelEntry> {
         let models = self.models();
         models.iter().find(|m| m.id == id).cloned().or_else(|| {

@@ -865,7 +865,9 @@ pub async fn layer(axum::extract::State(s): axum::extract::State<AppState>, req:
     // (never a request with tools: a coding agent would silently get another model mid-task; "strata_overflow": true opts in)
     let with_tools = v.get("tools").and_then(Value::as_array).is_some_and(|t| !t.is_empty());
     // "strata_local_only" (a private-data job's requests): never a remote model, not even as overflow
-    if v.get("strata_local_only") == Some(&Value::Bool(true)) {
+    // and a request for a private, uncensored or abliterated model of this server (or, with no model, while one is loaded)
+    if v.get("strata_local_only") == Some(&Value::Bool(true))
+        || (model.as_deref().is_none_or(|m| !is_mix_name(m) && provider_of(&c, m).is_none()) && s.mgr.local_only_model(model.as_deref())) {
         return match model.as_deref().filter(|m| is_mix_name(m) || provider_of(&c, m).is_some()) {
             Some(m) => refuse(family, StatusCode::BAD_REQUEST, "invalid_request_error", format!("{m}: a local-only request cannot use a remote model or a mix")),
             None => next.run(pass(parts, bytes)).await,
