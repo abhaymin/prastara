@@ -1,0 +1,8 @@
+[package]
+name = "strata-safety"
+description = "The fixed minor-safety text rules, shared by the server (uncensored models' chats) and the Workshop (private datasets)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

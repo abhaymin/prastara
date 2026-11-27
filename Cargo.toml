@@ -9,6 +9,7 @@ members = [
     "crates/strata-gguf",
     "crates/strata-hub",
     "crates/strata-pack",
+    "crates/strata-safety",
     "crates/am2pack",
     "crates/strata-workshop",
     "crates/am2strata",
@@ -52,6 +53,7 @@ strata-engine = { path = "crates/strata-engine" }
 strata-gguf = { path = "crates/strata-gguf" }
 strata-hub = { path = "crates/strata-hub" }
 strata-pack = { path = "crates/strata-pack" }
+strata-safety = { path = "crates/strata-safety" }
 strata-frontend = { path = "crates/strata-frontend" }
 
 # strata-workshop (the mold candle fork — same pinned rev as strata-media, CPU build here: no cuda feature). autograd +
