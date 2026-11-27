@@ -358,7 +358,8 @@ It goes in phases. Each phase is measured before anything is claimed (see "Measu
 | C | Tools travel with a request | a routed request keeps its caller's tool sets (`x-strata-routed-tools`); memory and MCP stay on the main machine | built, 1c3f457 |
 | D | Both ways | each machine pairs with the other as its master too, so either can be the main one; the masters list and the workers list already allow it, and pairing in both directions is tested | next |
 | E | Tools across machines | a tool that exists on one machine only (its browser, its desktop, an MCP server, a model) is called from the other over the pinned link: a `remote_tool` call that the receiving side runs for its master's key, with the results streamed back | next |
-| F | Models and data shared | a model or media file on one machine is copied to another by Prastara itself: content-addressed (the media library ids are hashes already), resumable, over the pinned TLS link, checked by hash, so no machine downloads the same model twice from the internet | next |
+| F | Models and data shared | a model or media file on one machine is copied to another by Prastara itself: content-addressed (the media library ids are hashes already), resumable, over the pinned TLS link, checked by hash, so no machine downloads the same model twice from the internet | **partly built**: the files of a Workshop job travel this way (J); models for chat, and media files, not yet |
+| J | Workshop jobs across the cluster | a Workshop job (clean, convert, quantize, datagen, regress, train, ...) runs on the machine the request names, or on the idlest one that can (`"node": "any"`); its inputs go there and its outputs come back by hash | built (below) |
 | G | Caches shared | a prompt's KV prefix (the system prompt of an agent, a long document) made on one machine is reused by the other when it is cheaper to send than to recompute; embeddings and web-fetch caches are shared by key | after F |
 | H | Compute and memory pooled | one model split by layers across machines (phase 2 above: pipeline parallel, KV kept where its layers are). This is what pools memory: a model bigger than one machine runs at all, and the context is longer | after F, measured against llama.cpp RPC |
 | I | Storage pooled | a job's files are kept where they were made and read through the main machine (they already are, for media jobs); the free disk of each machine is shown and used by F | after F |
@@ -371,6 +372,92 @@ It goes in phases. Each phase is measured before anything is claimed (see "Measu
   machines. That is what parts A and B give today.
 - Over a USB4 or Thunderbolt link, splitting layers across machines may pay off even for a single answer. That is
   measured first, not claimed.
+
+### Workshop jobs across the cluster (owner, 2026-11-27: "make cluster group work"; `crates/am2strata/src/cluster_workshop.rs`)
+
+So the Mula plan's data cleaning, packing, datagen, tests and training can use every machine.
+
+- **The request.** `POST /v1/workshop/jobs` takes an optional `"node"`:
+  - a paired worker's name (`"macm4"`);
+  - `"any"`: the idlest machine that can run that kind, this one included (fewest Workshop jobs, then the most free
+    RAM, then the most free disk);
+  - left out: this machine, as before.
+
+  `"keep_on_node": true` leaves the outputs on the worker. The answer is the master's own job (202, the same id space),
+  with `"node": "macm4"`. When `"any"` picks this machine, the job is an ordinary local one, with `"picked"` saying so.
+- **The job.** `GET /v1/workshop/jobs/{id}` on the master shows the worker's state, log (each line prefixed with the
+  worker's name), progress, points and result, mirrored every second. Its result adds `"node"`, `"remote_output"` and
+  `"transfer"`, which lists each file with its sha256, bytes, and whether it was cached or resumed (and at which
+  byte). `DELETE` cancels it and forwards the cancel to the worker's job (within a second).
+- **Files (part F, minimal).** The master checks the request with its own Workshop's rules first: the same
+  refusals, the same default output, paths only inside its Workshop folders, and every file inside a model folder too
+  (a link out of them is refused). Then:
+  1. Each input is hashed (SHA-256, streamed; a file is hashed again only when its size or time changed). A worker
+     that has the hash is sent nothing (`GET /api/cluster/files/{sha}`).
+  2. Otherwise the file is streamed in 1 MiB chunks (`PUT /api/cluster/files/{sha}?offset=&size=`). The worker
+     appends to `<workshop>/cluster/partial/<sha>.part`. A cut stream keeps what came, and the next try resumes at
+     that byte. The file becomes a read-only blob (`cluster/blobs/<sha>`) only when all of it hashes right. There are
+     six tries, with a growing pause between them.
+  3. The job is sent with each path replaced by a placeholder. The worker makes its own paths: hard links of the blobs
+     in `cluster/in/<hash>/<name>` (the names are kept), outputs in `cluster/out/<tag>/<name>`. A suite travels as its
+     JSON, with its tests' data files sent too.
+  4. When it is done, the outputs come back the same way: listed with their hashes, streamed into the path the master
+     planned (`.cluster-part`, resumed after a cut, renamed only when the hash matches), and skipped when the master
+     already has that hash there.
+
+  Nothing is held whole in memory, so a 16 GB model folder streams. The worker answers these routes only for a
+  master's key on its pinned link: not for its owner's key, and never for a client.
+- **Capabilities** (`GET /api/cluster/workshop` on the master, `/api/cluster/workshop/caps` on a worker). For each
+  node:
+  - whether its `am2strata-workshop` is installed;
+  - the kinds it runs, with the CPU kinds (clean, convert, quantize, datagen through the node's own chat API, regress
+    on the CPU, strata, merge, loop);
+  - its GPU: cuda when `nvidia-smi -L` lists one; Metal only when the run config says
+    `"cluster": {"workshop_gpu": "metal"}`, for a Workshop built with `--features metal`; `"none"` turns it off;
+  - its free RAM and disk, and its active jobs.
+
+  `"any"` sends a GPU job (`devices` cuda, or GPU `engine_args`) only to a CUDA node. A datagen job that names a model
+  goes only to a node that has it.
+- **Privacy.** A job is private when an input or output is:
+  - marked `prastara_private` / `private: true` in a config.json, or in a dataset row;
+  - a model config with the `private`, `uncensored` or `abliterated` flags;
+  - a GGUF marked private;
+  - anything under `Strata-data/private`.
+
+  A private job is routed only to a node the request names. `"any"` refuses it (400 `private_data`, naming the file
+  and the row). Workshop jobs never go to a remote provider. The Workshop tab says so under "Run on".
+- **CLI and UI.**
+  - CLI: `am2strata-run workshop <kind> ... --node macm4|any [--keep-on-node]`.
+  - The Workshop tab has a "Run on" bar above its forms (This machine, Any, each worker with its GPU and free RAM; a
+    worker that cannot take jobs is greyed out). It is shown only when there are workers. Job cards carry a node
+    badge.
+- **Tested** (`tests/cluster_workshop.rs`, two servers on this machine paired over pinned TLS, a stand-in Workshop
+  command on the worker, CPU only):
+  - a clean job runs on the worker and its output comes back matching by hash;
+  - the same input again is not re-sent;
+  - a transfer cut at half resumes at exactly that byte;
+  - a private dataset row is refused with `"any"` and taken with the worker's name;
+  - `"any"` picks the worker when this machine cannot;
+  - a cancel reaches the worker's job;
+  - the worker's side refuses its own owner's key.
+  - Unit tests: names and paths, the privacy marks, capability matching.
+- **Honest limits.**
+  - **Time.** A 16 GB model over gigabit Ethernet takes about 2-3 minutes; over Wi-Fi (200-400 Mbit/s in practice)
+    6-12 minutes. Hashing it first takes about half a minute to a minute (once per file version). Copy a model once
+    and keep it there: the hash cache makes later jobs on it free.
+  - **Disk and memory.** The worker's blobs are never evicted yet: they stay in `<workshop>/cluster/blobs` until
+    removed by hand. A blob and its hard links share the disk space. The worker's routed jobs are kept in memory: after
+    it restarts, the master says "no longer knows its job" and fails the mirror plainly.
+  - **Datagen.** A datagen job uses the worker's own chat API and model. A worker whose chat goes to a remote (assist)
+    provider would send the sources there. Private datagen is not blocked on that yet: name a worker whose model is
+    local.
+  - **Not tested here.**
+    - The resume of an output copy back (the same code path as the input side, but no test cuts it).
+    - A real 16 GB transfer.
+    - The real Mac.
+  - **Not covered.** A model in a Hugging Face cache (its files are links outside the Workshop's folders) is refused:
+    copy it into a Workshop folder first. There is no `pack` kind in the Workshop on this branch yet, so it is not
+    routable.
 
 ## Native media pipeline (owner, 2026-11-19)
 

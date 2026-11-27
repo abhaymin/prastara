@@ -188,6 +188,23 @@ const ROUTES: &[Row] = &[
     row("POST", "/api/cluster/forget", Special).statuses(401, 401, 401, 401, 401)
         .note("only a key this worker gave a master: not even the owner's"),
     row("DELETE", "/api/cluster/workers/{name}", Owner).at("/api/cluster/workers/nope").ok(404),
+    row("GET", "/api/cluster/workshop", Owner),
+    row("GET", "/api/cluster/workshop/caps", Special).statuses(401, 401, 401, 401, 401)
+        .note("a worker's Workshop as a node, for a paired master's key on its own link only: not even the owner's"),
+    row("GET", "/api/cluster/files/{sha}", Special).at("/api/cluster/files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").statuses(401, 401, 401, 401, 401)
+        .note("a master's key only (cluster_workshop.rs): whether the worker has a file of that hash"),
+    row("PUT", "/api/cluster/files/{sha}", Special).at("/api/cluster/files/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa?offset=0&size=5").raw("application/octet-stream", "hello")
+        .statuses(401, 401, 401, 401, 401).note("a master's key only: a file's bytes, resumable"),
+    row("POST", "/api/cluster/workshop/jobs", Special).json(r#"{"request": {"kind": "clean"}}"#).statuses(401, 401, 401, 401, 401)
+        .note("a master's key only: a Workshop job sent to this worker"),
+    row("GET", "/api/cluster/workshop/jobs/{id}", Special).at("/api/cluster/workshop/jobs/1").statuses(401, 401, 401, 401, 401)
+        .note("a master's key only: a job it sent"),
+    row("DELETE", "/api/cluster/workshop/jobs/{id}", Special).at("/api/cluster/workshop/jobs/1").statuses(401, 401, 401, 401, 401)
+        .note("a master's key only: cancel a job it sent"),
+    row("GET", "/api/cluster/workshop/jobs/{id}/outputs", Special).at("/api/cluster/workshop/jobs/1/outputs").statuses(401, 401, 401, 401, 401)
+        .note("a master's key only: what a job it sent wrote, with hashes"),
+    row("GET", "/api/cluster/workshop/jobs/{id}/file", Special).at("/api/cluster/workshop/jobs/1/file?field=output").statuses(401, 401, 401, 401, 401)
+        .note("a master's key only: one output file, from an offset"),
     row("POST", "/api/machine/measure", Owner),
     row("GET", "/api/optimise", Owner),
     row("POST", "/api/models/{id}/optimise", Owner).at("/api/models/nope/optimise").json(r#"{"objective": "decode"}"#).ok(404)

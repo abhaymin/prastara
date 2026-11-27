@@ -533,6 +533,15 @@
       </nav>
       <main class="ws-work" id="ws-work">
         <div class="msg-error" id="ws-error" hidden></div>
+        <div class="ws-runon" id="ws-runon" hidden>
+          <label class="ws-runon__pick">Run on <select class="st-input" id="ws-node" aria-describedby="ws-runon-note">
+            <option value="">This machine</option><option value="any">Any (the idlest that can)</option></select></label>
+          <label class="ws-runon__keep small" id="ws-keep-wrap" hidden><input type="checkbox" id="ws-keep"> Leave the output there</label>
+          <p class="muted small" id="ws-runon-note">For every job below. Its inputs are copied to that machine over the cluster's encrypted link
+            and its output back, each checked by its hash (a large model takes minutes). Private data (a private dataset row, a
+            private or abliterated model, Strata-data/private) goes only to a machine you pick by name: never with "Any", and
+            Workshop jobs never go to a remote provider.</p>
+        </div>
         <section class="ws-panel" data-ws-panel="overview" hidden>
           <header class="ws-panel__head"><h3>Your models</h3><p class="muted">Everything the Workshop has made or can use, newest first, with what it came from and what to do next.</p></header>
           <div class="ws-panel__body">

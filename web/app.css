@@ -1058,3 +1058,11 @@ details.media-job__log ol { padding-left: 18px; margin: 4px 0 0; }
 .ws-rep__samples > summary { cursor: pointer; font-size: var(--st-fs-sm); }
 .ws-rep__pair { border-top: 1px solid var(--st-line-soft); padding: 6px 0; }
 .ws-rep__sample { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 16em; overflow-y: auto; margin: 2px 0 6px; }
+
+/* Workshop: "Run on" a machine of the cluster (cluster_workshop.rs) and the node badge on a job card */
+.ws-runon { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin: 0 0 12px; padding: 10px 12px;
+  border: 1px solid var(--st-line); border-radius: var(--st-r-md, 8px); background: var(--st-surface-2); }
+.ws-runon__pick { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; }
+.ws-runon__keep { display: inline-flex; align-items: center; gap: 6px; }
+.ws-runon p { flex-basis: 100%; margin: 0; }
+.ws-job__node { max-width: 10em; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
