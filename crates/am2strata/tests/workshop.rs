@@ -414,6 +414,23 @@ if [ "$1" = "--json" ] && { [ "$2" = "regress" ] || [ "$2" = "grade-train" ]; };
   fi
   exit 0
 fi
+if [ "$1" = "--json" ] && [ "$2" = "private-import-probe" ]; then
+  echo "$@" > "$here/probe-args.txt"
+  echo '{"event":"probe","what":"url https://example.com/set.zip","bytes":4096,"files":1,"commit":null,"network":true}'
+  exit 0
+fi
+if [ "$1" = "--json" ] && [ "$2" = "private-import-discard" ]; then
+  echo "$@" > "$here/discard-args.txt"
+  echo '{"event":"done","output":"x","kind":"discarded","bytes":0,"seconds":0.1}'
+  exit 0
+fi
+if [ "$1" = "--json" ] && [ "$2" = "private-import" ]; then
+  echo "$@" > "$here/private-import-args.txt"
+  echo '{"event":"start","what":"private import"}'
+  echo '{"event":"progress","done":3,"total":4,"message":"3 of 4 items checked","counts":{"fetched":1,"items":4,"checked":3,"rejected":1,"deleted":1,"released":0},"import":"set-1"}'
+  echo '{"event":"error","message":"the age estimate check model is not installed; nothing is released"}'
+  exit 1
+fi
 if [ "$1" = "--json" ] && [ "$2" = "private-data" ]; then
   echo "$@" > "$here/private-data-args.txt"
   printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/private-data-env.txt"
@@ -1416,4 +1433,123 @@ fn abliteration_carry_direction_only_and_refusal_check_jobs_check_their_inputs()
     assert!(args.contains(&format!("--engine-gguf {}", pack.display())) && args.contains(&format!("--before {}", gguf.display()))
             && args.contains("--n 8") && args.contains("--engine-args --threads 2") && args.contains(&format!("--tokenizer {}", abl.display())), "{args}");
     let _ = std::fs::remove_dir_all(&tools);
+}
+
+/// A private import (docs/internal/PRIVATE-DATA.md): a network source needs its SOURCE.toml and the size the owner
+/// confirmed; the job's counts and why it stopped reach the job; the quarantine is refused by every job kind, never
+/// listed or shown, never sent to another machine, and private data never goes to a remote model. Synthetic files only.
+#[cfg(unix)]
+#[test]
+fn private_imports_are_confirmed_and_their_quarantine_is_refused_everywhere() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-import-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let err = |b: &Value| -> (u16, String) {
+        let (c, e) = s.post("/v1/workshop/jobs", b);
+        (c, e["error"]["message"].as_str().unwrap_or("").to_string())
+    };
+    // the sources and their checks
+    let attest = s.dir.join("SOURCE.toml");
+    std::fs::write(&attest, "owner_attests_adults_only = true\nowner_attests_consent = true\norigin = \"test\"\nlicence = \"test\"\nurl = \"https://example.com/set.zip\"\n").unwrap();
+    for (body, why) in [
+        (json!({"kind": "private-import", "name": "set", "source": {"folder": "/etc"}}), "/etc"),
+        (json!({"kind": "private-import", "name": "../x", "source": {"url": "https://example.com/set.zip"}}), "\"name\""),
+        (json!({"kind": "private-import", "name": "set", "source": {"url": "http://example.com/set.zip"}, "attestation": attest, "confirm_bytes": 1}), "https"),
+        (json!({"kind": "private-import", "name": "set", "source": {"url": "https://example.com/set.zip"}, "confirm_bytes": 1}), "attestation"),
+        (json!({"kind": "private-import", "name": "set", "source": {"url": "https://example.com/set.zip"}, "attestation": attest}), "confirm its size"),
+        (json!({"kind": "private-import", "name": "set", "source": {"hf": "a/b/c"}, "attestation": attest, "confirm_bytes": 1}), "owner/name"),
+        (json!({"kind": "private-import", "name": "set", "source": {"url": "https://example.com/set.zip"}, "attestation": attest, "confirm_bytes": 1, "minor_share": 0.5}), "minor_share"),
+    ] {
+        let (c, m) = err(&body);
+        assert_eq!(c, 400, "{body}: {m}");
+        assert!(m.contains(why), "{body}: {m}");
+    }
+    // the probe the confirm dialog shows, then the job with the size confirmed
+    let (c, p) = s.post("/v1/workshop/private-import/probe", &json!({"source": {"url": "https://example.com/set.zip"}}));
+    assert_eq!((c, p["bytes"].as_u64(), p["network"].as_bool()), (200, Some(4096), Some(true)), "{p}");
+    let (c, j) = s.post("/v1/workshop/jobs", &json!({"kind": "private-import", "name": "set", "source": {"url": "https://example.com/set.zip"},
+                                                     "attestation": attest, "confirm_bytes": p["bytes"], "node": "any"}));
+    assert_eq!(c, 400, "a private import runs on this machine only: {j}");
+    let (c, j) = s.post("/v1/workshop/jobs", &json!({"kind": "private-import", "name": "set", "source": {"url": "https://example.com/set.zip"},
+                                                     "attestation": attest, "confirm_bytes": p["bytes"]}));
+    assert_eq!(c, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "failed");
+    assert_eq!(done["error"], "the age estimate check model is not installed; nothing is released");
+    assert_eq!(done["progress"]["counts"]["deleted"], 1, "{done}");
+    let args = std::fs::read_to_string(tools.join("private-import-args.txt")).unwrap();
+    assert!(args.contains("--url https://example.com/set.zip") && args.contains("--confirm-bytes 4096") && args.contains("--attestation"), "{args}");
+
+    // an import stopped in quarantine (as the command leaves it): listed by its counts, never its items
+    let q = s.dir.join("private/quarantine/set-1");
+    std::fs::create_dir_all(q.join("items")).unwrap();
+    std::fs::write(q.join("items/aa.jsonl"), "{\"messages\":[{\"role\":\"user\",\"content\":\"lorem\"}]}\n").unwrap();
+    std::fs::write(q.join("import.json"), json!({"id": "set-1", "name": "set", "source": "folder x", "status": "stopped", "reason": "the age estimate check model is not installed; nothing is released",
+        "counts": {"items": 1}, "created": 1, "items": [{"sha256": "aa", "ext": "jsonl", "bytes": 1, "status": "pending"}]}).to_string()).unwrap();
+    let (c, l) = s.get("/v1/workshop/private-imports", true);
+    assert_eq!(c, 200);
+    assert_eq!(l["imports"][0]["status"], "stopped");
+    assert!(l["imports"][0].get("items").is_none(), "no items are listed: {l}");
+    // a resume takes the import's own source
+    let (c, j) = s.post("/v1/workshop/jobs", &json!({"kind": "private-import", "name": "set", "resume": "set-1"}));
+    assert_eq!(c, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "failed");
+    let args = std::fs::read_to_string(tools.join("private-import-args.txt")).unwrap();
+    assert!(args.contains("--id set-1") && !args.contains("--url"), "{args}");
+
+    // the quarantine refused by every job kind
+    let qf = q.join("items/aa.jsonl").display().to_string();
+    let qd = q.display().to_string();
+    let kinds = [
+        json!({"kind": "convert", "input": qd}), json!({"kind": "quantize", "input": qf, "type": "q4_k"}),
+        json!({"kind": "merge", "base": qd, "adapter": qd}), json!({"kind": "loop", "input": qd, "start": 1, "end": 2, "passes": 2}),
+        json!({"kind": "upcycle", "input": qd, "experts": 2, "top_k": 1}), json!({"kind": "export-moe", "input": qd}),
+        json!({"kind": "abliterate", "input": qd, "harmful": qf, "harmless": qf}), json!({"kind": "train", "model": qd, "data": qf}),
+        json!({"kind": "strata", "input": qf}), json!({"kind": "pack", "input": qf}),
+        json!({"kind": "datagen", "recipe": "qa", "sources": [qf]}), json!({"kind": "clean", "inputs": [qf]}),
+        json!({"kind": "regress", "model": qd, "suite": qf}), json!({"kind": "grade-train", "model": qd, "suite": qf, "data": qf}),
+        json!({"kind": "private-data", "name": "x", "sources": [qd]}),
+        json!({"kind": "private-import", "name": "x", "source": {"folder": qd}}),
+        json!({"kind": "clean", "inputs": [qf], "node": "macm4"}),
+    ];
+    for b in &kinds {
+        let (c, m) = err(b);
+        assert_eq!(c, 400, "{b}: {m}");
+        assert!(m.contains("quarantine"), "{b}: {m}");
+    }
+    // a link into the quarantine is the quarantine
+    let link = s.dir.join("innocent.jsonl");
+    std::os::unix::fs::symlink(q.join("items/aa.jsonl"), &link).unwrap();
+    assert!(err(&json!({"kind": "clean", "inputs": [link]})).1.contains("quarantine"));
+    // never shown or listed
+    let (c, _) = s.get(&format!("/v1/workshop/dataset?path={qf}"), true);
+    assert_eq!(c, 400);
+    let (c, b) = s.get(&format!("/v1/workshop/browse?path={}", s.dir.join("private").display()), true);
+    assert_eq!(c, 200);
+    assert!(!b["entries"].as_array().unwrap().iter().any(|e| e["name"] == "quarantine"), "{b}");
+    assert_eq!(s.get(&format!("/v1/workshop/browse?path={qd}"), true).0, 400);
+
+    // a released private dataset never goes to another machine, not even a named one
+    let rel = s.dir.join("private/datasets/old/text.jsonl");
+    std::fs::create_dir_all(rel.parent().unwrap()).unwrap();
+    std::fs::write(&rel, "{\"messages\":[{\"role\":\"user\",\"content\":\"lorem ipsum\"},{\"role\":\"assistant\",\"content\":\"dolor sit amet\"}],\"private\":true}\n").unwrap();
+    let (c, e) = s.post("/v1/workshop/jobs", &json!({"kind": "clean", "inputs": [rel], "node": "macm4"}));
+    assert_eq!((c, e["error"]["type"].as_str()), (400, Some("private_data")), "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("never leaves this machine"), "{e}");
+    // and private data never goes to a remote model; with a local one every chat is marked local-only
+    let (c, m) = err(&json!({"kind": "datagen", "recipe": "qa", "sources": [rel], "model": "openai/gpt-5.5"}));
+    assert_eq!(c, 400);
+    assert!(m.contains("remote model"), "{m}");
+    let (c, m) = err(&json!({"kind": "datagen", "recipe": "qa", "sources": [rel], "model": "not-a-local-model"}));
+    assert!(c == 400 && m.contains("remote model"), "an unknown name is not taken for a local model: {m}");
+    let (c, j) = s.post("/v1/workshop/jobs", &json!({"kind": "datagen", "recipe": "qa", "sources": [rel], "model": "mock-a"}));
+    assert_eq!(c, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
+    assert!(args.contains("--local-only"), "{args}");
+
+    // discard: through the command
+    let (c, d) = s.post("/v1/workshop/private-imports/set-1/discard", &json!({}));
+    assert_eq!(c, 200, "{d}");
+    assert!(std::fs::read_to_string(tools.join("discard-args.txt")).unwrap().contains("--id set-1"));
+    assert_eq!(s.post("/v1/workshop/private-imports/..%2Fx/discard", &json!({})).0, 400);
 }

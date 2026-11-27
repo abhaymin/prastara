@@ -730,7 +730,16 @@ fn a_busy_uncensored_model_never_overflows_to_a_remote_one() {
         let (code, h, text) = call(&s, KEY, "/v1/chat/completions", &body);
         assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, ""), "{text}");
     }
-    assert!(!mock.bodies().iter().any(|b| { let b = b.to_string(); b.contains("PRIVWORD") || b.contains("NOMODELWORD") }), "nothing left this machine");
+    // a job over private data (datagen, regress, grade-train with --local-only) marks every chat local-only: a remote
+    // model or a mix named is refused, and with the local model busy it waits rather than overflow
+    for m in ["openai/busy-model", "mix"] {
+        let (code, _, text) = call(&s, KEY, "/v1/chat/completions", &json!({"model": m, "strata_local_only": true, "messages": [user("hi LOCALWORD")]}));
+        assert_eq!(code, 400, "{m}: {text}");
+        assert!(text.contains("local-only"), "{text}");
+    }
+    let (code, h, text) = call(&s, KEY, "/v1/chat/completions", &json!({"model": "mock-a", "strata_local_only": true, "messages": [user("hi LOCALWORD")]}));
+    assert_eq!((code, header(&h, "x-strata-routed").as_str()), (200, ""), "{text}");
+    assert!(!mock.bodies().iter().any(|b| { let b = b.to_string(); b.contains("PRIVWORD") || b.contains("NOMODELWORD") || b.contains("LOCALWORD") }), "nothing left this machine");
     let _ = busy.join();
 }
 

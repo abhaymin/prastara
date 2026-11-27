@@ -157,3 +157,103 @@ mod tests {
         assert!(check("an explicit note about someone aged 25").is_none());
     }
 }
+
+/// The fixed rules of a private-data import (`strata-workshop`'s `private_import`): how a check model's label scores
+/// become a decision, and when a whole source is rejected. No setting turns any of them off; a setting can only make
+/// them stricter.
+pub mod import {
+    /// The share of a source's items that may be flagged as involving a minor before the whole import is rejected and
+    /// its quarantine deleted. A setting can lower it, never raise it.
+    pub const MAX_MINOR_SHARE: f64 = 0.01;
+    /// A minor check (image, text, age) flags an item when its flag labels together score at least this. A setting can
+    /// lower it (stricter), never raise it above [`MINOR_THRESHOLD_MAX`].
+    pub const MINOR_THRESHOLD_DEFAULT: f32 = 0.2;
+    pub const MINOR_THRESHOLD_MAX: f32 = 0.5;
+    /// The real-person check's default and highest threshold.
+    pub const REAL_THRESHOLD_DEFAULT: f32 = 0.5;
+    pub const REAL_THRESHOLD_MAX: f32 = 0.9;
+    /// An age model that answers in years (one output) flags an item under this age.
+    pub const ADULT_AGE: f32 = 18.0;
+    /// ... plus at least this margin, for the model's error (a setting can raise it, never lower it).
+    pub const AGE_MARGIN_MIN: f32 = 3.0;
+
+    /// The minor-share limit a source runs with: `asked` when it is stricter, else the fixed one.
+    pub fn minor_share(asked: Option<f64>) -> f64 {
+        match asked {
+            Some(a) if a.is_finite() && (0.0..=MAX_MINOR_SHARE).contains(&a) => a,
+            _ => MAX_MINOR_SHARE,
+        }
+    }
+
+    /// Whether `flagged` of `total` items passes the limit (the whole source is rejected). No items: not rejected.
+    pub fn source_rejected(flagged: usize, total: usize, share: f64) -> bool {
+        total > 0 && flagged as f64 > share * total as f64
+    }
+
+    /// A threshold as asked, held inside `(0, max]`; anything else (missing, NaN, above max) is `default`.
+    pub fn threshold(asked: Option<f32>, default: f32, max: f32) -> f32 {
+        match asked {
+            Some(t) if t.is_finite() && t > 0.0 && t <= max => t,
+            Some(t) if t.is_finite() && t > max => max,
+            _ => default,
+        }
+    }
+
+    /// An age label as a range of years: "0-2", "10-19", "20 - 29", "more than 70", "70+", "under 18", "12", "(8, 12)".
+    /// None when it names no age.
+    pub fn age_range(label: &str) -> Option<(f32, f32)> {
+        let l = label.to_lowercase();
+        let nums: Vec<f32> = l.split(|c: char| !c.is_ascii_digit() && c != '.').filter(|s| !s.is_empty())
+            .filter_map(|s| s.parse::<f32>().ok()).collect();
+        match nums.as_slice() {
+            [] => None,
+            [n] if l.contains("more") || l.contains("over") || l.contains('+') || l.contains("above") || l.contains("older") => Some((*n, 200.0)),
+            [n] if l.contains("under") || l.contains("less") || l.contains("below") || l.contains("younger") || l.contains('<') => Some((0.0, *n)),
+            [n] => Some((*n, *n)),
+            [a, b, ..] => Some((a.min(*b), a.max(*b))),
+        }
+    }
+
+    /// Whether an age label may mean someone under 18: any range that reaches below 18 (so "10-19" does).
+    pub fn age_label_minor(label: &str) -> Option<bool> {
+        age_range(label).map(|(lo, _)| lo < ADULT_AGE)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn settings_only_make_the_rules_stricter() {
+            assert_eq!(minor_share(None), MAX_MINOR_SHARE);
+            assert_eq!(minor_share(Some(0.5)), MAX_MINOR_SHARE, "a higher share is not taken");
+            assert_eq!(minor_share(Some(0.0)), 0.0);
+            assert_eq!(minor_share(Some(f64::NAN)), MAX_MINOR_SHARE);
+            assert_eq!(threshold(Some(0.9), MINOR_THRESHOLD_DEFAULT, MINOR_THRESHOLD_MAX), MINOR_THRESHOLD_MAX);
+            assert_eq!(threshold(Some(0.05), MINOR_THRESHOLD_DEFAULT, MINOR_THRESHOLD_MAX), 0.05);
+            assert_eq!(threshold(Some(0.0), MINOR_THRESHOLD_DEFAULT, MINOR_THRESHOLD_MAX), MINOR_THRESHOLD_DEFAULT);
+            assert_eq!(threshold(None, MINOR_THRESHOLD_DEFAULT, MINOR_THRESHOLD_MAX), MINOR_THRESHOLD_DEFAULT);
+        }
+
+        #[test]
+        fn a_source_over_the_share_is_rejected() {
+            assert!(!source_rejected(1, 100, 0.01), "1 % is the limit, not over it");
+            assert!(source_rejected(2, 100, 0.01));
+            assert!(source_rejected(1, 10, 0.01));
+            assert!(source_rejected(1, 1000, 0.0));
+            assert!(!source_rejected(0, 0, 0.01));
+        }
+
+        #[test]
+        fn age_labels_are_read_and_a_range_reaching_under_18_is_minor() {
+            assert_eq!(age_label_minor("0-2"), Some(true));
+            assert_eq!(age_label_minor("10-19"), Some(true));
+            assert_eq!(age_label_minor("20-29"), Some(false));
+            assert_eq!(age_label_minor("more than 70"), Some(false));
+            assert_eq!(age_label_minor("70+"), Some(false));
+            assert_eq!(age_label_minor("under 18"), Some(true));
+            assert_eq!(age_label_minor("(15, 20)"), Some(true));
+            assert_eq!(age_label_minor("adult"), None);
+        }
+    }
+}

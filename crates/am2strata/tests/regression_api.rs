@@ -298,6 +298,11 @@ const ROUTES: &[Row] = &[
     row("POST", "/v1/workshop/library", Owner).json(r#"{"name": "no-such-recipe"}"#).ok(400),
     row("GET", "/v1/workshop/dataset", Owner).at("/v1/workshop/dataset?path=/nope/x.jsonl").ok(400).note("outside the Workshop's folders"),
     row("POST", "/v1/workshop/dataset", Owner).json(r#"{"path": "/nope/x.jsonl"}"#).ok(400),
+    // the private import (docs/internal/PRIVATE-DATA.md): counts and reasons only, never an item
+    row("POST", "/v1/workshop/private-import/probe", Owner).json(r#"{"source": {"url": "http://example.com/x.zip"}}"#).ok(400)
+        .note("only https: nothing is asked of the network"),
+    row("GET", "/v1/workshop/private-imports", Owner),
+    row("POST", "/v1/workshop/private-imports/{id}/discard", Owner).at("/v1/workshop/private-imports/..x/discard").ok(400).note("not an import id"),
     // ------------------------------------------------------------------------------------------- HTTPS, Computer
     row("GET", "/api/tls", Owner),
     row("POST", "/api/tls", Owner).json(r#"{"action": "nope"}"#).ok(400).note("an unknown action: HTTPS stays as it is"),

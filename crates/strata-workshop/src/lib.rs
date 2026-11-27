@@ -22,6 +22,7 @@ pub mod export_moe;
 pub mod finetune;
 pub mod datagen;
 pub mod private_data;
+pub mod private_import;
 pub mod recipes;
 pub mod regress;
 pub mod engine;

@@ -18,6 +18,9 @@
 //! am2strata-workshop regress --model <hf-folder> [--adapter <dir>] [--passes 1,2] --suite <suite.json> --out <report-dir> [--against <report>]
 //! am2strata-workshop clean <in.jsonl>... --out <out.jsonl> [--model <hf-folder>] [--max-len 1024] [--min-answer-tokens N] [--max-repeat R] [--dedupe exact|near|off] [--lang-match] [--drop-cut] [--exclude held-out.jsonl] [--cap-per-language N [--cap-only in.jsonl]] [--report card.md]
 //! am2strata-workshop private-data --name <name> --source <folder>... [--model <local-model>] [--data-dir ~/Development/Strata-data]
+//! am2strata-workshop private-import (--folder <dir> | --url <https-url> | --hf <owner/name> [--revision main] [--pattern "*.zip"]) --name <name> [--attestation SOURCE.toml] [--confirm-bytes N] [--id <import-id>]
+//! am2strata-workshop private-import-probe (--folder <dir> | --url <https-url> | --hf <owner/name>)
+//! am2strata-workshop private-import-discard --id <import-id>
 //! am2strata-workshop grade-train --model <hf-folder> --data <prompts.jsonl> --samples N --grader code|judge --rounds R --suite <suite.json> --out <dir>
 //! ```
 //!
@@ -48,6 +51,9 @@ struct Cli {
     /// one JSON event per line on stdout (for the server and scripts)
     #[arg(long, global = true)]
     json: bool,
+    /// a job over private data (the server adds it): every chat with the server stays on this machine
+    #[arg(long, global = true, hide = true)]
+    local_only: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -356,6 +362,46 @@ enum Cmd {
         /// videos: at most this many frames each
         #[arg(long, default_value_t = 8)]
         max_frames: usize,
+    },
+    /// import the owner's adult dataset (a folder, a read-only NAS mount too, an https URL or a Hugging Face dataset;
+    /// each with its SOURCE.toml) into <data-dir>/private/quarantine/<id>/, check every item with the local check models
+    /// (<data-dir>/private/check-models/), and release what passed to <data-dir>/private/datasets/<name>/. A network
+    /// source needs --confirm-bytes, the size its probe gave. The checks cannot be turned off.
+    PrivateImport {
+        #[command(flatten)]
+        src: ImportSource,
+        /// the dataset's name: its folder under <data-dir>/private/datasets
+        #[arg(long)]
+        name: String,
+        /// the SOURCE.toml (default: the folder's own); outside the folder it names the source (folder, url or hf)
+        #[arg(long)]
+        attestation: Option<PathBuf>,
+        /// a network source: the size in bytes you confirmed (it must still be the size)
+        #[arg(long)]
+        confirm_bytes: Option<u64>,
+        /// the flagged share that rejects the whole source (at most and by default 0.01)
+        #[arg(long)]
+        minor_share: Option<f64>,
+        /// resume this import (in quarantine) instead of starting one
+        #[arg(long)]
+        id: Option<String>,
+        /// one check of one item at most this many seconds
+        #[arg(long, default_value_t = 120)]
+        check_timeout_s: u64,
+        #[arg(long, default_value = "~/Development/Strata-data")]
+        data_dir: String,
+    },
+    /// what a private-import source holds (files, bytes, the Hub commit) without fetching it
+    PrivateImportProbe {
+        #[command(flatten)]
+        src: ImportSource,
+    },
+    /// delete an import's quarantine
+    PrivateImportDiscard {
+        #[arg(long)]
+        id: String,
+        #[arg(long, default_value = "~/Development/Strata-data")]
+        data_dir: String,
     },
     /// a chat dataset cleaned for training: duplicates and near-copies, answers that repeat themselves, are too short,
     /// empty, echo the prompt, are in the wrong script or carry template junk, prompts too long for --max-len, rows of
@@ -896,6 +942,61 @@ fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, a
 
 fn os_threads() -> Option<u64> {
     std::fs::read_to_string("/proc/self/status").ok()?.lines().find(|l| l.starts_with("Threads:"))?.split_whitespace().nth(1)?.parse().ok()
+}
+
+/// A private-import source: one of a folder, an https URL, or a Hugging Face dataset.
+#[derive(Args, Clone)]
+struct ImportSource {
+    /// a local folder (a read-only NAS mount too); never written to
+    #[arg(long)]
+    folder: Option<PathBuf>,
+    /// a direct https URL to an archive or a file
+    #[arg(long)]
+    url: Option<String>,
+    /// a Hugging Face dataset id (owner/name), fetched over the Hub's HTTP API (HF_ENDPOINT, HF_TOKEN)
+    #[arg(long)]
+    hf: Option<String>,
+    /// --hf: the branch, tag or commit
+    #[arg(long, default_value = "main")]
+    revision: String,
+    /// --hf: only the files that match (`*`, `**`, `?`; `|` between patterns)
+    #[arg(long)]
+    pattern: Option<String>,
+}
+
+impl ImportSource {
+    fn spec(&self) -> Result<strata_workshop::private_import::Spec, String> {
+        use strata_workshop::private_import::Spec;
+        match (&self.folder, &self.url, &self.hf) {
+            (Some(f), None, None) => Ok(Spec::Folder(f.clone())),
+            (None, Some(u), None) => Ok(Spec::Url(u.clone())),
+            (None, None, Some(h)) => Ok(Spec::Hf { id: h.clone(), revision: self.revision.clone(), pattern: self.pattern.clone() }),
+            _ => Err("give one source: --folder, --url or --hf".into()),
+        }
+    }
+}
+
+fn home_path(p: &str) -> Result<PathBuf, String> {
+    Ok(match p.strip_prefix("~/") {
+        Some(rest) => std::env::var_os("HOME").map(PathBuf::from).ok_or("no HOME for ~")?.join(rest),
+        None => PathBuf::from(p),
+    })
+}
+
+/// A folder's plain files (links not followed) and their bytes, for the confirm dialog.
+fn folder_size(d: &Path) -> (u64, usize, Option<String>) {
+    let (mut bytes, mut files) = (0u64, 0usize);
+    let mut stack = vec![(d.to_path_buf(), 0)];
+    while let Some((p, depth)) = stack.pop() {
+        for e in std::fs::read_dir(&p).into_iter().flatten().flatten() {
+            match std::fs::symlink_metadata(e.path()) {
+                Ok(m) if m.is_file() => { bytes += m.len(); files += 1; }
+                Ok(m) if m.is_dir() && depth < 16 => stack.push((e.path(), depth + 1)),
+                _ => {}
+            }
+        }
+    }
+    (bytes, files, None)
 }
 
 /// set by SIGTERM (a cancel from the server): datagen stops after the current request and writes what it made
@@ -1676,6 +1777,60 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             Ok((s.out_dir(), "private-dataset".into(), json!({"private": true, "vision_rows": r.vision_rows, "prompt_rows": r.prompt_rows,
                 "text_rows": r.text_rows, "dropped": r.dropped, "blocked": r.blocked.len()})))
         }
+        Cmd::PrivateImport { src, name, attestation, confirm_bytes, minor_share, id, check_timeout_s, data_dir } => {
+            use strata_workshop::private_import as pi;
+            let root = strata_workshop::private_data::private_root(&home_path(data_dir)?);
+            // a resume takes the source its import started with (kept in quarantine)
+            let spec = match (src.spec(), id) {
+                (Ok(sp), _) => sp,
+                (Err(_), Some(_)) => pi::Spec::Folder(PathBuf::new()),
+                (Err(e), None) => return Err(e),
+            };
+            let mut s = pi::Settings::new(root.clone(), name, spec.clone());
+            if let Some(i) = id { s.id = i.clone(); }
+            s.attestation = attestation.clone();
+            s.confirm_bytes = *confirm_bytes;
+            s.minor_share = *minor_share;
+            s.timeout = std::time::Duration::from_secs((*check_timeout_s).clamp(1, 3600));
+            // a folder never needs it (a bad HF_ENDPOINT then only stops a network source)
+            let net = pi::Net::from_env().ok();
+            out.event(json!({"event": "start", "what": if id.is_some() { format!("private import {} resumed", s.id) } else { format!("private import {} of {} into quarantine", s.id, spec.describe()) }}));
+            install_term_handler();
+            let models = root.join(pi::CHECK_MODELS);
+            let timeout = s.timeout;
+            let mut loader = |k: pi::checks::CheckKind| pi::checks::load(k, &models, timeout);
+            let mut progress = |c: &pi::Counts, msg: &str| out.event(json!({"event": "progress", "done": c.checked, "total": c.items.max(c.checked),
+                "message": msg, "counts": c, "import": s.id}));
+            let stop = || TERM.load(std::sync::atomic::Ordering::SeqCst);
+            match pi::run(&s, net.as_ref(), &mut loader, &mut progress, &stop).map_err(|e| format!("{e:#}"))? {
+                pi::Outcome::Released { dir, counts } => {
+                    out.event(json!({"event": "progress", "done": counts.checked, "total": counts.items, "message": "released", "counts": counts, "import": s.id}));
+                    Ok((dir, "private-dataset".into(), json!({"private": true, "import": s.id, "status": "released", "counts": counts})))
+                }
+                pi::Outcome::Rejected { reason, counts } | pi::Outcome::Stopped { reason, counts } => {
+                    out.event(json!({"event": "progress", "done": counts.checked, "total": counts.items, "message": "nothing released", "counts": counts, "import": s.id}));
+                    Err(reason)
+                }
+            }
+        }
+        Cmd::PrivateImportProbe { src } => {
+            use strata_workshop::private_import as pi;
+            let spec = src.spec()?;
+            let (bytes, files, commit) = match &spec {
+                pi::Spec::Folder(d) => folder_size(d),
+                _ => {
+                    let p = pi::Net::from_env().and_then(|n| n.probe(&spec)).map_err(|e| format!("{e:#}"))?;
+                    (p.bytes, p.files.len(), p.commit)
+                }
+            };
+            out.event(json!({"event": "probe", "what": spec.describe(), "bytes": bytes, "files": files, "commit": commit, "network": spec.is_network()}));
+            Ok((PathBuf::new(), "info".into(), json!({})))
+        }
+        Cmd::PrivateImportDiscard { id, data_dir } => {
+            let root = strata_workshop::private_data::private_root(&home_path(data_dir)?);
+            strata_workshop::private_import::discard(&root, id).map_err(|e| format!("{e:#}"))?;
+            Ok((root.join("quarantine"), "discarded".into(), json!({"import": id})))
+        }
         Cmd::RefusalCheck { engine, tokenizer, harmful, harmless, n, max_tokens, before, report } => {
             use strata_workshop::{abliterate, refusal_check};
             let spec = engine.spec()?.ok_or("refusal-check needs --engine-gguf: the GGUF or Kosha pack to check")?;
@@ -1770,7 +1925,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } | Cmd::PrivateData { .. } | Cmd::RefusalCheck { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } | Cmd::PrivateData { .. } | Cmd::PrivateImport { .. } | Cmd::PrivateImportProbe { .. } | Cmd::PrivateImportDiscard { .. } | Cmd::RefusalCheck { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))
@@ -1955,8 +2110,19 @@ fn main() -> ExitCode {
             return code;
         }
     }
+    if cli.local_only {
+        datagen::set_local_only();
+    }
     let out = Out { json: cli.json };
     let t0 = Instant::now();
+    // nothing in a private quarantine is read by any command but the import itself (it is not checked yet)
+    if !matches!(cli.cmd, Cmd::PrivateImport { .. } | Cmd::PrivateImportProbe { .. } | Cmd::PrivateImportDiscard { .. }) {
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        if let Some(why) = strata_workshop::private_import::quarantine_args(&args) {
+            out.event(json!({"event": "error", "message": why}));
+            return ExitCode::from(1);
+        }
+    }
     match run(&cli.cmd, &out) {
         Ok((path, kind, extra)) => {
             if kind != "info" {

@@ -315,6 +315,11 @@ impl Model {
         if !think {
             body["chat_template_kwargs"] = json!({"enable_thinking": false});
         }
+        // a job over private data (--local-only, which the server adds): its chats stay on this machine, never a
+        // cluster worker or a remote model, not even as overflow
+        if local_only() {
+            body["strata_local_only"] = json!(true);
+        }
         let send = |body: &Value| -> Result<(bool, Value)> {
             let mut rb = self.client.post(format!("{}/v1/chat/completions", self.url)).json(body);
             if let Some(t) = timeout { rb = rb.timeout(t); }
@@ -746,4 +751,18 @@ mod tests {
         let c = card(&s, "tiel", &Report { kept: 7, generated: 9, ..Default::default() });
         assert!(c.contains("Records kept | 7") && c.contains("responsible for having the right"));
     }
+}
+
+static LOCAL_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Mark every chat of this process local-only (`am2strata-workshop --local-only`, which the server adds for a job over
+/// private data).
+pub fn set_local_only() {
+    LOCAL_ONLY.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether this job's chats must stay on this machine ([`set_local_only`], or `AM2STRATA_LOCAL_ONLY=1`).
+pub fn local_only() -> bool {
+    LOCAL_ONLY.load(std::sync::atomic::Ordering::SeqCst)
+        || std::env::var("AM2STRATA_LOCAL_ONLY").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }

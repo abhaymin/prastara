@@ -61,7 +61,7 @@ pub struct Source {
 }
 
 /// A small TOML reader for `key = value` lines (booleans and quoted strings); sections and comments are skipped.
-fn toml_values(text: &str) -> BTreeMap<String, Value> {
+pub(crate) fn toml_values(text: &str) -> BTreeMap<String, Value> {
     let mut out = BTreeMap::new();
     for line in text.lines() {
         let line = line.trim();

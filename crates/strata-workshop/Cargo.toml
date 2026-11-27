@@ -36,6 +36,11 @@ clap.workspace = true
 libc = "0.2"
 # datagen: the server's own chat API (the loaded model writes the data)
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# private_import: images decoded for the check models (never shown), archives unpacked under guards (zip is the
+# workspace's patched copy)
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+flate2 = "1"
 
 [features]
 # training on NVIDIA GPUs (candle's CUDA backend; needs the CUDA toolkit at build time)
@@ -44,7 +49,5 @@ cuda = ["candle-core/cuda", "candle-nn/cuda"]
 metal = ["candle-core/metal", "candle-nn/metal"]
 
 [dev-dependencies]
-# private_data's tests make tiny PNGs
-image = { version = "0.25", default-features = false, features = ["png"] }
 # refusal-check's test builds a Kosha pack to answer from (tests only: the Workshop itself never links the AGPL crate)
 am2pack = { path = "../am2pack" }

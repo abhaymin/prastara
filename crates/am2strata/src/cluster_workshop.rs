@@ -142,6 +142,9 @@ fn hash_cached(p: &Path) -> Result<(String, u64), String> {
 /// Why a path is private (None: it is not): under Strata-data/private, a config or run config marked so, a dataset
 /// with a private row, a GGUF marked private. A folder is private when anything in it is.
 pub fn private_reason(p: &Path) -> Option<String> {
+    if crate::workshop::in_quarantine(p) {
+        return Some(format!("{} is in the private quarantine", p.display()));
+    }
     let s = p.display().to_string().replace('\\', "/").to_lowercase();
     if s.contains("strata-data/private") {
         return Some(format!("{} is under Strata-data/private", p.display()));
@@ -166,6 +169,15 @@ pub fn private_reason(p: &Path) -> Option<String> {
         return None;
     }
     file_private(p)
+}
+
+/// Whether `p` is in the private folder (`<data>/private`: the private datasets and the import quarantine), by its
+/// path, resolved, or its name.
+pub fn private_root_holds(root: &Path, p: &Path) -> bool {
+    let canon = |x: &Path| x.canonicalize().ok();
+    crate::workshop::in_quarantine(p) || p.starts_with(root)
+        || canon(p).zip(canon(root)).is_some_and(|(a, b)| a.starts_with(b))
+        || p.display().to_string().replace('\\', "/").to_lowercase().contains("strata-data/private/")
 }
 
 fn flags_private(v: &Value) -> Option<&'static str> {
@@ -486,6 +498,17 @@ pub async fn submit(s: &AppState, ws: &Arc<Workshop>, mut req: Value) -> Respons
     let gpu = Workshop::train_on_gpu(&local);
     let ws2 = ws.clone();
     let (k2, l2, o2) = (kind.clone(), local.clone(), output.clone());
+    let root = crate::workshop::private_root_of(ws);
+    let (k3, l3, o3, ws3) = (kind.clone(), local.clone(), output.clone(), ws.clone());
+    // the private folder itself (the owner's adult datasets and the import quarantine): never another machine, even
+    // a named one
+    let in_root = tokio::task::spawn_blocking(move || named_paths(&ws3, &k3, &l3, &o3).into_iter().find(|p| private_root_holds(&root, p)))
+        .await.unwrap_or(None);
+    if let Some(p) = in_root {
+        return error(StatusCode::BAD_REQUEST, "private_data",
+                     format!("{}: {} the private folder: it never leaves this machine, not even for a named worker", p.display(),
+                             if crate::workshop::in_quarantine(&p) { "is in the private quarantine of" } else { "is in" }));
+    }
     let private = tokio::task::spawn_blocking(move || named_paths(&ws2, &k2, &l2, &o2).iter().find_map(|p| private_reason(p)))
         .await.unwrap_or(None);
     // a datagen job writes through the chat API of the machine it runs on, which may send chats on to a remote
@@ -1355,6 +1378,20 @@ mod tests {
         std::fs::write(d.join("strata-x.json"), "{\"uncensored\":true}").unwrap();
         assert!(private_reason(&d.join("strata-x.json")).is_some());
         assert!(private_reason(Path::new("/data/Strata-data/private/a.jsonl")).is_some());
+        // the import quarantine and the private folder: private, and held to this machine
+        let q = Path::new("/data/x/private/quarantine/set-1/items/a.png");
+        assert!(private_reason(q).unwrap().contains("quarantine"));
+        let root = d.join("data/private");
+        std::fs::create_dir_all(root.join("datasets/set")).unwrap();
+        assert!(private_root_holds(&root, &root.join("datasets/set/text.jsonl")));
+        assert!(private_root_holds(&root, q), "any quarantine, wherever it is");
+        assert!(private_root_holds(&root, Path::new("/data/Strata-data/private/datasets/x/manifest.jsonl")));
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("datasets/set"), d.join("link")).unwrap();
+            assert!(private_root_holds(&root, &d.join("link")), "a link into it is inside it");
+        }
+        assert!(!private_root_holds(&root, &d.join("open.jsonl")));
         std::fs::remove_dir_all(&d).ok();
     }
 

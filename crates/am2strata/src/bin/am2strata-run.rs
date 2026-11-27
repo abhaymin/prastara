@@ -1413,6 +1413,21 @@ struct DatagenOpts {
     every_s: Option<f64>,
     #[arg(long, hide = true)]
     max_frames: Option<u64>,
+    /// private-import (docs/internal/PRIVATE-DATA.md): the SOURCE.toml (a URL or Hub source needs one naming it),
+    /// the Hub revision and file pattern, a stricter minor share (at most 0.01), an import to resume, and --yes to
+    /// take the size shown without asking
+    #[arg(long, hide = true)]
+    attestation: Option<String>,
+    #[arg(long, hide = true)]
+    revision: Option<String>,
+    #[arg(long, hide = true)]
+    pattern: Option<String>,
+    #[arg(long, hide = true)]
+    minor_share: Option<f64>,
+    #[arg(long, hide = true)]
+    resume: Option<String>,
+    #[arg(long, hide = true)]
+    yes: bool,
     /// abliterate: the prompts the model refuses, and ordinary ones (text files, one prompt per line, in Workshop folders)
     #[arg(long)]
     harmful: Option<String>,
@@ -1683,6 +1698,70 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "model": dg.writer.clone(), "text_count": dg.count, "per_chunk": dg.per_chunk,
                                    "chunk_chars": dg.chunk_chars, "temperature": dg.temperature, "every_s": dg.every_s,
                                    "max_frames": dg.max_frames})
+            }
+            "private-import" => {
+                // the owner's adult dataset into quarantine, checked before release (docs/internal/PRIVATE-DATA.md)
+                const USE: &str = "private-import <folder | https-url | hf:owner/name> --name <name> [--attestation SOURCE.toml] \
+                                   [--revision main] [--pattern \"*.zip\"] [--minor-share 0.01] [--resume <import-id>] [--yes]";
+                // a resume (--resume <id>) keeps its import's own source
+                let src = match (first.clone(), &dg.resume) {
+                    (Some(s), _) => s,
+                    (None, Some(_)) => String::new(),
+                    (None, None) => return Err(USE.into()),
+                };
+                let source = if src.is_empty() {
+                    serde_json::Value::Null
+                } else if let Some(h) = src.strip_prefix("hf:") {
+                    serde_json::json!({"hf": h, "revision": dg.revision.clone(), "pattern": dg.pattern.clone()})
+                } else if src.starts_with("https://") || src.starts_with("http://") {
+                    serde_json::json!({"url": src})
+                } else {
+                    serde_json::json!({"folder": abs(src)})
+                };
+                let mut body = serde_json::json!({"kind": "private-import", "name": install.0.clone().ok_or(USE)?, "source": source,
+                                                  "attestation": dg.attestation.clone().map(abs), "minor_share": dg.minor_share,
+                                                  "resume": dg.resume.clone()});
+                // a fresh fetch: the source and its size first, and the owner's yes for it (a resume fetches nothing new)
+                if dg.resume.is_none() {
+                    let p = send(client.post(format!("{url}/v1/workshop/private-import/probe")).json(&serde_json::json!({"source": body["source"]})))?;
+                    let bytes = p["bytes"].as_u64().unwrap_or(0);
+                    println!("source: {}", p["what"].as_str().unwrap_or(""));
+                    println!("size: {bytes} bytes ({:.2} GB) in {} files{}", bytes as f64 / 1e9, p["files"],
+                             p["commit"].as_str().map(|c| format!(", commit {c}")).unwrap_or_default());
+                    if !dg.yes {
+                        use std::io::Write as _;
+                        print!("{} it into the private quarantine? [y/N] ", if p["network"] == true { "Fetch" } else { "Copy" });
+                        std::io::stdout().flush().ok();
+                        let mut line = String::new();
+                        std::io::stdin().read_line(&mut line).ok();
+                        if !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+                            return Err("nothing fetched".into());
+                        }
+                    }
+                    body["confirm_bytes"] = serde_json::json!(bytes);
+                }
+                body
+            }
+            "private-imports" => {
+                let j = send(client.get(format!("{url}/v1/workshop/private-imports")))?;
+                for i in j["imports"].as_array().into_iter().flatten() {
+                    let c = &i["counts"];
+                    println!("{} ({}) {}: fetched {}, checked {} of {}, rejected {}, deleted {}, released {}", i["id"].as_str().unwrap_or(""),
+                             i["name"].as_str().unwrap_or(""), i["status"].as_str().unwrap_or(""), c["fetched"], c["checked"], c["items"],
+                             c["rejected"], c["deleted"], c["released"]);
+                    if let Some(r) = i["reason"].as_str() { println!("  {r}"); }
+                }
+                for d in j["datasets"].as_array().into_iter().flatten() {
+                    println!("released: {} {}", d["name"].as_str().unwrap_or(""), d["path"].as_str().unwrap_or(""));
+                }
+                println!("check models: {}", j["check_models"].as_str().unwrap_or(""));
+                return Ok(());
+            }
+            "private-import-discard" => {
+                let id = first.clone().ok_or("private-import-discard <import-id>")?;
+                send(client.post(format!("{url}/v1/workshop/private-imports/{id}/discard")))?;
+                println!("discarded {id}");
+                return Ok(());
             }
             "upload" => {
                 let file = first.clone().ok_or("upload <file>")?;
