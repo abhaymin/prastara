@@ -722,6 +722,63 @@ fn training_runs_from_the_workshop_with_an_estimate_and_its_loss_curve() {
     let _ = std::fs::remove_dir_all(&tools);
 }
 
+/// Layer by layer from the Workshop (after Soup): streaming, LISA and freezing the bottom blocks reach the train command
+/// and the estimate as their flags; values the command would refuse are refused by the server first.
+#[cfg(unix)]
+#[test]
+fn training_layer_by_layer_settings_reach_the_command_and_bad_ones_are_refused() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-layers-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let model = s.dir.join("workshop/base-model");
+    std::fs::create_dir_all(&model).unwrap();
+    std::fs::write(model.join("config.json"), "{}").unwrap();
+    let data = s.dir.join("workshop/datasets/d.jsonl");
+    std::fs::create_dir_all(data.parent().unwrap()).unwrap();
+    std::fs::write(&data, "{}\n").unwrap();
+    let req = json!({"kind": "train", "model": model, "data": data, "devices": "cuda:0,cuda:1", "stream_layers": "ram", "stream_buffers": 3,
+                     "lisa_layers": 4, "lisa_interval": 10, "lisa_seed": 5, "freeze_bottom": 2});
+    let (code, est) = s.post("/v1/workshop/estimate", &req);
+    assert_eq!(code, 200, "{est}");
+    let pa = std::fs::read_to_string(tools.join("profile-args.txt")).unwrap();
+    for f in ["--stream-layers ram", "--stream-buffers 3", "--lisa-layers 4", "--lisa-interval 10", "--lisa-seed 5", "--freeze-bottom 2"] {
+        assert!(pa.contains(f), "{f}: {pa}");
+    }
+    // true is auto; the job gets the same flags
+    let job = json!({"kind": "train", "model": model, "data": data, "stream_layers": true, "lisa_layers": 2});
+    let (code, j) = s.post("/v1/workshop/jobs", &job);
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let ta = std::fs::read_to_string(tools.join("train-args.txt")).unwrap();
+    assert!(ta.contains("--stream-layers auto") && ta.contains("--lisa-layers 2") && !ta.contains("--lisa-interval"), "{ta}");
+    // off is no flag at all
+    let (code, _) = s.post("/v1/workshop/estimate", &json!({"kind": "train", "model": model, "data": data, "stream_layers": "off"}));
+    assert_eq!(code, 200);
+    assert!(!std::fs::read_to_string(tools.join("profile-args.txt")).unwrap().contains("--stream"));
+    for (bad, why) in [
+        (json!({"stream_layers": "nvme"}), "an unknown tier"),
+        (json!({"stream_layers": 3}), "not a tier"),
+        (json!({"stream_layers": "ram", "stream_buffers": 1}), "one buffer"),
+        (json!({"stream_layers": "ram", "stream_buffers": 9}), "nine buffers"),
+        (json!({"stream_layers": "ram", "stream_buffers": 2.5}), "half a buffer"),
+        (json!({"stream_buffers": 2}), "buffers without streaming"),
+        (json!({"lisa_layers": 0}), "no blocks"),
+        (json!({"lisa_interval": 5}), "an interval without blocks"),
+        (json!({"lisa_layers": 2, "lisa_interval": 0}), "an interval of 0"),
+        (json!({"lisa_layers": "two"}), "not a number"),
+        (json!({"freeze_bottom": 2, "train_layers": 3}), "both ways of choosing the blocks"),
+        (json!({"freeze_bottom": -1}), "a negative count"),
+    ] {
+        let mut r = json!({"kind": "train", "model": model, "data": data});
+        for (k, v) in bad.as_object().unwrap() {
+            r[k] = v.clone();
+        }
+        assert_eq!(s.post("/v1/workshop/jobs", &r).0, 400, "job: {why}");
+        assert_eq!(s.post("/v1/workshop/estimate", &r).0, 400, "estimate: {why}");
+    }
+    let _ = std::fs::remove_dir_all(&tools);
+}
+
 /// Abliteration from the Workshop: the request becomes the command's arguments, the prompt lists must be files in
 /// the Workshop's folders (never a sensitive one), the layer table and the refusal checks are kept with the job, and
 /// the copy lands beside the others as `<model>-abliterated` (then `-2`, never over an earlier one).

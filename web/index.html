@@ -842,6 +842,14 @@ origin = "my own photos, 2026"</pre>
                   <label><input type="checkbox" value="gate_proj" checked> gate</label><label><input type="checkbox" value="up_proj" checked> up</label>
                   <label><input type="checkbox" value="down_proj" checked> down</label></div></fieldset>
               <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-t-ckpt" checked> Gradient checkpointing (less memory, about a third more time)</label>
+              <div class="ws-field"><label class="st-label" for="ws-t-stream">Layer streaming <output>after Soup</output></label>
+                <select class="st-input" id="ws-t-stream" title="Keep the frozen base off the GPUs and copy each block in just before it runs: less GPU memory, slower (PCIe). Turns checkpointing on.">
+                  <option value="">off (the base on the GPUs)</option><option value="auto">auto (RAM, or disk when it does not fit)</option>
+                  <option value="ram">from RAM</option><option value="disk">from a shard cache on disk</option></select></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-buffers">Stream buffers <output>blocks per GPU</output></label><input class="st-input" id="ws-t-buffers" type="number" min="2" max="8" value="2" disabled></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-lisa">LISA blocks <output>trained at a time; empty: all</output></label><input class="st-input" id="ws-t-lisa" type="number" min="1" placeholder="all"
+                title="LISA (after Soup): only this many sampled blocks' adapters train, sampled anew every interval"></div>
+              <div class="ws-field"><label class="st-label" for="ws-t-lisa-every">LISA interval <output>steps</output></label><input class="st-input" id="ws-t-lisa-every" type="number" min="1" value="20" disabled></div>
               <div class="ws-field ws-field--wide"><label class="st-label" for="ws-t-out">Adapter folder <output>optional</output></label>
                 <input class="st-input mono" id="ws-t-out" placeholder="in the Workshop's adapters folder"></div>
             </div>

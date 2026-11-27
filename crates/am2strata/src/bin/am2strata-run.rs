@@ -162,6 +162,8 @@ enum Cmd {
     /// | abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto] [--check 8] (a private copy)
     /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
+    /// | train <hf-folder> --data train.jsonl [--rank 16] [--devices cuda:0,cuda:1] [--stream-layers ram|disk|auto] [--stream-buffers 2]
+    ///   [--lisa-layers K --lisa-interval N] [--freeze-bottom N] (a LoRA adapter; layer by layer after Soup)
     /// | regress <hf-folder> [<adapter>] --suite suite.json [--passes 1,2] [--against <report>] (the regression report card)
     /// | grade-train <hf-folder> --data prompts.jsonl --suite suite.json [--grader code|judge] [--samples 4] [--rounds 1]
     /// | clean <in.jsonl> [--input more.jsonl] [--tokenizer <hf-folder>] [--max-len 1024] [--min-answer-tokens 4] [--max-repeat 0.5]
@@ -1508,6 +1510,42 @@ struct DatagenOpts {
     /// strata, export-moe: also build and install its Kosha pack once the GGUF is ready
     #[arg(long)]
     pack: bool,
+    /// train: LoRA rank, epochs, learning rate, the most optimizer steps
+    #[arg(long)]
+    rank: Option<u64>,
+    #[arg(long)]
+    epochs: Option<f64>,
+    #[arg(long)]
+    lr: Option<f64>,
+    #[arg(long)]
+    max_steps: Option<u64>,
+    /// train: adapters in the top N blocks only
+    #[arg(long)]
+    train_layers: Option<u64>,
+    /// train: of q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    #[arg(long)]
+    targets: Option<String>,
+    /// train: f32, f16 or bf16 (bf16 by default on GPUs)
+    #[arg(long)]
+    base_dtype: Option<String>,
+    #[arg(long)]
+    gradient_checkpointing: bool,
+    /// train: stream each block's frozen weights to the GPU just before it runs: ram, disk or auto (after Soup)
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto", value_name = "ram|disk|auto")]
+    stream_layers: Option<String>,
+    /// train: with --stream-layers, blocks held on each GPU at once (2 to 8)
+    #[arg(long)]
+    stream_buffers: Option<u64>,
+    /// train: LISA, only K sampled blocks train at a time, sampled anew every --lisa-interval steps (after Soup)
+    #[arg(long)]
+    lisa_layers: Option<u64>,
+    #[arg(long)]
+    lisa_interval: Option<u64>,
+    #[arg(long)]
+    lisa_seed: Option<u64>,
+    /// train: no adapters in the bottom N blocks (Soup's freeze_layers)
+    #[arg(long)]
+    freeze_bottom: Option<u64>,
 }
 
 /// `am2strata-run workshop ...`: the server's /v1/workshop API, as the Workshop tab uses it.
@@ -1596,6 +1634,16 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "data": abs(dg.prompts.clone().ok_or(USE)?), "suite": abs(dg.suite.clone().ok_or(USE)?), "grader": dg.grader.clone(),
                                    "samples": dg.samples, "rounds": dg.rounds, "passes": dg.passes.clone(), "temperature": dg.temperature,
                                    "devices": dg.devices.clone(), "output": out.clone().map(abs)})
+            }
+            "train" => {
+                const USE: &str = "train <hf-folder> --data train.jsonl [--rank 16] [--epochs 1] [--devices cuda:0,cuda:1] [--stream-layers ram|disk|auto] \
+                                   [--stream-buffers 2] [--lisa-layers K --lisa-interval N] [--freeze-bottom N]";
+                serde_json::json!({"kind": "train", "model": abs(first.clone().ok_or(USE)?), "data": abs(dg.prompts.clone().ok_or(USE)?),
+                                   "devices": dg.devices.clone(), "rank": dg.rank, "epochs": dg.epochs, "lr": dg.lr, "max_steps": dg.max_steps,
+                                   "max_len": dg.max_len, "train_layers": dg.train_layers, "targets": dg.targets.clone(), "base_dtype": dg.base_dtype.clone(),
+                                   "gradient_checkpointing": dg.gradient_checkpointing, "stream_layers": dg.stream_layers.clone(),
+                                   "stream_buffers": dg.stream_buffers, "lisa_layers": dg.lisa_layers, "lisa_interval": dg.lisa_interval,
+                                   "lisa_seed": dg.lisa_seed, "freeze_bottom": dg.freeze_bottom, "output": out.clone().map(abs)})
             }
             "clean" => {
                 const USE: &str = "clean <in.jsonl> [--input more.jsonl] [--tokenizer <hf-folder>] [--max-len 1024] [--lang-match] [--exclude held-out.jsonl] [--cap-per-language N]";

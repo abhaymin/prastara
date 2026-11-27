@@ -448,7 +448,9 @@ impl Workshop {
     /// A training request's settings as `am2strata-workshop` run arguments (shared by `train` and the estimate):
     /// `model` (an HF folder), `data` (a dataset), and optional `rank`, `alpha`, `epochs`, `lr`, `max_len`,
     /// `train_layers`, `targets` (comma-separated projections), `devices` ("cpu", "cuda:0" or "cuda:0,cuda:1"),
-    /// `gradient_checkpointing`, `base_dtype` (f32, f16, bf16; bf16 by default on GPUs), `val_split`, `max_steps`.
+    /// `gradient_checkpointing`, `base_dtype` (f32, f16, bf16; bf16 by default on GPUs), `val_split`, `max_steps`, and the
+    /// layer-by-layer settings: `stream_layers` ("ram", "disk", "auto", or true for auto), `stream_buffers` (2 to 8),
+    /// `lisa_layers` with `lisa_interval` and `lisa_seed`, `freeze_bottom`.
     pub fn train_args(&self, req: &Value) -> Result<Vec<String>, String> {
         let s = |k: &str| req[k].as_str().filter(|v| !v.is_empty());
         let model = self.allowed(s("model").ok_or("training needs \"model\": a Hugging Face model folder")?, true)?;
@@ -497,6 +499,54 @@ impl Workshop {
         }
         if req["gradient_checkpointing"] == true {
             a.push("--gradient-checkpointing".into());
+        }
+        a.extend(Self::layer_args(req)?);
+        Ok(a)
+    }
+
+    /// The layer-by-layer part of a training request (streaming, LISA, freezing the bottom blocks) as arguments.
+    fn layer_args(req: &Value) -> Result<Vec<String>, String> {
+        let mut a = Vec::new();
+        let whole = |k: &str, lo: u64, hi: u64| -> Result<Option<u64>, String> {
+            match &req[k] {
+                Value::Null => Ok(None),
+                v => v.as_u64().filter(|n| (lo..=hi).contains(n)).map(Some).ok_or_else(|| format!("\"{k}\" is a whole number from {lo} to {hi}")),
+            }
+        };
+        let stream = match &req["stream_layers"] {
+            Value::Null | Value::Bool(false) => None,
+            Value::Bool(true) => Some("auto"),
+            Value::String(m) if m.is_empty() || m == "off" => None,
+            Value::String(m) if ["ram", "disk", "auto"].contains(&m.as_str()) => Some(m.as_str()),
+            _ => return Err("\"stream_layers\" is ram, disk, auto (or true for auto, false or \"off\" for none)".into()),
+        };
+        if let Some(m) = stream {
+            a.extend(["--stream-layers".into(), m.into()]);
+        }
+        if let Some(n) = whole("stream_buffers", 2, 8)? {
+            if stream.is_none() {
+                return Err("\"stream_buffers\" needs \"stream_layers\"".into());
+            }
+            a.extend(["--stream-buffers".into(), n.to_string()]);
+        }
+        match (whole("lisa_layers", 1, 1024)?, whole("lisa_interval", 1, 1_000_000)?, whole("lisa_seed", 0, u64::MAX)?) {
+            (Some(k), n, seed) => {
+                a.extend(["--lisa-layers".into(), k.to_string()]);
+                if let Some(n) = n {
+                    a.extend(["--lisa-interval".into(), n.to_string()]);
+                }
+                if let Some(s) = seed {
+                    a.extend(["--lisa-seed".into(), s.to_string()]);
+                }
+            }
+            (None, None, None) => {}
+            _ => return Err("\"lisa_interval\" and \"lisa_seed\" need \"lisa_layers\" (the blocks trained at a time)".into()),
+        }
+        if let Some(n) = whole("freeze_bottom", 0, 1024)? {
+            if !req["train_layers"].is_null() {
+                return Err("give \"freeze_bottom\" or \"train_layers\", not both".into());
+            }
+            a.extend(["--freeze-bottom".into(), n.to_string()]);
         }
         Ok(a)
     }

@@ -5513,11 +5513,24 @@ $("ws-t-devs").addEventListener("click", (e) => {
 function wsTrainReq() {
   const num = (id) => { const v = $(id).value.trim(); return v === "" ? undefined : Number(v); };
   const targets = [...$("ws-t-targets").querySelectorAll("input:checked")].map((c) => c.value);
+  const stream = $("ws-t-stream").value, lisa = num("ws-t-lisa");
   return {kind: "train", model: $("ws-t-model").value.trim(), data: $("ws-t-data").value.trim(), devices: wsTrainDev(),
           rank: num("ws-t-rank"), epochs: num("ws-t-epochs"), lr: num("ws-t-lr"), max_len: num("ws-t-len"), train_layers: num("ws-t-layers"),
           targets: targets.length ? targets.join(",") : undefined, gradient_checkpointing: $("ws-t-ckpt").checked,
+          stream_layers: stream || undefined, stream_buffers: stream ? num("ws-t-buffers") : undefined,
+          lisa_layers: lisa, lisa_interval: lisa ? num("ws-t-lisa-every") : undefined,
           output: $("ws-t-out").value.trim() || undefined};
 }
+// layer by layer: the buffers and the interval only mean something with streaming and LISA on
+function wsTrainLayerFields() {
+  const stream = !!$("ws-t-stream").value, lisa = $("ws-t-lisa").value.trim() !== "";
+  $("ws-t-buffers").disabled = !stream;
+  $("ws-t-lisa-every").disabled = !lisa;
+  // streaming replays each block from its streamed weights: checkpointing is on with it
+  if (stream) $("ws-t-ckpt").checked = true;
+  $("ws-t-ckpt").disabled = stream;
+}
+for (const id of ["ws-t-stream", "ws-t-lisa"]) $(id).addEventListener("input", wsTrainLayerFields);
 let wsEstTimer = null, wsEstSeq = 0;
 function wsTrainEstimateSoon() { clearTimeout(wsEstTimer); wsEstTimer = setTimeout(wsTrainEstimate, 700); }
 async function wsTrainEstimate() {
@@ -5545,7 +5558,8 @@ async function wsTrainEstimate() {
       `<ul>${(e.lines || []).map((l) => `<li>${esc(l)}</li>`).join("")}</ul></div>`;
   } catch (err) { if (seq === wsEstSeq) body.innerHTML = `<p class="msg-error">${esc(err.message)}</p>`; }
 }
-for (const id of ["ws-t-model", "ws-t-data", "ws-t-rank", "ws-t-epochs", "ws-t-lr", "ws-t-len", "ws-t-layers", "ws-t-ckpt"]) $(id).addEventListener("change", wsTrainEstimateSoon);
+for (const id of ["ws-t-model", "ws-t-data", "ws-t-rank", "ws-t-epochs", "ws-t-lr", "ws-t-len", "ws-t-layers", "ws-t-ckpt", "ws-t-stream", "ws-t-buffers",
+                  "ws-t-lisa", "ws-t-lisa-every"]) $(id).addEventListener("change", wsTrainEstimateSoon);
 $("ws-t-targets").addEventListener("change", wsTrainEstimateSoon);
 $("ws-t-est").onclick = wsTrainEstimate;
 $("ws-t-start").onclick = (e) => {
