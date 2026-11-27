@@ -146,7 +146,7 @@ fn on_the_gpus_block_boundary_trims_keep_the_steps_and_the_reserve_down() {
     let moe = root.join("moe");
     make_upcycled(&looped, &moe, MoeSpec { expert_ff: Some(512), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(16, 4) }).unwrap();
     let mut results = Vec::new();
-    for (tag, gap) in [("no trim", u64::MAX - 1), ("default gap", strata_workshop::model::DEFAULT_TRIM_GAP), ("every block", 0)] {
+    for (tag, gap) in [("no trim (the default)", strata_workshop::model::DEFAULT_TRIM_GAP), ("1 GiB gap", 1 << 30), ("every block", 0)] {
         TRIM_GAP.store(gap, Ordering::SeqCst);
         let t0 = TRIMS.load(Ordering::SeqCst);
         let mut s = settings(&moe, &data, &root.join(format!("out-{}", gap.min(1 << 40))));
@@ -181,8 +181,54 @@ fn on_the_gpus_block_boundary_trims_keep_the_steps_and_the_reserve_down() {
     TRIM_GAP.store(u64::MAX, Ordering::SeqCst);
     assert_eq!(results[0].0, results[2].0, "trimming changes no arithmetic");
     assert_eq!(results[0].0, results[1].0);
-    assert!(results[0].1 == 0 && results[2].1 > 0);
+    assert!(results[0].1 == 0 && results[2].1 > 0, "the default is off");
     // summed over the cards, one pool chunk (32 MiB) of noise allowed: the reserve is a high-water mark
     let (none, every): (i64, i64) = (results[0].2.iter().sum(), results[2].2.iter().sum());
     assert!(every <= none + 32, "trimming at every block keeps the reserve nearer the use: {:?}", results.iter().map(|r| &r.2).collect::<Vec<_>>());
+}
+
+/// On two GPUs (`AM2_TEST_GPUS=2 -- --ignored`): when a micro-step runs out of memory (injected after its backward
+/// pass, the activations' peak), the retry's cleanup leaves nothing of it alive on either card: after the trim each
+/// card's reserve is back at its use, as the retry's log line says.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_two_gpus_the_retry_frees_both_cards() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let devices: Vec<String> = match std::env::var("AM2_TEST_DEVICES") {
+        Ok(l) => l.split(',').map(|d| d.trim().to_string()).collect(),
+        Err(_) => vec!["cuda:0".into(), "cuda:1".into()],
+    };
+    let root = common::temp_dir("retry-gpus");
+    let (model, data) = (root.join("model"), root.join("train.jsonl"));
+    common::chat_model_sized(&model, 6, 512, 2048);
+    let rows: Vec<serde_json::Value> = (0..24).map(|i| {
+        let (thing, colour) = common::THINGS[i % common::THINGS.len()];
+        let story = format!("The {thing} is {colour}. ").repeat(10 + i % 20);
+        serde_json::json!({"messages": [{"role": "user", "content": format!("{story} What colour is {thing}?")}, {"role": "assistant", "content": format!("It is {colour}. {story}")}]})
+    }).collect();
+    common::write_jsonl(&data, &rows);
+    for stream in [None, Some(StreamMode::Ram)] {
+        let mut s = settings(&model, &data, &root.join(format!("out-{}", stream.is_some())));
+        s.devices = devices.clone();
+        s.base_dtype = strata_workshop::model::BaseDtype::BF16;
+        s.stream_layers = stream;
+        s.max_len = 512;
+        s.max_steps = Some(2);
+        INJECT_OOM_TIMES.store(1, Ordering::SeqCst);
+        INJECT_OOM.store(1, Ordering::SeqCst);
+        let (_, logs) = run(&s).unwrap();
+        INJECT_OOM.store(usize::MAX, Ordering::SeqCst);
+        let line = logs.iter().find(|l| l.contains("out of device memory")).expect("the retry was logged");
+        println!("{line}");
+        // "devN R MiB reserved, U MiB in use" for each card
+        let cards: Vec<(u64, u64)> = line.split("dev").skip(1).filter_map(|p| {
+            let n: Vec<u64> = p.split(|c: char| !c.is_ascii_digit()).filter_map(|w| w.parse().ok()).collect();
+            (n.len() >= 3).then(|| (n[1], n[2]))
+        }).collect();
+        assert_eq!(cards.len(), devices.len(), "{line}");
+        for (d, (reserved, used)) in cards.iter().enumerate() {
+            assert!(reserved.saturating_sub(*used) <= 32, "dev{d}: {reserved} MiB reserved for {used} MiB in use after the retry's trim: {line}");
+        }
+    }
 }

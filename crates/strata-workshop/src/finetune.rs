@@ -756,17 +756,12 @@ impl Runner {
             // nothing is counted twice, and they are added in place as always: no second set of gradients is held.
             let mut attempt = 0;
             let (value, aux, tokens) = loop {
-                // the retry trims the pools at every block boundary (the gap 0), then the gap is as before
-                let gap = (attempt > 0).then(|| model::TRIM_GAP.swap(0, std::sync::atomic::Ordering::Relaxed));
                 let before_empty: Vec<bool> = sum.iter().map(Option::is_none).collect();
                 let mut added = Vec::new();
                 let tried = self.micro(step, m, lr).and_then(|(value, aux, tokens, grads, extra)| {
                     self.commit(m, &mut sum, &grads, &extra, &mut added)?;
                     Ok((value, aux, tokens))
                 });
-                if let Some(g) = gap {
-                    model::TRIM_GAP.store(g, std::sync::atomic::Ordering::Relaxed);
-                }
                 match tried {
                     Ok(r) => break r,
                     Err(e) if attempt == 0 && is_out_of_memory(&e) => {
@@ -775,11 +770,13 @@ impl Runner {
                         self.model.synchronize()?;
                         let undone = added.len();
                         Self::uncommit(&mut sum, &before_empty, added)?;
-                        let marks = self.model.memory_marks(false);
-                        let line = format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped{}, the pools trimmed{}, trying it once more with a trim at every block",
+                        // what the cards hold now (not the high-water marks): after the trim, the reserve should be
+                        // back at the use, which is the run's fixed state (adapters, moments, stream buffers)
+                        let now = self.model.memory_now();
+                        let line = format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped{}, the pools trimmed{}, trying it once more",
                             step + 1, first_line(&e), if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
-                            if marks.is_empty() { String::new() } else {
-                                format!(" (reserved now {})", marks.iter().map(|(_, r)| format!("{} MiB", r >> 20)).collect::<Vec<_>>().join(", ")) });
+                            if now.is_empty() { String::new() } else {
+                                format!(" (now {})", now.iter().enumerate().map(|(d, (u, r))| format!("dev{d} {} MiB reserved, {} MiB in use", r >> 20, u >> 20)).collect::<Vec<_>>().join("; ")) });
                         // (train() says it even when the retry fails too and the step ends the run)
                         self.pending.push(line);
                     }

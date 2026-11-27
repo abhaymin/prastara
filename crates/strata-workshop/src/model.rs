@@ -943,20 +943,21 @@ pub enum Mask {
     Causal { window: usize },
 }
 
-/// Sequences longer than this use [`chunked_attention`] (set lower in tests).
 /// Above this many bytes between a CUDA device's memory-pool reserve and its use, a block boundary (each block's
-/// forward and each checkpoint replay) synchronizes that device and trims its pool ([`trim_if_fragmented`]). The
-/// conversations' different shapes (and an upcycled block's per-group gathers) leave the stream-ordered pool holding
-/// freed pieces no new allocation fits: on the 56B-A5B it reserved 13.2 GB for 8.7 GB in use inside one micro-step and
-/// ran out of memory. `AM2_TRIM_GAP_MB` overrides it once (0: trim at every block).
+/// forward and each checkpoint replay) synchronizes that device and trims its pool ([`trim_if_fragmented`]). Off by
+/// default ([`TRIM_OFF`]): on the 56B-A5B (bf16, two cards) the trim at a 1 GiB gap made step 1 run out of memory
+/// where the run without it took its steps with at most 4.7 GB in use; on small models it lowered the reserve by a
+/// fifth. `AM2_TRIM_GAP_MB` turns it on (0: trim at every block).
 pub static TRIM_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 /// A test hook: the N-th checkpoint replay from now (counting down; 0 or less: none) fails with a device
 /// out-of-memory error, as one raised inside the replay's backward pass would.
 pub static INJECT_REPLAY_OOM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// How many block-boundary trims ran (for the log and the tests).
 pub static TRIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// The default gap: 1 GiB.
-pub const DEFAULT_TRIM_GAP: u64 = 1 << 30;
+/// The gap that means never.
+pub const TRIM_OFF: u64 = u64::MAX - 1;
+/// The default gap: never (see [`TRIM_GAP`]).
+pub const DEFAULT_TRIM_GAP: u64 = TRIM_OFF;
 
 /// The gap [`trim_if_fragmented`] trims above, in bytes.
 pub fn trim_gap_bytes() -> u64 {
@@ -1016,8 +1017,12 @@ pub fn pool_release_threshold(dev: &Device, set: Option<u64>) -> Option<u64> {
 pub fn trim_if_fragmented(dev: &Device) -> bool {
     #[cfg(feature = "cuda")]
     if let Device::Cuda(cd) = dev {
+        let gap = trim_gap();
+        if gap >= TRIM_OFF {
+            return false;
+        }
         let Some((_, reserved, used)) = pool_now(cd) else { return false };
-        if reserved.saturating_sub(used) <= trim_gap() {
+        if reserved.saturating_sub(used) <= gap {
             return false;
         }
         if dev.synchronize().is_err() {
@@ -1033,6 +1038,7 @@ pub fn trim_if_fragmented(dev: &Device) -> bool {
     false
 }
 
+/// Sequences longer than this use [`chunked_attention`] (set lower in tests).
 pub static CHUNKED_ABOVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
 /// Queries per chunk of [`chunked_attention`].
 pub static ATTENTION_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(512);
@@ -1741,6 +1747,19 @@ impl LlamaModel {
     /// went from 13.7 to 15.8 GB a card in 20 steps, then ran out of memory at step 10 of the real run.
     /// Each CUDA device's memory-pool high-water marks since the last call, in bytes: (used, reserved). With
     /// `reset` the marks start again from the current use. Empty off CUDA. (`AM2_MEM_TRACE` training traces.)
+    /// Each CUDA device's memory pool now: (bytes in use, bytes reserved). Empty off CUDA.
+    pub fn memory_now(&self) -> Vec<(u64, u64)> {
+        #[cfg(feature = "cuda")]
+        {
+            self.devs.iter().filter_map(|d| match d {
+                Device::Cuda(cd) => pool_now(cd).map(|(_, reserved, used)| (used, reserved)),
+                _ => None,
+            }).collect()
+        }
+        #[cfg(not(feature = "cuda"))]
+        Vec::new()
+    }
+
     pub fn memory_marks(&self, reset: bool) -> Vec<(u64, u64)> {
         #[cfg(feature = "cuda")]
         {

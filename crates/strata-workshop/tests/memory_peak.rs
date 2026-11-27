@@ -6,6 +6,8 @@
 //! and the adapter large, so the moment the gradients are added up is each micro-step's peak: a trainer that held a
 //! second set there (the micro-step's own sums beside the step's) shows two sets more, not one.
 
+#![cfg(feature = "cuda")]
+
 mod common;
 
 use std::path::Path;
@@ -20,7 +22,6 @@ fn used_high(trace: &Path) -> Vec<Vec<u64>> {
     }).collect()
 }
 
-#[cfg(feature = "cuda")]
 #[test]
 #[ignore]
 fn on_the_gpus_accumulation_holds_one_set_of_sums_more() {
