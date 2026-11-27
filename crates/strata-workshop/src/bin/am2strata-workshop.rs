@@ -44,7 +44,7 @@ use strata_workshop::chatdata::{self, ChatTokenizer, DataFormat};
 use strata_workshop::finetune::{self, Event, FindLr, Lisa, Resume, TrainSettings};
 use strata_workshop::layer_stream::StreamMode;
 use strata_workshop::model::{BaseDtype, ModelConfig, Target};
-use strata_workshop::profile::{self, AutopilotInput, Machine, ProfileInput, StreamProfile};
+use strata_workshop::profile::{self, AutopilotInput, BatchProfile, Machine, ProfileInput, StreamProfile};
 use strata_workshop::{clean, convert, datagen, merge, quantize_gguf, soup};
 
 #[derive(Parser)]
@@ -789,6 +789,18 @@ struct RunArgs {
     /// longer conversations are cut to this many tokens
     #[arg(long)]
     max_len: Option<usize>,
+    /// pack whole conversations into sequences of up to --max-len tokens (each attends only to itself, positions from
+    /// 0); a step is then --accumulation sequences. On by default with --stream-layers
+    #[arg(long, conflicts_with = "no_pack")]
+    pack: bool,
+    /// one conversation a sequence, even when streaming
+    #[arg(long)]
+    no_pack: bool,
+    /// sequences (conversations, unpacked) through each block together in one pass, up to --accumulation: a streamed
+    /// block's weights cross PCIe once for all of them. auto (the default with --stream-layers): the most that fit
+    /// the cards' free memory by the estimate
+    #[arg(long, value_name = "N|auto")]
+    seqs_per_pass: Option<String>,
     #[arg(long)]
     warmup_ratio: Option<f64>,
     #[arg(long)]
@@ -886,6 +898,16 @@ impl RunArgs {
             notes.push("--stream-layers turns gradient checkpointing on (each block is replayed from its streamed weights in the backward pass)".into());
             s.gradient_checkpointing = true;
         }
+        s.pack = if self.no_pack { false } else { self.pack || s.stream_layers.is_some() };
+        s.seqs_per_pass = match self.seqs_per_pass.as_deref() {
+            Some("auto") => 0,
+            Some(n) => match n.parse::<usize>() {
+                Ok(v) if v >= 1 => v,
+                _ => return Err(format!("--seqs-per-pass {n:?}: a number of 1 or more, or auto")),
+            },
+            None if s.stream_layers.is_some() => 0,
+            None => 1,
+        };
         match (self.lisa_layers, self.lisa_interval) {
             (Some(k), n) => s.lisa = Some(Lisa { layers: k, interval: n.unwrap_or(20), seed: self.lisa_seed.unwrap_or(s.seed) }),
             (None, Some(_)) => return Err("--lisa-interval needs --lisa-layers K".into()),
@@ -946,8 +968,21 @@ fn data_stats(s: &TrainSettings) -> Result<(usize, usize, usize), String> {
 
 /// The estimate's input for these settings: the data's size from the file when there is one.
 fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, avg_tokens: Option<usize>, bandwidth: &[f64]) -> Result<ProfileInput, String> {
+    // packed: the data tokenised and split as the run will, and packed as its first epoch is (exact)
+    let mut packed_sequences = None;
     let (n, avg) = if s.data.as_os_str().is_empty() {
-        (examples.unwrap_or(1000), avg_tokens.unwrap_or(s.max_len / 2))
+        let (n, avg) = (examples.unwrap_or(1000), avg_tokens.unwrap_or(s.max_len / 2));
+        if s.pack {
+            // no data to pack: as full as packing usually gets (an estimate)
+            packed_sequences = Some(((n * avg) as f64 / (s.max_len as f64 * 0.95)).ceil().max(1.0) as usize);
+        }
+        (n, avg)
+    } else if s.pack {
+        let data = finetune::prepare_data(s).map_err(|e| format!("{e:#}"))?;
+        let lens: Vec<usize> = data.train.iter().map(|e| e.tokens.len()).collect();
+        let sched = strata_workshop::packing::Schedule::new(&lens, s.seed, s.epochs, s.max_len, true);
+        packed_sequences = Some(sched.per_epoch());
+        (examples.unwrap_or(lens.len()), avg_tokens.unwrap_or(lens.iter().sum::<usize>() / lens.len().max(1)))
     } else {
         let (n, avg, _) = data_stats(s)?;
         // what is held out is not trained on
@@ -973,7 +1008,29 @@ fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, a
         StreamProfile { mode, tier, buffers: s.stream_buffers, rates, on_gpu }
     });
     Ok(ProfileInput { checkpointing: s.gradient_checkpointing || stream.is_some(), devices, lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
-                      cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg, stream })
+                      cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg, stream,
+                      batch: BatchProfile { packed_sequences, seqs_per_pass: s.seqs_per_pass.max(1) } })
+}
+
+/// `--seqs-per-pass auto`: the most units a pass that fit the free memory of the cards the run names (by the
+/// estimate), up to --accumulation; 1 off the GPU. Sets it in both `s` and `p`; returns a line saying so.
+fn resolve_seqs_per_pass(s: &mut TrainSettings, p: &mut ProfileInput, machine: &Machine) -> Option<String> {
+    if s.seqs_per_pass != 0 {
+        return None;
+    }
+    let cards: Vec<&profile::Gpu> = s.devices.iter().filter_map(|d| d.strip_prefix("cuda:")?.parse::<u32>().ok())
+        .filter_map(|i| machine.gpus.iter().find(|g| g.index == i)).collect();
+    let free: Vec<u64> = cards.iter().map(|g| g.free_bytes).collect();
+    let n = profile::auto_seqs_per_pass(p, &free);
+    s.seqs_per_pass = n;
+    p.batch.seqs_per_pass = n;
+    let idle = profile::auto_seqs_per_pass(p, &cards.iter().map(|g| g.total_bytes).collect::<Vec<_>>());
+    Some(if cards.is_empty() {
+        "--seqs-per-pass auto: 1 (not a GPU run)".to_string()
+    } else {
+        format!("--seqs-per-pass auto: {n} by the estimate against the cards' free memory now ({}){}", free.iter().map(|b| profile::human_bytes(*b)).collect::<Vec<_>>().join(" / "),
+                if idle > n { format!("; {idle} would fit the cards empty (unload what is on them, or pass --seqs-per-pass {idle})") } else { String::new() })
+    })
 }
 
 fn os_threads() -> Option<u64> {
@@ -1090,7 +1147,7 @@ fn moe_training_plan(cfg: &ModelConfig) -> (Vec<String>, Value) {
     let cards = machine.gpus.len().max(1);
     let p = ProfileInput { cfg: cfg.clone(), lora: strata_workshop::model::LoraSpec { r: 16, alpha: 32.0, targets: Target::ALL.to_vec(), ..Default::default() },
                            base_dtype: BaseDtype::BF16, max_len: 1024, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: 512,
-                           checkpointing: true, devices: cards, stream: None };
+                           checkpointing: true, devices: cards, stream: None, batch: BatchProfile::default() };
     let e = profile::estimate(&p);
     let card = profile::card_bytes(&e);
     let mut lines = vec![format!("training (rank 16, all targets, 1,024 tokens, checkpointing, bf16 base, {cards} GPU(s)): about {} on the busiest card, {} trainable",
@@ -1339,7 +1396,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
     let plain = |r: Result<(PathBuf, String), String>| r.map(|(p, k)| (p, k, json!({})));
     match cmd {
         Cmd::Train { run, force } => {
-            let (s, notes) = run.settings(true)?;
+            let (mut s, notes) = run.settings(true)?;
             let cfg = ModelConfig::load(&s.model).map_err(|e| format!("{e:#}"))?;
             out.event(json!({"event": "start", "what": format!("train a LoRA adapter on {} with {} into {}", s.model.display(), s.data.display(), s.out.display()),
                              "threads": run.threads, "device": if s.devices.is_empty() { "cpu".to_string() } else { s.devices.join(",") }, "base_dtype": s.base_dtype.as_str()}));
@@ -1348,12 +1405,16 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             }
             out.event(json!({"event": "log", "message": format!("the base is held in {}; a 4-bit base (QLoRA) is not done in this trainer", s.base_dtype.as_str())}));
             // the estimate first: a run that will not fit is refused before it loads anything
-            let p = profile_input(&s, cfg, None, None, &run.stream_bandwidth)?;
-            let est = profile::estimate(&p);
+            let mut p = profile_input(&s, cfg, None, None, &run.stream_bandwidth)?;
             let machine = Machine::detect();
+            if let Some(l) = resolve_seqs_per_pass(&mut s, &mut p, &machine) {
+                out.event(json!({"event": "log", "message": l}));
+            }
+            let est = profile::estimate(&p);
             let lines = profile::report_lines(&p, &est, &machine);
             let streamed: Vec<String> = lines.iter().filter(|l| l.starts_with("layer streaming") || l.starts_with("PCIe") || l.starts_with("host RAM for")
-                                                              || l.starts_with("disk for the shard")).cloned().collect();
+                                                              || l.starts_with("disk for the shard") || l.starts_with("packing:") || l.starts_with("an epoch:")
+                                                              || l.ends_with("conversations a pass")).cloned().collect();
             let first: Vec<String> = lines.into_iter().skip(1).take(4).filter(|l| !streamed.contains(l)).collect();
             for l in first.into_iter().chain(streamed) {
                 out.event(json!({"event": "log", "message": l}));
@@ -1417,14 +1478,16 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             if preset.is_some() && run.data.is_some() {
                 return Err("--preset has no tokenizer to count --data with: give --examples and --avg-tokens".into());
             }
-            let (s, notes) = run.settings(false)?;
-            let p = profile_input(&s, cfg, *examples, *avg_tokens, &run.stream_bandwidth)?;
-            let est = profile::estimate(&p);
+            let (mut s, notes) = run.settings(false)?;
+            let mut p = profile_input(&s, cfg, *examples, *avg_tokens, &run.stream_bandwidth)?;
             let mut machine = Machine::detect();
             if let Some(g) = cpu_gflops {
                 machine.cpu_gflops = *g;
             }
+            let auto = resolve_seqs_per_pass(&mut s, &mut p, &machine);
+            let est = profile::estimate(&p);
             let mut lines = profile::report_lines(&p, &est, &machine);
+            lines.extend(auto);
             if s.devices.iter().any(|d| d.starts_with("cuda")) {
                 lines.extend(profile::gpu_fit_line(&p, &machine));
             }

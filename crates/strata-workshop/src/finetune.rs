@@ -34,7 +34,8 @@ use sha2::{Digest, Sha256};
 
 use crate::chatdata::{self, ChatTokenizer, DataFormat, Example};
 use crate::layer_stream::{StreamMode, StreamOptions, StreamStats};
-use crate::model::{self, BaseDtype, Ctx, LlamaModel, LoraSpec, ModelConfig};
+use crate::model::{self, BaseDtype, Ctx, LlamaModel, LoraSpec, ModelConfig, PassLayout};
+use crate::packing::Schedule;
 use crate::train::{hf_cosine_lr, AdamWState};
 
 pub const ADAPTER_FILE: &str = "adapter_model.safetensors";
@@ -107,6 +108,15 @@ pub struct TrainSettings {
     /// Soup's `freeze_layers`: the bottom N blocks carry no adapters (resolved into `lora.train_layers` once the model's
     /// block count is known, [`TrainSettings::apply_freeze_bottom`])
     pub freeze_bottom: Option<usize>,
+    /// sequence packing ([`crate::packing`]): whole conversations laid end to end into sequences of up to `max_len`
+    /// tokens, each conversation attending only to itself from position 0; a step is then `accumulation` sequences.
+    /// The command turns it on by default when the base is streamed.
+    pub pack: bool,
+    /// sequences (or, unpacked, conversations) that go through each block together in one pass: a streamed block's
+    /// weights are copied once for all of them, forward and in the replay. The gradients are those of running them one
+    /// by one (dropout's masks aside: they are drawn per pass). 0: auto, which the command resolves from the cards'
+    /// free memory ([`crate::profile::auto_seqs_per_pass`]); here it is 1. At most `accumulation` are used.
+    pub seqs_per_pass: usize,
 }
 
 /// LISA (Layerwise Importance Sampled AdamW, after Soup's `lisa`): every `interval` optimizer steps, `layers` of the
@@ -164,6 +174,7 @@ impl TrainSettings {
             warmup_ratio: 0.03, weight_decay: 0.01, max_grad_norm: 1.0, seed: 42, cache_dir: None, save_steps: 100, eval_steps: 0,
             logging_steps: 10, resume: None, chat_template: None, score_everything: false, devices: Vec::new(), gradient_checkpointing: false,
             stream_layers: None, stream_buffers: crate::layer_stream::DEFAULT_BUFFERS, stream_cache: None, lisa: None, freeze_bottom: None,
+            pack: false, seqs_per_pass: 1,
         }
     }
 
@@ -210,7 +221,7 @@ impl TrainSettings {
     }
 
     /// The facts a checkpoint must share with the run that resumes it, or the steps would not be the same steps.
-    fn fingerprint(&self, n_train: usize, total_steps: usize) -> Value {
+    fn fingerprint(&self, n_train: usize, total_steps: usize, units: usize) -> Value {
         let mut v = json!({
             "lr": self.lr, "accumulation": self.accumulation, "max_len": self.max_len, "seed": self.seed, "warmup_ratio": self.warmup_ratio,
             "weight_decay": self.weight_decay, "max_grad_norm": self.max_grad_norm, "train_examples": n_train, "total_steps": total_steps,
@@ -223,6 +234,11 @@ impl TrainSettings {
             v["lisa_layers"] = json!(l.layers);
             v["lisa_interval"] = json!(l.interval);
             v["lisa_seed"] = json!(l.seed);
+        }
+        // packing changes the steps (sequences per pass does not: the same sums, other memory)
+        if self.pack {
+            v["pack"] = json!(true);
+            v["packed_sequences"] = json!(units);
         }
         v
     }
@@ -513,14 +529,56 @@ pub fn prepare_data(s: &TrainSettings) -> Result<Data> {
 
 /// Optimizer steps for `n` conversations: `ceil(ceil(n · epochs) / accumulation)`, capped by `max_steps`.
 pub fn total_steps(n: usize, epochs: f64, accumulation: usize, max_steps: Option<usize>) -> usize {
-    let micro = (n as f64 * epochs).ceil() as usize;
-    let steps = micro.div_ceil(accumulation.max(1)).max(1);
+    total_units_steps((n as f64 * epochs).ceil() as usize, accumulation, max_steps)
+}
+
+/// Optimizer steps for a run of `units` units (conversations, or packed sequences): `ceil(units / accumulation)`,
+/// capped by `max_steps`.
+pub fn total_units_steps(units: usize, accumulation: usize, max_steps: Option<usize>) -> usize {
+    let steps = units.div_ceil(accumulation.max(1)).max(1);
     max_steps.map_or(steps, |m| steps.min(m.max(1)))
+}
+
+/// The training units (each a list of indices into `data.train`) of optimizer step `step` (0-based) of a run with
+/// these settings: what a run and its resumption both take at that step.
+pub fn step_batch(s: &TrainSettings, data: &Data, step: usize) -> Vec<Vec<usize>> {
+    let lens: Vec<usize> = data.train.iter().map(|e| e.tokens.len()).collect();
+    Schedule::new(&lens, s.seed, s.epochs, s.max_len, s.pack).step_units(step, s.accumulation).into_iter().map(<[usize]>::to_vec).collect()
 }
 
 // ---------------------------------------------------------------------------------------------------------------------
 // the run
 // ---------------------------------------------------------------------------------------------------------------------
+
+/// The conversations of one pass, end to end, and how they lie ([`PassLayout`]).
+struct Pass {
+    examples: Vec<Example>,
+    layout: PassLayout,
+    tokens: Vec<u32>,
+    supervised: Vec<bool>,
+}
+
+impl Pass {
+    /// The pass of `units` (each a sequence: indices into `pool`).
+    fn of(pool: &[Example], units: &[Vec<usize>]) -> Pass {
+        let examples: Vec<Example> = units.iter().flatten().map(|i| pool[*i].clone()).collect();
+        let layout = PassLayout { seqs: units.iter().map(|u| u.iter().map(|i| pool[*i].tokens.len()).collect()).collect() };
+        let tokens = examples.iter().flat_map(|e| e.tokens.iter().copied()).collect();
+        let supervised = examples.iter().flat_map(|e| e.supervised.iter().copied()).collect();
+        Pass { examples, layout, tokens, supervised }
+    }
+}
+
+/// What a pass gives the step: the sum of its conversations' losses, their mean router loss, its tokens and
+/// conversations, and its gradients.
+struct PassOut {
+    value: f64,
+    aux: Option<f64>,
+    tokens: u64,
+    conversations: usize,
+    grads: candle_core::backprop::GradStore,
+    extra: Vec<(Var, Tensor)>,
+}
 
 /// A loaded model with its adapters, optimizer and data: what `train` and `find_lr` both drive.
 struct Runner {
@@ -533,8 +591,13 @@ struct Runner {
     seed: u64,
     accumulation: usize,
     max_grad_norm: f64,
-    /// per-epoch order of the training conversations
-    orders: HashMap<usize, Vec<usize>>,
+    /// the run's training units in order: conversations, or packed sequences of them
+    sched: Schedule,
+    /// units per pass through the blocks (lowered for the rest of the run after a pass runs out of device memory)
+    seqs_per_pass: usize,
+    /// pack the held-out conversations too (the same mean, fewer passes)
+    pack_eval: bool,
+    max_len: usize,
     tokens_seen: u64,
     lower_in_memory: bool,
     /// the last step's mean load-balancing loss (an upcycled model only)
@@ -624,7 +687,10 @@ impl Runner {
         params.lr = s.lr;
         params.weight_decay = s.weight_decay;
         let opt = AdamWState::new(vars.clone(), params).map_err(|e| anyhow!("{e}"))?;
-        Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, orders: HashMap::new(),
+        let lens: Vec<usize> = data.train.iter().map(|e| e.tokens.len()).collect();
+        let sched = Schedule::new(&lens, s.seed, s.epochs, s.max_len, s.pack);
+        Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, sched,
+                  seqs_per_pass: s.seqs_per_pass.clamp(1, s.accumulation.max(1)), pack_eval: s.pack || s.seqs_per_pass > 1, max_len: s.max_len,
                   tokens_seen: 0, lower_in_memory, last_aux: None, private: false,
                   mem_trace: std::env::var_os("AM2_MEM_TRACE").map(PathBuf::from).or_else(|| Some(s.out.join("memory-trace.log"))), lisa, var_block,
                   pending: Vec::new() })
@@ -666,30 +732,37 @@ impl Runner {
         self.model.lower(&ex.tokens)
     }
 
-    /// The training conversation that micro-batch `m` of the whole run uses.
-    fn example_at(&mut self, m: usize) -> usize {
-        let n = self.data.train.len();
-        let (epoch, seed) = (m / n, self.seed);
-        self.orders.entry(epoch).or_insert_with(|| permutation(seed, epoch as u64 + 1, n))[m % n]
+    /// The hidden state entering the first trained block for a pass: each conversation's cached state end to end, or
+    /// the lower blocks run once over the whole pass (a block-diagonal mask: the same states).
+    fn hidden_pass(&mut self, pass: &Pass) -> Result<Tensor> {
+        if pass.examples.len() == 1 {
+            return self.hidden(&pass.examples[0]);
+        }
+        if self.cache.is_some() {
+            let parts = pass.examples.iter().map(|e| self.hidden(e)).collect::<Result<Vec<_>>>()?;
+            return Ok(Tensor::cat(&parts, 0)?);
+        }
+        self.model.lower_packed(&pass.tokens, &pass.layout)
     }
 
-    /// Micro-step `m` of step `step`: its loss, router loss, tokens, and its gradients as the backward pass left
-    /// them (the graph's store and the checkpoint replays' parts, no copies). Nothing of the run's state changes
-    /// here, so a micro-step that fails can be run again.
-    #[allow(clippy::type_complexity)]
-    fn micro(&mut self, step: usize, m: usize, lr: f64) -> Result<(f64, Option<f64>, u64, candle_core::backprop::GradStore, Vec<(Var, Tensor)>)> {
-        let index = self.example_at(m);
-        let ex = self.data.train[index].clone();
-        let h = self.hidden(&ex)?;
+    /// One pass through the blocks: units `m .. m + n` of the run (conversations, or packed sequences), all together.
+    /// Its loss is the sum of each conversation's own, so the step divides by its conversations; the gradients are as
+    /// the backward pass left them (the graph's store and the checkpoint replays' parts, no copies). Nothing of the
+    /// run's state changes here, so a pass that fails can be run again.
+    fn micro(&mut self, step: usize, m: usize, n: usize, lr: f64) -> Result<PassOut> {
+        let units: Vec<Vec<usize>> = (m..m + n).map(|j| self.sched.unit(j).to_vec()).collect();
+        let pass = Pass::of(&self.data.train, &units);
+        let h = self.hidden_pass(&pass)?;
         let mut dropout_seed = self.seed ^ (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let ctx = Ctx::train(splitmix(&mut dropout_seed));
-        let loss = self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &ctx)?;
+        let loss = self.model.loss_packed(&h, &pass.layout, &pass.tokens, &pass.supervised, &ctx)?;
         let value = loss.to_scalar::<f32>()? as f64;
         if !value.is_finite() {
             bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
         }
         let grads = loss.backward()?;
-        if INJECT_OOM.load(std::sync::atomic::Ordering::Relaxed) == m {
+        let hook = INJECT_OOM.load(std::sync::atomic::Ordering::Relaxed);
+        if (m..m + n).contains(&hook) {
             if INJECT_OOM_TIMES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 1 {
                 INJECT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
             }
@@ -698,7 +771,7 @@ impl Runner {
         // with checkpointing, the adapters inside a recomputed block get their gradient there
         let extra = self.model.take_checkpoint_grads();
         drop((loss, h));
-        Ok((value, ctx.aux_loss(), ex.tokens.len() as u64, grads, extra))
+        Ok(PassOut { value, aux: ctx.aux_loss(), tokens: pass.tokens.len() as u64, conversations: pass.examples.len(), grads, extra })
     }
 
     /// Add a micro-step's gradient parts into the step's sums, one part at a time, as the trainer always has (the
@@ -741,40 +814,53 @@ impl Runner {
         Ok(())
     }
 
-    /// One optimizer step at rate `lr` over micro-batches `step·accumulation ..`, as many as `count`. Returns the mean
-    /// loss before the update. A loss that is not a number stops the run without touching the adapters.
+    /// One optimizer step at rate `lr` over units `step·accumulation ..`, as many as `count`, `seqs_per_pass` of them
+    /// a pass. Returns the mean loss over the step's conversations before the update (and the gradient is the mean
+    /// over them too: one conversation's tokens weigh what they weigh unpacked). A loss that is not a number stops
+    /// the run without touching the adapters.
     fn step(&mut self, step: usize, count: usize, lr: f64) -> Result<f64> {
         self.lisa_select(step, true)?;
         let mut sum: Vec<Option<Tensor>> = vec![None; self.vars.len()];
         let mut loss_sum = 0.0;
         let mut aux_sum: Option<f64> = None;
-        for k in 0..count {
+        let mut conversations = 0usize;
+        let mut k = 0;
+        while k < count {
             let m = step * self.accumulation + k;
-            // a micro-step that runs out of device memory (anywhere in its forward or backward pass, a checkpoint
-            // replay included, or while its gradients are added up) is thrown away whole and run once more after the
-            // pools are trimmed. The step's sums take its gradients only after its backward pass has finished, so
-            // nothing is counted twice, and they are added in place as always: no second set of gradients is held.
+            // a pass that runs out of device memory (anywhere in its forward or backward pass, a checkpoint replay
+            // included, or while its gradients are added up) is thrown away whole and run once more after the pools
+            // are trimmed, with half the sequences when it had several (and so for the rest of the run). The step's
+            // sums take its gradients only after its backward pass has finished, so nothing is counted twice, and they
+            // are added in place as always: no second set of gradients is held.
             let mut attempt = 0;
-            let (value, aux, tokens) = loop {
+            let (n, value, aux, tokens, convs) = loop {
+                let n = self.seqs_per_pass.min(count - k).max(1);
                 let before_empty: Vec<bool> = sum.iter().map(Option::is_none).collect();
                 let mut added = Vec::new();
-                let tried = self.micro(step, m, lr).and_then(|(value, aux, tokens, grads, extra)| {
-                    self.commit(m, &mut sum, &grads, &extra, &mut added)?;
-                    Ok((value, aux, tokens))
+                let tried = self.micro(step, m, n, lr).and_then(|o| {
+                    self.commit(m, &mut sum, &o.grads, &o.extra, &mut added)?;
+                    Ok((o.value, o.aux, o.tokens, o.conversations))
                 });
                 match tried {
-                    Ok(r) => break r,
+                    Ok((value, aux, tokens, convs)) => break (n, value, aux, tokens, convs),
                     Err(e) if attempt == 0 && is_out_of_memory(&e) => {
                         attempt += 1;
                         drop(self.model.take_checkpoint_grads());
                         self.model.synchronize()?;
                         let undone = added.len();
                         Self::uncommit(&mut sum, &before_empty, added)?;
+                        let fewer = if n > 1 {
+                            self.seqs_per_pass = (n / 2).max(1);
+                            format!(" with {} sequences per pass instead of {n} (for the rest of the run)", self.seqs_per_pass)
+                        } else {
+                            String::new()
+                        };
                         // what the cards hold now (not the high-water marks): after the trim, the reserve should be
                         // back at the use, which is the run's fixed state (adapters, moments, stream buffers)
                         let now = self.model.memory_now();
-                        let line = format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped{}, the pools trimmed{}, trying it once more",
-                            step + 1, first_line(&e), if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
+                        let line = format!("step {} micro-step {m}{}: out of device memory ({}); its tensors dropped{}, the pools trimmed{}, trying it once more{fewer}",
+                            step + 1, if n > 1 { format!(" (a pass of {n})") } else { String::new() }, first_line(&e),
+                            if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
                             if now.is_empty() { String::new() } else {
                                 format!(" (now {})", now.iter().enumerate().map(|(d, (u, r))| format!("dev{d} {} MiB reserved, {} MiB in use", r >> 20, u >> 20)).collect::<Vec<_>>().join("; ")) });
                         // (train() says it even when the retry fails too and the step ends the run)
@@ -785,16 +871,17 @@ impl Runner {
             };
             loss_sum += value;
             if let Some(a) = aux {
-                aux_sum = Some(aux_sum.unwrap_or(0.0) + a);
+                aux_sum = Some(aux_sum.unwrap_or(0.0) + a * convs as f64);
             }
+            conversations += convs;
             self.tokens_seen += tokens;
             // the backward pass's buffers are free now: let the devices' memory pools take them back
             self.model.synchronize()?;
             let marks = self.model.memory_marks(true);
-            let index = self.example_at(m);
             if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
                 let mib = |b: u64| b >> 20;
-                let line = format!("step {} micro {m} tokens {} | {}\n", step + 1, self.data.train[index].tokens.len(),
+                let which = if n > 1 { format!("{m}-{}", m + n - 1) } else { m.to_string() };
+                let line = format!("step {} micro {which} tokens {tokens} | {}\n", step + 1,
                     marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
                 use std::io::Write as _;
                 if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
@@ -802,11 +889,13 @@ impl Runner {
                     let _ = f.write_all(line.as_bytes());
                 }
             }
+            k += n;
         }
+        let conversations = conversations.max(1);
         // the mean gradient over the step's conversations, clipped by its norm over all adapters
         let mut norm_sq = 0.0f64;
         for g in sum.iter_mut().flatten() {
-            *g = (&*g / count as f64)?;
+            *g = (&*g / conversations as f64)?;
             norm_sq += g.sqr()?.sum_all()?.to_scalar::<f32>()? as f64;
         }
         let norm = norm_sq.sqrt();
@@ -819,21 +908,39 @@ impl Runner {
         self.opt.step_grads(&sum).map_err(|e| anyhow!("{e}"))?;
         drop(sum);
         self.model.synchronize()?;
-        self.last_aux = aux_sum.map(|a| a / count as f64);
-        Ok(loss_sum / count as f64)
+        self.last_aux = aux_sum.map(|a| a / conversations as f64);
+        Ok(loss_sum / conversations as f64)
     }
 
+    /// The mean loss over the held-out conversations (each its own mean); packed and several sequences a pass when the
+    /// training is, which gives the same mean in fewer passes.
     fn eval_loss(&mut self) -> Result<Option<f64>> {
         if self.data.eval.is_empty() {
             return Ok(None);
         }
+        let n = self.data.eval.len();
         let mut sum = 0.0;
-        for i in 0..self.data.eval.len() {
-            let ex = self.data.eval[i].clone();
-            let h = self.hidden(&ex)?;
-            sum += self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &Ctx::inference())?.to_scalar::<f32>()? as f64;
+        if !self.pack_eval {
+            for i in 0..n {
+                let ex = self.data.eval[i].clone();
+                let h = self.hidden(&ex)?;
+                sum += self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &Ctx::inference())?.to_scalar::<f32>()? as f64;
+            }
+            return Ok(Some(sum / n as f64));
         }
-        Ok(Some(sum / self.data.eval.len() as f64))
+        let order: Vec<usize> = (0..n).collect();
+        let units = if self.sched.packed {
+            let lens: Vec<usize> = self.data.eval.iter().map(|e| e.tokens.len()).collect();
+            crate::packing::pack(&lens, &order, self.max_len)
+        } else {
+            order.into_iter().map(|i| vec![i]).collect()
+        };
+        for chunk in units.chunks(self.seqs_per_pass.max(1)) {
+            let pass = Pass::of(&self.data.eval, chunk);
+            let h = self.hidden_pass(&pass)?;
+            sum += self.model.loss_packed(&h, &pass.layout, &pass.tokens, &pass.supervised, &Ctx::inference())?.to_scalar::<f32>()? as f64;
+        }
+        Ok(Some(sum / n as f64))
     }
 
     fn save_adapter(&self, dir: &Path, base: &Path, spec: &LoraSpec) -> Result<()> {
@@ -938,11 +1045,26 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         on_event(Event::Log(n.clone()));
     }
     let (n_train, n_eval) = (data.train.len(), data.eval.len());
-    let total = total_steps(n_train, s.epochs, s.accumulation, s.max_steps);
-    let total_micro = ((n_train as f64 * s.epochs).ceil() as usize).min(total * s.accumulation);
-    let warmup = (s.warmup_ratio * total as f64).ceil() as usize;
-    let fingerprint = s.fingerprint(n_train, total);
+    let train_tokens: usize = data.train.iter().map(|e| e.tokens.len()).sum();
+    if s.seqs_per_pass == 0 {
+        on_event(Event::Log("--seqs-per-pass auto is resolved by the command from the cards' free memory; 1 here".into()));
+    }
     let mut run = Runner::new(s, data, on_event)?;
+    // the units (conversations, or packed sequences) the run takes, and its steps
+    let units = run.sched.total();
+    let total = total_units_steps(units, s.accumulation, s.max_steps);
+    let total_micro = units.min(total * s.accumulation);
+    let warmup = (s.warmup_ratio * total as f64).ceil() as usize;
+    let fingerprint = s.fingerprint(n_train, total, units);
+    if s.pack {
+        let per = run.sched.per_epoch();
+        on_event(Event::Log(format!("packing: {n_train} conversations ({train_tokens} tokens) into {per} sequences of up to {} tokens an epoch ({:.1} conversations and {:.0} % of the cap a sequence); a step is {} sequences",
+                                    s.max_len, n_train as f64 / per.max(1) as f64, 100.0 * train_tokens as f64 / (per.max(1) * s.max_len) as f64, s.accumulation)));
+    }
+    if run.seqs_per_pass > 1 || s.pack {
+        on_event(Event::Log(format!("{} {} per pass through the blocks (each streamed block copied once for all of them, forward and in the replay)",
+                                    run.seqs_per_pass, if s.pack { "sequences" } else { "conversations" })));
+    }
     // trained on a private dataset: the adapter (and what is merged, converted and installed from it) is private too
     run.private = crate::private_data::is_private_dataset(&s.data) || s.eval_data.as_deref().is_some_and(crate::private_data::is_private_dataset);
     if run.private {
@@ -950,8 +1072,8 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     }
     let trainable: u64 = run.vars.iter().map(|v| v.as_tensor().elem_count() as u64).sum();
     on_event(Event::Log(format!(
-        "{} conversations to train on, {} held out; {} steps of {} ({} warm-up); {} adapter parameters in blocks {} to {} of a {} base",
-        n_train, n_eval, total, s.accumulation, warmup, trainable, run.model.first_trained(), run.model.cfg.num_hidden_layers - 1, s.base_dtype.as_str())));
+        "{} conversations to train on, {} held out; {} steps of {} {} ({} warm-up); {} adapter parameters in blocks {} to {} of a {} base",
+        n_train, n_eval, total, s.accumulation, if s.pack { "sequences" } else { "conversations" }, warmup, trainable, run.model.first_trained(), run.model.cfg.num_hidden_layers - 1, s.base_dtype.as_str())));
 
     let (mut step, mut losses) = (0usize, Vec::new());
     let resume_dir = match &s.resume {
@@ -1037,6 +1159,7 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         "layer_stream": stream.map(|st| json!({"tier": run.model.stream().map(|l| l.tier.as_str()), "buffers": s.stream_buffers, "block_copies": st.loads,
                                                "bytes_copied": st.bytes, "prefetch_hits": st.prefetch_hits, "demand_loads": st.demand_loads})),
         "lisa": s.lisa.map(|l| json!({"layers": l.layers, "interval": l.interval, "seed": l.seed})),
+        "packing": {"packed": s.pack, "units": units, "units_per_epoch": run.sched.per_epoch(), "seqs_per_pass": run.seqs_per_pass},
     }))?)?;
     Ok(report)
 }

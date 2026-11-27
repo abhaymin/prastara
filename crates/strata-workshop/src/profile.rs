@@ -80,6 +80,24 @@ pub struct ProfileInput {
     pub devices: usize,
     /// layer streaming (None: the base is held on the devices)
     pub stream: Option<StreamProfile>,
+    /// packing and sequences per pass (the default: one conversation a pass, unpacked)
+    pub batch: BatchProfile,
+}
+
+/// How the conversations go through the blocks: packed into sequences ([`crate::packing`]) or not, and how many
+/// units (sequences, or conversations) share one pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BatchProfile {
+    /// sequences an epoch after packing (None: unpacked, one conversation a unit)
+    pub packed_sequences: Option<usize>,
+    /// units a pass (at most `accumulation` are used)
+    pub seqs_per_pass: usize,
+}
+
+impl Default for BatchProfile {
+    fn default() -> Self {
+        Self { packed_sequences: None, seqs_per_pass: 1 }
+    }
 }
 
 /// How a streamed run is planned.
@@ -113,9 +131,19 @@ pub struct StreamEstimate {
     pub host_bytes: u64,
     /// the disk tier's shard cache (0 for the RAM tier)
     pub disk_bytes: u64,
-    /// bytes over PCIe per conversation (each block read forward and again in its replay) and per optimizer step
+    /// bytes over PCIe per conversation (each block read forward and again in its replay: a pass's bytes over the
+    /// conversations in it), per pass and per optimizer step
     pub bytes_per_conversation: u64,
+    pub bytes_per_pass: u64,
     pub bytes_per_step: u64,
+    /// units (sequences, or conversations) a pass, and passes an epoch
+    pub seqs_per_pass: usize,
+    pub passes_per_epoch: usize,
+    /// one epoch: the transfer, the compute (at [`ASSUMED_GPU_GFLOPS`]) and the time to expect (per pass the larger
+    /// of the two for the RAM tier, overlapped; their sum for the disk tier)
+    pub transfer_seconds_per_epoch: f64,
+    pub compute_seconds_per_epoch: f64,
+    pub epoch_seconds: f64,
     pub transfer_seconds_per_step: f64,
     pub compute_seconds_per_step: f64,
     /// (compute + transfer overlapped) / compute, and (compute + transfer one after the other) / compute
@@ -152,6 +180,9 @@ pub struct Estimate {
     pub base_dtype: BaseDtype,
     /// layer streaming's part (None: not streamed)
     pub stream: Option<StreamEstimate>,
+    /// training units an epoch (packed sequences, or conversations) and units a pass
+    pub units_per_epoch: usize,
+    pub seqs_per_pass: usize,
 }
 
 /// f32 values per token that one trained block keeps for the backward pass, counted from `model.rs`'s forward:
@@ -228,6 +259,9 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let trained = layers - first;
     let cached = p.cache && first > 0;
     let seq = p.max_len.max(2);
+    // the units a pass holds at once (each up to `seq` tokens): their activations side by side
+    let per_pass = p.batch.seqs_per_pass.clamp(1, p.accumulation.max(1)) as f64;
+    let units = p.batch.packed_sequences.unwrap_or(p.examples);
 
     let trainable = p.lora.trainable_params(cfg);
     let weights = if cached { base_bytes(cfg, p.base_dtype, trained, false) } else { base_bytes(cfg, p.base_dtype, layers, true) };
@@ -242,16 +276,16 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
     let per_token = graph_floats_per_token(cfg, &p.lora, seq);
     // with checkpointing, one block's activations at a time (recomputed in the backward pass): on whichever device that
     // block sits, so it does not divide when the blocks are split
-    let one_block = if p.checkpointing { 2.0 * 4.0 * seq as f64 * per_token } else { 0.0 };
+    let one_block = if p.checkpointing { per_pass * 2.0 * 4.0 * seq as f64 * per_token } else { 0.0 };
     let graph = if p.checkpointing {
-        4.0 * (seq * cfg.hidden_size) as f64 * block_passes + one_block
+        per_pass * 4.0 * (seq * cfg.hidden_size) as f64 * block_passes + one_block
     } else {
-        2.0 * 4.0 * seq as f64 * per_token * block_passes
+        per_pass * 2.0 * 4.0 * seq as f64 * per_token * block_passes
     };
     // the head's loss goes a slice of rows at a time (model.rs, HEAD_SLICE_VALUES: 32 M logits): a slice's logits,
     // its softmax and its one-hot, as f32
     let head = 3.0 * 4.0 * ((seq * cfg.vocab_size) as f64).min((32u64 << 20) as f64);
-    let frozen = if cached || first == 0 { 0.0 } else { 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq) };
+    let frozen = if cached || first == 0 { 0.0 } else { per_pass * 4.0 * seq as f64 * graph_floats_per_token(cfg, &LoraSpec { targets: vec![], ..p.lora.clone() }, seq) };
     let activations = (graph + head + frozen + chunk_bytes(cfg, seq)) as u64;
 
     let largest = Target::ALL.iter().map(|t| { let (o, i) = cfg.target_shape(*t); o * i }).max().unwrap_or(0).max(cfg.vocab_size * cfg.hidden_size) as u64;
@@ -267,7 +301,7 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
         0
     };
 
-    let steps = crate::finetune::total_steps(p.examples, p.epochs, p.accumulation, None);
+    let steps = crate::finetune::total_steps(units, p.epochs, p.accumulation, None);
     // per token: 2 operations per weight used, plus the attention products (4·Q·seq)
     let tokens = p.avg_tokens.clamp(2, seq) as f64;
     let q = (cfg.num_attention_heads * cfg.head_dim) as f64;
@@ -299,7 +333,7 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
         optimizer_bytes: 2 * adapter, gradient_bytes: 2 * adapter, activation_bytes: activations, widening_bytes: widening, fill_bytes: fill,
         total_bytes: total, per_device_bytes: per_device,
         cache_disk_bytes: if cached { (p.examples * p.avg_tokens.clamp(2, seq) * cfg.hidden_size * 4) as u64 } else { 0 },
-        steps, flops, base_dtype: p.base_dtype, stream: None,
+        steps, flops, base_dtype: p.base_dtype, stream: None, units_per_epoch: units, seqs_per_pass: per_pass as usize,
     };
     if let Some(sp) = &p.stream {
         let parts = StreamParts { first, cached, seq, one_block, head, frozen, widening, chunk: chunk_bytes(cfg, seq) as u64 };
@@ -354,7 +388,7 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
             has_trained[k] = true;
             // its share of the adapters, AdamW and gradients (5 copies), and the inputs its checkpoints keep
             dev[k] += (5 * e.adapter_bytes) * r / trained_runs as u64;
-            dev[k] += r * 4 * (x.seq * cfg.hidden_size) as u64;
+            dev[k] += r * 4 * (x.seq * cfg.hidden_size) as u64 * e.seqs_per_pass as u64;
         }
     }
     for k in 0..d {
@@ -383,18 +417,28 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
         Tier::Ram => (streamed + table_in_ram, 0),
         Tier::Disk => (d as u64 * 2 * block_bytes + table_in_ram, streamed),
     };
+    // a pass's bytes: every streamed block forward and in its replay, once for all the units in it
     let micro: u64 = reads.iter().sum();
     let rate = |k: usize| sp.rates.get(k).or(sp.rates.last()).copied().filter(|r| *r > 0.0).unwrap_or(crate::layer_stream::DEFAULT_LINK_BYTES_S);
-    let transfer_micro: f64 = (0..d).map(|k| reads[k] as f64 / rate(k)).sum();
-    let acc = p.accumulation.max(1) as f64;
-    let passes = (p.examples as f64 * p.epochs).max(1.0);
-    let compute_micro = e.flops / passes / (ASSUMED_GPU_GFLOPS * 1e9);
-    let (c, t) = (compute_micro * acc, transfer_micro * acc);
+    let transfer_pass: f64 = (0..d).map(|k| reads[k] as f64 / rate(k)).sum();
+    let acc = p.accumulation.max(1);
+    let n = e.seqs_per_pass.clamp(1, acc);
+    let passes_per_step = acc.div_ceil(n);
+    let steps_per_epoch = e.units_per_epoch.div_ceil(acc).max(1);
+    let passes_per_epoch = steps_per_epoch * passes_per_step;
+    let compute_epoch = e.flops / p.epochs.max(1e-9) / (ASSUMED_GPU_GFLOPS * 1e9);
+    let transfer_epoch = transfer_pass * passes_per_epoch as f64;
+    let compute_pass = compute_epoch / passes_per_epoch as f64;
+    let epoch_seconds = if sp.tier == Tier::Ram { passes_per_epoch as f64 * compute_pass.max(transfer_pass) } else { compute_epoch + transfer_epoch };
+    let (c, t) = (compute_pass * passes_per_step as f64, transfer_pass * passes_per_step as f64);
     let (over, serial) = if c > 0.0 { (c.max(t) / c, (c + t) / c) } else { (1.0, 1.0) };
+    // conversations a pass: the units' share of the examples
+    let conv_per_pass = (p.examples as f64 / e.units_per_epoch.max(1) as f64 * n as f64).max(1.0);
     StreamEstimate {
         mode: sp.mode, tier: sp.tier, buffers: sp.buffers, block_bytes, buffer_bytes: sp.buffers as u64 * block_bytes, device_bytes: dev, host_bytes: host,
-        disk_bytes: disk, bytes_per_conversation: micro, bytes_per_step: micro * p.accumulation.max(1) as u64, transfer_seconds_per_step: t,
-        compute_seconds_per_step: c, slowdown_overlapped: over, slowdown_serial: serial, slowdown: if sp.tier == Tier::Ram { over } else { serial },
+        disk_bytes: disk, bytes_per_conversation: (micro as f64 / conv_per_pass) as u64, bytes_per_pass: micro, bytes_per_step: micro * passes_per_step as u64,
+        seqs_per_pass: n, passes_per_epoch, transfer_seconds_per_epoch: transfer_epoch, compute_seconds_per_epoch: compute_epoch, epoch_seconds,
+        transfer_seconds_per_step: t, compute_seconds_per_step: c, slowdown_overlapped: over, slowdown_serial: serial, slowdown: if sp.tier == Tier::Ram { over } else { serial },
     }
 }
 
@@ -595,12 +639,22 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
             Tier::Ram => format!("host RAM for the streamed base: {} (page-locked where it can be)", human_bytes(st.host_bytes)),
             Tier::Disk => format!("disk for the shard cache: {} (made once per model); host RAM in flight: {}", human_bytes(st.disk_bytes), human_bytes(st.host_bytes)),
         });
-        out.push(format!("PCIe: {} a conversation ({} a step: each block forward and again in its replay), about {:.1} s a step against {:.1} s of compute: \
+        out.push(format!("PCIe: {} a pass of {} {} ({} a conversation, {} a step: each block forward and again in its replay, once a pass), about {:.1} s a step against {:.1} s of compute: \
                           {:.2}x slower overlapped, {:.2}x if not ({:.2}x expected for the {} tier)",
+                         human_bytes(st.bytes_per_pass), st.seqs_per_pass, if p.batch.packed_sequences.is_some() { "sequences" } else { "conversations" },
                          human_bytes(st.bytes_per_conversation), human_bytes(st.bytes_per_step), st.transfer_seconds_per_step, st.compute_seconds_per_step,
                          st.slowdown_overlapped, st.slowdown_serial, st.slowdown, st.tier.as_str()));
+        out.push(format!("an epoch: {} passes; PCIe {} and compute {} (at {:.0} GFLOP/s): about {} an epoch, {} for {} epoch(s) (an estimate: the compute rate is the dense two-card run's)",
+                         st.passes_per_epoch, human_seconds(st.transfer_seconds_per_epoch), human_seconds(st.compute_seconds_per_epoch), ASSUMED_GPU_GFLOPS,
+                         human_seconds(st.epoch_seconds), human_seconds(st.epoch_seconds * p.epochs), p.epochs));
     } else if e.per_device_bytes > 0 {
         out.push(format!("split over the devices: about {} on the busiest (the last, which also holds the head)", human_bytes(e.per_device_bytes)));
+    }
+    if let Some(seqs) = p.batch.packed_sequences {
+        out.push(format!("packing: {} conversations into {} sequences of up to {} tokens an epoch ({:.1} a sequence); {} sequences a pass; a step is {} sequences",
+                         p.examples, seqs, p.max_len, p.examples as f64 / seqs.max(1) as f64, e.seqs_per_pass, p.accumulation));
+    } else if e.seqs_per_pass > 1 {
+        out.push(format!("{} conversations a pass", e.seqs_per_pass));
     }
     if e.cache_disk_bytes > 0 {
         out.push(format!("activation cache: about {} on disk; the {} frozen blocks run once per conversation, one block in memory at a time (peak {} while filling)",
@@ -678,6 +732,7 @@ pub fn estimate_json(p: &ProfileInput, e: &Estimate, m: &Machine) -> Value {
         "memory": {"weights": e.weights_bytes, "adapters": e.adapter_bytes, "optimizer": e.optimizer_bytes, "gradients": e.gradient_bytes,
                    "activations": e.activation_bytes, "widening": e.widening_bytes, "cache_fill_peak": e.fill_bytes, "total": e.total_bytes, "needed_with_headroom": v.need_bytes},
         "cache_disk_bytes": e.cache_disk_bytes, "steps": e.steps, "flops": e.flops,
+        "batch": {"packed_sequences": p.batch.packed_sequences, "units_per_epoch": e.units_per_epoch, "seqs_per_pass": e.seqs_per_pass},
         "seconds": {"cpu": v.cpu_seconds, "gpu_assumed": v.gpu_seconds},
         "machine": {"ram_total": m.ram_total, "ram_available": m.ram_available, "cpus": m.cpus, "cpu_gflops": m.cpu_gflops,
                     "gpus": m.gpus.iter().map(|g| json!({"index": g.index, "name": g.name, "total": g.total_bytes, "free": g.free_bytes})).collect::<Vec<_>>()},
@@ -687,7 +742,9 @@ pub fn estimate_json(p: &ProfileInput, e: &Estimate, m: &Machine) -> Value {
         "fits_gpu_idle": v.fits_gpu_idle.iter().map(|(i, f)| json!({"index": i, "fits": f})).collect::<Vec<_>>(),
         "stream": e.stream.as_ref().map(|st| json!({"mode": st.mode.as_str(), "tier": st.tier.as_str(), "buffers": st.buffers, "block_bytes": st.block_bytes,
             "buffer_bytes": st.buffer_bytes, "device_bytes": st.device_bytes, "host_bytes": st.host_bytes, "disk_bytes": st.disk_bytes,
-            "bytes_per_conversation": st.bytes_per_conversation, "bytes_per_step": st.bytes_per_step, "transfer_seconds_per_step": st.transfer_seconds_per_step,
+            "bytes_per_conversation": st.bytes_per_conversation, "bytes_per_pass": st.bytes_per_pass, "bytes_per_step": st.bytes_per_step,
+            "seqs_per_pass": st.seqs_per_pass, "passes_per_epoch": st.passes_per_epoch, "transfer_seconds_per_epoch": st.transfer_seconds_per_epoch,
+            "compute_seconds_per_epoch": st.compute_seconds_per_epoch, "epoch_seconds": st.epoch_seconds, "transfer_seconds_per_step": st.transfer_seconds_per_step,
             "compute_seconds_per_step": st.compute_seconds_per_step, "slowdown_overlapped": st.slowdown_overlapped, "slowdown_serial": st.slowdown_serial,
             "slowdown": st.slowdown})),
     })
@@ -769,7 +826,7 @@ pub fn autopilot(a: &AutopilotInput) -> Result<Plan> {
                               train_layers: (train_layers < layers).then_some(train_layers), seed: 42 };
         // whenever blocks are frozen: besides the time over several epochs, it is what keeps them out of memory
         let cache = train_layers < layers;
-        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, checkpointing: false, devices: 1, epochs, stream: None,
+        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, checkpointing: false, devices: 1, epochs, stream: None, batch: BatchProfile::default(),
                                          avg_tokens: a.avg_tokens.min(max_len) });
         (lora, cache, e)
     };
@@ -871,6 +928,28 @@ pub fn preset(name: &str) -> Option<ModelConfig> {
 
 pub const PRESETS: [&str; 5] = ["llama-2-7b", "mistral-7b", "llama-3.1-8b", "qwen2.5-7b", "qwen2.5-0.5b"];
 
+/// The most units a pass (up to `accumulation`) whose estimate fits every card: each device's need plus
+/// [`CUDA_OVERHEAD_BYTES`] within [`CARD_PLAN_SHARE`] of `available[k]` (the card's free memory; a missing entry: the
+/// last). 1 when even one does not fit, or without cards.
+pub fn auto_seqs_per_pass(p: &ProfileInput, available: &[u64]) -> usize {
+    if available.is_empty() {
+        return 1;
+    }
+    let fits = |n: usize| {
+        let e = estimate(&ProfileInput { batch: BatchProfile { seqs_per_pass: n, ..p.batch }, ..p.clone() });
+        let needs: Vec<u64> = match &e.stream {
+            Some(st) => st.device_bytes.clone(),
+            None if e.per_device_bytes > 0 => vec![e.per_device_bytes; p.devices.max(1)],
+            None => vec![e.total_bytes],
+        };
+        needs.iter().enumerate().all(|(k, b)| {
+            let have = *available.get(k).or(available.last()).unwrap_or(&0);
+            (b + CUDA_OVERHEAD_BYTES) as f64 <= have as f64 * CARD_PLAN_SHARE
+        })
+    };
+    (1..=p.accumulation.max(1)).rev().find(|n| fits(*n)).unwrap_or(1)
+}
+
 /// One way to train an upcycled model's experts, with what it costs on each card.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MoeScheme {
@@ -893,7 +972,7 @@ pub const DEFAULT_CARD_BYTES: u64 = 16_311 << 20;
 /// gradient checkpointing, a bf16 base, 4 conversations per step, the blocks split over `devices`.
 pub fn moe_profile(cfg: &ModelConfig, max_len: usize, devices: usize) -> ProfileInput {
     ProfileInput { cfg: cfg.clone(), lora: LoraSpec { r: 16, alpha: 32.0, targets: Target::ALL.to_vec(), ..Default::default() }, base_dtype: BaseDtype::BF16,
-                   max_len, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: max_len / 2, checkpointing: true, devices, stream: None }
+                   max_len, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: max_len / 2, checkpointing: true, devices, stream: None, batch: BatchProfile::default() }
 }
 
 /// The expert-training schemes for the upcycled `cfg` on `devices` cards of `card_total` bytes: expert ranks 16 to 2

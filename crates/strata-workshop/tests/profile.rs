@@ -15,7 +15,7 @@ fn lora(r: usize, train_layers: Option<usize>) -> LoraSpec {
 }
 
 fn input(cfg: ModelConfig, r: usize, train_layers: Option<usize>, dtype: BaseDtype, max_len: usize, cache: bool) -> ProfileInput {
-    ProfileInput { cfg, lora: lora(r, train_layers), base_dtype: dtype, max_len, accumulation: 4, cache, examples: 20, epochs: 3.0, avg_tokens: 12, checkpointing: false, devices: 1, stream: None }
+    ProfileInput { cfg, lora: lora(r, train_layers), base_dtype: dtype, max_len, accumulation: 4, cache, examples: 20, epochs: 3.0, avg_tokens: 12, checkpointing: false, devices: 1, stream: None, batch: Default::default() }
 }
 
 #[test]
@@ -174,7 +174,7 @@ fn the_autopilot_fits_the_machine_and_says_why() {
     assert_eq!((tight.lora.r, tight.lora.alpha, tight.lr, tight.epochs), (16, 32.0, 2e-4, 3.0));
     // the largest number of blocks that fits: twice as many would not
     let twice = profile::estimate(&ProfileInput { cfg: big.clone(), lora: LoraSpec { train_layers: Some(n * 2), ..tight.lora.clone() }, base_dtype: tight.base_dtype,
-                                                  max_len: tight.max_len, accumulation: tight.accumulation, cache: true, examples: 2000, epochs: tight.epochs, avg_tokens: 250, checkpointing: false, devices: 1, stream: None });
+                                                  max_len: tight.max_len, accumulation: tight.accumulation, cache: true, examples: 2000, epochs: tight.epochs, avg_tokens: 250, checkpointing: false, devices: 1, stream: None, batch: Default::default() });
     assert!(profile::need_bytes(&twice) > 16 << 30 || profile::cpu_seconds(&twice, 100.0) > 200.0 * 3600.0);
 
     // every choice has its one-line reason
@@ -292,4 +292,36 @@ fn the_56b_a5b_streams_on_two_16_gb_cards() {
         assert!(fits, "{len} tokens: {need}");
         assert!(st.slowdown_overlapped >= 1.0 && st.slowdown_serial > st.slowdown_overlapped);
     }
+}
+
+/// Packing and several sequences a pass: the same PCIe bytes a pass, fewer passes an epoch, more activations on the
+/// cards; auto picks the most that fit.
+#[test]
+fn packing_and_sequences_a_pass_in_the_estimate() {
+    let mut cfg = ModelConfig::from_json(&serde_json::json!({"model_type": "qwen3", "vocab_size": 151936, "hidden_size": 4096, "intermediate_size": 12288,
+        "num_hidden_layers": 36, "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128, "tie_word_embeddings": false})).unwrap();
+    cfg.moe = Some(MoeSpec { expert_ff: Some(1024), expert_rank: Some(4), shared_a: true, ..MoeSpec::full(120, 5) });
+    let rates = vec![strata_workshop::layer_stream::link_bytes_s(16.0, 4), strata_workshop::layer_stream::USB4_TUNNEL_BYTES_S];
+    let mut base = streamed(profile::moe_profile(&cfg, 1024, 2), Tier::Ram, 2, rates);
+    base.examples = 100_000;
+    base.avg_tokens = 320;
+    let one = profile::estimate(&base);
+    let packed = ProfileInput { batch: profile::BatchProfile { packed_sequences: Some(33_000), seqs_per_pass: 4 }, ..base.clone() };
+    let four = profile::estimate(&packed);
+    let (a, b) = (one.stream.unwrap(), four.stream.clone().unwrap());
+    assert_eq!(a.bytes_per_pass, b.bytes_per_pass, "a pass moves the base twice, whatever it holds");
+    assert_eq!((a.passes_per_epoch, b.passes_per_epoch), (100_000, 33_000 / 4));
+    assert_eq!(b.bytes_per_step, b.bytes_per_pass, "a step of 4 sequences is one pass");
+    assert!(b.epoch_seconds < a.epoch_seconds / 3.0, "{} vs {}", b.epoch_seconds, a.epoch_seconds);
+    assert!(b.device_bytes.iter().zip(&a.device_bytes).all(|(x, y)| x > y), "four sequences' activations");
+    assert_eq!((four.units_per_epoch, four.seqs_per_pass, four.steps), (33_000, 4, 33_000 / 4));
+    // auto: all four on empty 16 GB cards; on cards with almost nothing free, one
+    let empty = [profile::DEFAULT_CARD_BYTES; 2];
+    let n = profile::auto_seqs_per_pass(&packed, &empty);
+    assert!((1..=4).contains(&n));
+    assert_eq!(profile::auto_seqs_per_pass(&packed, &[1 << 30, 1 << 30]), 1);
+    for l in profile::report_lines(&packed, &four, &Machine { ram_total: 64 << 30, ram_available: 30 << 30, cpus: 16, cpu_gflops: 100.0, gpus: vec![] }) {
+        println!("  {l}");
+    }
+    println!("auto on two empty 16 GB cards: {n}");
 }

@@ -754,6 +754,8 @@ struct HeadLoss {
     w: Tensor,
     /// `[rows]` u32
     targets: Tensor,
+    /// `[rows]` f32: each row's weight in the sum (None: the mean, `1 / rows` each)
+    weights: Option<Tensor>,
 }
 
 fn head_slice_rows(vocab: usize) -> usize {
@@ -786,7 +788,30 @@ pub fn head_loss(h: &Tensor, w: &Tensor, targets: &[u32]) -> Result<Tensor> {
         sum = Some(match sum { Some(s) => (s + part)?, None => part });
     }
     let value = (sum.unwrap() / n as f64)?;
-    Ok(if h.track_op() { h.apply_op1(HeadLoss { y: Mutex::new(Some(value)), w: w.clone(), targets: tg })? } else { value })
+    Ok(if h.track_op() { h.apply_op1(HeadLoss { y: Mutex::new(Some(value)), w: w.clone(), targets: tg, weights: None })? } else { value })
+}
+
+/// `Σ_r weights[r] · CE_r`: [`head_loss`] with a weight per row instead of `1 / rows` (a packed pass weighs each
+/// conversation's tokens `1 / its supervised tokens`, so each conversation counts as its own mean).
+pub fn head_loss_weighted(h: &Tensor, w: &Tensor, targets: &[u32], weights: &[f32]) -> Result<Tensor> {
+    let n = h.dim(0)?;
+    if n != targets.len() || n != weights.len() || n == 0 {
+        bail!("head loss: {} rows, {} targets and {} weights", n, targets.len(), weights.len());
+    }
+    let tg = Tensor::from_vec(targets.to_vec(), (n,), h.device())?;
+    let wt = Tensor::from_vec(weights.to_vec(), (n,), h.device())?;
+    let step = head_slice_rows(w.dim(0)?);
+    let hd = h.detach();
+    let mut sum: Option<Tensor> = None;
+    for r0 in (0..n).step_by(step) {
+        let c = step.min(n - r0);
+        let (logits, lse) = head_slice(&hd.narrow(0, r0, c)?, w)?;
+        let picked = logits.gather(&tg.narrow(0, r0, c)?.unsqueeze(1)?, 1)?;
+        let part = ((lse - picked)?.squeeze(1)? * wt.narrow(0, r0, c)?)?.sum_all()?;
+        sum = Some(match sum { Some(s) => (s + part)?, None => part });
+    }
+    let value = sum.unwrap();
+    Ok(if h.track_op() { h.apply_op1(HeadLoss { y: Mutex::new(Some(value)), w: w.clone(), targets: tg, weights: Some(wt) })? } else { value })
 }
 
 impl CustomOp1 for HeadLoss {
@@ -810,7 +835,8 @@ impl CustomOp1 for HeadLoss {
 
     fn bwd(&self, h: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let (n, vocab) = (h.dim(0)?, self.w.dim(0)?);
-        let g = (grad_res.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0] as f64) / n as f64;
+        let grad = grad_res.to_dtype(DType::F32)?.flatten_all()?.to_vec1::<f32>()?[0] as f64;
+        let g = if self.weights.is_some() { grad } else { grad / n as f64 };
         let step = head_slice_rows(vocab);
         let hd = h.detach();
         let ids = Tensor::arange(0u32, vocab as u32, h.device())?.unsqueeze(0)?;
@@ -831,7 +857,11 @@ impl CustomOp1 for HeadLoss {
                 let part = d.narrow(1, v0, k)?.contiguous()?.matmul(&w)?;
                 acc = Some(match acc { Some(a) => (a + part)?, None => part });
             }
-            parts.push((acc.unwrap() * g)?);
+            let acc = match &self.weights {
+                Some(wt) => acc.unwrap().broadcast_mul(&wt.narrow(0, r0, c)?.unsqueeze(1)?)?,
+                None => acc.unwrap(),
+            };
+            parts.push((acc * g)?);
         }
         Ok(Some(if parts.len() == 1 { parts.pop().unwrap() } else { Tensor::cat(&parts, 0)? }))
     }
@@ -941,6 +971,69 @@ pub enum Mask {
     Table(Tensor),
     /// causal, and only the last `window` keys (usize::MAX: all of them)
     Causal { window: usize },
+}
+
+/// The rows of one pass through the blocks: one or more sequences, each of whole conversations, laid end to end
+/// (`seqs[s]` is sequence s's conversations' token counts, in order). Packing puts several conversations in one
+/// sequence; several sequences per pass let each streamed block's weights serve all of them in one copy. No row sees
+/// another conversation's rows (a block-diagonal causal mask), and each conversation's positions start at 0, so every
+/// conversation's hidden states are those it has when run alone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PassLayout {
+    pub seqs: Vec<Vec<usize>>,
+}
+
+impl PassLayout {
+    /// One sequence of one conversation of `n` tokens (what an unpacked pass is).
+    pub fn single(n: usize) -> Self {
+        Self { seqs: vec![vec![n]] }
+    }
+    pub fn rows(&self) -> usize {
+        self.seqs.iter().flatten().sum()
+    }
+    pub fn conversations(&self) -> usize {
+        self.seqs.iter().map(Vec::len).sum()
+    }
+    /// One sequence of one conversation.
+    pub fn is_single(&self) -> bool {
+        self.conversations() == 1
+    }
+    /// Each conversation's rows `(first, count)`, in order.
+    pub fn segments(&self) -> Vec<(usize, usize)> {
+        let mut at = 0;
+        self.seqs.iter().flatten().map(|n| { let s = (at, *n); at += n; s }).collect()
+    }
+    /// Each sequence's rows `(first, count)`.
+    pub fn sequences(&self) -> Vec<(usize, usize)> {
+        let mut at = 0;
+        self.seqs.iter().map(|s| { let n: usize = s.iter().sum(); let r = (at, n); at += n; r }).collect()
+    }
+    /// Each row's position: 0.. within its conversation.
+    pub fn positions(&self) -> Vec<usize> {
+        self.seqs.iter().flatten().flat_map(|n| 0..*n).collect()
+    }
+    /// The additive mask `[n, n]` (0 or -inf) of one sequence of conversations `lens`: query i sees key j when both
+    /// are in the same conversation, j <= i, and i - j < window.
+    pub fn mask_values(lens: &[usize], window: usize) -> Vec<f32> {
+        let conv: Vec<usize> = lens.iter().enumerate().flat_map(|(c, n)| std::iter::repeat(c).take(*n)).collect();
+        let n = conv.len();
+        (0..n).flat_map(|i| { let conv = &conv; (0..n).map(move |j| if j > i || i - j >= window || conv[i] != conv[j] { f32::NEG_INFINITY } else { 0.0 }) }).collect()
+    }
+}
+
+/// How a block's attention runs over the rows of a pass: each unit `(first row, rows, mask)` attends within itself
+/// (one unit for an unpacked pass: the whole input), and `segments` are the conversations (`None`: the whole input is
+/// one), over which the router losses are taken one by one.
+#[derive(Debug, Clone)]
+struct Attn {
+    units: Vec<(usize, usize, Mask)>,
+    segments: Option<Vec<(usize, usize)>>,
+}
+
+impl Attn {
+    fn whole(seq: usize, mask: Mask) -> Self {
+        Self { units: vec![(0, seq, mask)], segments: None }
+    }
 }
 
 /// Above this many bytes between a CUDA device's memory-pool reserve and its use, a block boundary (each block's
@@ -1345,11 +1438,25 @@ fn top_k_rows(probs: &[Vec<f32>], k: usize) -> Vec<Vec<usize>> {
 }
 
 /// The router losses of a block for `ctx` (training only): Switch's `E · Σ_e (share of the assignments to e) · (mean
-/// probability of e)`, and the z-loss `mean(logsumexp(logits)²)` when `logits` are given, as a `[2]` tensor.
-fn push_router_losses(ctx: &Ctx, probs: &Tensor, chosen: &[Vec<usize>], logits: Option<&Tensor>) -> Result<()> {
+/// probability of e)`, and the z-loss `mean(logsumexp(logits)²)` when `logits` are given, as a `[2]` tensor. A packed
+/// pass (`segments`) takes them per conversation, as each would have alone: `[conversations, 2]`.
+fn push_router_losses(ctx: &Ctx, probs: &Tensor, chosen: &[Vec<usize>], logits: Option<&Tensor>, segments: Option<&[(usize, usize)]>) -> Result<()> {
     if !ctx.train {
         return Ok(());
     }
+    let value = match segments {
+        None => router_losses(probs, chosen, logits)?,
+        Some(segs) => {
+            let parts = segs.iter().map(|(s, n)| router_losses(&probs.narrow(0, *s, *n)?, &chosen[*s..s + n], logits.map(|l| l.narrow(0, *s, *n)).transpose()?.as_ref()))
+                .collect::<Result<Vec<_>>>()?;
+            Tensor::stack(&parts, 0)?
+        }
+    };
+    ctx.aux.borrow_mut().push(value);
+    Ok(())
+}
+
+fn router_losses(probs: &Tensor, chosen: &[Vec<usize>], logits: Option<&Tensor>) -> Result<Tensor> {
     let (seq, n_exp) = probs.dims2()?;
     let k = chosen.first().map_or(1, |c| c.len()).max(1);
     let dev = probs.device();
@@ -1364,8 +1471,7 @@ fn push_router_losses(ctx: &Ctx, probs: &Tensor, chosen: &[Vec<usize>], logits: 
         }
         None => Tensor::zeros((), DType::F32, dev)?,
     };
-    ctx.aux.borrow_mut().push(Tensor::stack(&[&aux, &z], 0)?);
-    Ok(())
+    Ok(Tensor::stack(&[&aux, &z], 0)?)
 }
 
 /// The chosen experts' outputs `all` (rows in the order `pos` points into) weighed by the renormalised router
@@ -1391,9 +1497,9 @@ fn combine(all: Tensor, pos: Vec<u32>, probs: &Tensor, chosen: &[Vec<usize>], k:
 /// once to every token; each chosen expert adds its own LoRA terms on its tokens, and the down projection runs once
 /// per (token, expert). In training the block's load-balancing loss goes to `ctx`. (Full width with adapters: the
 /// original 57B-A8B path, bit for bit; everything else goes through [`moe_ffn_grouped`].)
-fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx, segs: Option<&[(usize, usize)]>) -> Result<Tensor> {
     if m.groups > 1 || m.experts.is_empty() {
-        return moe_ffn_grouped(block, m, h, ctx);
+        return moe_ffn_grouped(block, m, h, ctx, segs);
     }
     let seq = h.dim(0)?;
     let (k, dev) = (m.top_k, h.device().clone());
@@ -1423,7 +1529,7 @@ fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result<Tensor>
     }
     let all = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
     let out = combine(all, pos, &probs, &chosen, k)?;
-    push_router_losses(ctx, &probs, &chosen, None)?;
+    push_router_losses(ctx, &probs, &chosen, None, segs)?;
     Ok(out)
 }
 
@@ -1432,7 +1538,7 @@ fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result<Tensor>
 /// all of them (one product each, whatever the number of copies), and each copy adds its own LoRA terms to its rows.
 /// The block's weights hold the groups contiguously (permuted at load), so a slice is a view of them: gate and up
 /// rows `g·ff_e ..`, down columns `g·ff_e ..`. Each expert's output is multiplied by `out_scale`.
-fn moe_ffn_grouped(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+fn moe_ffn_grouped(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx, segs: Option<&[(usize, usize)]>) -> Result<Tensor> {
     let seq = h.dim(0)?;
     let (n_exp, k, groups, fe, dev) = (m.router.as_tensor().dim(0)?, m.top_k, m.groups, m.ff_e, h.device().clone());
     let logits = h.matmul(&ctx.var(&m.router).t()?)?;
@@ -1487,7 +1593,7 @@ fn moe_ffn_grouped(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx) -> Result
     }
     let all = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
     let out = combine(all, pos, &probs, &chosen, k)?;
-    push_router_losses(ctx, &probs, &chosen, if m.groups > 1 { Some(&logits) } else { None })?;
+    push_router_losses(ctx, &probs, &chosen, if m.groups > 1 { Some(&logits) } else { None }, segs)?;
     Ok(out)
 }
 
@@ -1527,14 +1633,15 @@ struct CheckpointBlock {
     cfg: ModelConfig,
     block: Block,
     rope: (Tensor, Tensor),
-    mask: Mask,
+    att: Attn,
     train: bool,
     seed: u64,
     calls: u64,
     grads: CkptGrads,
-    /// the block's router losses ride in one extra row of the output (`[seq + 1, hidden]`, the values at `[seq, 0..2]`),
-    /// so their gradient comes back through this node too
-    with_aux: bool,
+    /// the block's router losses (their shape: `[2]`, or `[conversations, 2]` for a packed pass) ride in extra rows of
+    /// the output (`[seq + extra, hidden]`, the values first, flat, then zeros), so their gradient comes back through
+    /// this node too
+    with_aux: Option<Vec<usize>>,
     /// a streamed base: `block` holds no frozen matrices, the replay fetches them again ([`crate::layer_stream`])
     stream: Option<StreamRef>,
     /// the block is not sampled (LISA): the replay reads its adapters detached and returns only the input's gradient
@@ -1597,12 +1704,12 @@ impl CustomOp1 for CheckpointBlock {
             }
             None => self.block.clone(),
         };
-        let y = block_forward(&self.cfg, &block, x.as_tensor(), &self.rope, &self.mask, &ctx).map_err(err)?;
+        let y = block_forward(&self.cfg, &block, x.as_tensor(), &self.rope, &self.att, &ctx).map_err(err)?;
         let (seq, g) = (y.dim(0)?, grad_res.detach());
         let mut total = (y * g.narrow(0, 0, seq)?)?.sum_all()?;
-        if self.with_aux {
+        if let Some(dims) = &self.with_aux {
             let aux = ctx.aux.borrow_mut().pop().ok_or_else(|| candle_core::Error::Msg("checkpointed block: no load-balancing loss in the replay".into()))?;
-            total = (total + (aux * g.get(seq)?.narrow(0, 0, 2)?)?.sum_all()?)?;
+            total = (total + (aux * unpack_aux(&g, seq, dims)?)?.sum_all()?)?;
         }
         let grads = total.backward()?;
         drop(block);
@@ -1619,11 +1726,11 @@ impl CustomOp1 for CheckpointBlock {
 /// See [`CheckpointBlock`]. `block` is the block as the model holds it; `run` is it with its frozen matrices (the
 /// same block unless the base is streamed, when `block` holds none and the node keeps only that).
 #[allow(clippy::too_many_arguments)]
-fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx, grads: &CkptGrads, active: bool,
+fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, rope: &(Tensor, Tensor), att: &Attn, ctx: &Ctx, grads: &CkptGrads, active: bool,
                 stream: Option<StreamRef>) -> Result<Tensor> {
     let calls = ctx.calls.get();
     let sub = Ctx { train: ctx.train, seed: ctx.seed, calls: Cell::new(calls), detach: Cell::new(ctx.detach.get()), ..Ctx::default() };
-    let value = block_forward(cfg, run, &x.detach(), rope, mask, &sub)?.detach();
+    let value = block_forward(cfg, run, &x.detach(), rope, att, &sub)?.detach();
     ctx.calls.set(sub.calls.get());
     let aux = sub.aux.borrow_mut().pop().map(|a| a.detach());
     if !x.track_op() && !(block.has_lora() && active) {
@@ -1637,20 +1744,29 @@ fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, rope:
     let packed = match &aux {
         Some(a) => {
             let hid = value.dim(1)?;
-            let row = Tensor::cat(&[&a.reshape((1, 2))?, &Tensor::zeros((1, hid - 2), DType::F32, value.device())?], 1)?;
-            Tensor::cat(&[&value, &row], 0)?
+            let n = a.elem_count();
+            let rows = n.div_ceil(hid);
+            let flat = a.flatten_all()?;
+            let flat = if rows * hid > n { Tensor::cat(&[&flat, &Tensor::zeros(rows * hid - n, DType::F32, value.device())?], 0)? } else { flat };
+            Tensor::cat(&[&value, &flat.reshape((rows, hid))?], 0)?
         }
         None => value,
     };
     // the input may not descend from a variable (the first trained block): give the node something to hang from
     let x_in = if x.track_op() { x.clone() } else { Var::from_tensor(&x.detach())?.as_tensor().clone() };
-    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: kept, rope: rope.clone(), mask: mask.clone(),
-                                               train: ctx.train, seed: ctx.seed, calls, grads: grads.clone(), with_aux: aux.is_some(), stream, detached: !active })?;
-    if aux.is_none() {
-        return Ok(out);
-    }
-    ctx.aux.borrow_mut().push(out.get(seq)?.narrow(0, 0, 2)?);
+    let dims = aux.as_ref().map(|a| a.dims().to_vec());
+    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: kept, rope: rope.clone(), att: att.clone(),
+                                               train: ctx.train, seed: ctx.seed, calls, grads: grads.clone(), with_aux: dims.clone(), stream, detached: !active })?;
+    let Some(dims) = dims else { return Ok(out) };
+    ctx.aux.borrow_mut().push(unpack_aux(&out, seq, &dims)?);
     Ok(out.narrow(0, 0, seq)?)
+}
+
+/// The router losses of shape `dims` from the extra rows after row `seq` of `t` (see [`CheckpointBlock::with_aux`]).
+fn unpack_aux(t: &Tensor, seq: usize, dims: &[usize]) -> candle_core::Result<Tensor> {
+    let n: usize = dims.iter().product();
+    let rows = t.dim(0)? - seq;
+    t.narrow(0, seq, rows)?.flatten_all()?.narrow(0, 0, n)?.reshape(dims)
 }
 
 /// The decoder: frozen base, adapters in the trained blocks.
@@ -2371,7 +2487,12 @@ impl LlamaModel {
     }
 
     fn rope(&self, seq: usize, dev: &Device) -> Result<(Tensor, Tensor)> {
-        let hd = self.cfg.head_dim;
+        self.rope_at(&(0..seq).collect::<Vec<_>>(), dev)
+    }
+
+    /// The rotary tables for rows at `positions` (a packed pass: each conversation from 0).
+    fn rope_at(&self, positions: &[usize], dev: &Device) -> Result<(Tensor, Tensor)> {
+        let (hd, seq) = (self.cfg.head_dim, positions.len());
         // as transformers: inv_freq in f32, angles = position × inv_freq, each repeated over both halves
         let (inv, scale): (Vec<f32>, f32) = match self.cfg.yarn {
             Some(y) => (y.inv_freq(hd, self.cfg.rope_theta).into_iter().map(|f| f as f32).collect(), y.attention_factor as f32),
@@ -2379,7 +2500,7 @@ impl LlamaModel {
         };
         let mut cos = Vec::with_capacity(seq * hd);
         let mut sin = Vec::with_capacity(seq * hd);
-        for p in 0..seq {
+        for &p in positions {
             for half in 0..2 {
                 let _ = half;
                 for f in &inv {
@@ -2396,7 +2517,7 @@ impl LlamaModel {
     /// streamed: its frozen matrices fetched first and the next block's prefetched, its adapters detached when LISA
     /// has not sampled it, checkpointed when that is on and anything here needs a gradient.
     #[allow(clippy::too_many_arguments)]
-    fn block_forward(&self, i: usize, pos: Option<(usize, u64)>, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
+    fn block_forward(&self, i: usize, pos: Option<(usize, u64)>, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), att: &Attn, ctx: &Ctx) -> Result<Tensor> {
         let active = self.is_active(i);
         trim_if_fragmented(&self.devs[self.block_dev[i]]);
         let sref = self.stream.as_ref().filter(|s| s.has_block(i))
@@ -2414,9 +2535,9 @@ impl LlamaModel {
         };
         let prev = ctx.detach.replace(!active);
         let out = if !ctx.no_grad && self.checkpoint && (x.track_op() || block.has_lora() && active) {
-            checkpointed(&self.cfg, block, run, x, rope, mask, ctx, &self.ckpt_grads, active, sref)
+            checkpointed(&self.cfg, block, run, x, rope, att, ctx, &self.ckpt_grads, active, sref)
         } else {
-            block_forward(&self.cfg, run, x, rope, mask, ctx)
+            block_forward(&self.cfg, run, x, rope, att, ctx)
         };
         ctx.detach.set(prev);
         out
@@ -2425,7 +2546,7 @@ impl LlamaModel {
 
 /// One decoder block, given the model's settings (what [`LlamaModel::block_forward`] and a checkpointed block's
 /// recomputation both run).
-fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
+fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), att: &Attn, ctx: &Ctx) -> Result<Tensor> {
     {
         let (seq, hd, nh, nkv) = (x.dim(0)?, c.head_dim, c.num_attention_heads, c.num_key_value_heads);
         let h = rms_norm(x, &block.norm1, c.rms_norm_eps)?;
@@ -2453,16 +2574,29 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
         };
         let (k, v) = (spread(k)?, spread(v)?);
         let scale = 1.0 / (hd as f64).sqrt();
-        let attended = match mask {
-            Mask::Table(m) => masked_softmax(&q.matmul(&k.transpose(1, 2)?.contiguous()?)?, scale, m)?.matmul(&v)?,
-            Mask::Causal { window } => chunked_attention(&q, &k.contiguous()?, &v.contiguous()?, scale, *window)?,
+        let attend = |q: &Tensor, k: &Tensor, v: &Tensor, mask: &Mask| -> Result<Tensor> {
+            Ok(match mask {
+                Mask::Table(m) => masked_softmax(&q.matmul(&k.transpose(1, 2)?.contiguous()?)?, scale, m)?.matmul(v)?,
+                Mask::Causal { window } => chunked_attention(q, &k.contiguous()?, &v.contiguous()?, scale, *window)?,
+            })
+        };
+        // a packed pass: each unit (a sequence, or one long conversation) attends within itself only
+        let attended = match att.units.as_slice() {
+            [(0, n, mask)] if *n == seq => attend(&q, &k, &v, mask)?,
+            units => {
+                let parts = units.iter().map(|(r0, n, mask)| {
+                    let cut = |t: &Tensor| -> Result<Tensor> { Ok(t.narrow(1, *r0, *n)?.contiguous()?) };
+                    attend(&cut(&q)?, &cut(&k)?, &cut(&v)?, mask)
+                }).collect::<Result<Vec<_>>>()?;
+                Tensor::cat(&parts, 1)?
+            }
         };
         let out = attended.transpose(0, 1)?.reshape((seq, nh * hd))?;
         let x = (x + block.lin[3].forward(&out, ctx)?)?;
 
         let h = rms_norm(&x, &block.norm2, c.rms_norm_eps)?;
         if let (Some(m), false) = (&block.moe, ctx.dense_ffn) {
-            return Ok((x + moe_ffn(block, m, &h, ctx)?)?);
+            return Ok((x + moe_ffn(block, m, &h, ctx, att.segments.as_deref())?)?);
         }
         let gated = (candle_nn::ops::silu(&block.lin[4].forward(&h, ctx)?)? * block.lin[5].forward(&h, ctx)?)?;
         if let Some(p) = &ctx.probe {
@@ -2486,16 +2620,52 @@ impl LlamaModel {
     }
 
     fn run_blocks(&self, x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx) -> Result<Tensor> {
-        self.run_blocks_seen(x, range, ctx, None)
+        self.run_blocks_with(x, range, ctx, None, None)
+    }
+
+    /// The attention units of a packed pass for a causal rule with `window` (see [`PassLayout`]): a sequence up to
+    /// `above` rows attends as one unit through a block-diagonal table; a longer one (which packing gives only when the
+    /// cap is above `above`) goes a conversation at a time, a long conversation by the chunked rule.
+    fn packed_attn(&self, l: &PassLayout, window: usize, above: usize, dev: &Device) -> Result<Attn> {
+        let mut units = Vec::new();
+        let mut at = 0;
+        for lens in &l.seqs {
+            let n: usize = lens.iter().sum();
+            if n <= above {
+                units.push((at, n, Mask::Table(Tensor::from_vec(PassLayout::mask_values(lens, window), (n, n), dev)?)));
+            } else {
+                let mut c0 = at;
+                for &cn in lens {
+                    let mask = if cn > above { Mask::Causal { window } } else { Mask::Table(self.window_mask(cn, window, dev)?) };
+                    units.push((c0, cn, mask));
+                    c0 += cn;
+                }
+            }
+            at += n;
+        }
+        Ok(Attn { units, segments: Some(l.segments()) })
     }
 
     /// [`run_blocks`](Self::run_blocks), handing `seen` the residual stream after every block of every pass, in the
     /// order they run: `(block, pass, state)`, pass 0 being the base's own pass and 1.. the loop's extra passes (the
     /// state there is the pass's own, before its gate mixes it in).
-    fn run_blocks_seen(&self, mut x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx, mut seen: Option<&mut dyn FnMut(usize, usize, &Tensor) -> Result<()>>) -> Result<Tensor> {
+    fn run_blocks_seen(&self, x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx, seen: Option<&mut dyn FnMut(usize, usize, &Tensor) -> Result<()>>) -> Result<Tensor> {
+        self.run_blocks_with(x, range, ctx, None, seen)
+    }
+
+    /// [`run_blocks_seen`](Self::run_blocks_seen) over the rows of a packed pass (`layout`; None or a single
+    /// conversation: the rows are one sequence).
+    fn run_blocks_with(&self, mut x: Tensor, range: std::ops::Range<usize>, ctx: &Ctx, layout: Option<&PassLayout>,
+                       mut seen: Option<&mut dyn FnMut(usize, usize, &Tensor) -> Result<()>>) -> Result<Tensor> {
         let seq = x.dim(0)?;
         if seq == 0 {
             bail!("an empty token sequence");
+        }
+        let layout = layout.filter(|l| !l.is_single());
+        if let Some(l) = layout {
+            if l.rows() != seq {
+                bail!("a packed pass of {} rows given {seq}", l.rows());
+            }
         }
         // the rotary tables and the mask, once per device the blocks sit on
         // (rope, the causal mask, the sliding layers' mask when there are any) per device
@@ -2503,9 +2673,14 @@ impl LlamaModel {
         // 4,096-token prompt holds [heads, 512, keys] at a time instead of [heads, seq, seq] (2 GB on Qwen3-8B)
         let above = if ctx.no_grad { ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed) } else { CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed) };
         let long = seq > above;
-        let mut per_dev: Vec<Option<((Tensor, Tensor), Mask, Option<Mask>)>> = vec![None; self.devs.len()];
+        let mut per_dev: Vec<Option<((Tensor, Tensor), Attn, Option<Attn>)>> = vec![None; self.devs.len()];
         for i in range.clone() {
             let d = self.block_dev[i];
+            if let (true, Some(l)) = (per_dev[d].is_none(), layout) {
+                let dev = &self.devs[d];
+                let sw = self.cfg.sliding_window.map(|w| self.packed_attn(l, w, above, dev)).transpose()?;
+                per_dev[d] = Some((self.rope_at(&l.positions(), dev)?, self.packed_attn(l, usize::MAX, above, dev)?, sw));
+            }
             if per_dev[d].is_none() {
                 // a long sequence never builds a seq x seq table: the chunked attention applies the rule itself
                 let (full, sw) = if long {
@@ -2517,7 +2692,7 @@ impl LlamaModel {
                     };
                     (Mask::Table(self.causal_mask(seq, &self.devs[d])?), sw)
                 };
-                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, full, sw));
+                per_dev[d] = Some((self.rope(seq, &self.devs[d])?, Attn::whole(seq, full), sw.map(|m| Attn::whole(seq, m))));
             }
         }
         // a streamed base is told the order the blocks run in (the loop's again for each extra pass), to prefetch
@@ -2590,7 +2765,7 @@ impl LlamaModel {
         };
         let above = if ctx.no_grad { ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed) } else { CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed) };
         let mask = if seq > above { Mask::Causal { window } } else { Mask::Table(self.window_mask(seq, window, dev)?) };
-        self.block_forward(i, None, b, &move_to(x, dev)?, &self.rope(seq, dev)?, &mask, ctx)
+        self.block_forward(i, None, b, &move_to(x, dev)?, &self.rope(seq, dev)?, &Attn::whole(seq, mask), ctx)
     }
 
     /// The mean next-token cross-entropy of the final hidden state `x` (before the final norm) over the supervised
@@ -2722,6 +2897,69 @@ impl LlamaModel {
 
     pub fn loss(&self, tokens: &[u32], supervised: &[bool], ctx: &Ctx) -> Result<Tensor> {
         self.loss_from_hidden(&self.lower(tokens)?, tokens, supervised, ctx)
+    }
+
+    /// [`lower`](Self::lower) for a packed pass: `tokens` are its conversations end to end, as `layout` lays them.
+    pub fn lower_packed(&self, tokens: &[u32], layout: &PassLayout) -> Result<Tensor> {
+        Ok(self.run_blocks_with(self.embed_tokens(tokens)?, 0..self.first_trained, &Ctx::inference(), Some(layout), None)?.detach())
+    }
+
+    /// [`upper_hidden`](Self::upper_hidden) for a packed pass.
+    pub fn upper_hidden_packed(&self, h: &Tensor, layout: &PassLayout, ctx: &Ctx) -> Result<Tensor> {
+        let x = self.run_blocks_with(h.clone(), self.first_trained..self.cfg.num_hidden_layers, ctx, Some(layout), None)?;
+        rms_norm(&move_to(&x, self.norm.device())?, &self.norm, self.cfg.rms_norm_eps)
+    }
+
+    /// The loss of a packed pass: the SUM over its conversations of the loss each has alone ([`loss_from_hidden`]:
+    /// the mean cross-entropy over its supervised tokens, plus its router losses averaged over the blocks), so a step
+    /// that divides by its conversations weighs every token as unpacked training does. All the conversations go
+    /// through each block together (one copy of a streamed block's weights for all of them). `tokens` and
+    /// `supervised` are the conversations' own, end to end.
+    ///
+    /// [`loss_from_hidden`]: Self::loss_from_hidden
+    pub fn loss_packed(&self, h: &Tensor, layout: &PassLayout, tokens: &[u32], supervised: &[bool], ctx: &Ctx) -> Result<Tensor> {
+        if layout.is_single() {
+            return self.loss_from_hidden(h, tokens, supervised, ctx);
+        }
+        if tokens.len() != layout.rows() || supervised.len() != tokens.len() {
+            bail!("a packed pass of {} rows given {} tokens and {} flags", layout.rows(), tokens.len(), supervised.len());
+        }
+        let (mut rows, mut targets, mut weights) = (Vec::new(), Vec::new(), Vec::new());
+        for (s, n) in layout.segments() {
+            let mine: Vec<usize> = (1..n).filter(|p| supervised[s + p]).collect();
+            if mine.is_empty() {
+                bail!("an example with no supervised token");
+            }
+            let w = 1.0 / mine.len() as f32;
+            for p in mine {
+                rows.push((s + p - 1) as u32);
+                targets.push(tokens[s + p]);
+                weights.push(w);
+            }
+        }
+        let n = rows.len();
+        let hidden = self.upper_hidden_packed(h, layout, ctx)?;
+        let hidden = hidden.index_select(&Tensor::from_vec(rows, (n,), hidden.device())?, 0)?;
+        let w = self.lm_head.as_ref().or(self.embed.as_ref()).ok_or_else(|| anyhow!("no output head in memory"))?;
+        let ce = head_loss_weighted(&move_to(&hidden, w.device())?, w, &targets, &weights)?;
+        let aux = std::mem::take(&mut *ctx.aux.borrow_mut());
+        if aux.is_empty() {
+            return Ok(ce);
+        }
+        // each block's `[conversations, 2]`: averaged over the blocks, then each conversation's terms summed
+        let n_aux = aux.len() as f64;
+        let mut sum = move_to(&aux[0], ce.device())?;
+        for a in &aux[1..] {
+            sum = (sum + move_to(a, ce.device())?)?;
+        }
+        let mean = (sum / n_aux)?;
+        let per = mean.mean(0)?.to_vec1::<f32>()?;
+        ctx.aux_value.set(Some(per[0] as f64));
+        if self.cfg.moe.is_some_and(|m| m.fine(&self.cfg)) {
+            ctx.z_value.set(Some(per[1] as f64));
+        }
+        let coef = Tensor::new(&[MOE_AUX_COEF as f32, MOE_Z_COEF as f32], mean.device())?;
+        Ok((ce + mean.broadcast_mul(&coef)?.sum_all()?)?)
     }
 }
 

@@ -36,6 +36,7 @@ pub mod merge;
 pub mod model;
 pub mod moe_init;
 pub mod naming;
+pub mod packing;
 pub mod profile;
 pub mod quantize_gguf;
 pub mod safetensors_io;
