@@ -1713,7 +1713,10 @@ impl LlamaModel {
             bail!("{}: no lm_head.weight and tie_word_embeddings is false", dir.display());
         }
         let embed = if with_embeddings || (with_head && !has_head) {
-            let e = matrix(&format!("{prefix}embed_tokens.weight"))?;
+            // an untied table on a GPU is only looked up (a few rows a step, frozen): it stays in RAM, which leaves the
+            // first card its 1.2 GB (Qwen3-8B) for activations; a tied one is the head and stays on the device
+            let e = if has_head && dev.is_cuda() { matrix_on(&format!("{prefix}embed_tokens.weight"), &Device::Cpu)? }
+                    else { matrix(&format!("{prefix}embed_tokens.weight"))? };
             expect(&e, &[cfg.vocab_size, cfg.hidden_size], "embed_tokens.weight")?;
             Some(e)
         } else {
@@ -2287,7 +2290,12 @@ impl LlamaModel {
             bail!("token id {bad} is outside the vocabulary of {}", self.cfg.vocab_size);
         }
         let ids = Tensor::from_vec(tokens.to_vec(), (tokens.len(),), embed.device())?;
-        Ok(embed.index_select(&ids, 0)?.to_dtype(DType::F32)?)
+        let rows = embed.index_select(&ids, 0)?.to_dtype(DType::F32)?;
+        // the table may be in RAM (see load_parts_on): the rows go where the first block runs
+        match self.devs.first() {
+            Some(d) if !d.same_device(embed.device()) => Ok(rows.to_device(d)?),
+            _ => Ok(rows),
+        }
     }
 
     /// Run `h` through the blocks in `range` as plain inference (they must carry no adapter); the result is detached.
