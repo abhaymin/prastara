@@ -51,6 +51,9 @@ struct Cli {
     /// one JSON event per line on stdout (for the server and scripts)
     #[arg(long, global = true)]
     json: bool,
+    /// a job over private data (the server adds it): every chat with the server stays on this machine
+    #[arg(long, global = true, hide = true)]
+    local_only: bool,
     #[command(subcommand)]
     cmd: Cmd,
 }
@@ -1777,15 +1780,21 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
         Cmd::PrivateImport { src, name, attestation, confirm_bytes, minor_share, id, check_timeout_s, data_dir } => {
             use strata_workshop::private_import as pi;
             let root = strata_workshop::private_data::private_root(&home_path(data_dir)?);
-            let spec = src.spec()?;
+            // a resume takes the source its import started with (kept in quarantine)
+            let spec = match (src.spec(), id) {
+                (Ok(sp), _) => sp,
+                (Err(_), Some(_)) => pi::Spec::Folder(PathBuf::new()),
+                (Err(e), None) => return Err(e),
+            };
             let mut s = pi::Settings::new(root.clone(), name, spec.clone());
             if let Some(i) = id { s.id = i.clone(); }
             s.attestation = attestation.clone();
             s.confirm_bytes = *confirm_bytes;
             s.minor_share = *minor_share;
             s.timeout = std::time::Duration::from_secs((*check_timeout_s).clamp(1, 3600));
-            let net = if spec.is_network() { Some(pi::Net::from_env().map_err(|e| e.to_string())?) } else { None };
-            out.event(json!({"event": "start", "what": format!("private import {} of {} into quarantine", s.id, spec.describe())}));
+            // a folder never needs it (a bad HF_ENDPOINT then only stops a network source)
+            let net = pi::Net::from_env().ok();
+            out.event(json!({"event": "start", "what": if id.is_some() { format!("private import {} resumed", s.id) } else { format!("private import {} of {} into quarantine", s.id, spec.describe()) }}));
             install_term_handler();
             let models = root.join(pi::CHECK_MODELS);
             let timeout = s.timeout;
@@ -2100,6 +2109,9 @@ fn main() -> ExitCode {
         if let Some(code) = with_threads(n) {
             return code;
         }
+    }
+    if cli.local_only {
+        datagen::set_local_only();
     }
     let out = Out { json: cli.json };
     let t0 = Instant::now();

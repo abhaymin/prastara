@@ -179,6 +179,25 @@ impl Audit {
 
 // ------------------------------------------------------------------------------------------------- the state
 
+/// A source as JSON (`{"folder"}`, `{"url"}`, `{"hf", "revision", "pattern"}`), as the state keeps it.
+pub fn spec_value(s: &Spec) -> Value {
+    match s {
+        Spec::Folder(p) => json!({"folder": p.display().to_string()}),
+        Spec::Url(u) => json!({"url": u}),
+        Spec::Hf { id, revision, pattern } => json!({"hf": id, "revision": revision, "pattern": pattern}),
+    }
+}
+
+pub fn spec_from(v: &Value) -> Result<Spec> {
+    let s = |k: &str| v[k].as_str().filter(|x| !x.is_empty()).map(str::to_string);
+    match (s("folder"), s("url"), s("hf")) {
+        (Some(f), None, None) => Ok(Spec::Folder(PathBuf::from(f))),
+        (None, Some(u), None) => Ok(Spec::Url(u)),
+        (None, None, Some(h)) => Ok(Spec::Hf { id: h, revision: s("revision").unwrap_or_else(|| "main".into()), pattern: s("pattern") }),
+        _ => bail!("not a source: {v}"),
+    }
+}
+
 /// Counts of one import (what the progress events and the card say).
 #[derive(Debug, Default, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Counts {
@@ -238,6 +257,14 @@ pub struct State {
     /// network files already fetched and taken in (a resumed fetch skips them)
     #[serde(default)]
     pub done_files: Vec<String>,
+    /// the source and the SOURCE.toml it started with (a resume uses them)
+    #[serde(default)]
+    pub spec: Option<Value>,
+    #[serde(default)]
+    pub attestation: Option<String>,
+    /// the size the owner confirmed (a resumed fetch holds to it)
+    #[serde(default)]
+    pub confirm_bytes: Option<u64>,
 }
 
 impl State {
@@ -377,6 +404,7 @@ fn flag_reason(k: CheckKind) -> String {
 
 struct Run<'a> {
     s: &'a Settings,
+    spec: Spec,
     dir: PathBuf,
     audit: Audit,
     state: State,
@@ -547,8 +575,8 @@ impl Run<'_> {
     }
 
     fn fetch_network(&mut self, net: &Net, stop: &dyn Fn() -> bool) -> Result<()> {
-        let probe = net.probe(&self.s.spec)?;
-        match self.s.confirm_bytes {
+        let probe = net.probe(&self.spec)?;
+        match self.s.confirm_bytes.or(self.state.confirm_bytes) {
             Some(c) if c == probe.bytes => {}
             Some(c) => bail!("the source is now {} bytes, not the {c} you confirmed; nothing is fetched", probe.bytes),
             None => bail!("a network source is fetched only after you confirm its size ({} bytes)", probe.bytes),
@@ -650,11 +678,18 @@ pub fn run(s: &Settings, net: Option<&Net>, loader: &mut dyn FnMut(CheckKind) ->
            progress: &mut dyn FnMut(&Counts, &str), stop: &dyn Fn() -> bool) -> Result<Outcome> {
     pd::check_name(&s.name)?;
     check_id(&s.id)?;
-    let att = read_attestation(&s.spec, s.attestation.as_deref())?;
+    let dir = s.quarantine();
+    // a resumed import keeps the source and the attestation it started with (read again: it must still hold)
+    let stored: Option<State> = std::fs::read_to_string(dir.join(STATE)).ok().map(|t| serde_json::from_str(&t)).transpose()?;
+    let (spec, att_file) = match stored.as_ref().and_then(|st| st.spec.clone().map(|v| (v, st.attestation.clone()))) {
+        Some((v, a)) => (spec_from(&v)?, a.map(PathBuf::from)),
+        None => (s.spec.clone(), s.attestation.clone()),
+    };
+    let att = read_attestation(&spec, att_file.as_deref())?;
     if s.dataset().join(pd::CARD).exists() {
         bail!("{}: a private dataset of this name exists; pick another name", s.dataset().display());
     }
-    if let Spec::Folder(d) = &s.spec {
+    if let Spec::Folder(d) = &spec {
         let (dc, rc) = (d.canonicalize().with_context(|| format!("{}", d.display()))?, s.root.canonicalize().unwrap_or(s.root.clone()));
         if dc.starts_with(&rc) || rc.starts_with(&dc) {
             bail!("{}: the source may not be the private folder or contain it", d.display());
@@ -662,30 +697,29 @@ pub fn run(s: &Settings, net: Option<&Net>, loader: &mut dyn FnMut(CheckKind) ->
     }
     pd::private_dir(&s.root)?;
     pd::private_dir(&s.root.join(QUARANTINE))?;
-    let dir = s.quarantine();
     let audit = Audit::open(&s.root)?;
-    let resumed = dir.join(STATE).is_file();
-    let state = if resumed {
-        let st: State = serde_json::from_str(&std::fs::read_to_string(dir.join(STATE))?)?;
+    let resumed = stored.is_some();
+    let state = if let Some(st) = stored {
         if st.name != s.name {
             bail!("import {} is for the dataset {:?}, not {:?}", s.id, st.name, s.name);
         }
         st
     } else {
-        State { id: s.id.clone(), name: s.name.clone(), source: s.spec.describe(), origin: att.origin.clone(), licence: att.licence.clone(),
-                commit: None, created: now(), status: "fetching".into(), reason: None, counts: Counts::default(), items: vec![], fetched_done: false, done_files: vec![] }
+        State { id: s.id.clone(), name: s.name.clone(), source: spec.describe(), origin: att.origin.clone(), licence: att.licence.clone(),
+                commit: None, created: now(), status: "fetching".into(), reason: None, counts: Counts::default(), items: vec![], fetched_done: false,
+                done_files: vec![], spec: Some(spec_value(&spec)), attestation: att_file.as_ref().map(|p| p.display().to_string()), confirm_bytes: s.confirm_bytes }
     };
     for d in [dir.clone(), dir.join("items"), dir.join("incoming")] {
         pd::private_dir(&d)?;
     }
-    let mut r = Run { s, dir: dir.clone(), audit, state, progress };
+    let mut r = Run { s, spec: spec.clone(), dir: dir.clone(), audit, state, progress };
     r.audit.log(&s.id, if resumed { "resume" } else { "start" }, json!({"source": r.state.source, "name": s.name,
         "attestation": {"adults_only": true, "consent": true, "licence": att.licence}}))?;
     r.state.save(&dir)?;
 
     // 1. into quarantine
     if !r.state.fetched_done {
-        let fetched = match &s.spec {
+        let fetched = match &spec {
             Spec::Folder(src) => r.walk(src, stop),
             _ => match net {
                 Some(n) => r.fetch_network(n, stop),

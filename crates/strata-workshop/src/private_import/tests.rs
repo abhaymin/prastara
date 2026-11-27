@@ -190,9 +190,9 @@ fn a_file_that_disappears_mid_walk_is_skipped() {
     pd::private_dir(&s.quarantine().join("items")).unwrap();
     pd::private_dir(&s.quarantine().join("incoming")).unwrap();
     let st = State { id: s.id.clone(), name: s.name.clone(), source: s.spec.describe(), origin: "x".into(), licence: None, commit: None, created: 0,
-                     status: "fetching".into(), reason: None, counts: Counts::default(), items: vec![], fetched_done: false, done_files: vec![] };
+                     status: "fetching".into(), reason: None, counts: Counts::default(), items: vec![], fetched_done: false, done_files: vec![], spec: None, attestation: None, confirm_bytes: None };
     let mut noop = |_: &Counts, _: &str| {};
-    let mut r = Run { s: &s, dir: s.quarantine(), audit: Audit::open(&s.root).unwrap(), state: st, progress: &mut noop };
+    let mut r = Run { s: &s, spec: s.spec.clone(), dir: s.quarantine(), audit: Audit::open(&s.root).unwrap(), state: st, progress: &mut noop };
     let listed = vec![sc.src().join("b-000.png"), sc.src().join("b-001.png")];
     std::fs::remove_file(&listed[0]).unwrap(); // gone between the listing and the copy
     r.copy_listed(&listed, &|| false).unwrap();

@@ -4825,7 +4825,7 @@ async function wsFiles() {
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", "private-data": "private", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", pack: "pack", regress: "test", "grade-train": "grade"};
+const WS_STEP_OF = {datagen: "data", "private-data": "private", "private-import": "private", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", pack: "pack", regress: "test", "grade-train": "grade"};
 const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.model || r.seeds || (r.sources || [])[0] || (r.inputs || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
@@ -4916,6 +4916,7 @@ async function refreshJobs(pushed = null) {
     wsAblitRefresh(jobs);
     wsTestRefresh(jobs);
     wsGradeRefresh(jobs);
+    wsPiRefresh(jobs);
     // something a job just made appears in the pickers and the overview
     const made = jobs.filter((x) => x.state === "done").map(wsJobOut).join("\n");
     if (made !== ws.made) { const first = ws.made === undefined; ws.made = made; if (!first) wsFiles(); else wsOverview(); }
@@ -5232,6 +5233,78 @@ $("ws-private").onclick = (e) => {
   wsSubmit({kind: "private-data", name: $("ws-p-name").value.trim(), sources: wsLines("ws-p-sources"), model: $("ws-p-model").value.trim(),
     text_count: n("ws-p-count"), every_s: n("ws-p-every"), max_frames: n("ws-p-frames")}, e.currentTarget);
 };
+
+// ------------------------------------------------------------------ Workshop: private import (docs/internal/PRIVATE-DATA.md)
+// The source and its size go in a confirm dialog first; nothing is fetched before the yes. Only counts and reasons are
+// shown: never an item, a file name or a preview of anything in quarantine or in a private dataset.
+const WS_PI_HINT = {folder: ["a folder inside the Workshop's folders", "/mnt/nas-download/my-set"],
+  url: ["a direct https link to an archive or a file", "https://example.com/set.zip"], hf: ["a Hugging Face dataset id", "owner/name"]};
+$("ws-pi-kind").onchange = () => {
+  const k = $("ws-pi-kind").value;
+  $("ws-pi-src-hint").textContent = WS_PI_HINT[k][0];
+  $("ws-pi-src").placeholder = WS_PI_HINT[k][1];
+  for (const el of document.querySelectorAll("[data-pi-hf]")) el.hidden = k !== "hf";
+};
+function wsPiSource() {
+  const k = $("ws-pi-kind").value, v = $("ws-pi-src").value.trim();
+  if (k === "hf") return {hf: v, revision: $("ws-pi-rev").value.trim() || undefined, pattern: $("ws-pi-pattern").value.trim() || undefined};
+  return {[k]: v};
+}
+async function wsPiStart(body, btn) {
+  wsError("");
+  for (const k of Object.keys(body)) if (body[k] === "" || body[k] === undefined) delete body[k];
+  btn.disabled = true;
+  try {
+    // never sent to another machine: no "node", whatever the Run on choice is
+    const j = await wsFetch("v1/workshop/jobs", {method: "POST", body: JSON.stringify(body)});
+    toast("success", `Job #${j.id} queued`, "private import: its counts show below");
+    refreshJobs();
+  } catch (e) { wsError(e.message); }
+  finally { btn.disabled = false; }
+}
+$("ws-pi-go").onclick = async (e) => {
+  const btn = e.currentTarget, name = $("ws-pi-name").value.trim(), source = wsPiSource();
+  if (!name || !Object.values(source)[0]) { wsError("Give the import a name and a source."); return; }
+  wsError("");
+  btn.disabled = true;
+  let p;
+  try { p = await wsFetch("v1/workshop/private-import/probe", {method: "POST", body: JSON.stringify({source})}); }
+  catch (err) { wsError(err.message); btn.disabled = false; return; }
+  btn.disabled = false;
+  const what = p.network ? "Fetch" : "Copy";
+  if (!confirm(`${what} this source into the private quarantine?\n\n${p.what}\n${fmtBytes(p.bytes || 0)} (${p.bytes} bytes) in ${p.files} files` +
+    `${p.commit ? `\ncommit ${p.commit}` : ""}\n\nNothing is released until every item has passed the checks on this PC.`)) return;
+  wsPiStart({kind: "private-import", name, source, attestation: $("ws-pi-attest").value.trim(), confirm_bytes: p.bytes}, btn);
+};
+const wsPiCounts = (c) => c ? `fetched ${c.fetched ?? 0} · checked ${c.checked ?? 0} of ${c.items ?? 0} · rejected ${c.rejected ?? 0} · ` +
+  `deleted ${c.deleted ?? 0} · released ${c.released ?? 0}` : "";
+let wsPiAt = 0;
+async function wsPiRefresh(jobs) {
+  const live = jobs.filter((x) => x.kind === "private-import" && (x.state === "running" || x.state === "queued"));
+  const last = jobs.find((x) => x.kind === "private-import");
+  const job = live[0] || last;
+  $("ws-pi-status").innerHTML = job ? `<p><strong>#${job.id} ${esc(job.state)}</strong>${job.progress?.counts ? ` · ${esc(wsPiCounts(job.progress.counts))}` : ""}</p>` +
+    (job.state === "failed" && job.error ? `<p class="muted">Stopped: ${esc(job.error)}</p>` : "") : "";
+  if (Date.now() - wsPiAt < 3000 && live.length) return;
+  wsPiAt = Date.now();
+  let l;
+  try { l = await wsFetch("v1/workshop/private-imports"); } catch (e) { return; }
+  const rows = (l.imports || []).map((i) => `<li><span class="mono">${esc(i.id)}</span> · ${esc(i.status)} · ${esc(wsPiCounts(i.counts))}` +
+    (i.reason ? `<br><span class="muted">${esc(i.reason)}</span>` : "") +
+    (live.length ? "" : ` <button type="button" class="st-btn st-btn--ghost" data-pi-resume="${esc(i.id)}" data-pi-name="${esc(i.name)}">Check again</button>` +
+      ` <button type="button" class="st-btn st-btn--ghost" data-pi-discard="${esc(i.id)}">Discard</button>`) + "</li>");
+  const sets = (l.datasets || []).map((d) => `<li><span class="ws-tag ws-tag--private">private</span> <span class="mono">${esc(d.name)}</span></li>`);
+  $("ws-pi-list").innerHTML = (rows.length ? `<p>In quarantine (nothing in it is used or shown):</p><ul>${rows.join("")}</ul>` : "") +
+    (sets.length ? `<p>Released:</p><ul>${sets.join("")}</ul>` : "") +
+    `<p class="muted">Check models go in <code>${esc(l.check_models || "")}</code> (see docs/internal/PRIVATE-DATA.md).</p>`;
+  for (const b of document.querySelectorAll("[data-pi-resume]")) b.onclick = (e) =>
+    wsPiStart({kind: "private-import", name: b.dataset.piName, resume: b.dataset.piResume}, e.currentTarget);
+  for (const b of document.querySelectorAll("[data-pi-discard]")) b.onclick = async () => {
+    if (!confirm(`Delete everything import ${b.dataset.piDiscard} holds in quarantine? It cannot be undone.`)) return;
+    try { await wsFetch(`v1/workshop/private-imports/${encodeURIComponent(b.dataset.piDiscard)}/discard`, {method: "POST"}); } catch (e) { wsError(e.message); }
+    wsPiAt = 0; refreshJobs();
+  };
+}
 
 // ------------------------------------------------------------------ Workshop: cleaning a dataset
 const wsLines = (id) => $(id).value.split("\n").map((x) => x.trim()).filter(Boolean);

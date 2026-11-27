@@ -107,6 +107,11 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
+// the private-data import (docs/internal/PRIVATE-DATA.md): its job, probe, list and discard
+mod private_import;
+pub use private_import::{discard_post as private_import_discard_post, in_quarantine, list_get as private_imports_get,
+                         probe_post as private_import_probe_post};
+
 const KINDS: [&str; 15] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "pack", "datagen", "clean", "regress", "grade-train",
                            "refusal-check"];
 
@@ -207,6 +212,11 @@ fn mark_config(path: &Path, m: &Marks) -> Result<(), String> {
         cfg["abliterated"] = json!(true);
     }
     std::fs::write(path, serde_json::to_string_pretty(&cfg).unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// The private folder of this server's Workshop (`<data>/private`).
+pub fn private_root_of(w: &Workshop) -> PathBuf {
+    private_root(&w.data_dir())
 }
 
 /// Where private datasets go: `<data>/private`, made 0700 (only the owner may enter).
@@ -426,6 +436,11 @@ impl Workshop {
         };
         if let Some(why) = sensitive(&resolved).or_else(|| sensitive(&path)) {
             return Err(format!("{p}: {why}; the Workshop never touches these"));
+        }
+        // a private import's quarantine: nothing in it is read, listed or written by any job until it is checked and
+        // released (the import job itself works there through its own command, never through this check)
+        if in_quarantine(&resolved) || in_quarantine(&path) {
+            return Err(format!("{p}: refused, it is in the private quarantine; nothing in quarantine is used until it is checked and released"));
         }
         if !self.roots.iter().any(|r| resolved.starts_with(r)) {
             return Err(format!("{p} is outside the Workshop's folders ({}); add its folder to \"workshop\": {{\"dirs\": [...]}} in the run config",
@@ -1151,6 +1166,14 @@ impl Workshop {
                         args.extend([format!("--{k}"), v.chars().take(200).collect()]);
                     }
                 }
+                // private sources: never a remote model or a mix, and every chat marked local-only (no worker, no overflow)
+                let inputs: Vec<PathBuf> = sources.iter().cloned().chain(seeds.clone()).collect();
+                if let Some(why) = Self::private_input(&inputs) {
+                    if let Some(m) = s("model").filter(|m| !self.local_model(m)) {
+                        return Err(format!("{why}: refused, private data never goes to a remote model or a mix ({m:?}); write with a local model"));
+                    }
+                    args.push("--local-only".into());
+                }
                 Ok((kind.into(), args, output))
             }
             "clean" => {
@@ -1328,6 +1351,24 @@ impl Workshop {
                     (Value::String(_), _) => {}
                     _ => return Err("\"engine_gguf\" is the path of a .gguf file".into()),
                 }
+                // private test data or prompts: the judge must be a local model, and every chat stays on this machine
+                let mut inputs = vec![suite.clone()];
+                let sv: Value = std::fs::read_to_string(&suite).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+                let base = suite.parent().map(Path::to_path_buf).unwrap_or_default();
+                inputs.extend(sv["tests"].as_array().into_iter().flatten().filter_map(|t| t["data"].as_str())
+                    .map(|d| if Path::new(d).is_absolute() { PathBuf::from(d) } else { base.join(d) }));
+                if kind == "grade-train" {
+                    if let Some(d) = s("data").and_then(|d| self.dataset_path(d).ok()) {
+                        inputs.push(d);
+                    }
+                }
+                if let Some(why) = Self::private_input(&inputs) {
+                    let judge = s("judge_model").or(sv["judge_model"].as_str().filter(|m| !m.is_empty()));
+                    if let Some(m) = judge.filter(|m| !self.local_model(m)) {
+                        return Err(format!("{why}: refused, private data never goes to a remote model or a mix ({m:?}); judge with a local model"));
+                    }
+                    args.push("--local-only".into());
+                }
                 let stem = |p: &Path| p.file_name().and_then(|x| x.to_str()).unwrap_or("model").to_string();
                 if kind == "regress" {
                     let against: Vec<&str> = match &req["against"] {
@@ -1444,6 +1485,7 @@ impl Workshop {
                 Ok((kind.into(), args, output))
             }
             "private-data" => self.plan_private(req),
+            "private-import" => self.plan_import(req),
             other => Err(format!("unknown kind {other:?}: {}", KINDS.join(", "))),
         }
     }
@@ -1671,6 +1713,10 @@ impl Workshop {
                             j.log.push(format!("[{}/{}] {m}", ev["done"], ev["total"]));
                         }
                         j.progress = Some(json!({"done": ev["done"], "total": ev["total"], "message": ev["message"]}));
+                        // a private import's counts (fetched, checked, rejected, deleted, released)
+                        if ev["counts"].is_object() {
+                            if let Some(p) = j.progress.as_mut() { p["counts"] = ev["counts"].clone(); p["import"] = ev["import"].clone(); }
+                        }
                     }
                     Some("error") => j.error = ev["message"].as_str().map(str::to_string),
                     _ => j.log.push(l.clone()),
@@ -1867,6 +1913,9 @@ impl Workshop {
             let Ok(rd) = std::fs::read_dir(d) else { return };
             for e in rd.flatten() {
                 let p = e.path();
+                if in_quarantine(&p) {
+                    continue;
+                }
                 if p.is_dir() {
                     let modified = |p: &Path| p.metadata().ok().and_then(|m| m.modified().ok())
                         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());
@@ -2309,6 +2358,8 @@ pub async fn browse_get(State(s): State<AppState>, headers: HeaderMap,
         if name.starts_with('.') || name.ends_with(".part") { return None; }
         let p = e.path();
         if sensitive(&p).is_some() { return None; }
+        // a private quarantine is never listed (nothing in it is shown before its release)
+        if in_quarantine(&p) { return None; }
         let m = e.metadata().ok();
         let is_dir = p.is_dir();
         let modified = m.as_ref().and_then(|m| m.modified().ok()).and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs());

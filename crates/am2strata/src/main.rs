@@ -722,6 +722,9 @@ async fn main() -> Result<()> {
         .route("/v1/workshop/browse", get(workshop::browse_get))
         .route("/v1/workshop/estimate", axum::routing::post(workshop::estimate_post))
         .route("/v1/workshop/dataset", get(workshop::dataset_get).post(workshop::dataset_post))
+        .route("/v1/workshop/private-import/probe", axum::routing::post(workshop::private_import_probe_post))
+        .route("/v1/workshop/private-imports", get(workshop::private_imports_get))
+        .route("/v1/workshop/private-imports/{id}/discard", axum::routing::post(workshop::private_import_discard_post))
         .route("/api/tls", get(web::tls_get).post(web::tls_post))
         // remote models: the owner's page and its API (remote/api.rs), linked from nowhere
         .route("/rtenai", get(remote::api::page))

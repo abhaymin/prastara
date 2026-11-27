@@ -692,6 +692,43 @@ origin = "my own photos, 2026"</pre>
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-private">Build private dataset</button></div>
           </div>
+          <div class="st-card ws-block ws-private" id="ws-pi">
+            <h4>Import a dataset</h4>
+            <p class="muted small">Bring in an adult dataset of your own: a folder (a read-only NAS mount too, never written to), a
+              direct https link to an archive or file, or a Hugging Face dataset. Everything lands in a locked quarantine
+              (<code>private/quarantine</code>); nothing in it can be cleaned, trained on or shown. Each item is then checked on
+              this PC (the blocklist, minor safety for images and text, the age estimate, real people), and only what passed is
+              released to <code>private/datasets/&lt;name&gt;</code>. Nothing is fetched until you confirm the source and its size.</p>
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-pi-name">Name <output>letters, digits, - and _</output></label>
+                <input class="st-input mono" id="ws-pi-name" autocomplete="off" placeholder="my-import"></div>
+              <div class="ws-field"><label class="st-label" for="ws-pi-kind">Source</label>
+                <select class="st-input" id="ws-pi-kind"><option value="folder">A folder</option><option value="url">An https link</option><option value="hf">A Hugging Face dataset</option></select></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-pi-src">Where <output id="ws-pi-src-hint">a folder inside the Workshop's folders</output></label>
+                <input class="st-input mono" id="ws-pi-src" autocomplete="off" placeholder="/mnt/nas-download/my-set"></div>
+              <div class="ws-field" data-pi-hf hidden><label class="st-label" for="ws-pi-rev">Revision</label>
+                <input class="st-input mono" id="ws-pi-rev" autocomplete="off" placeholder="main"></div>
+              <div class="ws-field" data-pi-hf hidden><label class="st-label" for="ws-pi-pattern">Files <output>a pattern</output></label>
+                <input class="st-input mono" id="ws-pi-pattern" autocomplete="off" placeholder="data/*.zip"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-pi-attest">SOURCE.toml <output>needed for a link or a Hub dataset</output></label>
+                <input class="st-input mono" id="ws-pi-attest" autocomplete="off" placeholder="default: the folder's own SOURCE.toml"></div>
+              <details class="ws-more ws-field--wide small"><summary>What its <code>SOURCE.toml</code> says</summary>
+                <pre class="mono small">owner_attests_adults_only = true
+owner_attests_consent = true
+origin = "where it came from"
+licence = "its licence"            # a link or a Hub dataset
+url = "https://..."                # or: hf = "owner/name", or: folder = "/mnt/..."</pre>
+                <p class="muted small">A SOURCE.toml outside the folder must name the source it is for. Without one, nothing is read.</p>
+              </details>
+              <p class="ws-field--wide muted small">Fixed checks you cannot turn off: an item flagged as involving a minor is deleted at
+                once and its hash blocked; if more than 1&nbsp;% of a source is flagged, the whole import is rejected and its quarantine
+                deleted. A check model that is not installed, an error or a timeout stops the import in quarantine: nothing is
+                released. Items are never previewed here.</p>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-pi-go">Check the size and import…</button></div>
+            <div id="ws-pi-status" class="small" aria-live="polite"></div>
+            <div id="ws-pi-list" class="small"></div>
+          </div>
           </div>
         </section>
         <section class="ws-panel" data-ws-panel="review" hidden>
