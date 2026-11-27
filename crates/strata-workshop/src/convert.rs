@@ -247,7 +247,8 @@ type TensorF32 = (Vec<usize>, Vec<f32>);
 pub fn read_tensors(dir: &Path) -> Result<BTreeMap<String, TensorF32>> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors"))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors")
+                    && p.file_name().and_then(|s| s.to_str()) != Some(crate::carry::DIRECTION_FILE))
         .collect();
     files.sort();
     if files.is_empty() {
@@ -903,7 +904,7 @@ pub fn convert_qwen3(dir: &Path, out: &Path, outtype: OutType, pre_tokenizer: Op
     // the weights: every shard but the loop's gates
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors")
-                    && p.file_name().and_then(|s| s.to_str()) != Some(crate::model::LOOP_FILE)).collect();
+                    && !matches!(p.file_name().and_then(|s| s.to_str()), Some(crate::model::LOOP_FILE | crate::carry::DIRECTION_FILE))).collect();
     files.sort();
     anyhow::ensure!(!files.is_empty(), "{d}: no *.safetensors shards found");
     let shards: Vec<safetensors_io::Shard> = files.iter().map(|f| safetensors_io::Shard::open(f)).collect::<Result<_>>()?;
@@ -1051,7 +1052,8 @@ pub const PRIVATE_KEY: &str = "prastara.private";
 pub const ABLITERATED_KEY: &str = "prastara.abliterated";
 
 /// The marks a folder's config.json carries into its GGUF: `"prastara_private": true` as [`PRIVATE_KEY`], and a
-/// `"prastara_abliterated"` block as [`ABLITERATED_KEY`] (true) and `prastara.abliterated.layer` / `.scale`.
+/// `"prastara_abliterated"` block as [`ABLITERATED_KEY`] (true) and `prastara.abliterated.layer` / `.scale` (and
+/// `.carried` for a model trained from an abliterated base, [`crate::carry`]).
 pub fn prastara_marks(c: &Json) -> Vec<(String, Kv)> {
     let mut kv = vec![];
     let abl = &c["prastara_abliterated"];
@@ -1065,6 +1067,10 @@ pub fn prastara_marks(c: &Json) -> Vec<(String, Kv)> {
         }
         if let Some(s) = abl["scale"].as_f64() {
             kv.push((format!("{ABLITERATED_KEY}.scale"), Kv::F32(s as f32)));
+        }
+        // a model trained from an abliterated base: whether its adapter's changes were kept off the direction (crate::carry)
+        if let Some(c) = abl["carried"].as_bool() {
+            kv.push((format!("{ABLITERATED_KEY}.carried"), Kv::Bool(c)));
         }
     }
     kv

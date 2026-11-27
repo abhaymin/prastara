@@ -4008,6 +4008,7 @@ dependencies = [
 name = "strata-workshop"
 version = "0.2.0"
 dependencies = [
+ "am2pack",
  "anyhow",
  "base64 0.22.1",
  "candle-core-mold",
