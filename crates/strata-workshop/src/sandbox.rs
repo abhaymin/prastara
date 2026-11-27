@@ -178,6 +178,9 @@ pub fn run(program: &Path, args: &[&str], dir: &Path, stdin: &[u8], limits: &Lim
                     if libc::setrlimit(what, &r) != 0 { Err(std::io::Error::last_os_error()) } else { Ok(()) }
                 };
                 set(libc::RLIMIT_CPU, l.cpu_seconds, l.cpu_seconds + 1)?;
+                // macOS refuses a lower RLIMIT_AS/RLIMIT_DATA (EINVAL) and does not enforce them: there the parent
+                // watches the child's resident memory instead (below)
+                #[cfg(not(target_os = "macos"))]
                 set(if l.limit_address_space { libc::RLIMIT_AS } else { libc::RLIMIT_DATA }, l.memory_bytes, l.memory_bytes)?;
                 set(libc::RLIMIT_FSIZE, l.file_bytes, l.file_bytes)?;
                 set(libc::RLIMIT_CORE, 0, 0)?;
@@ -207,7 +210,15 @@ pub fn run(program: &Path, args: &[&str], dir: &Path, stdin: &[u8], limits: &Lim
     let err = read_capped(child.stderr.take().unwrap(), limits.output_bytes);
     let deadline = Duration::from_secs_f64(limits.wall_seconds.max(0.1));
     let mut timed_out = false;
+    let mut memory_killed = false;
     let status = loop {
+        #[cfg(target_os = "macos")]
+        if resident_bytes(pid).is_some_and(|b| b > limits.memory_bytes) {
+            memory_killed = true;
+            unsafe { libc::kill(-pid, libc::SIGKILL); }
+            let _ = child.kill();
+            break child.wait().ok();
+        }
         match child.try_wait() {
             Ok(Some(s)) => break Some(s),
             Ok(None) if t0.elapsed() >= deadline => {
@@ -229,7 +240,9 @@ pub fn run(program: &Path, args: &[&str], dir: &Path, stdin: &[u8], limits: &Lim
     let stderr = String::from_utf8_lossy(&err.join().unwrap_or_default()).into_owned();
     let seconds = t0.elapsed().as_secs_f64();
     let oom = |e: &str| e.contains("MemoryError") || e.contains("memory allocation of") || e.contains("Cannot allocate memory") || e.contains("std::bad_alloc");
-    let ending = if timed_out {
+    let ending = if memory_killed {
+        Ending::Memory
+    } else if timed_out {
         Ending::WallTime
     } else {
         match status {
@@ -261,6 +274,16 @@ pub fn run(program: &Path, args: &[&str], dir: &Path, stdin: &[u8], limits: &Lim
         }
     };
     Outcome { ending, stdout, stderr, seconds, network_isolated: isolate }
+}
+
+/// The resident memory of process `pid` (macOS, where the memory rlimits are not enforced): the sandbox's limit
+/// there counts the child itself, not the processes it starts.
+#[cfg(target_os = "macos")]
+fn resident_bytes(pid: i32) -> Option<u64> {
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_taskinfo>() as i32;
+    let n = unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTASKINFO, 0, &mut info as *mut _ as *mut libc::c_void, size) };
+    (n == size).then_some(info.pti_resident_size)
 }
 
 /// `name` on the PATH, if it is there.

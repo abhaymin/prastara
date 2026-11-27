@@ -121,7 +121,8 @@ fn at_the_start_the_mixture_is_the_dense_base() {
         assert!(!m.lora_vars().iter().any(|(n, _)| n.ends_with("layers.0.mlp.up_proj.lora_A.weight")), "the feed-forward adapters are the experts'");
         let d = max_diff(&logits(&m), &base);
         if k == 1 {
-            assert_eq!(d, 0.0, "top-1: the weight is exactly 1, the logits are the base's bit for bit");
+            // bit for bit on Linux; macOS's CPU kernels sum the expert's product in another order (7e-7 seen)
+            assert!(d <= 1e-6, "top-1: the weight is exactly 1, the logits are the base's: {d}");
         } else {
             assert!(d < 1e-5, "top-{k}: {d}");
         }
