@@ -622,6 +622,8 @@ pub struct Report {
     pub languages: BTreeMap<String, usize>,
     pub excluded_rows: usize,
     pub tokens: bool,
+    /// an input is a private dataset (crate::private_data): every kept row and the card are marked private
+    pub private: bool,
 }
 
 fn clip(s: &str, n: usize) -> String {
@@ -642,7 +644,11 @@ pub fn run(s: &Settings, mut event: impl FnMut(Value)) -> Result<Report> {
         Some(m) => Some(ChatTokenizer::load(m, s.chat_template.as_deref()).with_context(|| format!("the tokenizer of {}", m.display()))?),
         None => None,
     };
-    let mut rep = Report { tokens: tok.is_some(), ..Default::default() };
+    let private = s.inputs.iter().any(|p| crate::private_data::is_private_dataset(p));
+    let mut rep = Report { tokens: tok.is_some(), private, ..Default::default() };
+    if private {
+        event(json!({"event": "log", "message": "an input is private: the cleaned rows and the card are marked private"}));
+    }
     let name = |p: &Path| p.file_name().and_then(|x| x.to_str()).unwrap_or("?").to_string();
 
     // the held-out rows: their prompts, conversations and signatures
@@ -784,7 +790,11 @@ pub fn run(s: &Settings, mut event: impl FnMut(Value)) -> Result<Report> {
     let mut out = String::new();
     for (i, len) in &kept {
         let row = &rows[*i];
-        out.push_str(&row.raw);
+        if private {
+            out.push_str(&crate::private_data::mark_row(&row.raw));
+        } else {
+            out.push_str(&row.raw);
+        }
         out.push('\n');
         rep.sources[row.source].kept += 1;
         *rep.languages.entry(row.language().unwrap_or_else(|| "unknown".into())).or_default() += 1;
@@ -806,6 +816,14 @@ pub fn run(s: &Settings, mut event: impl FnMut(Value)) -> Result<Report> {
         event(json!({"event": "log", "message": format!("{} kept rows are longer than {} tokens: the trainer cuts their tail", rep.cut, s.max_len)}));
     }
     std::fs::write(s.card_path(), card(s, &rep)).with_context(|| format!("writing {}", s.card_path().display()))?;
+    #[cfg(unix)]
+    if private {
+        // only the owner reads a private dataset
+        use std::os::unix::fs::PermissionsExt as _;
+        for p in [&s.out, &s.card_path()] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600)).ok();
+        }
+    }
     Ok(rep)
 }
 
@@ -819,7 +837,13 @@ fn shuffle<T>(v: &mut [T], d: &mut Draw) {
 /// The card: sources, settings, the count per rule, examples of each.
 pub fn card(s: &Settings, r: &Report) -> String {
     let name = s.out.file_name().and_then(|x| x.to_str()).unwrap_or("dataset");
-    let mut o = format!("# Dataset card: {name}\n\nCleaned by Prastara's Workshop (`am2strata-workshop clean`): {} rows read, **{} kept**.\n\n", r.read, r.kept);
+    let mut o = if r.private {
+        format!("{}\n**Private.** Cleaned from a private dataset: it stays on this PC, and every row carries `\"private\": true`.\n\n",
+                crate::private_data::CARD_MARK)
+    } else {
+        String::new()
+    };
+    o.push_str(&format!("# Dataset card: {name}\n\nCleaned by Prastara's Workshop (`am2strata-workshop clean`): {} rows read, **{} kept**.\n\n", r.read, r.kept));
     o.push_str("## Sources\n\n| File | Rows | Kept | Licence | Written by |\n|---|---:|---:|---|---|\n");
     for sc in &r.sources {
         let f = Path::new(&sc.path).file_name().and_then(|x| x.to_str()).unwrap_or(&sc.path);
