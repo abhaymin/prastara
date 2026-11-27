@@ -268,6 +268,23 @@ pub struct TrainReport {
     pub stream: Option<StreamStats>,
 }
 
+/// A test hook: the micro-step with this number fails, after its backward pass, as if the device had run out of
+/// memory (`usize::MAX`: never), [`INJECT_OOM_TIMES`] times. One failure is retried and must give the run it would
+/// have had; two end the run.
+pub static INJECT_OOM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+pub static INJECT_OOM_TIMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// Whether `e` is a device's out-of-memory error (CUDA's or cuBLAS's, as candle and cudarc word them, or Metal's).
+/// Not sticky on CUDA: the context stays usable, so the micro-step can run again.
+pub fn is_out_of_memory(e: &anyhow::Error) -> bool {
+    let t = format!("{e:#}");
+    t.contains("CUDA_ERROR_OUT_OF_MEMORY") || t.contains("CUBLAS_STATUS_ALLOC_FAILED") || t.contains("out of memory") && (t.contains("CUDA") || t.contains("cuda") || t.contains("Metal"))
+}
+
+fn first_line(e: &anyhow::Error) -> String {
+    format!("{e:#}").lines().next().unwrap_or("").chars().take(160).collect()
+}
+
 /// A run of at most this many steps reports every step's loss, whatever `logging_steps` says.
 pub const SHORT_RUN_STEPS: usize = 50;
 
@@ -652,6 +669,58 @@ impl Runner {
         self.orders.entry(epoch).or_insert_with(|| permutation(seed, epoch as u64 + 1, n))[m % n]
     }
 
+    /// Micro-step `m` of step `step`: its loss, router loss, tokens and each variable's gradient (in `vars` order).
+    /// Nothing of the run's state changes here except the memory trace, so a failed micro-step can be run again.
+    fn micro(&mut self, step: usize, m: usize, lr: f64) -> Result<(f64, Option<f64>, u64, Vec<Option<Tensor>>)> {
+        let index = self.example_at(m);
+        let ex = self.data.train[index].clone();
+        let h = self.hidden(&ex)?;
+        let mut dropout_seed = self.seed ^ (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        let ctx = Ctx::train(splitmix(&mut dropout_seed));
+        let loss = self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &ctx)?;
+        let value = loss.to_scalar::<f32>()? as f64;
+        if !value.is_finite() {
+            bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
+        }
+        let grads = loss.backward()?;
+        if INJECT_OOM.load(std::sync::atomic::Ordering::Relaxed) == m {
+            if INJECT_OOM_TIMES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 1 {
+                INJECT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+            }
+            bail!("injected for a test: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")");
+        }
+        // with checkpointing, the adapters inside a recomputed block get their gradient there
+        let extra = self.model.take_checkpoint_grads();
+        drop(loss);
+        let mut mine: Vec<Option<Tensor>> = Vec::with_capacity(self.vars.len());
+        for var in &self.vars {
+            let id = var.as_tensor().id();
+            let mut acc: Option<Tensor> = None;
+            for g in grads.get(var).into_iter().chain(extra.iter().filter(|(v, _)| v.as_tensor().id() == id).map(|(_, g)| g)) {
+                acc = Some(match acc {
+                    Some(a) => (a + g)?,
+                    None => g.clone(),
+                });
+            }
+            mine.push(acc);
+        }
+        drop((grads, extra, h));
+        // the backward pass's buffers are free now: let the devices' memory pools take them back
+        self.model.synchronize()?;
+        let marks = self.model.memory_marks(true);
+        if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
+            let mib = |b: u64| b >> 20;
+            let line = format!("step {} micro {m} tokens {} | {}\n", step + 1, ex.tokens.len(),
+                marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
+            use std::io::Write as _;
+            if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                let _ = f.write_all(line.as_bytes());
+            }
+        }
+        Ok((value, ctx.aux_loss(), ex.tokens.len() as u64, mine))
+    }
+
     /// One optimizer step at rate `lr` over micro-batches `step·accumulation ..`, as many as `count`. Returns the mean
     /// loss before the update. A loss that is not a number stops the run without touching the adapters.
     fn step(&mut self, step: usize, count: usize, lr: f64) -> Result<f64> {
@@ -661,49 +730,40 @@ impl Runner {
         let mut aux_sum: Option<f64> = None;
         for k in 0..count {
             let m = step * self.accumulation + k;
-            let index = self.example_at(m);
-            let ex = self.data.train[index].clone();
-            let h = self.hidden(&ex)?;
-            let mut dropout_seed = self.seed ^ (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-            let ctx = Ctx::train(splitmix(&mut dropout_seed));
-            let loss = self.model.loss_from_hidden(&h, &ex.tokens, &ex.supervised, &ctx)?;
-            let value = loss.to_scalar::<f32>()? as f64;
-            if !value.is_finite() {
-                bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
-            }
+            // a micro-step that runs out of device memory is thrown away whole (its loss, its gradients, those the
+            // checkpoint replays left) and run again once, after the pools are trimmed; the step's sums only take a
+            // micro-step's results once all of it has succeeded, so nothing is counted twice
+            let mut attempt = 0;
+            let (value, aux, tokens, next) = loop {
+                let tried = self.micro(step, m, lr).and_then(|(value, aux, tokens, grads)| {
+                    let next = sum.iter().zip(grads).map(|(acc, g)| -> Result<Option<Tensor>> {
+                        Ok(match (acc, g) {
+                            (Some(a), Some(g)) => Some((a + g)?),
+                            (a, g) => a.clone().or(g),
+                        })
+                    }).collect::<Result<Vec<_>>>()?;
+                    Ok((value, aux, tokens, next))
+                });
+                match tried {
+                    Ok(r) => break r,
+                    Err(e) if attempt == 0 && is_out_of_memory(&e) => {
+                        attempt += 1;
+                        drop(self.model.take_checkpoint_grads());
+                        self.model.synchronize()?;
+                        let marks = self.model.memory_marks(false);
+                        self.pending.push(format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped, the pools trimmed{}, trying it once more",
+                            step + 1, first_line(&e), if marks.is_empty() { String::new() } else {
+                                format!(" (reserved now {})", marks.iter().map(|(_, r)| format!("{} MiB", r >> 20)).collect::<Vec<_>>().join(", ")) }));
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+            sum = next;
             loss_sum += value;
-            if let Some(a) = ctx.aux_loss() {
+            if let Some(a) = aux {
                 aux_sum = Some(aux_sum.unwrap_or(0.0) + a);
             }
-            self.tokens_seen += ex.tokens.len() as u64;
-            let grads = loss.backward()?;
-            // with checkpointing, the adapters inside a recomputed block get their gradient there
-            let extra = self.model.take_checkpoint_grads();
-            drop(loss);
-            for (slot, var) in sum.iter_mut().zip(&self.vars) {
-                let id = var.as_tensor().id();
-                let parts = grads.get(var).into_iter().chain(extra.iter().filter(|(v, _)| v.as_tensor().id() == id).map(|(_, g)| g));
-                for g in parts {
-                    *slot = Some(match slot.take() {
-                        Some(acc) => (acc + g)?,
-                        None => g.clone(),
-                    });
-                }
-            }
-            drop((grads, extra, h));
-            // the backward pass's buffers are free now: let the devices' memory pools take them back
-            self.model.synchronize()?;
-            let marks = self.model.memory_marks(true);
-            if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
-                let mib = |b: u64| b >> 20;
-                let line = format!("step {} micro {m} tokens {} | {}\n", step + 1, ex.tokens.len(),
-                    marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
-                use std::io::Write as _;
-                if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
-                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                    let _ = f.write_all(line.as_bytes());
-                }
-            }
+            self.tokens_seen += tokens;
         }
         // the mean gradient over the step's conversations, clipped by its norm over all adapters
         let mut norm_sq = 0.0f64;
@@ -834,6 +894,7 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     };
     s.validate()?;
     let t0 = Instant::now();
+    let trims_at_start = model::TRIMS.load(std::sync::atomic::Ordering::Relaxed);
     let data = prepare_data(s)?;
     for n in &data.notes {
         on_event(Event::Log(n.clone()));
@@ -915,6 +976,11 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         if let Some(note) = crate::layer_stream::host_memory_note() {
             on_event(Event::Log(format!("host memory at the end: {note}")));
         }
+    }
+    let trims = model::TRIMS.load(std::sync::atomic::Ordering::Relaxed) - trims_at_start;
+    if trims > 0 {
+        on_event(Event::Log(format!("{trims} block-boundary trims of the devices' memory pools (reserve more than {} MiB above use)",
+                                    model::trim_gap_bytes() >> 20)));
     }
     let report = TrainReport {
         out: s.out.clone(), steps_done: step, total_steps: total, stopped, losses: losses.clone(), eval_loss: eval, train_examples: n_train,

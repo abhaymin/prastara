@@ -944,6 +944,92 @@ pub enum Mask {
 }
 
 /// Sequences longer than this use [`chunked_attention`] (set lower in tests).
+/// Above this many bytes between a CUDA device's memory-pool reserve and its use, a block boundary (each block's
+/// forward and each checkpoint replay) synchronizes that device and trims its pool ([`trim_if_fragmented`]). The
+/// conversations' different shapes (and an upcycled block's per-group gathers) leave the stream-ordered pool holding
+/// freed pieces no new allocation fits: on the 56B-A5B it reserved 13.2 GB for 8.7 GB in use inside one micro-step and
+/// ran out of memory. `AM2_TRIM_GAP_MB` overrides it once (0: trim at every block).
+pub static TRIM_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// How many block-boundary trims ran (for the log and the tests).
+pub static TRIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The default gap: 1 GiB.
+pub const DEFAULT_TRIM_GAP: u64 = 1 << 30;
+
+/// The gap [`trim_if_fragmented`] trims above, in bytes.
+pub fn trim_gap_bytes() -> u64 {
+    trim_gap()
+}
+
+fn trim_gap() -> u64 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let g = TRIM_GAP.load(Relaxed);
+    if g != u64::MAX {
+        return g;
+    }
+    let g = std::env::var("AM2_TRIM_GAP_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).map_or(DEFAULT_TRIM_GAP, |mb| mb << 20);
+    TRIM_GAP.store(g, Relaxed);
+    g
+}
+
+/// `dev`'s default memory pool's (reserved, used) bytes now, on CUDA.
+#[cfg(feature = "cuda")]
+fn pool_now(cd: &candle_core::CudaDevice) -> Option<(candle_core::cuda_backend::cudarc::driver::sys::CUmemoryPool, u64, u64)> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+    let stream = cd.cuda_stream();
+    let ctx = stream.context();
+    ctx.bind_to_thread().ok()?;
+    unsafe {
+        let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+        if sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()) != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        let get = |a: sys::CUmemPool_attribute| { let mut v: u64 = 0; sys::cuMemPoolGetAttribute(pool, a, &mut v as *mut u64 as *mut _); v };
+        Some((pool, get(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT), get(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT)))
+    }
+}
+
+/// `dev`'s default memory pool's release threshold (CU_MEMPOOL_ATTR_RELEASE_THRESHOLD: the reserve it keeps through a
+/// synchronize), on CUDA; with `set`, set it first.
+pub fn pool_release_threshold(dev: &Device, set: Option<u64>) -> Option<u64> {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(cd) = dev {
+        use candle_core::cuda_backend::cudarc::driver::sys;
+        let (pool, _, _) = pool_now(cd)?;
+        unsafe {
+            if let Some(mut v) = set {
+                sys::cuMemPoolSetAttribute(pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &mut v as *mut u64 as *mut _);
+            }
+            let mut v: u64 = 0;
+            sys::cuMemPoolGetAttribute(pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RELEASE_THRESHOLD, &mut v as *mut u64 as *mut _);
+            return Some(v);
+        }
+    }
+    let _ = (dev, set);
+    None
+}
+
+/// When `dev`'s pool reserves more than [`TRIM_GAP`] above what it uses: wait for the device and give the pool's
+/// unused memory back (`cuMemPoolTrimTo(0)`). Returns whether it trimmed. A no-op off CUDA.
+pub fn trim_if_fragmented(dev: &Device) -> bool {
+    #[cfg(feature = "cuda")]
+    if let Device::Cuda(cd) = dev {
+        let Some((_, reserved, used)) = pool_now(cd) else { return false };
+        if reserved.saturating_sub(used) <= trim_gap() {
+            return false;
+        }
+        if dev.synchronize().is_err() {
+            return false;
+        }
+        if let Some((pool, _, _)) = pool_now(cd) {
+            unsafe { candle_core::cuda_backend::cudarc::driver::sys::cuMemPoolTrimTo(pool, 0) };
+            TRIMS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return true;
+        }
+    }
+    let _ = dev;
+    false
+}
+
 pub static CHUNKED_ABOVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
 /// Queries per chunk of [`chunked_attention`].
 pub static ATTENTION_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(512);
@@ -1486,6 +1572,7 @@ impl CustomOp1 for CheckpointBlock {
 
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let err = |e: anyhow::Error| candle_core::Error::Msg(format!("checkpointed block: {e}"));
+        trim_if_fragmented(arg.device());
         let x = Var::from_tensor(&arg.detach())?;
         let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls), detach: Cell::new(self.detached), ..Ctx::default() };
         let block = match &self.stream {
@@ -2286,6 +2373,7 @@ impl LlamaModel {
     #[allow(clippy::too_many_arguments)]
     fn block_forward(&self, i: usize, pos: Option<(usize, u64)>, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
         let active = self.is_active(i);
+        trim_if_fragmented(&self.devs[self.block_dev[i]]);
         let sref = self.stream.as_ref().filter(|s| s.has_block(i))
             .map(|s| StreamRef { s: s.clone(), block: i, pos: pos.map(|p| p.0), generation: pos.map_or(0, |p| p.1) });
         let fetched;
