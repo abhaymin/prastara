@@ -46,3 +46,5 @@ metal = ["candle-core/metal", "candle-nn/metal"]
 [dev-dependencies]
 # private_data's tests make tiny PNGs
 image = { version = "0.25", default-features = false, features = ["png"] }
+# refusal-check's test builds a Kosha pack to answer from (tests only: the Workshop itself never links the AGPL crate)
+am2pack = { path = "../am2pack" }

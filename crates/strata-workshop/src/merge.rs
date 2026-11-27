@@ -14,6 +14,9 @@
 //!   whose output shape matches the parameter's own `[E, d1, d2]`, refusing a square target its layouts are indistinguishable on.
 //! * **Output** ([`crate::st_writer`]): written a tensor at a time in ~5 GB shards, `model.safetensors` or
 //!   `model-0000i-of-0000n.safetensors` with an index whose `weight_map` names each tensor's file.
+//! * **Abliterated base** ([`crate::carry`]): when the base is marked `prastara_abliterated`, the change of every
+//!   matrix that writes the residual stream is projected off its saved refusal direction before it is added, and the
+//!   output keeps the mark with `"carried": true`; a base without its direction file is refused unless told otherwise.
 //! * **Report** ([`MergeReport`]): per tensor the relative-norm delta `|ΔW|/|W|` — targeted tensors are > 0, untargeted
 //!   ones are exactly 0 (their bytes never left disk).
 
@@ -41,6 +44,10 @@ pub struct TensorDelta {
 pub struct MergeReport {
     pub out_dir: PathBuf,
     pub per_tensor: Vec<TensorDelta>,
+    /// what was done about an abliterated base ([`crate::carry`])
+    pub carry: crate::carry::Report,
+    /// the carry's lines (its loud warning when it was skipped)
+    pub carry_lines: Vec<String>,
 }
 
 /// A LoRA delta pair for one base weight, resolved from the adapter's A/B matrices. The 2-D vs fused-MoE path is chosen by
@@ -67,11 +74,18 @@ pub struct Merger<'a> {
     out_dir: &'a Path,
     scaling_override: Option<f32>,
     shard_bytes: u64,
+    carry: crate::carry::Options,
 }
 
 impl<'a> Merger<'a> {
     pub fn new(base_dir: &'a Path, adapter_dir: &'a Path, out_dir: &'a Path) -> Self {
-        Self { base_dir, adapter_dir, out_dir, scaling_override: None, shard_bytes: st_writer::SHARD_BYTES }
+        Self { base_dir, adapter_dir, out_dir, scaling_override: None, shard_bytes: st_writer::SHARD_BYTES, carry: Default::default() }
+    }
+
+    /// What to do when the base is abliterated (default: project every writer's change off its refusal direction).
+    pub fn set_carry(&mut self, c: crate::carry::Options) -> &mut Self {
+        self.carry = c;
+        self
     }
 
     /// Force a scaling factor instead of the one in `adapter_config.json` (used by the rsLoRA gate to prove the default
@@ -98,6 +112,10 @@ impl<'a> Merger<'a> {
         let shard_files = crate::model::weight_files(self.base_dir)?;
 
         let adapters = load_adapters(self.adapter_dir)?;
+        // an abliterated base: decided (and a missing direction refused) before anything is written
+        let base_cfg: Value = std::fs::read_to_string(self.base_dir.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let plan = crate::carry::plan(self.base_dir, &base_cfg, &self.carry)?;
+        let mut carry = crate::carry::Report { state: plan.state().into(), ..Default::default() };
         // every output tensor keeps its name, dtype and shape: the writer plans ~5 GB shards from the list, then each
         // tensor is read off its shard's mmap, folded when targeted, and written before the next is read
         let mut specs = Vec::new();
@@ -119,7 +137,7 @@ impl<'a> Merger<'a> {
                     }
                     Some(ad) => {
                         let base = to_f32s(&wt.name, wt.dtype, wt.bytes)?;
-                        let (w, delta) = match wt.shape.len() {
+                        let (mut w, mut delta) = match wt.shape.len() {
                             2 => {
                                 let (o, in_) = (wt.shape[0], wt.shape[1]);
                                 let r = ad.a.len().div_ceil(in_);
@@ -128,6 +146,13 @@ impl<'a> Merger<'a> {
                             3 => add_expert_delta(&wt.name, &base, &ad.a, &ad.b, wt.shape[0], wt.shape[1], wt.shape[2], scaling)?,
                             other => return Err(anyhow!("{}: base weight of rank {other} is not a LoRA target", wt.name)),
                         };
+                        // a writer of an abliterated base: the adapter's change loses its part along r
+                        if let Some(d) = plan.direction() {
+                            if crate::carry::project_delta(&wt.name, &wt.shape, &mut delta, d)? {
+                                w.iter_mut().zip(base.iter().zip(&delta)).for_each(|(x, (b, dl))| *x = b + dl);
+                                carry.projected.push(wt.name.clone());
+                            }
+                        }
                         writer.write(&wt.name, &from_f32s(wt.dtype, &w))?;
                         rel_norm(&base, &delta)
                     }
@@ -166,7 +191,12 @@ impl<'a> Merger<'a> {
             std::fs::copy(&base_gates, self.out_dir.join(crate::model::LOOP_FILE))?;
         }
 
-        Ok(MergeReport { out_dir: self.out_dir.to_path_buf(), per_tensor: report })
+        // the abliterated marks (carried, or dropped) and the direction beside the result
+        if self.out_dir.join("config.json").exists() {
+            crate::carry::finish_folder(self.out_dir, &plan)?;
+        }
+
+        Ok(MergeReport { out_dir: self.out_dir.to_path_buf(), per_tensor: report, carry, carry_lines: plan.lines() })
     }
 }
 

@@ -479,6 +479,10 @@ pub async fn submit(s: &AppState, ws: &Arc<Workshop>, mut req: Value) -> Respons
     if !ROUTABLE.contains(&kind.as_str()) {
         return bad(format!("a {kind} job runs on this machine only"));
     }
+    // it writes into a folder that is already here (an abliterated model's, private): never sent away
+    if kind == "abliterate" && local["direction_only"] == true {
+        return bad("a direction-only abliterate writes into a folder on this machine: it runs on this machine only".into());
+    }
     let gpu = Workshop::train_on_gpu(&local);
     let ws2 = ws.clone();
     let (k2, l2, o2) = (kind.clone(), local.clone(), output.clone());

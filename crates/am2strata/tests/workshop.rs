@@ -424,6 +424,24 @@ if [ "$1" = "--json" ] && [ "$2" = "private-data" ]; then
   echo "{\"event\":\"done\",\"output\":\"$data/private/$name\",\"kind\":\"private-dataset\",\"private\":true,\"bytes\":1,\"seconds\":0.1}"
   exit 0
 fi
+if [ "$1" = "--json" ] && [ "$2" = "abliterate" ] && case " $* " in *" --direction-only "*) true;; *) false;; esac; then
+  echo "$@" > "$here/direction-args.txt"
+  out=""; prev=""
+  for a in "$@"; do [ "$prev" = "--out" ] && out="$a"; prev="$a"; done
+  echo x > "$out/refusal_direction.safetensors"
+  echo '{"event":"start","what":"direction"}'
+  echo "{\"event\":\"done\",\"output\":\"$out/refusal_direction.safetensors\",\"kind\":\"refusal-direction\",\"separation\":9.2,\"bytes\":1,\"seconds\":0.1}"
+  exit 0
+fi
+if [ "$1" = "--json" ] && { [ "$2" = "refusal-check" ] || [ "$2" = "merge" ]; }; then
+  echo "$@" > "$here/$2-args.txt"
+  out=""; prev=""
+  for a in "$@"; do { [ "$prev" = "--report" ] || [ "$prev" = "--out" ]; } && out="$a"; prev="$a"; done
+  echo "{\"event\":\"start\",\"what\":\"$2\"}"
+  if [ "$2" = "merge" ]; then mkdir -p "$out"; else mkdir -p "$(dirname "$out")"; echo '{}' > "$out"; fi
+  echo "{\"event\":\"done\",\"output\":\"$out\",\"kind\":\"report\",\"bytes\":2,\"seconds\":0.1}"
+  exit 0
+fi
 if [ "$1" = "--json" ] && [ "$2" = "abliterate" ]; then
   echo "$@" > "$here/abliterate-args.txt"
   out=""; prev=""
@@ -1220,4 +1238,125 @@ fn private_data_jobs_check_their_sources_and_model_and_get_the_server_by_environ
     // the model list says each model's run config marks, for the job's model check
     let (_, m) = s.get("/api/models", true);
     assert!(m["models"].as_array().unwrap().iter().all(|x| x["marks"].is_array()), "{m}");
+}
+
+/// A model trained from an abliterated base stays abliterated (strata_workshop::carry): merge and export-moe pass the
+/// carry's settings to the command, a direction-only abliterate writes into the abliterated folder at its recorded
+/// site, and a refusal check runs the engine on a GGUF or a Kosha pack (taking the GPUs when its engine is on them).
+#[cfg(unix)]
+#[test]
+fn abliteration_carry_direction_only_and_refusal_check_jobs_check_their_inputs() {
+    let tools = std::env::temp_dir().join(format!("am2-ws-carry-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    let ws = s.dir.join("workshop");
+    let orig = ws.join("tiny-model");
+    std::fs::create_dir_all(&orig).unwrap();
+    for f in ["config.json", "tokenizer.json"] {
+        std::fs::write(orig.join(f), "{}").unwrap();
+    }
+    let abl = ws.join("tiny-model-abliterated");
+    std::fs::create_dir_all(&abl).unwrap();
+    std::fs::write(abl.join("config.json"), r#"{"model_type": "qwen3", "prastara_private": true, "prastara_abliterated": {"layer": 22, "pass": 0, "scale": 1.0, "separation": 9.2}}"#).unwrap();
+    std::fs::write(abl.join("tokenizer.json"), "{}").unwrap();
+    let lists = ws.join("abliterate");
+    std::fs::create_dir_all(&lists).unwrap();
+    let (h, b) = (lists.join("harmful.txt"), lists.join("harmless.txt"));
+    std::fs::write(&h, "a\nb\n").unwrap();
+    std::fs::write(&b, "c\nd\n").unwrap();
+    let ad = ws.join("tiny-adapter");
+    std::fs::create_dir_all(&ad).unwrap();
+    std::fs::write(ad.join("adapter_config.json"), r#"{"r": 16}"#).unwrap();
+
+    // merge: the carry's settings become the command's flags
+    let merge = json!({"kind": "merge", "base": abl, "adapter": ad});
+    let with = |base: &Value, extra: Value| { let mut r = base.clone(); for (k, v) in extra.as_object().unwrap() { r[k] = v.clone(); } r };
+    for (bad, why) in [
+        (with(&merge, json!({"abliterate_carry": "no"})), "a carry that is no bool"),
+        (with(&merge, json!({"abliterate_carry": false, "allow_unprojected": true})), "both"),
+        (with(&merge, json!({"direction": "/etc/passwd"})), "a direction outside the Workshop"),
+        (with(&merge, json!({"direction": h})), "a direction that is no safetensors"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &with(&merge, json!({"abliterate_carry": false, "output": ws.join("m1")})));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(std::fs::read_to_string(tools.join("merge-args.txt")).unwrap().trim_end().ends_with("--no-abliterate-carry"));
+    let (code, j) = s.post("/v1/workshop/jobs", &with(&merge, json!({"allow_unprojected": true, "output": ws.join("m2")})));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(std::fs::read_to_string(tools.join("merge-args.txt")).unwrap().contains("--allow-unprojected"));
+    let (code, j) = s.post("/v1/workshop/jobs", &with(&merge, json!({"output": ws.join("m3")})));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let a = std::fs::read_to_string(tools.join("merge-args.txt")).unwrap();
+    assert!(!a.contains("carry") && !a.contains("unprojected"), "the carry is the default: {a}");
+
+    // export-moe too
+    let up = ws.join("tiny-up");
+    std::fs::create_dir_all(&up).unwrap();
+    std::fs::write(up.join("config.json"), r#"{"model_type": "qwen3", "prastara_moe": {"experts": 4, "top_k": 2}, "prastara_abliterated": {"layer": 22}}"#).unwrap();
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "export-moe", "input": up, "abliterate_carry": false}));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(std::fs::read_to_string(tools.join("export-moe-args.txt")).unwrap().contains("--no-abliterate-carry"));
+
+    // a direction-only abliterate: the original as input, the abliterated folder as "into", the recorded site
+    let dir_only = json!({"kind": "abliterate", "direction_only": true, "input": orig, "into": abl, "harmful": h, "harmless": b});
+    for (bad, why) in [
+        (with(&dir_only, json!({"into": null})), "no folder to write into"),
+        (with(&dir_only, json!({"into": orig})), "a folder that is not abliterated"),
+        (with(&dir_only, json!({"layer": "21"})), "another layer than the recorded one"),
+        (with(&dir_only, json!({"layer": "22:1"})), "another pass than the recorded one"),
+        (with(&dir_only, json!({"tolerance": 2})), "a tolerance too wide"),
+        (with(&dir_only, json!({"harmful": lists})), "a folder is not a list"),
+        (with(&dir_only, json!({"into": "/etc"})), "a folder outside the Workshop"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &with(&dir_only, json!({"layer": 22})));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(done["output"].as_str().unwrap().ends_with("tiny-model-abliterated/refusal_direction.safetensors"), "{done}");
+    let args = std::fs::read_to_string(tools.join("direction-args.txt")).unwrap();
+    assert!(args.starts_with(&format!("--json abliterate {} --direction-only", orig.display())) && args.contains("--layer 22:0")
+            && args.contains(&format!("--out {}", abl.display())) && args.contains("--tolerance 0.05"), "{args}");
+    // the file is there now: a second one is refused
+    let (code, _) = s.post("/v1/workshop/jobs", &dir_only);
+    assert_eq!(code, 400);
+    // never sent to another machine
+    let (code, e) = s.post("/v1/workshop/jobs", &with(&dir_only, json!({"node": "any"})));
+    assert_eq!(code, 400, "{e}");
+
+    // a refusal check on a GGUF or a pack
+    let gguf = ws.join("tiny-model.Q4_K.gguf");
+    std::fs::write(&gguf, "GGUF").unwrap();
+    let pack = ws.join("tiny-model.kosha");
+    std::fs::write(&pack, "AM2AIPAC").unwrap();
+    let rc = json!({"kind": "refusal-check", "engine_gguf": gguf, "tokenizer": abl, "harmful": h, "harmless": b});
+    for (bad, why) in [
+        (with(&rc, json!({"engine_gguf": h})), "not a model file"),
+        (with(&rc, json!({"engine_gguf": ws.join("none.gguf")})), "a file that does not exist"),
+        (with(&rc, json!({"tokenizer": lists})), "a folder without a tokenizer"),
+        (with(&rc, json!({"n": 0})), "no prompts"),
+        (with(&rc, json!({"max_tokens": 9999})), "too many tokens"),
+        (with(&rc, json!({"engine_args": "--pack /etc"})), "an engine flag that names a file"),
+        (with(&rc, json!({"before": "/etc/x.gguf"})), "a comparison outside the Workshop"),
+        (with(&rc, json!({"output": ws.join("x.txt")})), "a report that is no .json"),
+        (with(&rc, json!({"harmless": null})), "no harmless list"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{why}: {e}");
+    }
+    let (code, j) = s.post("/v1/workshop/jobs", &with(&rc, json!({"engine_gguf": pack, "before": gguf, "n": 8, "engine_args": "--threads 2"})));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(done["output"].as_str().unwrap().ends_with("reports/refusal-tiny-model.json"), "{done}");
+    let args = std::fs::read_to_string(tools.join("refusal-check-args.txt")).unwrap();
+    assert!(args.contains(&format!("--engine-gguf {}", pack.display())) && args.contains(&format!("--before {}", gguf.display()))
+            && args.contains("--n 8") && args.contains("--engine-args --threads 2") && args.contains(&format!("--tokenizer {}", abl.display())), "{args}");
+    let _ = std::fs::remove_dir_all(&tools);
 }

@@ -13,6 +13,10 @@
 //! experts: every choice gives the base's feed-forward, as the Workshop's dense block does. Without an adapter the
 //! whole model is exported that way, which is exactly the dense base.
 //!
+//! An abliterated base ([`crate::carry`]): every expert's down LoRA and the o_proj adapter are projected off the
+//! saved refusal direction before they are folded in, and the GGUF keeps `prastara.abliterated` with
+//! `prastara.abliterated.carried`.
+//!
 //! The rotary layout: the engine runs `qwen*` architectures with NEOX rotation, which is Hugging Face's own layout, so
 //! Llama and Mistral bases are written without llama.cpp's q/k permute and run as `qwen3moe` (without q/k norms).
 
@@ -66,6 +70,9 @@ pub struct ExportReport {
     /// blocks whose router and experts came from the adapter (the rest: identical experts)
     pub trained_blocks: usize,
     pub bytes: u64,
+    /// what was done about an abliterated base
+    pub carry: crate::carry::Report,
+    pub carry_lines: Vec<String>,
 }
 
 /// The adapter: its tensors, mapped, and its scaling.
@@ -151,8 +158,18 @@ pub fn export_moe(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType
 /// [`export_moe`], calling `progress(bytes written, bytes in all, tensor)` after each tensor.
 pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType, pre_tokenizer: Option<&str>,
                        progress: &mut dyn FnMut(u64, u64, &str)) -> Result<ExportReport> {
+    export_moe_carry(dir, adapter, out, ty, pre_tokenizer, &crate::carry::Options::default(), progress)
+}
+
+/// [`export_moe_with`], with what to do about an abliterated base said outright (`carry`).
+pub fn export_moe_carry(dir: &Path, adapter: Option<&Path>, out: &Path, ty: ExportType, pre_tokenizer: Option<&str>, carry_opts: &crate::carry::Options,
+                        progress: &mut dyn FnMut(u64, u64, &str)) -> Result<ExportReport> {
     let d = dir.display();
-    let c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("reading config for {d}"))?)?;
+    let mut c: Json = serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).with_context(|| format!("reading config for {d}"))?)?;
+    // an abliterated base: the plan (and a refusal when its direction is missing) before anything is written
+    let abl = crate::carry::plan(dir, &c, carry_opts)?;
+    crate::carry::mark(&mut c, &abl);
+    let mut carry = crate::carry::Report { state: abl.state().into(), ..Default::default() };
     let cfg = ModelConfig::from_json(&c).with_context(|| format!("{d}"))?;
     let moe = cfg.moe.ok_or_else(|| anyhow!("{d} is not an upcycled model (no prastara_moe in config.json): run `am2strata-workshop upcycle` on it first"))?;
     // long context (the `context` copy, or a base with YaRN in its config): the keys convert_qwen3 writes
@@ -185,7 +202,8 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
     let ad = adapter.map(|a| Adapter::open(a, moe)).transpose()?;
 
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)?.filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors") && p.file_name().and_then(|s| s.to_str()) != Some(LOOP_FILE)).collect();
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("safetensors")
+                    && !matches!(p.file_name().and_then(|s| s.to_str()), Some(LOOP_FILE | MOE_INIT_FILE | crate::carry::DIRECTION_FILE))).collect();
     files.sort();
     anyhow::ensure!(!files.is_empty(), "{d}: no *.safetensors shards found");
     let shards: Vec<Shard> = files.iter().map(|f| Shard::open(f)).collect::<Result<_>>()?;
@@ -288,7 +306,16 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
             Source::Attn(i, desc, stem) => {
                 let mut v = base(*i, desc)?;
                 if let Some(a) = &ad {
-                    a.fold(stem, &mut v, desc.shape()[0], desc.shape()[1])?;
+                    let before = abl.direction().map(|_| v.clone());
+                    if a.fold(stem, &mut v, desc.shape()[0], desc.shape()[1])? {
+                        // o_proj of an abliterated base: the adapter's change off r (q, k, v read the stream)
+                        if let (Some(dr), Some(before)) = (abl.direction(), before) {
+                            let name = desc.name().to_string();
+                            if crate::carry::project_change(&name, desc.shape(), &before, &mut v, dr)? {
+                                carry.projected.push(g.clone());
+                            }
+                        }
+                    }
                 }
                 w.tensor_data(&encode_par(&v, t, desc.shape()[1]))?;
             }
@@ -334,8 +361,15 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
                         if a.expert_rank > 0 {
                             let stem = moe_expert_stem(*b, e, target);
                             let a_name = if moe.shared_a { format!("{}.lora_A.weight", moe_group_stem(*b, e % groups, target)) } else { format!("{stem}.lora_A.weight") };
+                            let before = (*role == 2).then(|| abl.direction().map(|_| v.clone())).flatten();
                             if !a.fold_pair(&a_name, &format!("{stem}.lora_B.weight"), a.expert_scaling, &mut v, o, inn)? {
                                 bail!("block {b} has a router in the adapter but expert {e} has no {} adapter", target.as_str());
+                            }
+                            // an expert's down projection writes the stream: its LoRA's change off r
+                            if let (Some(dr), Some(before)) = (abl.direction(), before) {
+                                if crate::carry::project_change(&format!("model.layers.{b}.mlp.experts.{e}.down_proj.weight"), &[o, inn], &before, &mut v, dr)? && e == 0 {
+                                    carry.projected.push(g.clone());
+                                }
                             }
                         }
                     }
@@ -355,7 +389,7 @@ pub fn export_moe_with(dir: &Path, adapter: Option<&Path>, out: &Path, ty: Expor
     w.finish()?;
     std::fs::rename(&partial, out).with_context(|| format!("moving the finished file to {}", out.display()))?;
     let bytes = std::fs::metadata(out).map(|m| m.len()).unwrap_or(0);
-    Ok(ExportReport { out: out.to_path_buf(), moe, total_params: total, active_params: active, trained_blocks: trained, bytes })
+    Ok(ExportReport { out: out.to_path_buf(), moe, total_params: total, active_params: active, trained_blocks: trained, bytes, carry, carry_lines: abl.lines() })
 }
 
 /// [`encode`] with the rows split over the CPUs: block quantizers work row by row (a row's blocks never depend on

@@ -5,7 +5,12 @@
 //! - `POST /v1/workshop/jobs` `{"kind": "convert" | "quantize" | "merge", ...}` queues a job:
 //!   - convert: `"input"` (a Hugging Face model folder), `"output"`? (a .gguf), `"outtype"`? (f16 | f32), `"pre_tokenizer"`?
 //!   - quantize: `"input"` (a .gguf), `"output"`?, `"type"` (q8_0 | q6_k | q5_k | q4_k | q4_0 | f16)
-//!   - merge: `"base"` (an HF model folder), `"adapter"` (a PEFT/Unsloth adapter folder), `"output"`? (a folder)
+//!   - merge: `"base"` (an HF model folder), `"adapter"` (a PEFT/Unsloth adapter folder), `"output"`? (a folder). An
+//!     abliterated base (strata_workshop::carry): the adapter's change of every matrix that writes the residual stream
+//!     is projected off its refusal direction and the result stays marked abliterated (`"carried": true`) by default;
+//!     `"abliterate_carry"`? (bool, default true; false skips it and drops the abliterated mark), `"allow_unprojected"`?
+//!     (bool: go on when the base has no refusal_direction.safetensors, marked `"carried": false`), `"direction"`? (a
+//!     direction file to use instead). Without either, a base whose direction file is missing is refused
 //!   - loop: `"input"` (an HF model folder), `"start"`, `"end"` (its blocks start..end), `"passes"`? (2-16, default 2),
 //!     `"output"`? (a folder) — a looped copy (Avarta): the core runs again behind gates that start closed, so the copy
 //!     is exactly its base until trained; convert carries the loop into the GGUF and the Rust engine runs it
@@ -21,11 +26,21 @@
 //!   - export-moe: `"input"` (an upcycled folder), `"adapter"`? (the adapter trained on it), `"type"`? (q4_k | q8_0 |
 //!     q6_k | q5_k | q4_0 | f16 | f32, default q4_k), `"pre_tokenizer"`?, `"output"`? (a .gguf) — the real qwen3moe
 //!     model, each expert's LoRA folded into its own copy of the feed-forward, quantized as it is written;
-//!     `"pack"`? (bool) queues a `pack` job on the GGUF once it is written (GGUF -> Kosha -> the model list)
+//!     `"pack"`? (bool) queues a `pack` job on the GGUF once it is written (GGUF -> Kosha -> the model list);
+//!     `"abliterate_carry"`?, `"allow_unprojected"`?, `"direction"`? as for merge (each expert's down LoRA and the
+//!     o_proj adapter kept off an abliterated base's refusal direction; the GGUF keeps `prastara.abliterated`)
 //!   - abliterate: `"input"` (an HF model folder), `"harmful"` and `"harmless"` (text files in Workshop folders, one
 //!     prompt per line), `"layer"`? (auto | N | "N:P"), `"scale"`? (0-2, default 1), `"check"`? (held-out prompts to
 //!     answer before and after), `"devices"`?, `"output"`? (a folder; default `<stem>-abliterated`) — the refusal
-//!     direction removed from every matrix that writes the residual stream; the copy is marked `prastara_private`
+//!     direction removed from every matrix that writes the residual stream; the copy is marked `prastara_private`, and
+//!     the direction is saved in it (refusal_direction.safetensors). With `"direction_only": true` and `"into"` (an
+//!     abliterated folder made without that file), `"input"` is the original model: the direction is recomputed at the
+//!     recorded site (`"layer"`? must be it) and only the file is written into `"into"` (`"tolerance"`?: how far the
+//!     separation may be from the recorded one, default 0.05)
+//!   - refusal-check: `"engine_gguf"` (a .gguf or .kosha), `"tokenizer"` (the model's HF folder), `"harmful"` and
+//!     `"harmless"` (text files), `"n"`? (prompts of each, default 32), `"max_tokens"`?, `"engine_args"`? (as for
+//!     regress; `--devices cuda:…` takes the GPUs), `"before"`? (another .gguf or .kosha to compare), `"output"`? (a .json;
+//!     default `reports/refusal-<stem>.json`) — the refusal rate through the Rust engine
 //!   - strata: `"input"` (a .gguf), `"name"`?, `"display_name"`?, `"overwrite"`? — make it a model the server runs: the
 //!     same run config and tokenizer folder a downloaded model gets (strata-hub's config writer, which picks the engine
 //!     for the architecture and refuses one no engine runs), so it appears in the model list; `"pack"`? (bool) also
@@ -92,7 +107,8 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 14] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "pack", "datagen", "clean", "regress", "grade-train"];
+const KINDS: [&str; 15] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "pack", "datagen", "clean", "regress", "grade-train",
+                           "refusal-check"];
 
 /// The job kinds `POST /v1/workshop/estimate` estimates with their own command's `--estimate` (train uses `profile`).
 const ESTIMATED: [&str; 3] = ["abliterate", "upcycle", "export-moe"];
@@ -534,6 +550,43 @@ impl Workshop {
             or run the model under test on the CPU"))
     }
 
+    /// merge and export-moe: what to do with an abliterated base (`"abliterate_carry"`, `"allow_unprojected"`, `"direction"`).
+    fn carry_args(&self, req: &Value) -> Result<Vec<String>, String> {
+        let flag = |k: &str| -> Result<Option<bool>, String> {
+            match &req[k] {
+                Value::Null => Ok(None),
+                Value::Bool(b) => Ok(Some(*b)),
+                _ => Err(format!("\"{k}\" is true or false")),
+            }
+        };
+        let (carry, unprojected) = (flag("abliterate_carry")?.unwrap_or(true), flag("allow_unprojected")?.unwrap_or(false));
+        let mut a = Vec::new();
+        if !carry && unprojected {
+            return Err("\"abliterate_carry\": false and \"allow_unprojected\": true: one or the other".into());
+        }
+        if !carry {
+            a.push("--no-abliterate-carry".to_string());
+        }
+        if unprojected {
+            a.push("--allow-unprojected".to_string());
+        }
+        match &req["direction"] {
+            Value::Null => {}
+            Value::String(d) if !d.is_empty() => {
+                if !carry {
+                    return Err("\"direction\" goes with the carry, not with \"abliterate_carry\": false".into());
+                }
+                let d = self.allowed(d, true)?;
+                if !d.is_file() || d.extension().and_then(|x| x.to_str()) != Some("safetensors") {
+                    return Err(format!("{}: \"direction\" is a refusal_direction.safetensors file", d.display()));
+                }
+                a.extend(["--direction".to_string(), d.display().to_string()]);
+            }
+            _ => return Err("\"direction\" is the path of a refusal_direction.safetensors file".into()),
+        }
+        Ok(a)
+    }
+
     /// Check a request and turn it into the command's arguments and its output path.
     pub fn plan(&self, req: &Value) -> Result<(String, Vec<String>, PathBuf), String> {
         let kind = req["kind"].as_str().ok_or_else(|| format!("\"kind\" is one of {}", KINDS.join(", ")))?;
@@ -591,8 +644,9 @@ impl Workshop {
                     Some(o) => self.allowed(o, false)?,
                     None => self.default_output(&adapter, "-merged"),
                 };
-                Ok((kind.into(), vec!["merge".into(), base.display().to_string(), adapter.display().to_string(),
-                                      "--out".into(), output.display().to_string()], output))
+                let mut args = vec!["merge".into(), base.display().to_string(), adapter.display().to_string(), "--out".into(), output.display().to_string()];
+                args.extend(self.carry_args(req)?);
+                Ok((kind.into(), args, output))
             }
             "loop" => {
                 let input = self.allowed(s("input").ok_or("loop needs \"input\": a Hugging Face model folder")?, true)?;
@@ -778,7 +832,64 @@ impl Workshop {
                     return Err(format!("{} already exists", output.display()));
                 }
                 args.extend(["--out".into(), output.display().to_string(), "--type".into(), ty]);
+                args.extend(self.carry_args(req)?);
                 Ok((kind.into(), args, output))
+            }
+            "abliterate" if req["direction_only"] == true => {
+                let input = self.allowed(s("input").ok_or("a direction-only abliterate needs \"input\": the original (un-abliterated) model folder")?, true)?;
+                let into = self.allowed(s("into").ok_or("a direction-only abliterate needs \"into\": the abliterated folder to write the direction into")?, true)?;
+                let cfg: Value = std::fs::read_to_string(into.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok())
+                    .ok_or_else(|| format!("{} has no config.json: \"into\" is an abliterated model folder", into.display()))?;
+                let meta = &cfg["prastara_abliterated"];
+                let Some(rec) = meta["layer"].as_u64() else {
+                    return Err(format!("{} is not marked abliterated (no prastara_abliterated in its config.json)", into.display()));
+                };
+                let rec_pass = meta["pass"].as_u64().unwrap_or(0);
+                let file = into.join("refusal_direction.safetensors");
+                if file.symlink_metadata().is_ok() {
+                    return Err(format!("{} already exists", file.display()));
+                }
+                if !input.join("config.json").exists() || !input.join("tokenizer.json").exists() {
+                    return Err(format!("{} needs config.json and tokenizer.json: \"input\" is the original Hugging Face model folder", input.display()));
+                }
+                let list = |k: &str| -> Result<PathBuf, String> {
+                    let p = self.allowed(s(k).ok_or_else(|| format!("a direction-only abliterate needs \"{k}\": the list the abliteration read"))?, true)?;
+                    if !p.is_file() {
+                        return Err(format!("{}: \"{k}\" is a text file, one prompt per line", p.display()));
+                    }
+                    Ok(p)
+                };
+                let (harmful, harmless) = (list("harmful")?, list("harmless")?);
+                // the recorded site; a layer given must be it
+                let asked = match &req["layer"] {
+                    Value::Null => None,
+                    Value::Number(n) => Some((n.as_u64().ok_or("\"layer\" is a block number or N:P")?, 0)),
+                    Value::String(t) if t.is_empty() || t == "auto" => None,
+                    Value::String(t) => {
+                        let (b, p) = t.split_once(':').unwrap_or((t.as_str(), "0"));
+                        Some((b.parse::<u64>().map_err(|_| "\"layer\" is a block number or N:P")?, p.parse::<u64>().map_err(|_| "\"layer\" is a block number or N:P")?))
+                    }
+                    _ => return Err("\"layer\" is a block number or N:P".into()),
+                };
+                if asked.is_some_and(|a| a != (rec, rec_pass)) {
+                    return Err(format!("\"layer\" is not the site {} was abliterated at (block {rec} pass {rec_pass})", into.display()));
+                }
+                let tolerance = match &req["tolerance"] {
+                    Value::Null => 0.05,
+                    v => v.as_f64().filter(|x| *x > 0.0 && *x <= 0.5).ok_or("\"tolerance\" is a number above 0, at most 0.5")?,
+                };
+                let devices = s("devices").unwrap_or("cpu");
+                let ok = devices == "cpu" || devices.split(',').all(|d| d.strip_prefix("cuda:").is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit())));
+                if !ok {
+                    return Err(format!("\"devices\" is cpu, cuda:0 or cuda:0,cuda:1 (got {devices:?})"));
+                }
+                let mut args = vec!["abliterate".into(), input.display().to_string(), "--direction-only".into(), "--harmful".into(), harmful.display().to_string(),
+                                    "--harmless".into(), harmless.display().to_string(), "--layer".into(), format!("{rec}:{rec_pass}"),
+                                    "--tolerance".into(), tolerance.to_string(), "--out".into(), into.display().to_string()];
+                if devices != "cpu" {
+                    args.extend(["--devices".into(), devices.into()]);
+                }
+                Ok((kind.into(), args, file))
             }
             "abliterate" => {
                 let input = self.allowed(s("input").ok_or("abliterate needs \"input\": a Hugging Face model folder")?, true)?;
@@ -1219,6 +1330,69 @@ impl Workshop {
                 args.extend(["--out".into(), output.display().to_string()]);
                 Ok((kind.into(), args, output))
             }
+            "refusal-check" => {
+                let model_file = |k: &str, v: &str| -> Result<PathBuf, String> {
+                    if !(v.ends_with(".gguf") || v.ends_with(".kosha") || v.ends_with(".am2aipac")) {
+                        return Err(format!("\"{k}\" is a .gguf or .kosha file"));
+                    }
+                    let p = self.allowed(v, true)?;
+                    if !p.is_file() {
+                        return Err(format!("{}: \"{k}\" is a .gguf or .kosha file", p.display()));
+                    }
+                    Ok(p)
+                };
+                let gguf = model_file("engine_gguf", s("engine_gguf").ok_or("refusal-check needs \"engine_gguf\": the .gguf or .kosha to check")?)?;
+                let tok = self.allowed(s("tokenizer").ok_or("refusal-check needs \"tokenizer\": the model's Hugging Face folder (its tokenizer and chat template)")?, true)?;
+                if !tok.join("tokenizer.json").exists() {
+                    return Err(format!("{} has no tokenizer.json: \"tokenizer\" is the model's Hugging Face folder", tok.display()));
+                }
+                let list = |k: &str| -> Result<PathBuf, String> {
+                    let p = self.allowed(s(k).ok_or_else(|| format!("refusal-check needs \"{k}\": a text file of prompts, one per line"))?, true)?;
+                    if !p.is_file() {
+                        return Err(format!("{}: \"{k}\" is a text file, one prompt per line", p.display()));
+                    }
+                    Ok(p)
+                };
+                let (harmful, harmless) = (list("harmful")?, list("harmless")?);
+                let num = |k: &str, lo: u64, hi: u64, d: u64| -> Result<u64, String> {
+                    match &req[k] {
+                        Value::Null => Ok(d),
+                        v => v.as_u64().filter(|n| (lo..=hi).contains(n)).ok_or_else(|| format!("\"{k}\" is a whole number from {lo} to {hi}")),
+                    }
+                };
+                let (n, max_tokens) = (num("n", 1, 1024, 32)?, num("max_tokens", 1, 512, 48)?);
+                let mut args = vec!["refusal-check".to_string(), "--engine-gguf".into(), gguf.display().to_string(), "--tokenizer".into(), tok.display().to_string(),
+                                    "--harmful".into(), harmful.display().to_string(), "--harmless".into(), harmless.display().to_string(),
+                                    "--n".into(), n.to_string(), "--max-tokens".into(), max_tokens.to_string()];
+                match &req["engine_args"] {
+                    Value::Null => {}
+                    Value::String(t) if t.trim().is_empty() => {}
+                    Value::String(t) => args.extend(["--engine-args".into(), check_engine_args(t)?.join(" ")]),
+                    _ => return Err("\"engine_args\" is a string of engine flags, e.g. \"--devices cuda:0=14 --max-context 8192\"".into()),
+                }
+                match &req["before"] {
+                    Value::Null => {}
+                    Value::String(b) if b.is_empty() => {}
+                    Value::String(b) => args.extend(["--before".into(), model_file("before", b)?.display().to_string()]),
+                    _ => return Err("\"before\" is the path of a .gguf or .kosha file".into()),
+                }
+                if let Some(e) = self.engine_exe() {
+                    args.extend(["--engine-exe".into(), e.display().to_string()]);
+                }
+                let output = match s("output") {
+                    Some(o) if o.ends_with(".json") => self.allowed(o, false)?,
+                    Some(_) => return Err("\"output\" is a .json file".into()),
+                    None => {
+                        let stem = gguf.file_stem().and_then(|x| x.to_str()).unwrap_or("model");
+                        Self::fresh(&self.out_dir.join("reports"), &format!("refusal-{stem}"), ".json")
+                    }
+                };
+                if output.exists() {
+                    return Err(format!("{} already exists", output.display()));
+                }
+                args.extend(["--report".into(), output.display().to_string()]);
+                Ok((kind.into(), args, output))
+            }
             "private-data" => self.plan_private(req),
             other => Err(format!("unknown kind {other:?}: {}", KINDS.join(", "))),
         }
@@ -1342,7 +1516,7 @@ impl Workshop {
             return;
         }
         let mut lease = None;
-        if matches!(job.kind.as_str(), "train" | "abliterate" | "regress" | "grade-train") && Self::train_on_gpu(&job.request) {
+        if matches!(job.kind.as_str(), "train" | "abliterate" | "regress" | "grade-train" | "refusal-check") && Self::train_on_gpu(&job.request) {
             let mgr = self.mgr.lock().unwrap().clone();
             if let Some(m) = mgr {
                 let before = m.queue.resident();

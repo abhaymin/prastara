@@ -4,11 +4,13 @@
 //! am2strata-workshop info <model.gguf | hf-folder>
 //! am2strata-workshop convert <hf-folder> --out <model.gguf> [--outtype f16|f32] [--pre-tokenizer NAME] [--yarn 4 [--yarn-original 32768]]
 //! am2strata-workshop quantize <in.gguf> --out <out.gguf> --type q8_0|q6_k|q5_k|q4_k|q4_0|f16
-//! am2strata-workshop merge <base-hf-folder> <adapter-folder> --out <merged-hf-folder>
+//! am2strata-workshop merge <base-hf-folder> <adapter-folder> --out <merged-hf-folder> [--no-abliterate-carry | --allow-unprojected] [--direction <file>]
 //! am2strata-workshop upcycle <hf-folder> --experts 10 --top-k 1 --out <dir>
 //! am2strata-workshop upcycle <hf-folder> --experts 120 --expert-ff 1024 --top-k 5 [--split cluster|contiguous] [--calib chat.jsonl] [--dense-start-check] --out <dir>
-//! am2strata-workshop export-moe <upcycled-folder> [--adapter <dir>] --out <model.gguf> [--type q4_k|q8_0|f16|f32]
+//! am2strata-workshop export-moe <upcycled-folder> [--adapter <dir>] --out <model.gguf> [--type q4_k|q8_0|f16|f32] [--no-abliterate-carry | --allow-unprojected] [--direction <file>]
 //! am2strata-workshop abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N|N:P] [--scale 1.0] [--check N] --out <dir>
+//! am2strata-workshop abliterate --direction-only <original-hf-folder> --harmful a.txt --harmless b.txt --layer N [--pass P] [--tolerance 0.05] --out <abliterated-folder>
+//! am2strata-workshop refusal-check --engine-gguf <model.gguf|model.kosha> --tokenizer <hf-folder> --harmful a.txt --harmless b.txt [--n 32] [--max-tokens 48] [--engine-args "…"] [--before <other.gguf>] [--report out.json]
 //! am2strata-workshop train --model <hf-folder> --data <chat.jsonl> --out <adapter-folder> [--soup soup.yaml] [...]
 //! am2strata-workshop find-lr --model <hf-folder> --data <chat.jsonl> [--steps 40]
 //! am2strata-workshop profile (--model <hf-folder> | --preset llama-2-7b) [--data <chat.jsonl>] [...]
@@ -140,6 +142,8 @@ enum Cmd {
         /// print the disk and memory it needs, and stop
         #[arg(long)]
         estimate: bool,
+        #[command(flatten)]
+        carry: CarryArgs,
     },
     /// abliteration: remove the direction the model writes into its residual stream before refusing (from the mean
     /// residuals of two prompt lists, one prompt per line) from every o_proj, down_proj and the embeddings; the copy
@@ -168,11 +172,47 @@ enum Cmd {
         /// hold the model as f32, f16 or bf16 while reading (default: f32 for an f32 checkpoint, else bf16)
         #[arg(long)]
         base_dtype: Option<String>,
+        /// with --direction-only: the abliterated folder the direction is written into; else the new folder
         #[arg(long)]
         out: PathBuf,
         /// print what the run needs (memory, disk, time) and stop
         #[arg(long)]
         estimate: bool,
+        /// only recompute the refusal direction of an abliterated folder (--out) that has no refusal_direction.safetensors,
+        /// on its original model (the positional folder) at the recorded block and pass; writes only that file
+        #[arg(long)]
+        direction_only: bool,
+        /// the loop pass of --layer (the same as --layer N:P)
+        #[arg(long)]
+        pass: Option<usize>,
+        /// --direction-only: how far the recomputed separation may be from the recorded one (relative; 0.05 is 5 %)
+        #[arg(long, default_value_t = 0.05)]
+        tolerance: f64,
+    },
+    /// how often a GGUF or Kosha pack refuses, answered greedily through the Rust engine: the last --n prompts of each
+    /// list, a refusal phrase list (abliterate's); --before answers the same prompts with another file
+    RefusalCheck {
+        #[command(flatten)]
+        engine: EngineOpts,
+        /// the model's Hugging Face folder: its tokenizer and chat template (the folder the file was made from)
+        #[arg(long)]
+        tokenizer: PathBuf,
+        #[arg(long)]
+        harmful: PathBuf,
+        #[arg(long)]
+        harmless: PathBuf,
+        /// prompts of each list (the last ones)
+        #[arg(long, default_value_t = 32)]
+        n: usize,
+        /// new tokens per answer
+        #[arg(long, default_value_t = 48)]
+        max_tokens: usize,
+        /// another GGUF or pack to answer the same prompts with (e.g. the model before abliteration)
+        #[arg(long)]
+        before: Option<PathBuf>,
+        /// write the result here as JSON
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     /// ordinary prompts from chat JSONL files or folders of them (the first user message of each record), one per line:
     /// the harmless list for `abliterate`, from our own data
@@ -408,6 +448,8 @@ enum Cmd {
         adapter: PathBuf,
         #[arg(long)]
         out: PathBuf,
+        #[command(flatten)]
+        carry: CarryArgs,
     },
     /// the regression suite on a model (and an adapter), at each pass count of a loop: held-out loss, code run in a
     /// sandbox (pass@1), QA exact match and F1, judge scores (through the server's API, AM2STRATA_URL/KEY); writes
@@ -1013,6 +1055,51 @@ impl EngineOpts {
     }
 }
 
+/// What merge and export-moe do with an abliterated base (strata_workshop::carry).
+#[derive(clap::Args, Debug, Clone, Default)]
+struct CarryArgs {
+    /// do not keep the adapter's changes off an abliterated base's refusal direction: the result may refuse again and
+    /// loses its abliterated mark (it stays private)
+    #[arg(long)]
+    no_abliterate_carry: bool,
+    /// an abliterated base without its refusal_direction.safetensors: go on without the projection (marked "carried": false)
+    #[arg(long)]
+    allow_unprojected: bool,
+    /// the refusal direction file to use instead of the one beside the base
+    #[arg(long)]
+    direction: Option<PathBuf>,
+}
+
+impl CarryArgs {
+    fn options(&self) -> Result<strata_workshop::carry::Options, String> {
+        use strata_workshop::carry::Mode;
+        let mode = match (self.no_abliterate_carry, self.allow_unprojected) {
+            (true, true) => return Err("--no-abliterate-carry and --allow-unprojected: one or the other".into()),
+            (true, false) => Mode::Skip,
+            (false, true) => Mode::AllowUnprojected,
+            (false, false) => Mode::Carry,
+        };
+        if self.direction.is_some() && mode == Mode::Skip {
+            return Err("--direction goes with the carry, not with --no-abliterate-carry".into());
+        }
+        Ok(strata_workshop::carry::Options { mode, direction: self.direction.clone() })
+    }
+
+    /// The plan for `base`, decided before the job starts (a missing direction refused at once), and its lines logged.
+    fn plan(&self, base: &Path, out: &Out) -> Result<strata_workshop::carry::Options, String> {
+        let o = self.options()?;
+        let cfg: Value = std::fs::read_to_string(base.join("config.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let p = strata_workshop::carry::plan(base, &cfg, &o).map_err(|e| format!("{e:#}"))?;
+        for l in p.lines() {
+            if !out.json {
+                eprintln!("{l}");
+            }
+            out.event(json!({"event": "log", "message": l, "carry": p.state()}));
+        }
+        Ok(o)
+    }
+}
+
 /// The judge for a suite's judge tests: the server's model (`--judge-model`, the suite's `judge_model`, or the loaded
 /// one), when the suite has such tests and the server answers; otherwise None (those tests then report why).
 fn judge_for(s: &strata_workshop::regress::Suite, want: Option<&str>, out: &Out) -> Option<datagen::Model> {
@@ -1181,11 +1268,34 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                              "trainable_parameters": plan.estimate.trainable_params, "cache_disk_bytes": plan.estimate.cache_disk_bytes}}));
             Ok((model.clone(), "info".into(), json!({})))
         }
-        Cmd::Abliterate { model, harmful, harmless, layer, scale, check, devices, base_dtype, out: dst, estimate } => {
+        Cmd::Abliterate { model, harmful, harmless, layer, scale, check, devices, base_dtype, out: dst, estimate, direction_only, pass, tolerance } => {
             use strata_workshop::abliterate;
             let read = |p: &Path| abliterate::read_prompt_list(p).map_err(|e| format!("{}: {e:#}", p.display()));
+            let mut choice = abliterate::LayerChoice::parse(layer).map_err(|e| e.to_string())?;
+            if let Some(p) = pass {
+                match &mut choice {
+                    abliterate::LayerChoice::Site(s) if !layer.contains(':') => s.pass = *p,
+                    abliterate::LayerChoice::Site(_) => return Err("--pass and --layer N:P: say the pass once".into()),
+                    abliterate::LayerChoice::Auto => return Err("--pass goes with --layer N".into()),
+                }
+            }
+            if *direction_only {
+                if *estimate || *check > 0 || *scale != 1.0 {
+                    return Err("--direction-only writes the direction of an existing abliterated folder: --estimate, --check and --scale do not apply".into());
+                }
+                let mut o = abliterate::DirectionOnly::new(model, read(harmful)?, read(harmless)?, dst);
+                o.layer = choice;
+                o.tolerance = *tolerance;
+                o.devices = devices.clone();
+                o.base_dtype = base_dtype.as_deref().map(BaseDtype::from_s).transpose().map_err(|e| e.to_string())?;
+                out.event(json!({"event": "start", "what": format!("recompute the refusal direction of {} from {}", dst.display(), model.display())}));
+                let r = abliterate::direction_only(&o, &mut |v| out.event(v)).map_err(|e| format!("{e:#}"))?;
+                return Ok((r.file.clone(), "refusal-direction".into(), json!({"layer": r.chosen.site.block, "pass": r.chosen.site.pass,
+                    "separation": r.chosen.separation, "recorded_separation": r.recorded_separation, "separation_error": r.separation_error,
+                    "writers": r.writers.iter().map(|(n, b, a)| json!({"tensor": n, "original": b, "abliterated": a})).collect::<Vec<_>>()})));
+            }
             let mut o = abliterate::Options::new(model, read(harmful)?, read(harmless)?, dst);
-            o.layer = abliterate::LayerChoice::parse(layer).map_err(|e| e.to_string())?;
+            o.layer = choice;
             o.scale = *scale;
             o.check = *check;
             o.devices = devices.clone();
@@ -1333,8 +1443,9 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             Ok((dst.clone(), "hf-model".into(), json!({"experts": experts, "top_k": top_k, "moe": m.to_json(), "total_parameters": total, "active_parameters": active,
                                                          "dense_parameters": dense.total_params(), "export_bytes": sizes, "training": train, "init": init})))
         }
-        Cmd::ExportMoe { model, adapter, out: dst, ty, pre_tokenizer, estimate } => {
-            use strata_workshop::export_moe::{export_moe_with, export_needs, ExportType};
+        Cmd::ExportMoe { model, adapter, out: dst, ty, pre_tokenizer, estimate, carry } => {
+            use strata_workshop::export_moe::{export_moe_carry, export_needs, ExportType};
+            let carry_opts = carry.plan(model, out)?;
             let t = ExportType::from_s(ty).map_err(|e| e.to_string())?;
             let cfg = ModelConfig::load(model).map_err(|e| format!("{e:#}"))?;
             let (need, ram) = export_needs(&cfg, t, adapter.as_ref().map_or(0, |a| size_of(a))).map_err(|e| format!("{}: {e}", model.display()))?;
@@ -1360,7 +1471,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                 out.event(json!({"event": "log", "message": l}));
             }
             let mut last = Instant::now();
-            let r = export_moe_with(model, adapter.as_deref(), dst, t, pre_tokenizer.as_deref(), &mut |done, all, name| {
+            let r = export_moe_carry(model, adapter.as_deref(), dst, t, pre_tokenizer.as_deref(), &carry_opts, &mut |done, all, name| {
                 if last.elapsed().as_secs_f64() >= 2.0 || done == all {
                     last = Instant::now();
                     out.event(json!({"event": "progress", "done": done, "total": all, "message": format!("writing {name}")}));
@@ -1368,8 +1479,11 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             }).map_err(|e| format!("{e:#}"))?;
             out.event(json!({"event": "log", "message": format!("{} experts x top-{}: {} parameters, {} active per token; {} of {} blocks carry trained experts",
                 r.moe.experts, r.moe.top_k, params_label(r.total_params), params_label(r.active_params), r.trained_blocks, cfg.num_hidden_layers)}));
+            if r.carry.state == "carried" {
+                out.event(json!({"event": "log", "message": format!("abliteration carried: {} writer tensors had the adapter's change projected off the refusal direction", r.carry.projected.len())}));
+            }
             Ok((r.out, "gguf".into(), json!({"experts": r.moe.experts, "top_k": r.moe.top_k, "total_parameters": r.total_params,
-                                              "active_parameters": r.active_params, "trained_blocks": r.trained_blocks})))
+                                              "active_parameters": r.active_params, "trained_blocks": r.trained_blocks, "abliteration": r.carry.to_json()})))
         }
         Cmd::Regress { model, adapter, passes, suite, out: dst, against, devices, base_dtype, max_prompt_tokens, judge_model, force, engine } => {
             use strata_workshop::regress;
@@ -1484,6 +1598,36 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             Ok((s.out_dir(), "private-dataset".into(), json!({"private": true, "vision_rows": r.vision_rows, "prompt_rows": r.prompt_rows,
                 "text_rows": r.text_rows, "dropped": r.dropped, "blocked": r.blocked.len()})))
         }
+        Cmd::RefusalCheck { engine, tokenizer, harmful, harmless, n, max_tokens, before, report } => {
+            use strata_workshop::{abliterate, refusal_check};
+            let spec = engine.spec()?.ok_or("refusal-check needs --engine-gguf: the GGUF or Kosha pack to check")?;
+            let read = |p: &Path| abliterate::read_prompt_list(p).map_err(|e| format!("{}: {e:#}", p.display()));
+            let mut spec = spec;
+            spec.log = report.as_ref().map(|r| r.with_extension("engine.log"));
+            let o = refusal_check::Options { engine: spec, tokenizer: tokenizer.clone(), harmful: read(harmful)?, harmless: read(harmless)?,
+                                             n: *n, max_tokens: *max_tokens, before: before.clone() };
+            out.event(json!({"event": "start", "what": format!("refusal check of {} through the Rust engine", o.engine.gguf.display())}));
+            let r = refusal_check::run(&o, &mut |v| out.event(v)).map_err(|e| format!("{e:#}"))?;
+            let rate = |c: &abliterate::CheckResult, k: usize| if c.n == 0 { 0.0 } else { 100.0 * k as f64 / c.n as f64 };
+            let line = |label: &str, f: &refusal_check::FileResult| format!("{label}: {:.0} % of harmful and {:.0} % of harmless prompts refused ({} each, {:.1} tokens/s)",
+                rate(&f.check, f.check.harmful_refused), rate(&f.check, f.check.harmless_refused), f.check.n, f.speed.tokens_per_second());
+            if let Some(b) = &r.before {
+                out.event(json!({"event": "log", "message": line("before", b)}));
+            }
+            out.event(json!({"event": "log", "message": line("this file", &r.after)}));
+            let v = r.to_json();
+            let path = match report {
+                Some(p) => {
+                    if let Some(d) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+                        std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+                    }
+                    std::fs::write(p, serde_json::to_string_pretty(&v).unwrap_or_default()).map_err(|e| format!("{}: {e}", p.display()))?;
+                    p.clone()
+                }
+                None => o.engine.gguf.clone(),
+            };
+            Ok((path, "report".into(), json!({"refusal": v})))
+        }
         other => plain(run_tools(other, out)),
     }
 }
@@ -1548,7 +1692,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } | Cmd::PrivateData { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } | Cmd::PrivateData { .. } | Cmd::RefusalCheck { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))
@@ -1666,9 +1810,15 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             strata_workshop::model::make_long_context(model, dst, *length, *original, *window, *full_every).map_err(|e| e.to_string())?;
             Ok((dst.clone(), "hf-model".into()))
         }
-        Cmd::Merge { base, adapter, out: dst } => {
+        Cmd::Merge { base, adapter, out: dst, carry } => {
             out.event(json!({"event": "start", "what": format!("merge {} into {} as {}", adapter.display(), base.display(), dst.display())}));
-            let r = merge::merge(base, adapter, dst).map_err(|e| e.to_string())?;
+            let opts = carry.plan(base, out)?;
+            let mut m = merge::Merger::new(base, adapter, dst);
+            m.set_carry(opts);
+            let r = m.run().map_err(|e| format!("{e:#}"))?;
+            if r.carry.state == "carried" {
+                out.event(json!({"event": "log", "message": format!("abliteration carried: {} writer tensors had the adapter's change projected off the refusal direction", r.carry.projected.len())}));
+            }
             let touched: Vec<&merge::TensorDelta> = r.per_tensor.iter().filter(|t| t.delta_rel_norm > 0.0).collect();
             out.event(json!({"event": "log", "message": format!("{} of {} tensors changed by the adapter", touched.len(), r.per_tensor.len())}));
             for t in touched.iter().take(8) {

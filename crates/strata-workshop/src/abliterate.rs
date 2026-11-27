@@ -14,6 +14,9 @@
 //!    and `tie_word_embeddings` becomes false, so the head reads exactly as before. Every other tensor is copied byte
 //!    for byte, a tensor at a time ([`crate::st_writer`]); the tokenizer, `loop.safetensors` and every other file are
 //!    copied. `config.json` gains `"prastara_abliterated"` and `"prastara_private": true`: such a model stays on this PC.
+//!    r itself is saved as `refusal_direction.safetensors` ([`crate::carry`]), so that a model trained from this one
+//!    can be kept off it when its adapter is merged or exported; [`direction_only`] recomputes it for a folder made
+//!    before the file was saved.
 //!    An Avarta loop's gates mix two passes channel by channel, which no weight edit keeps orthogonal: from the second
 //!    extra pass on, a small part of the direction can come back through the mix.
 //! 4. **Check** (optional, `check > 0`): the last N prompts of each list are held out of the direction; short greedy
@@ -310,13 +313,21 @@ pub fn orthogonalize(src: &Path, out: &Path, r: &[f32], scale: f32, meta: Value,
     for e in std::fs::read_dir(src)?.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
         let path = e.path();
-        if !path.is_file() || name == "config.json" || name == st_writer::INDEX_FILE || weights.contains(&name) || out.join(&name).exists() {
+        if !path.is_file() || name == "config.json" || name == st_writer::INDEX_FILE || name == crate::carry::DIRECTION_FILE || weights.contains(&name) || out.join(&name).exists() {
             continue;
         }
         std::fs::copy(&path, out.join(&name)).with_context(|| format!("copying {}", path.display()))?;
     }
     if tied {
         cfg["tie_word_embeddings"] = json!(false);
+    }
+    // r itself, so a model trained from this one can be kept off it when it is merged or exported (crate::carry)
+    let site = |k: &str| meta[k].as_u64().unwrap_or(0) as usize;
+    crate::carry::save(out, &crate::carry::Direction { r: r.to_vec(), scale, layer: site("layer"), pass: site("pass"),
+                                                       separation: meta["separation"].as_f64().unwrap_or(f64::NAN), source: "abliterate".into() })?;
+    let mut meta = meta;
+    if meta.is_object() {
+        meta["direction_file"] = json!(crate::carry::DIRECTION_FILE);
     }
     cfg["prastara_abliterated"] = meta;
     cfg["prastara_private"] = json!(true);
@@ -535,6 +546,152 @@ pub fn run(o: &Options, emit: &mut dyn FnMut(Value)) -> Result<Report> {
         None
     };
     Ok(Report { chosen, scores, ortho, before, after })
+}
+
+/// The settings of `abliterate --direction-only`: r recomputed on the original model for an abliterated folder whose
+/// direction was not saved (made before [`crate::carry::DIRECTION_FILE`] existed).
+#[derive(Debug, Clone)]
+pub struct DirectionOnly {
+    /// the original (un-abliterated) model
+    pub model: PathBuf,
+    pub harmful: Vec<String>,
+    pub harmless: Vec<String>,
+    /// the site asked for: must be the recorded one (Auto: take the recorded one)
+    pub layer: LayerChoice,
+    /// the abliterated folder: its config's `prastara_abliterated` is what is matched, and the file goes there
+    pub into: PathBuf,
+    /// how far the recomputed separation may be from the recorded one, relative (0.05: 5 %)
+    pub tolerance: f64,
+    pub devices: Vec<String>,
+    pub base_dtype: Option<BaseDtype>,
+}
+
+impl DirectionOnly {
+    pub fn new(model: impl Into<PathBuf>, harmful: Vec<String>, harmless: Vec<String>, into: impl Into<PathBuf>) -> Self {
+        Self { model: model.into(), harmful, harmless, layer: LayerChoice::Auto, into: into.into(), tolerance: 0.05, devices: Vec::new(), base_dtype: None }
+    }
+}
+
+/// What `--direction-only` found.
+#[derive(Debug, Clone)]
+pub struct DirectionOnlyReport {
+    pub chosen: SiteScore,
+    pub recorded_separation: f64,
+    /// |recomputed − recorded| / recorded
+    pub separation_error: f64,
+    /// per writer of the chosen block: (name, `‖rᵀW‖/‖W‖` in the original, the same in the abliterated folder)
+    pub writers: Vec<(String, f64, f64)>,
+    pub file: PathBuf,
+}
+
+/// The largest share of the original's write along r that the abliterated folder's writers may still have under the
+/// recomputed r: an r at cosine c to the one that was removed leaves about √(1 − c²) of it (0.25: c above 0.968).
+pub const DIRECTION_FIT: f64 = 0.25;
+
+fn read_writer(dir: &Path, name: &str) -> Result<Option<(Vec<usize>, Vec<f32>)>> {
+    for f in crate::model::weight_files(dir)? {
+        let s = Shard::open(&f)?;
+        if let Some(t) = s.get(name) {
+            return Ok(Some((t.shape().to_vec(), to_f32s(name, t.dtype(), s.bytes(t))?)));
+        }
+    }
+    Ok(None)
+}
+
+/// Recompute r for `o.into` from `o.model`, check it is the one that was removed, and write only
+/// [`crate::carry::DIRECTION_FILE`] into `o.into` (no weight and no config is touched). Refused when the site is not
+/// the recorded one, when the separation is off by more than the tolerance, or when the abliterated folder's writers
+/// still write along the recomputed r ([`DIRECTION_FIT`]).
+pub fn direction_only(o: &DirectionOnly, emit: &mut dyn FnMut(Value)) -> Result<DirectionOnlyReport> {
+    let into_cfg: Value = serde_json::from_str(&std::fs::read_to_string(o.into.join("config.json"))
+        .with_context(|| format!("{}: no config.json", o.into.display()))?)?;
+    let meta = &into_cfg["prastara_abliterated"];
+    if !meta.is_object() {
+        bail!("{} is not marked abliterated (no prastara_abliterated in its config.json): --out names the abliterated folder", o.into.display());
+    }
+    let file = o.into.join(crate::carry::DIRECTION_FILE);
+    if file.symlink_metadata().is_ok() {
+        bail!("{} already exists", file.display());
+    }
+    let orig_cfg: Value = serde_json::from_str(&std::fs::read_to_string(o.model.join("config.json"))
+        .with_context(|| format!("{}: no config.json", o.model.display()))?)?;
+    if orig_cfg["prastara_abliterated"].is_object() {
+        bail!("{} is itself abliterated: the direction is read from the original model it was made from", o.model.display());
+    }
+    if std::fs::canonicalize(&o.model).ok() == std::fs::canonicalize(&o.into).ok() {
+        bail!("the original model and the abliterated folder are the same folder");
+    }
+    for k in ["hidden_size", "num_hidden_layers", "vocab_size", "prastara_loop"] {
+        if orig_cfg[k] != into_cfg[k] {
+            bail!("{} and {} differ in {k} ({} and {}): not the model it was made from", o.model.display(), o.into.display(), orig_cfg[k], into_cfg[k]);
+        }
+    }
+    let recorded = Site { block: meta["layer"].as_u64().ok_or_else(|| anyhow!("{}: prastara_abliterated has no layer", o.into.display()))? as usize,
+                          pass: meta["pass"].as_u64().unwrap_or(0) as usize };
+    if let LayerChoice::Site(s) = o.layer {
+        if s != recorded {
+            bail!("--layer {}:{} is not the site {} was abliterated at (block {} pass {}): the direction must be the one that was removed",
+                  s.block, s.pass, o.into.display(), recorded.block, recorded.pass);
+        }
+    }
+    let rec_sep = meta["separation"].as_f64().ok_or_else(|| anyhow!("{}: prastara_abliterated has no separation to check against", o.into.display()))?;
+    let scale = meta["scale"].as_f64().unwrap_or(1.0) as f32;
+    // the same prompts as the run: the first of each list (a check held the last ones out)
+    let take = |list: &[String], k: &str| -> Result<Vec<String>> {
+        match meta["prompts"][k].as_u64() {
+            Some(n) if (n as usize) > list.len() => bail!("the {k} list has {} prompts, the run read the direction from {n}: give the same list", list.len()),
+            Some(n) => Ok(list[..n as usize].to_vec()),
+            None => Ok(list.to_vec()),
+        }
+    };
+    let (hl, bl) = (take(&o.harmful, "harmful")?, take(&o.harmless, "harmless")?);
+    let tok = ChatTokenizer::load(&o.model, None)?;
+    let enc = |list: &[String]| -> Result<Vec<Vec<u32>>> { list.iter().map(|p| tok.prompt_ids_answering(p)).collect() };
+    let (harmful, harmless) = (enc(&hl)?, enc(&bl)?);
+    let devs = crate::finetune::open_devices(&o.devices)?;
+    let dtype = match o.base_dtype { Some(d) => d, None => checkpoint_dtype(&o.model)? };
+    emit(json!({"event": "log", "message": format!("recomputing the direction of {} on {} at block {} pass {} from {} harmful and {} harmless prompts ({})",
+                o.into.display(), o.model.display(), recorded.block, recorded.pass, hl.len(), bl.len(), dtype.as_str())}));
+    let model = LlamaModel::load_on(&o.model, dtype, &devs)?;
+    let total = harmful.len() + harmless.len();
+    let ch = capture(&model, &harmful, &mut |d, _| emit(json!({"event": "progress", "done": d, "total": total, "message": "reading the residual stream"})))?;
+    let cb = capture(&model, &harmless, &mut |d, _| emit(json!({"event": "progress", "done": harmful.len() + d, "total": total, "message": "reading the residual stream"})))?;
+    drop(model);
+    let scores = directions(&ch, &cb)?;
+    drop((ch, cb));
+    let chosen = scores[choose(&scores, LayerChoice::Site(recorded))?].clone();
+    let err = (chosen.separation - rec_sep).abs() / rec_sep.abs().max(1e-12);
+    emit(json!({"event": "log", "message": format!("separation {:.4}, recorded {rec_sep:.4} ({:.2} % apart, {:.1} % allowed)", chosen.separation, err * 100.0, o.tolerance * 100.0)}));
+    if err > o.tolerance {
+        bail!("the recomputed separation {:.4} is {:.2} % from the recorded {rec_sep:.4} (more than {:.1} %): not the same model, prompts or site \
+               (the lists must be the ones the abliteration read, in the same order)", chosen.separation, err * 100.0, o.tolerance * 100.0);
+    }
+    // the abliterated weights themselves: they must no longer write along this r (the original does)
+    let hidden = chosen.direction.len();
+    let mut writers = Vec::new();
+    for name in [format!("model.layers.{}.self_attn.o_proj.weight", recorded.block), format!("model.layers.{}.mlp.down_proj.weight", recorded.block)] {
+        let (Some((sa, a)), Some((sb, b))) = (read_writer(&o.model, &name)?, read_writer(&o.into, &name)?) else { continue };
+        let Role::Writer { axis } = role(&name, &sa, hidden)? else { continue };
+        let ratio = |shape: &[usize], v: Vec<f32>| -> Result<f64> { residual_write(&Tensor::from_vec(v, shape.to_vec(), &Device::Cpu)?, axis, &chosen.direction) };
+        let (before, after) = (ratio(&sa, a)?, ratio(&sb, b)?);
+        emit(json!({"event": "log", "message": format!("{name}: writes {before:.5} along r in the original, {after:.5} in the abliterated folder")}));
+        writers.push((name, before, after));
+    }
+    if writers.is_empty() {
+        bail!("{}: no o_proj or down_proj of block {} to check the direction against", o.into.display(), recorded.block);
+    }
+    for (name, before, after) in &writers {
+        // at scale s the abliterated weights keep (1 − s) of what they wrote
+        let left = (1.0 - scale as f64).abs();
+        if *after > (left + DIRECTION_FIT) * before {
+            bail!("{name} of {} still writes {after:.5} along the recomputed direction (the original {before:.5}): this is not the direction that was removed",
+                  o.into.display());
+        }
+    }
+    let file = crate::carry::save(&o.into, &crate::carry::Direction { r: chosen.direction.clone(), scale, layer: recorded.block, pass: recorded.pass,
+                                                                       separation: chosen.separation, source: "direction-only".into() })?;
+    emit(json!({"event": "log", "message": format!("wrote {}", file.display())}));
+    Ok(DirectionOnlyReport { chosen, recorded_separation: rec_sep, separation_error: err, writers, file })
 }
 
 /// What a run needs, before it starts (printed first, as `profile` does for training).

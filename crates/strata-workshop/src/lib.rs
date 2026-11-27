@@ -39,5 +39,7 @@ pub mod safetensors_io;
 pub mod soup;
 pub mod st_writer;
 pub mod abliterate;
+pub mod carry;
+pub mod refusal_check;
 pub mod train;
 pub mod testmodel;
