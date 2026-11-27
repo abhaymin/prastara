@@ -735,7 +735,13 @@ impl Runner {
             // micro-step's results once all of it has succeeded, so nothing is counted twice
             let mut attempt = 0;
             let (value, aux, tokens, next) = loop {
-                let tried = self.micro(step, m, lr).and_then(|(value, aux, tokens, grads)| {
+                // the retry trims the pools at every block boundary (the gap 0), then the gap is as before
+                let gap = (attempt > 0).then(|| model::TRIM_GAP.swap(0, std::sync::atomic::Ordering::Relaxed));
+                let tried = self.micro(step, m, lr);
+                if let Some(g) = gap {
+                    model::TRIM_GAP.store(g, std::sync::atomic::Ordering::Relaxed);
+                }
+                let tried = tried.and_then(|(value, aux, tokens, grads)| {
                     let next = sum.iter().zip(grads).map(|(acc, g)| -> Result<Option<Tensor>> {
                         Ok(match (acc, g) {
                             (Some(a), Some(g)) => Some((a + g)?),
@@ -751,7 +757,7 @@ impl Runner {
                         drop(self.model.take_checkpoint_grads());
                         self.model.synchronize()?;
                         let marks = self.model.memory_marks(false);
-                        self.pending.push(format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped, the pools trimmed{}, trying it once more",
+                        self.pending.push(format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped, the pools trimmed{}, trying it once more with a trim at every block",
                             step + 1, first_line(&e), if marks.is_empty() { String::new() } else {
                                 format!(" (reserved now {})", marks.iter().map(|(_, r)| format!("{} MiB", r >> 20)).collect::<Vec<_>>().join(", ")) }));
                     }
