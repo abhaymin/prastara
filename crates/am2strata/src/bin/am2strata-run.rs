@@ -1703,8 +1703,15 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 // the owner's adult dataset into quarantine, checked before release (docs/internal/PRIVATE-DATA.md)
                 const USE: &str = "private-import <folder | https-url | hf:owner/name> --name <name> [--attestation SOURCE.toml] \
                                    [--revision main] [--pattern \"*.zip\"] [--minor-share 0.01] [--resume <import-id>] [--yes]";
-                let src = first.clone().ok_or(USE)?;
-                let source = if let Some(h) = src.strip_prefix("hf:") {
+                // a resume (--resume <id>) keeps its import's own source
+                let src = match (first.clone(), &dg.resume) {
+                    (Some(s), _) => s,
+                    (None, Some(_)) => String::new(),
+                    (None, None) => return Err(USE.into()),
+                };
+                let source = if src.is_empty() {
+                    serde_json::Value::Null
+                } else if let Some(h) = src.strip_prefix("hf:") {
                     serde_json::json!({"hf": h, "revision": dg.revision.clone(), "pattern": dg.pattern.clone()})
                 } else if src.starts_with("https://") || src.starts_with("http://") {
                     serde_json::json!({"url": src})

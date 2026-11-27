@@ -253,7 +253,7 @@ am2strata-run workshop private-import /mnt/nas-download/set --name my-set --atte
 am2strata-run workshop private-import https://example.com/set.zip --name web-set --attestation ./SOURCE.toml
 am2strata-run workshop private-import hf:owner/name --revision main --pattern "data/*.zip" --name hub-set --attestation ./SOURCE.toml
 am2strata-run workshop private-imports                    # the imports in quarantine (counts, why stopped) and the released sets
-am2strata-run workshop private-import --resume my-set-1795789257 --name my-set x   # check again after installing a model
+am2strata-run workshop private-import --resume my-set-1795789257 --name my-set   # check again after installing a model
 am2strata-run workshop private-import-discard my-set-1795789257
 ```
 
