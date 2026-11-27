@@ -117,7 +117,9 @@ impl Job {
         let mut v = json!({"id": self.id, "kind": self.kind, "state": self.state, "request": self.request,
                            "output": self.output.display().to_string(), "queued_at": self.queued_at,
                            "started_at": self.started_at, "finished_at": self.finished_at, "error": self.error,
-                           "result": self.result, "progress": self.progress});
+                           "result": self.result, "progress": self.progress,
+                           // the machine of the cluster that runs it (cluster_workshop.rs); null: this one
+                           "node": self.request["node"]});
         if with_log {
             v["log"] = json!(self.log);
             v["points"] = json!(self.points);
@@ -1142,7 +1144,23 @@ impl Workshop {
         Ok(job)
     }
 
-    fn update(&self, id: u64, f: impl FnOnce(&mut Job)) {
+    /// A job another machine of the cluster runs (cluster_workshop.rs): listed here like one of this machine's, in
+    /// the same id space, its state mirrored from there. It never takes this machine's turn.
+    pub(crate) fn add_mirror(&self, kind: &str, request: Value, output: PathBuf) -> Job {
+        let id = { let mut n = self.next.lock().unwrap(); let id = *n; *n += 1; id };
+        let job = Job { id, kind: kind.into(), args: vec![], request, output, state: "queued", queued_at: now(), started_at: None,
+                        finished_at: None, log: vec![], error: None, result: None, pid: None, progress: None, points: vec![] };
+        self.jobs.lock().unwrap().push(job.clone());
+        crate::live_channel::poke();
+        job
+    }
+
+    /// The Workshop's own folder (`<data>/workshop`).
+    pub fn out_dir(&self) -> PathBuf {
+        self.out_dir.clone()
+    }
+
+    pub(crate) fn update(&self, id: u64, f: impl FnOnce(&mut Job)) {
         if let Some(j) = self.jobs.lock().unwrap().iter_mut().find(|j| j.id == id) {
             f(j);
         }
@@ -1480,6 +1498,12 @@ pub async fn jobs_post(State(s): State<AppState>, headers: HeaderMap, Json(req):
     if crate::foreign_origin(&s, &headers) {
         return crate::not_own_page("Workshop jobs can be started");
     }
+    // "node": another machine of the cluster, or "any" (cluster_workshop.rs)
+    if crate::cluster_workshop::routed(&req) {
+        return crate::cluster_workshop::submit(&s, &w, req).await;
+    }
+    let mut req = req;
+    if let Some(o) = req.as_object_mut() { o.remove("node"); o.remove("keep_on_node"); }
     match w.submit(req) {
         Ok(j) => (StatusCode::ACCEPTED, Json(j.view(false))).into_response(),
         Err(e) => error(StatusCode::BAD_REQUEST, "invalid_request_error", e),

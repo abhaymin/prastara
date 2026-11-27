@@ -11,6 +11,7 @@ mod edit_controls;
 mod image_search;
 mod cluster;
 mod cluster_tls;
+mod cluster_workshop;
 mod workshop;
 mod server_tls;
 mod machine;
@@ -600,6 +601,7 @@ async fn main() -> Result<()> {
     let ws = workshop::Workshop::init(&dir, &expand(&args.data_dir), &first.cfg.rest);
     ws.set_server(&host, port, state.api_key.clone());
     ws.set_manager(mgr.clone());
+    cluster_workshop::init(&first.cfg.rest);
     let web_dir = match args.web_dir.map(|p| expand(&p)) {
         Some(d) => d,
         None => own_web_dir().context("the Prastara web app (web/ in the am2strata folder) was not found; pass --web-dir")?,
@@ -632,6 +634,15 @@ async fn main() -> Result<()> {
         .route("/api/cluster/join", post(cluster::join))
         .route("/api/cluster/forget", post(cluster::forget))
         .route("/api/cluster/workers/{name}", axum::routing::delete(cluster::remove))
+        // Workshop jobs across the cluster (cluster_workshop.rs): the nodes for the master's "Run on"; the rest a worker
+        // answers for a master's key on its pinned link only
+        .route("/api/cluster/workshop", get(cluster_workshop::nodes_get))
+        .route("/api/cluster/workshop/caps", get(cluster_workshop::caps_get))
+        .route("/api/cluster/files/{sha}", get(cluster_workshop::blob_get).put(cluster_workshop::blob_put).layer(axum::extract::DefaultBodyLimit::disable()))
+        .route("/api/cluster/workshop/jobs", post(cluster_workshop::jobs_post))
+        .route("/api/cluster/workshop/jobs/{id}", get(cluster_workshop::job_get).delete(cluster_workshop::job_delete))
+        .route("/api/cluster/workshop/jobs/{id}/outputs", get(cluster_workshop::job_outputs))
+        .route("/api/cluster/workshop/jobs/{id}/file", get(cluster_workshop::job_file))
         .route("/api/machine/measure", post(web::machine_measure))
         .route("/api/optimise", get(web::optimise_status))
         .route("/api/models/{id}/optimise", post(web::optimise))
