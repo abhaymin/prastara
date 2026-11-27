@@ -41,6 +41,11 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 flate2 = "1"
+# import: the datasets as published (Parquet without Arrow: the row reader; CSV; globs for the file lists)
+parquet = { version = "57", default-features = false, features = ["json", "snap", "zstd", "flate2", "flate2-rust_backened", "lz4", "brotli"] }
+bytes = "1"
+csv = "1"
+glob = "0.3"
 
 [features]
 # training on NVIDIA GPUs (candle's CUDA backend; needs the CUDA toolkit at build time)

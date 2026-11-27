@@ -7,6 +7,9 @@
 //! - `bad_row`: not JSON, or no conversation with an answer in it.
 //! - `held_out`: the row is in an `--exclude` file (a regression test's held-out set), the same prompt or a
 //!   near-copy of the conversation: training on it would make the test meaningless.
+//! - `contaminated` (with `--decontaminate`): the prompt or the answer shares a word n-gram (`--ngram`, 13 by default)
+//!   with an item of a test set, or the prompt is a short test question itself: a score on that test would be
+//!   meaningless after training on it.
 //! - `prompt_too_long`: with a tokenizer, the trainer's rule: the prompt alone fills `--max-len`, so no answer token
 //!   is left to learn from. Rows that fit but are longer than `--max-len` are kept and counted as `cut`.
 //! - `empty_answer`: an answer with nothing in it.
@@ -16,6 +19,9 @@
 //! - `too_short`: fewer answer tokens than `--min-answer-tokens`, or fewer than `--min-answer-ratio` × the prompt's.
 //! - `repetition`: the answer repeats itself: the share of its word 3-grams that occur more than once is over
 //!   `--max-repeat`, or the whole answer is one phrase said again and again.
+//! - `loop` (with `--drop-loops`): the answer is stuck in a loop: a word n-gram (1 to 10 words) said again and again
+//!   in a row, or the same line three times running.
+//! - `cut_tail` (with `--clean-end`): the answer stops mid-sentence or leaves a code block open (a truncated tail).
 //! - `script_mismatch` (with `--lang-match`): the answer is not in the script it should be — the translation's
 //!   target language when the prompt asks for one (or the row's `meta.to`), else the prompt's own script or the
 //!   row's `meta.language`.
@@ -74,6 +80,11 @@ pub struct Settings {
     pub near: f64,
     pub lang_match: bool,
     pub exclude: Vec<PathBuf>,
+    /// test sets: a row sharing a word n-gram with one of their items is dropped
+    pub decontaminate: Vec<PathBuf>,
+    pub ngram: usize,
+    pub drop_loops: bool,
+    pub clean_end: bool,
     pub cap_per_language: Option<usize>,
     /// the cap drops rows only from these inputs (the others are kept whole, but count towards it); empty: all
     pub cap_only: Vec<PathBuf>,
@@ -85,7 +96,8 @@ pub struct Settings {
 impl Settings {
     pub fn new(inputs: Vec<PathBuf>, out: PathBuf) -> Self {
         Settings { inputs, out, model: None, chat_template: None, max_len: 1024, drop_cut: false, min_answer_tokens: 4, min_answer_ratio: 0.0,
-                   max_repeat: 0.5, dedupe: Dedupe::Near, near: 0.8, lang_match: false, exclude: vec![], cap_per_language: None, cap_only: vec![],
+                   max_repeat: 0.5, dedupe: Dedupe::Near, near: 0.8, lang_match: false, exclude: vec![], decontaminate: vec![], ngram: 13,
+                   drop_loops: false, clean_end: false, cap_per_language: None, cap_only: vec![],
                    seed: 7, report: None }
     }
 
@@ -98,6 +110,7 @@ impl Settings {
 pub const RULES: &[(&str, &str)] = &[
     ("bad_row", "not JSON, or no conversation with an answer"),
     ("held_out", "in an --exclude (held-out) file: same prompt or a near-copy"),
+    ("contaminated", "shares a long word n-gram with a test item (--decontaminate)"),
     ("prompt_too_long", "the prompt alone fills --max-len: the trainer would drop it (no answer token left)"),
     ("too_long", "longer than --max-len with --drop-cut: the trainer would cut the answer before it ends"),
     ("empty_answer", "the answer is empty"),
@@ -105,6 +118,8 @@ pub const RULES: &[(&str, &str)] = &[
     ("echo", "the answer only repeats the prompt"),
     ("too_short", "too few answer tokens (absolute or for the prompt's length)"),
     ("repetition", "the answer repeats itself"),
+    ("loop", "the answer is stuck in a loop (--drop-loops)"),
+    ("cut_tail", "the answer stops mid-sentence or leaves a code block open (--clean-end)"),
     ("script_mismatch", "the answer is not in the expected script"),
     ("exact_duplicate", "the same conversation, once normalised"),
     ("near_duplicate", "a near-copy (prompt and answer) of a kept row"),
@@ -326,6 +341,89 @@ pub fn repetition(answer: &str) -> f64 {
         *seen.entry(g).or_default() += 1;
     }
     grams.iter().filter(|g| seen[*g] > 1).count() as f64 / grams.len() as f64
+}
+
+/// A loop in an answer: a word n-gram (1 to 10 words, with a real word in it) said again and again in a row (6 times
+/// for one word, 4 for two or three, 3 for longer), or the same line (of 20 characters or more) three times running.
+pub fn looped(answer: &str) -> Option<String> {
+    let w = words(answer);
+    for n in 1..=10usize {
+        let need = match n { 1 => 6, 2 | 3 => 4, _ => 3 };
+        if w.len() < n * need {
+            continue;
+        }
+        let mut i = 0;
+        while i + n * need <= w.len() {
+            let g = &w[i..i + n];
+            let wordy = g.iter().any(|x| x.chars().filter(|c| c.is_alphabetic()).count() >= 2);
+            let mut k = 1;
+            while wordy && i + (k + 1) * n <= w.len() && &w[i + k * n..i + (k + 1) * n] == g {
+                k += 1;
+            }
+            if k >= need {
+                return Some(format!("\"{}\" {k} times in a row", g.join(" ")));
+            }
+            i += 1;
+        }
+    }
+    let lines: Vec<&str> = answer.lines().map(str::trim).collect();
+    for x in lines.windows(3) {
+        if x[0].chars().count() >= 20 && x[0] == x[1] && x[1] == x[2] {
+            return Some(format!("the line \"{}\" three times running", x[0].chars().take(60).collect::<String>()));
+        }
+    }
+    None
+}
+
+/// A truncated tail: an open code fence, or a prose answer (more than 12 words) whose last line stops mid-sentence
+/// (on a letter, a comma, a hyphen or an open bracket) and is not a list item, a table row or code.
+pub fn cut_tail(answer: &str) -> Option<String> {
+    let a = answer.trim_end();
+    if a.matches("```").count() % 2 == 1 {
+        return Some("an open code block".into());
+    }
+    if a.split_whitespace().count() <= 12 {
+        return None;
+    }
+    let last = a.lines().last().unwrap_or("").trim();
+    let listy = last.starts_with(['-', '*', '•', '|', '#', '>']) || last.split_once(['.', ')']).is_some_and(|(n, _)| !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit()));
+    // code: an indented or bracketed last line, or one with code punctuation
+    let codey = a.contains("```") || last.ends_with([';', '{', '}']) || answer.lines().last().is_some_and(|l| l.starts_with("    ") || l.starts_with('\t'));
+    if listy || codey {
+        return None;
+    }
+    let c = last.chars().last()?;
+    if c.is_alphabetic() || matches!(c, ',' | '-' | '–' | '—' | '(' | '[' | '{' | '/' | '&') || (c as u32 >= 0x0900 && c as u32 <= 0x0DFF && c != '।' && c != '॥') {
+        return Some(format!("ends with \"…{}\"", last.chars().rev().take(30).collect::<Vec<_>>().into_iter().rev().collect::<String>()));
+    }
+    None
+}
+
+/// The word n-grams of a text, hashed.
+fn ngrams(text: &str, n: usize) -> Vec<u64> {
+    let w = words(text);
+    if w.len() < n {
+        return vec![];
+    }
+    w.windows(n).map(|g| fnv(g.join(" ").as_bytes())).collect()
+}
+
+/// The test sets' n-grams (to the test file they are from) and their short questions.
+#[derive(Default)]
+struct TestIndex {
+    grams: HashMap<u64, u16>,
+    short: HashMap<[u8; 16], u16>,
+    names: Vec<String>,
+    items: Vec<usize>,
+}
+
+impl TestIndex {
+    fn hit(&self, prompt: &str, answer: &str, n: usize) -> Option<u16> {
+        if let Some(t) = self.short.get(&prompt_key(prompt)) {
+            return Some(*t);
+        }
+        ngrams(prompt, n).into_iter().chain(ngrams(answer, n)).find_map(|g| self.grams.get(&g).copied())
+    }
 }
 
 /// The scripts an answer may be in, and why; empty: not checked.
@@ -582,6 +680,16 @@ pub fn check_row(s: &Settings, row: &Row, len: &Length) -> Option<(&'static str,
     if r > s.max_repeat {
         return Some(("repetition", format!("{:.0}% of its 3-grams repeat", r * 100.0)));
     }
+    if s.drop_loops {
+        if let Some(why) = row.record.messages.iter().filter(|(r, _)| r == "assistant").find_map(|(_, c)| looped(c)) {
+            return Some(("loop", why));
+        }
+    }
+    if s.clean_end {
+        if let Some(why) = row.record.messages.iter().rev().find(|(r, _)| r == "assistant").and_then(|(_, c)| cut_tail(c)) {
+            return Some(("cut_tail", why));
+        }
+    }
     if s.lang_match {
         if let Some(why) = script_mismatch(&q, &a, &row.meta) {
             return Some(("script_mismatch", why));
@@ -620,6 +728,14 @@ pub struct Report {
     pub cut: usize,
     pub sources: Vec<SourceCount>,
     pub languages: BTreeMap<String, usize>,
+    /// kept rows by `meta.domain` and by `meta.source` (with its licence)
+    pub domains: BTreeMap<String, (usize, usize)>,
+    pub meta_sources: BTreeMap<String, (String, String, usize, usize)>,
+    /// kept rows' tokens (with a tokenizer): all, and the answers'
+    pub kept_tokens: usize,
+    pub kept_answer_tokens: usize,
+    /// test file → its items, and the training rows dropped for sharing an n-gram with it
+    pub contamination: Vec<(String, usize, usize)>,
     pub excluded_rows: usize,
     pub tokens: bool,
     /// an input is a private dataset (crate::private_data): every kept row and the card are marked private
@@ -664,6 +780,26 @@ pub fn run(s: &Settings, mut event: impl FnMut(Value)) -> Result<Report> {
         rep.excluded_rows += rows.len();
         event(json!({"event": "log", "message": format!("{}: {} held-out rows to keep out", p.display(), rows.len())}));
     }
+
+    let mut tests = TestIndex::default();
+    for (ti, p) in s.decontaminate.iter().enumerate() {
+        let (rows, _) = read_rows(p, usize::MAX)?;
+        let t = ti.min(u16::MAX as usize) as u16;
+        for r in &rows {
+            let all: String = r.record.messages.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\n");
+            for g in ngrams(&all, s.ngram) {
+                tests.grams.entry(g).or_insert(t);
+            }
+            let q = r.prompt();
+            if words(&q).len() < s.ngram && words(&q).len() >= 4 {
+                tests.short.entry(prompt_key(&q)).or_insert(t);
+            }
+        }
+        tests.names.push(p.file_name().and_then(|x| x.to_str()).unwrap_or("?").to_string());
+        tests.items.push(rows.len());
+        event(json!({"event": "log", "message": format!("{}: {} test items to decontaminate against", p.display(), rows.len())}));
+    }
+    rep.contamination = tests.names.iter().zip(&tests.items).map(|(n, i)| (n.clone(), *i, 0)).collect();
 
     let mut rows = vec![];
     for (i, p) in s.inputs.iter().enumerate() {
@@ -723,6 +859,13 @@ pub fn run(s: &Settings, mut event: impl FnMut(Value)) -> Result<Report> {
             }
             if let Some(j) = held_near.find(&signature(&q), &signature(&a), s.near) {
                 drop_row(&mut rep, "held_out", row, format!("a near-copy of held-out row {}", j + 1));
+                continue;
+            }
+        }
+        if !s.decontaminate.is_empty() {
+            if let Some(t) = tests.hit(&q, &a, s.ngram) {
+                rep.contamination[t as usize].2 += 1;
+                drop_row(&mut rep, "contaminated", row, format!("an n-gram of {}", tests.names[t as usize]));
                 continue;
             }
         }
@@ -798,6 +941,19 @@ pub fn run(s: &Settings, mut event: impl FnMut(Value)) -> Result<Report> {
         out.push('\n');
         rep.sources[row.source].kept += 1;
         *rep.languages.entry(row.language().unwrap_or_else(|| "unknown".into())).or_default() += 1;
+        let tokens = if rep.tokens { len.total } else { 0 };
+        let dom = rep.domains.entry(row.meta["domain"].as_str().unwrap_or("-").to_string()).or_default();
+        dom.0 += 1;
+        dom.1 += tokens;
+        let src = row.meta["source"].as_str().unwrap_or("-").to_string();
+        let ms = rep.meta_sources.entry(src).or_insert_with(|| (row.meta["domain"].as_str().unwrap_or("-").to_string(),
+            row.meta["licence"].as_str().or(row.meta["license"].as_str()).unwrap_or("-").to_string(), 0, 0));
+        ms.2 += 1;
+        ms.3 += tokens;
+        rep.kept_tokens += tokens;
+        if rep.tokens {
+            rep.kept_answer_tokens += len.answer;
+        }
         if rep.tokens && len.total > s.max_len {
             rep.cut += 1;
         }
@@ -859,6 +1015,8 @@ pub fn card(s: &Settings, r: &Report) -> String {
         s.max_repeat * 100.0, match s.dedupe { Dedupe::Off => "off".to_string(), Dedupe::Exact => "exact".into(), Dedupe::Near => format!("exact and near (Jaccard {:.2})", s.near) },
         if s.lang_match { "on" } else { "off" }, s.cap_per_language.map_or("none".to_string(), |c| if s.cap_only.is_empty() { c.to_string() } else {
             format!("{c}, drawn from {} only", s.cap_only.iter().filter_map(|p| p.file_name()?.to_str()).collect::<Vec<_>>().join(", ")) }), s.seed));
+    o.push_str(&format!("- loops: {}\n- truncated tails: {}\n- drop rows longer than max length: {}\n", if s.drop_loops { "dropped" } else { "not checked" },
+                        if s.clean_end { "dropped" } else { "not checked" }, if s.drop_cut { "yes" } else { "no (the trainer cuts them)" }));
     if !s.exclude.is_empty() {
         o.push_str(&format!("- held out ({} rows kept out): {}\n", r.excluded_rows, s.exclude.iter().map(|p| format!("`{}`", p.display())).collect::<Vec<_>>().join(", ")));
     }
@@ -868,6 +1026,26 @@ pub fn card(s: &Settings, r: &Report) -> String {
     }
     if r.tokens {
         o.push_str(&format!("\n{} kept rows are longer than {} tokens: they train on their first {} tokens only.\n", r.cut, s.max_len, s.max_len));
+    }
+    if !s.decontaminate.is_empty() {
+        o.push_str(&format!("\n## Decontamination\n\nA row is dropped when its prompt or answer shares a word {}-gram with a test item (or its prompt is a short test question itself).\n\n| Test set | Items | Training rows dropped |\n|---|---:|---:|\n", s.ngram));
+        for (n, items, hit) in &r.contamination {
+            o.push_str(&format!("| {n} | {items} | {hit} |\n"));
+        }
+    }
+    if r.domains.len() > 1 || r.domains.keys().any(|k| k != "-") {
+        let pct = |n: usize| if r.kept == 0 { 0.0 } else { 100.0 * n as f64 / r.kept as f64 };
+        o.push_str("\n## Kept, by domain\n\n| Domain | Rows | Share | Tokens |\n|---|---:|---:|---:|\n");
+        for (d, (n, t)) in &r.domains {
+            o.push_str(&format!("| {d} | {n} | {:.1}% | {} |\n", pct(*n), if r.tokens { t.to_string() } else { "-".into() }));
+        }
+        o.push_str("\n## Kept, by source\n\n| Source (`meta.source`) | Domain | Licence | Rows | Share | Tokens |\n|---|---|---|---:|---:|---:|\n");
+        for (src, (d, l, n, t)) in &r.meta_sources {
+            o.push_str(&format!("| {src} | {d} | {l} | {n} | {:.1}% | {} |\n", pct(*n), if r.tokens { t.to_string() } else { "-".into() }));
+        }
+        if r.tokens {
+            o.push_str(&format!("\nKept: {} tokens in all ({} of them answer tokens).\n", r.kept_tokens, r.kept_answer_tokens));
+        }
     }
     o.push_str("\n## Kept, by language\n\n| Language | Rows |\n|---|---:|\n");
     for (l, n) in &r.languages {
@@ -907,6 +1085,43 @@ mod tests {
 
     fn words_len(r: &Row) -> Length {
         length_of(r, None, 1024).unwrap()
+    }
+
+    #[test]
+    fn loops_and_cut_tails_are_found_but_ordinary_answers_pass() {
+        assert!(looped("I think so. And then and then and then and then we left.").is_some());
+        assert!(looped("ok ok ok ok ok ok").is_some());
+        assert!(looped("The cat sat on the mat. The dog sat on the rug. It was a calm day.").is_none());
+        assert!(looped("x = [0, 0, 0, 0, 0, 0, 0, 0]").is_none(), "numbers in data are not a loop");
+        let l = "This sentence is long enough to count.";
+        assert!(looped(&format!("{l}\n{l}\n{l}")).is_some());
+        assert!(cut_tail("```python\nprint(1)\n").is_some());
+        assert!(cut_tail("The river rises in the hills and flows to the sea, passing many towns and").is_some());
+        assert!(cut_tail("The river rises in the hills and flows to the sea, passing many towns on the way.").is_none());
+        assert!(cut_tail("Paris").is_none(), "short answers need no full stop");
+        assert!(cut_tail("Here are the steps you can follow today:\n1. Open the box\n2. Take out the parts").is_none());
+    }
+
+    #[test]
+    fn decontamination_drops_rows_sharing_a_long_ngram_with_a_test_item() {
+        let dir = std::env::temp_dir().join(format!("clean-decontam-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let test = dir.join("test.jsonl");
+        std::fs::write(&test, concat!(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May. How many clips did she sell?\"},{\"role\":\"assistant\",\"content\":\"72\"}]}\n",
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"What is the capital of France?\"},{\"role\":\"assistant\",\"content\":\"Paris\"}]}\n")).unwrap();
+        let input = dir.join("in.jsonl");
+        std::fs::write(&input, concat!(
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"Solve: Natalia sold clips to 48 of her friends in April, and then she sold half as many clips in May.\"},{\"role\":\"assistant\",\"content\":\"She sold 72 clips.\"}]}\n",
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"what is the capital of france\"},{\"role\":\"assistant\",\"content\":\"Paris is the capital.\"}]}\n",
+            "{\"messages\":[{\"role\":\"user\",\"content\":\"Name a large river in Africa.\"},{\"role\":\"assistant\",\"content\":\"The Nile is the longest river in Africa.\"}]}\n")).unwrap();
+        let mut s = Settings::new(vec![input], dir.join("out.jsonl"));
+        s.decontaminate = vec![test];
+        let r = run(&s, |_| {}).unwrap();
+        assert_eq!(r.dropped.get("contaminated").copied(), Some(2));
+        assert_eq!(r.kept, 1);
+        assert_eq!(r.contamination[0].2, 2);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

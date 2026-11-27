@@ -17,6 +17,8 @@
 //! am2strata-workshop autopilot --model <hf-folder> --data <chat.jsonl> [--time-budget 2h] [--ram-budget 12GB]
 //! am2strata-workshop regress --model <hf-folder> [--adapter <dir>] [--passes 1,2] --suite <suite.json> --out <report-dir> [--against <report>]
 //! am2strata-workshop clean <in.jsonl>... --out <out.jsonl> [--model <hf-folder>] [--max-len 1024] [--min-answer-tokens N] [--max-repeat R] [--dedupe exact|near|off] [--lang-match] [--drop-cut] [--exclude held-out.jsonl] [--cap-per-language N [--cap-only in.jsonl]] [--report card.md]
+//! am2strata-workshop import <mapping.json>... --out-dir <dir>   (Parquet, JSON, JSONL, CSV, TSV, lines, CoNLL-U, OPUS Moses → chat JSONL)
+//! am2strata-workshop import-peek <file-or-glob[!zip-member-glob]>... [--n 3] [--format F] [--json-path P]
 //! am2strata-workshop private-data --name <name> --source <folder>... [--model <local-model>] [--data-dir ~/Development/Strata-data]
 //! am2strata-workshop private-import (--folder <dir> | --url <https-url> | --hf <owner/name> [--revision main] [--pattern "*.zip"]) --name <name> [--attestation SOURCE.toml] [--confirm-bytes N] [--id <import-id>]
 //! am2strata-workshop private-import-probe (--folder <dir> | --url <https-url> | --hf <owner/name>)
@@ -445,6 +447,18 @@ enum Cmd {
         /// rows to keep out (a regression test's held-out set; repeat it)
         #[arg(long)]
         exclude: Vec<PathBuf>,
+        /// test sets (JSONL; repeat it): drop a row sharing a word n-gram with one of their items
+        #[arg(long)]
+        decontaminate: Vec<PathBuf>,
+        /// the n of --decontaminate's n-grams
+        #[arg(long, default_value_t = 13)]
+        ngram: usize,
+        /// drop answers stuck in a loop (an n-gram or a line said again and again in a row)
+        #[arg(long)]
+        drop_loops: bool,
+        /// drop answers that stop mid-sentence or leave a code block open
+        #[arg(long)]
+        clean_end: bool,
         /// at most this many rows per language (meta.language), drawn by the seed
         #[arg(long)]
         cap_per_language: Option<usize>,
@@ -456,6 +470,28 @@ enum Cmd {
         /// the card (default: <out>.card.md)
         #[arg(long)]
         report: Option<PathBuf>,
+    },
+    /// a downloaded dataset as published (Parquet, JSON, JSONL, CSV, TSV, lines, CoNLL-U, OPUS Moses zips; also zip
+    /// members) turned into chat JSONL by a per-dataset mapping (columns → messages): `<out-dir>/<name>.jsonl` and a card
+    Import {
+        #[arg(required = true)]
+        mappings: Vec<PathBuf>,
+        #[arg(long)]
+        out_dir: PathBuf,
+    },
+    /// the first records of files as the importer reads them (to write a mapping)
+    ImportPeek {
+        #[arg(required = true)]
+        files: Vec<String>,
+        #[arg(long, default_value_t = 3)]
+        n: usize,
+        #[arg(long)]
+        format: Option<String>,
+        #[arg(long)]
+        json_path: Option<String>,
+        /// cut each text value to this many characters
+        #[arg(long, default_value_t = 300)]
+        clip: usize,
     },
     /// the model library: ready-made recipes (Soup's catalogue, ported, and Prastara's own) for text, code, tools,
     /// vision, OCR, image, speech, music and video models:
@@ -1998,7 +2034,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             Ok((dst.clone(), "dataset".into()))
         }
         Cmd::Clean { inputs, out: dst, model, chat_template, max_len, min_answer_tokens, min_answer_ratio, max_repeat, dedupe, near,
-                     lang_match, drop_cut, exclude, cap_per_language, cap_only, seed, report } => {
+                     lang_match, drop_cut, exclude, decontaminate, ngram, drop_loops, clean_end, cap_per_language, cap_only, seed, report } => {
             let mut s = clean::Settings::new(inputs.clone(), dst.clone());
             s.model = model.clone();
             s.chat_template = chat_template.clone();
@@ -2011,6 +2047,10 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
             s.lang_match = *lang_match;
             s.drop_cut = *drop_cut;
             s.exclude = exclude.clone();
+            s.decontaminate = decontaminate.clone();
+            s.ngram = (*ngram).max(4);
+            s.drop_loops = *drop_loops;
+            s.clean_end = *clean_end;
             s.cap_per_language = *cap_per_language;
             s.cap_only = cap_only.clone();
             if let Some(c) = cap_only.iter().find(|c| !inputs.contains(c)) {
@@ -2031,6 +2071,37 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 return Err(format!("no rows kept: every row was dropped ({})", why.join(", ")));
             }
             Ok((dst.clone(), "dataset".into()))
+        }
+        Cmd::Import { mappings, out_dir } => {
+            use strata_workshop::import;
+            let mut last = out_dir.clone();
+            for mp in mappings {
+                for m in import::Mapping::load(mp).map_err(|e| format!("{e:#}"))? {
+                    out.event(json!({"event": "start", "what": format!("import {} ({}) into {}", m.source, m.out_name(), out_dir.display())}));
+                    let (p, r) = import::import_to(&m, out_dir, |v| out.event(v)).map_err(|e| format!("{}: {e:#}", m.source))?;
+                    out.event(json!({"event": "log", "message": format!("{}: {} records, {} filtered, {} unusable, {} rows, {} kept → {}", m.source, r.records, r.filtered, r.unusable, r.rows, r.kept, p.display())}));
+                    last = p;
+                }
+            }
+            Ok((last, "dataset".into()))
+        }
+        Cmd::ImportPeek { files, n, format, json_path, clip } => {
+            fn cut(v: &mut Value, n: usize) {
+                match v {
+                    Value::String(s) if s.chars().count() > n => *s = format!("{}…", s.chars().take(n).collect::<String>()),
+                    Value::Array(a) => { a.truncate(8); a.iter_mut().for_each(|x| cut(x, n)) }
+                    Value::Object(o) => o.values_mut().for_each(|x| cut(x, n)),
+                    _ => {}
+                }
+            }
+            for (name, recs) in strata_workshop::import::peek(files, format.as_deref(), json_path.as_deref(), *n).map_err(|e| format!("{e:#}"))? {
+                println!("== {name}");
+                for mut r in recs {
+                    cut(&mut r, *clip);
+                    println!("{r}");
+                }
+            }
+            Ok((PathBuf::new(), "none".into()))
         }
         Cmd::Loop { model, out: dst, start, end, passes } => {
             out.event(json!({"event": "start", "what": format!("loop blocks {start}..{end} of {} x{passes} as {}", model.display(), dst.display())}));

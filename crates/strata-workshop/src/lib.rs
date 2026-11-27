@@ -20,6 +20,7 @@ pub mod convert;
 pub mod dataset;
 pub mod export_moe;
 pub mod finetune;
+pub mod import;
 pub mod datagen;
 pub mod private_data;
 pub mod private_import;
