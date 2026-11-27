@@ -522,10 +522,12 @@ fn looped_moe_trains_the_same(devices: &[&str], dtype: BaseDtype, tol: f64, hidd
         assert!(dl <= tol && de <= tol, "{devices:?} {}: losses differ by {dl}, eval by {de}", mode.as_str());
     }
     let dp = a.losses.iter().zip(&p.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
-    // open: a bf16 base split over two GPUs and NOT checkpointed drifts from the checkpointed run by ~2.5e-3 after a
-    // few steps (deterministic; one GPU, f32, or the CPU agree to 1e-7, and the gradients of one step agree to 4e-8),
-    // so that case gets a looser bound until it is understood; streaming is always checkpointed and is held exactly
-    let loose = dtype != BaseDtype::F32 && devices.len() > 1 && devices.iter().all(|d| d.starts_with("cuda"));
+    // a bf16 base on a GPU: checkpointed and not differ by ~2.5e-3 after a few steps. Not a bug: under checkpointing a
+    // looped block's adapters get their gradient in two parts (one per pass, from the replays) and without it in one,
+    // so the sums associate differently; AdamW turns those last-bit differences on near-zero gradients into full-size
+    // steps. Changing only the order the trainer adds a micro-step's parts in moved the drift from the two-GPU run to
+    // the one-GPU one. f32 and the CPU agree to 1e-7; streamed against held (both checkpointed) stays exact.
+    let loose = dtype != BaseDtype::F32 && devices.iter().all(|d| d.starts_with("cuda"));
     let ptol = if loose { 5e-3 } else { tol };
     assert!(dp <= ptol, "checkpointing changes the losses by {dp}");
     // training helps: the held-out loss after training is in line with the last train losses, not far above them
