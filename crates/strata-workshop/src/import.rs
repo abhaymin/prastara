@@ -87,6 +87,12 @@ pub struct Join {
     /// keep the record when the key is not in the table (default: drop it)
     #[serde(default)]
     pub optional: bool,
+    /// csv/tsv without a header row: the column names
+    #[serde(default)]
+    pub columns: Option<Vec<String>>,
+    /// only the table's rows that pass these are indexed (a big table read in part)
+    #[serde(default, rename = "where")]
+    pub where_: Vec<Cond>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -99,6 +105,13 @@ pub struct Group {
     /// at most this many values per group (the rest are left out)
     #[serde(default)]
     pub max_items: Option<usize>,
+    /// the first collected column's most typical value (the most words in common with the others) goes in this
+    /// column, and the other values in `<it>_others`
+    #[serde(default)]
+    pub central: Option<String>,
+    /// groups with fewer values are left out
+    #[serde(default)]
+    pub min_items: Option<usize>,
 }
 
 fn default_sep() -> String {
@@ -113,6 +126,8 @@ pub enum Kind {
     Transcript,
     Continue,
     Entities,
+    /// a conversation tree (OpenAssistant): from the root at `column`, each turn's best-ranked child in `children`
+    Tree,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -140,6 +155,16 @@ pub struct Mapping {
     pub columns: Option<Vec<String>>,
     #[serde(default)]
     pub joins: Vec<Join>,
+    /// columns that hold JSON or a Python literal (`{'a': 'b'}`) as text: parsed into values first
+    #[serde(default)]
+    pub parse: Vec<String>,
+    /// tree: the children's key, the rank key (lowest first) and the most turns taken
+    #[serde(default)]
+    pub children: Option<String>,
+    #[serde(default)]
+    pub rank_key: Option<String>,
+    #[serde(default)]
+    pub max_turns: Option<usize>,
     #[serde(default)]
     pub group: Option<Group>,
     #[serde(default, rename = "where")]
@@ -147,6 +172,9 @@ pub struct Mapping {
     /// lookup tables for `{col@table}` in templates
     #[serde(default)]
     pub lookups: HashMap<String, HashMap<String, String>>,
+    /// JSON files of more lookup tables (`{"table": {"key": "value"}}`)
+    #[serde(default)]
+    pub lookup_files: Vec<String>,
     pub kind: Kind,
 
     // columns
@@ -167,9 +195,12 @@ pub struct Mapping {
     /// roles renamed; a role mapped to "" is dropped, a role not listed is kept as it is
     #[serde(default)]
     pub roles: HashMap<String, String>,
-    /// transcript: the markers that start a turn, and the role each starts
+    /// transcript: the markers (regexes) that start a turn, and the role each starts
     #[serde(default)]
     pub markers: Vec<(String, String)>,
+    /// transcript: a user turn put before the transcript (when it starts with the assistant)
+    #[serde(default)]
+    pub first_user: Option<Tpl>,
     /// messages/transcript: a separate column that holds the system prompt
     #[serde(default)]
     pub system_column: Option<String>,
@@ -245,9 +276,20 @@ impl Mapping {
             Value::Array(a) => a,
             o => vec![o],
         };
-        list.into_iter().enumerate()
+        let mut out: Vec<Mapping> = list.into_iter().enumerate()
             .map(|(i, m)| serde_json::from_value(m).with_context(|| format!("{}: mapping {}", path.display(), i + 1)))
-            .collect()
+            .collect::<Result<_>>()?;
+        for m in out.iter_mut() {
+            for f in m.lookup_files.clone() {
+                let p = home(&f);
+                let t: HashMap<String, HashMap<String, String>> = serde_json::from_str(&std::fs::read_to_string(&p).with_context(|| format!("{}", p.display()))?)
+                    .with_context(|| format!("{}: lookup tables", p.display()))?;
+                for (k, v) in t {
+                    m.lookups.entry(k).or_default().extend(v);
+                }
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -401,7 +443,24 @@ pub fn each_record(src: &Source, m_format: Option<&str>, json_path: Option<&str>
         }
         "json" => {
             let bytes = gunzip_if(&src.inner_name(), src.bytes()?)?;
-            let v: Value = serde_json::from_slice(&bytes).with_context(|| format!("{}: not JSON", src.name()))?;
+            let v: Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                // a .json that is JSON lines
+                Err(e) if e.to_string().contains("trailing characters") => {
+                    for (i, line) in bytes.split(|b| *b == b'\n').enumerate() {
+                        let line = String::from_utf8_lossy(line);
+                        if line.trim().is_empty() {
+                            continue;
+                        }
+                        let v: Value = serde_json::from_str(&line).with_context(|| format!("{} line {}", src.name(), i + 1))?;
+                        if !f(v) {
+                            break;
+                        }
+                    }
+                    return Ok(());
+                }
+                Err(e) => return Err(anyhow!("{}: not JSON: {e}", src.name())),
+            };
             let list = match json_path {
                 Some(p) => get(&v, p).clone(),
                 None => match v {
@@ -605,6 +664,71 @@ fn read_moses(src: &Source, f: &mut dyn FnMut(Value) -> bool) -> Result<()> {
     Ok(())
 }
 
+/// A Python literal (`{'a': 'b', 'c': [1, True, None]}`) as JSON; JSON itself is read as it is.
+pub fn parse_literal(text: &str) -> Option<Value> {
+    if let Ok(v) = serde_json::from_str::<Value>(text) {
+        return Some(v);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let cs: Vec<char> = text.chars().collect();
+    let mut i = 0;
+    while i < cs.len() {
+        let c = cs[i];
+        if c == '\'' || c == '"' {
+            let q = c;
+            out.push('"');
+            i += 1;
+            while i < cs.len() && cs[i] != q {
+                if cs[i] == '\\' && i + 1 < cs.len() {
+                    let n = cs[i + 1];
+                    match n {
+                        '\'' => out.push('\''),
+                        '"' => out.push_str("\\\""),
+                        'x' if i + 3 < cs.len() => {
+                            let h: String = cs[i + 2..i + 4].iter().collect();
+                            out.push_str(&format!("\\u00{h}"));
+                            i += 2;
+                        }
+                        _ => {
+                            out.push('\\');
+                            out.push(n);
+                        }
+                    }
+                    i += 2;
+                    continue;
+                }
+                match cs[i] {
+                    '"' => out.push_str("\\\""),
+                    '\n' => out.push_str("\\n"),
+                    '\t' => out.push_str("\\t"),
+                    '\r' => out.push_str("\\r"),
+                    ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+                    ch => out.push(ch),
+                }
+                i += 1;
+            }
+            out.push('"');
+            i += 1;
+            continue;
+        }
+        let rest: String = cs[i..cs.len().min(i + 5)].iter().collect();
+        if rest.starts_with("True") {
+            out.push_str("true");
+            i += 4;
+        } else if rest.starts_with("False") {
+            out.push_str("false");
+            i += 5;
+        } else if rest.starts_with("None") {
+            out.push_str("null");
+            i += 4;
+        } else {
+            out.push(if c == '(' { '[' } else if c == ')' { ']' } else { c });
+            i += 1;
+        }
+    }
+    serde_json::from_str(&out).ok()
+}
+
 // ------------------------------------------------------------------------------------------------------ templates
 
 /// `{path}`, `{path@table}` (a lookup), `{{` and `}}` for braces.
@@ -629,18 +753,24 @@ pub fn render(tpl: &str, rec: &Value, lookups: &HashMap<String, HashMap<String, 
                     }
                     key.push(c);
                 }
-                let (path, table) = match key.split_once('@') {
-                    Some((p, t)) => (p, Some(t)),
-                    None => (key.as_str(), None),
+                let (key, sep) = match key.split_once('~') {
+                    Some((k, s)) => (k.to_string(), Some(s.replace("\\n", "\n"))),
+                    None => (key.clone(), None),
                 };
-                let v = as_text(get(rec, path));
-                match table {
-                    None => out.push_str(&v),
-                    Some(t) => {
-                        let tab = lookups.get(t).ok_or_else(|| anyhow!("no lookup table {t:?}"))?;
-                        out.push_str(tab.get(&v).or_else(|| tab.get("*")).map(String::as_str).unwrap_or(&v));
+                // {path@a@b}: looked up in table a, then the result in table b
+                let mut parts = key.split('@');
+                let path = parts.next().unwrap_or("");
+                let mut v = match (sep, get(rec, path)) {
+                    (Some(sep), Value::Array(a)) => a.iter().map(as_text).collect::<Vec<_>>().join(&sep),
+                    (_, x) => as_text(x),
+                };
+                for t in parts {
+                    let tab = lookups.get(t).ok_or_else(|| anyhow!("no lookup table {t:?}"))?;
+                    if let Some(x) = tab.get(&v).or_else(|| tab.get("*")) {
+                        v = x.clone();
                     }
                 }
+                out.push_str(&v);
             }
             c => out.push(c),
         }
@@ -809,30 +939,33 @@ fn conversations(m: &Mapping, rec: &Value, d: &mut Draw) -> Result<Vec<Vec<(Stri
         Kind::Transcript => {
             let col = m.column.as_deref().ok_or_else(|| anyhow!("transcript: no column"))?;
             let text = as_text(get(rec, col));
+            let markers: Vec<(regex::Regex, &String)> = m.markers.iter().map(|(mk, r)| Ok((regex::Regex::new(mk)?, r))).collect::<Result<_>>()?;
             let mut msgs = vec![];
             if let Some(sc) = &m.system_column {
                 let mut s = as_text(get(rec, sc));
-                for (mk, _) in &m.markers {
-                    if let Some(rest) = s.trim_start().strip_prefix(mk.as_str()) {
-                        s = rest.to_string();
-                    }
-                }
+                let sys = regex::Regex::new(r"^\s*SYSTEM:\s*").unwrap();
+                s = sys.replace(&s, "").into_owned();
                 if !s.trim().is_empty() {
                     msgs.push(("system".to_string(), s.trim().to_string()));
                 }
+            } else if let Some(s) = &m.system {
+                msgs.push(("system".to_string(), render(s.pick(d), rec, lk)?));
+            }
+            if let Some(u) = &m.first_user {
+                msgs.push(("user".to_string(), render(u.pick(d), rec, lk)?));
             }
             // split at the earliest marker each time
             let mut rest = text.as_str();
             let mut role: Option<String> = None;
             loop {
-                let next = m.markers.iter().filter_map(|(mk, r)| rest.find(mk.as_str()).map(|i| (i, mk.len(), r))).min_by_key(|x| x.0);
+                let next = markers.iter().filter_map(|(re, r)| re.find(rest).map(|mt| (mt.start(), mt.end(), *r))).min_by_key(|x| x.0);
                 match next {
-                    Some((i, l, r)) => {
+                    Some((i, e, r)) => {
                         if let Some(ro) = role.take() {
                             msgs.push((ro, rest[..i].trim().to_string()));
                         }
                         role = Some(r.clone());
-                        rest = &rest[i + l..];
+                        rest = &rest[e..];
                     }
                     None => {
                         if let Some(ro) = role.take() {
@@ -842,7 +975,17 @@ fn conversations(m: &Mapping, rec: &Value, d: &mut Draw) -> Result<Vec<Vec<(Stri
                     }
                 }
             }
-            convs.push(msgs.into_iter().filter(|(r, c)| !r.is_empty() && !c.is_empty()).collect());
+            let mut merged: Vec<(String, String)> = vec![];
+            for (r, c) in msgs.into_iter().filter(|(r, c)| !r.is_empty() && !c.is_empty()) {
+                match merged.last_mut() {
+                    Some((r0, c0)) if *r0 == r => {
+                        c0.push_str("\n\n");
+                        c0.push_str(&c);
+                    }
+                    _ => merged.push((r, c)),
+                }
+            }
+            convs.push(merged);
         }
         Kind::Continue => {
             let text = render(m.text.as_deref().unwrap_or("{text}"), rec, lk)?;
@@ -862,6 +1005,27 @@ fn conversations(m: &Mapping, rec: &Value, d: &mut Draw) -> Result<Vec<Vec<(Stri
                 msgs.push(("assistant".to_string(), an));
                 convs.push(msgs);
             }
+        }
+        Kind::Tree => {
+            let (rk, ck) = (m.role_key.as_deref().unwrap_or("role"), m.content_key.as_deref().unwrap_or("text"));
+            let (kids, rank) = (m.children.as_deref().unwrap_or("replies"), m.rank_key.as_deref().unwrap_or("rank"));
+            let mut node = get(rec, m.column.as_deref().unwrap_or("prompt")).clone();
+            let mut msgs = vec![];
+            if let Some(s) = &m.system {
+                msgs.push(("system".to_string(), render(s.pick(d), rec, lk)?));
+            }
+            while !node.is_null() && m.max_turns.is_none_or(|n| msgs.len() < n) {
+                let role = as_text(get(&node, rk));
+                let role = m.roles.get(&role).cloned().unwrap_or(role);
+                msgs.push((role, as_text(get(&node, ck))));
+                // the best-ranked child that was not deleted (unranked children only when there is one)
+                let children: Vec<Value> = get(&node, kids).as_array().cloned().unwrap_or_default().into_iter()
+                    .filter(|c| c["deleted"] != Value::Bool(true) && c["review_result"] != Value::Bool(false)).collect();
+                let next = children.iter().filter(|c| get(c, rank).is_number()).min_by_key(|c| get(c, rank).as_u64().unwrap_or(u64::MAX)).cloned()
+                    .or_else(|| if children.len() == 1 { children.into_iter().next() } else { None });
+                node = next.unwrap_or(Value::Null);
+            }
+            convs.push(msgs);
         }
         Kind::Entities => {
             let toks = list_of_text(get(rec, m.tokens.as_deref().unwrap_or("tokens")));
@@ -913,15 +1077,21 @@ pub struct ImportReport {
 }
 
 /// A table read whole (for a join).
-fn table(spec: &str, format: Option<&str>) -> Result<Vec<Value>> {
-    let mut rows = vec![];
-    for src in expand(&[spec.to_string()])? {
-        each_record(&src, format, None, None, None, &mut |v| {
-            rows.push(v);
+fn table(j: &Join) -> Result<HashMap<String, Value>> {
+    let conds = Compiled {
+        conds: j.where_.iter().map(|w| Ok((w.clone(), w.re.as_deref().map(regex::Regex::new).transpose()?, w.not_re.as_deref().map(regex::Regex::new).transpose()?))).collect::<Result<_>>()?,
+        replace: vec![],
+    };
+    let mut idx = HashMap::new();
+    for src in expand(&[j.file.clone()])? {
+        each_record(&src, j.format.as_deref(), None, None, j.columns.as_deref(), &mut |v| {
+            if passes(&conds, &v) {
+                idx.entry(as_text(get(&v, &j.key))).or_insert(v);
+            }
             true
         })?;
     }
-    Ok(rows)
+    Ok(idx)
 }
 
 fn finish(m: &Mapping, c: &Compiled, msgs: Vec<(String, String)>, rec: &Value) -> Result<Option<Value>> {
@@ -965,13 +1135,20 @@ pub fn import(m: &Mapping, mut event: impl FnMut(Value)) -> Result<(Vec<Value>, 
         replace: m.replace.iter().map(|(a, b)| Ok((regex::Regex::new(a)?, b.clone()))).collect::<Result<_>>()?,
     };
     let line_re = compile(&m.regex)?;
+    // the same table joined twice (on two columns) is read and kept once
+    let mut tables: Vec<(String, std::rc::Rc<HashMap<String, Value>>)> = vec![];
     let mut joins = vec![];
     for j in &m.joins {
-        let mut idx: HashMap<String, Value> = HashMap::new();
-        for r in table(&j.file, j.format.as_deref())? {
-            idx.entry(as_text(get(&r, &j.key))).or_insert(r);
-        }
-        event(json!({"event": "log", "message": format!("join {}: {} keys", j.file, idx.len())}));
+        let sig = format!("{}|{}|{:?}|{:?}|{:?}", j.file, j.key, j.format, j.columns, j.where_);
+        let idx = match tables.iter().find(|(s, _)| *s == sig) {
+            Some((_, t)) => t.clone(),
+            None => {
+                let t = std::rc::Rc::new(table(j)?);
+                event(json!({"event": "log", "message": format!("join {}: {} keys", j.file, t.len())}));
+                tables.push((sig, t.clone()));
+                t
+            }
+        };
         joins.push((j, idx));
     }
     let srcs = expand(&m.files)?;
@@ -1009,6 +1186,16 @@ pub fn import(m: &Mapping, mut event: impl FnMut(Value)) -> Result<(Vec<Value>, 
         event(json!({"event": "progress", "done": fi, "total": srcs.len(), "message": format!("reading {}", src.name())}));
         each_record(src, m.format.as_deref(), m.json_path.as_deref(), line_re.as_ref(), m.columns.as_deref(), &mut |mut rec| {
             rep.records += 1;
+            if let Value::Object(o) = &mut rec {
+                o.entry("_file").or_insert_with(|| Value::String(src.inner_name()));
+            }
+            for col in &m.parse {
+                if let Some(t) = rec.get(col).and_then(|v| v.as_str()).map(String::from) {
+                    if let (Some(v), Value::Object(o)) = (parse_literal(&t), &mut rec) {
+                        o.insert(col.clone(), v);
+                    }
+                }
+            }
             for (j, idx) in &joins {
                 match idx.get(&as_text(get(&rec, &j.on))) {
                     Some(other) => {
@@ -1056,10 +1243,31 @@ pub fn import(m: &Mapping, mut event: impl FnMut(Value)) -> Result<(Vec<Value>, 
     if let (Some(g), Some((order, mut map))) = (m.group.as_ref(), groups) {
         for key in order {
             let (mut rec, items) = map.remove(&key).unwrap();
+            if g.min_items.is_some_and(|n| items.len() < n) {
+                rep.filtered += 1;
+                continue;
+            }
             if let Value::Object(o) = &mut rec {
                 for (ci, col) in g.collect.iter().enumerate() {
                     let mut vs: Vec<String> = items.iter().map(|v| v[ci].clone()).filter(|s| !s.is_empty()).collect();
                     vs.dedup();
+                    if ci == 0 {
+                        if let Some(cname) = &g.central {
+                            let ws: Vec<std::collections::HashSet<String>> = vs.iter().map(|v| v.to_lowercase().split_whitespace()
+                                .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()).to_string()).collect()).collect();
+                            let score = |i: usize| -> f64 {
+                                (0..ws.len()).filter(|j| *j != i).map(|j| {
+                                    let (a, b) = (&ws[i], &ws[j]);
+                                    a.intersection(b).count() as f64 / a.union(b).count().max(1) as f64
+                                }).sum()
+                            };
+                            if let Some(best) = (0..vs.len()).max_by(|a, b| score(*a).total_cmp(&score(*b)).then(b.cmp(a))) {
+                                o.insert(cname.clone(), Value::String(vs[best].clone()));
+                                let others: Vec<String> = vs.iter().enumerate().filter(|(i, _)| *i != best).map(|(_, v)| v.clone()).collect();
+                                o.insert(format!("{cname}_others"), Value::String(others.join(&g.sep)));
+                            }
+                        }
+                    }
                     o.insert(col.clone(), Value::String(vs.join(&g.sep)));
                 }
                 o.insert("_count".into(), json!(items.len()));
@@ -1132,6 +1340,9 @@ mod tests {
         let rec = json!({"a": {"b": ["x", "y"]}, "lang": "hin", "n": 3});
         let lk: HashMap<String, HashMap<String, String>> = [("name".to_string(), [("hin".to_string(), "Hindi".to_string())].into())].into();
         assert_eq!(render("{a.b.1} {lang@name} {n} {{x}}", &rec, &lk).unwrap(), "y Hindi 3 {x}");
+        assert_eq!(render("{a.b~\\n}", &rec, &lk).unwrap(), "x\ny");
+        let lk2: HashMap<String, HashMap<String, String>> = [("f".to_string(), [("hin_train.json".to_string(), "hin".to_string())].into()), ("name".to_string(), [("hin".to_string(), "Hindi".to_string())].into())].into();
+        assert_eq!(render("{_file@f@name}", &json!({"_file": "hin_train.json"}), &lk2).unwrap(), "Hindi");
     }
 
     #[test]
@@ -1140,6 +1351,26 @@ mod tests {
         let rec = json!({"chat": "USER: hi there ASSISTANT: hello! USER: bye"});
         let c = conversations(&m, &rec, &mut Draw::new(1)).unwrap();
         assert_eq!(c[0], vec![("user".to_string(), "hi there".to_string()), ("assistant".to_string(), "hello!".to_string())]);
+    }
+
+    #[test]
+    fn python_literals_become_json() {
+        let v = parse_literal("{'code': 'fn a() {\\n    \"x\"\\n}', 'ok': True, 'n': None, 't': (1, 2), 'q': 'it\\'s'}").unwrap();
+        assert_eq!(v["code"], "fn a() {\n    \"x\"\n}");
+        assert_eq!(v["ok"], true);
+        assert!(v["n"].is_null());
+        assert_eq!(v["t"], json!([1, 2]));
+        assert_eq!(v["q"], "it's");
+    }
+
+    #[test]
+    fn a_tree_follows_the_best_ranked_reply() {
+        let m = mapping("tree", json!({"roles": {"prompter": "user"}}));
+        let rec = json!({"prompt": {"role": "prompter", "text": "hi", "replies": [
+            {"role": "assistant", "text": "second", "rank": 1, "replies": []},
+            {"role": "assistant", "text": "best", "rank": 0, "replies": [{"role": "prompter", "text": "thanks", "replies": []}]}]}});
+        let c = conversations(&m, &rec, &mut Draw::new(1)).unwrap();
+        assert_eq!(c[0], vec![("user".to_string(), "hi".to_string()), ("assistant".to_string(), "best".to_string())]);
     }
 
     #[test]
