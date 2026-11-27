@@ -273,6 +273,10 @@ pub struct TrainReport {
 /// have had; two end the run.
 pub static INJECT_OOM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
 pub static INJECT_OOM_TIMES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+/// A test hook: the micro-step with this number fails while its gradients are being added into the step's sums,
+/// after the first [`INJECT_COMMIT_AFTER`] parts (once; `usize::MAX`: never).
+pub static INJECT_COMMIT_OOM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(usize::MAX);
+pub static INJECT_COMMIT_AFTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(3);
 
 /// Whether `e` is a device's out-of-memory error (CUDA's or cuBLAS's, as candle and cudarc word them, or Metal's).
 /// Not sticky on CUDA: the context stays usable, so the micro-step can run again.
@@ -669,9 +673,11 @@ impl Runner {
         self.orders.entry(epoch).or_insert_with(|| permutation(seed, epoch as u64 + 1, n))[m % n]
     }
 
-    /// Micro-step `m` of step `step`: its loss, router loss, tokens and each variable's gradient (in `vars` order).
-    /// Nothing of the run's state changes here except the memory trace, so a failed micro-step can be run again.
-    fn micro(&mut self, step: usize, m: usize, lr: f64) -> Result<(f64, Option<f64>, u64, Vec<Option<Tensor>>)> {
+    /// Micro-step `m` of step `step`: its loss, router loss, tokens, and its gradients as the backward pass left
+    /// them (the graph's store and the checkpoint replays' parts, no copies). Nothing of the run's state changes
+    /// here, so a micro-step that fails can be run again.
+    #[allow(clippy::type_complexity)]
+    fn micro(&mut self, step: usize, m: usize, lr: f64) -> Result<(f64, Option<f64>, u64, candle_core::backprop::GradStore, Vec<(Var, Tensor)>)> {
         let index = self.example_at(m);
         let ex = self.data.train[index].clone();
         let h = self.hidden(&ex)?;
@@ -691,34 +697,48 @@ impl Runner {
         }
         // with checkpointing, the adapters inside a recomputed block get their gradient there
         let extra = self.model.take_checkpoint_grads();
-        drop(loss);
-        let mut mine: Vec<Option<Tensor>> = Vec::with_capacity(self.vars.len());
-        for var in &self.vars {
+        drop((loss, h));
+        Ok((value, ctx.aux_loss(), ex.tokens.len() as u64, grads, extra))
+    }
+
+    /// Add a micro-step's gradient parts into the step's sums, one part at a time, as the trainer always has (the
+    /// extra memory is one variable's new sum). `added` records each `(slot, part)` for [`Runner::uncommit`].
+    fn commit(&self, m: usize, sum: &mut [Option<Tensor>], grads: &candle_core::backprop::GradStore, extra: &[(Var, Tensor)],
+              added: &mut Vec<(usize, Tensor)>) -> Result<()> {
+        for (slot, var) in self.vars.iter().enumerate() {
             let id = var.as_tensor().id();
-            let mut acc: Option<Tensor> = None;
             for g in grads.get(var).into_iter().chain(extra.iter().filter(|(v, _)| v.as_tensor().id() == id).map(|(_, g)| g)) {
-                acc = Some(match acc {
-                    Some(a) => (a + g)?,
+                if INJECT_COMMIT_OOM.load(std::sync::atomic::Ordering::Relaxed) == m && added.len() == INJECT_COMMIT_AFTER.load(std::sync::atomic::Ordering::Relaxed) {
+                    INJECT_COMMIT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+                    bail!("injected for a test: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")");
+                }
+                let next = match &sum[slot] {
+                    Some(acc) => (acc + g)?,
                     None => g.clone(),
-                });
-            }
-            mine.push(acc);
-        }
-        drop((grads, extra, h));
-        // the backward pass's buffers are free now: let the devices' memory pools take them back
-        self.model.synchronize()?;
-        let marks = self.model.memory_marks(true);
-        if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
-            let mib = |b: u64| b >> 20;
-            let line = format!("step {} micro {m} tokens {} | {}\n", step + 1, ex.tokens.len(),
-                marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
-            use std::io::Write as _;
-            if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
-            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-                let _ = f.write_all(line.as_bytes());
+                };
+                sum[slot] = Some(next);
+                added.push((slot, g.clone()));
             }
         }
-        Ok((value, ctx.aux_loss(), ex.tokens.len() as u64, mine))
+        Ok(())
+    }
+
+    /// Take back the parts a [`Runner::commit`] that failed half-way added (after the pools are trimmed, so the
+    /// subtraction has room): exact for a slot that was empty before, one rounding of `(s + g) − g` otherwise. Only
+    /// needed when the device runs out of memory while the gradients are being added up, after the whole micro-step.
+    fn uncommit(sum: &mut [Option<Tensor>], before_empty: &[bool], added: Vec<(usize, Tensor)>) -> Result<()> {
+        let mut first_part: Vec<bool> = before_empty.to_vec();
+        let mut plan: Vec<(usize, Tensor, bool)> = Vec::with_capacity(added.len());
+        for (slot, g) in added {
+            let first = std::mem::replace(&mut first_part[slot], false);
+            plan.push((slot, g, first));
+        }
+        for (slot, g, first) in plan.into_iter().rev() {
+            let Some(s) = sum[slot].take() else { continue };
+            // the slot's first part into an empty sum is the sum: dropping it is exact
+            sum[slot] = if first { None } else { Some((s - g)?) };
+        }
+        Ok(())
     }
 
     /// One optimizer step at rate `lr` over micro-batches `step·accumulation ..`, as many as `count`. Returns the mean
@@ -730,46 +750,61 @@ impl Runner {
         let mut aux_sum: Option<f64> = None;
         for k in 0..count {
             let m = step * self.accumulation + k;
-            // a micro-step that runs out of device memory is thrown away whole (its loss, its gradients, those the
-            // checkpoint replays left) and run again once, after the pools are trimmed; the step's sums only take a
-            // micro-step's results once all of it has succeeded, so nothing is counted twice
+            // a micro-step that runs out of device memory (anywhere in its forward or backward pass, a checkpoint
+            // replay included, or while its gradients are added up) is thrown away whole and run once more after the
+            // pools are trimmed. The step's sums take its gradients only after its backward pass has finished, so
+            // nothing is counted twice, and they are added in place as always: no second set of gradients is held.
             let mut attempt = 0;
-            let (value, aux, tokens, next) = loop {
+            let (value, aux, tokens) = loop {
                 // the retry trims the pools at every block boundary (the gap 0), then the gap is as before
                 let gap = (attempt > 0).then(|| model::TRIM_GAP.swap(0, std::sync::atomic::Ordering::Relaxed));
-                let tried = self.micro(step, m, lr);
+                let before_empty: Vec<bool> = sum.iter().map(Option::is_none).collect();
+                let mut added = Vec::new();
+                let tried = self.micro(step, m, lr).and_then(|(value, aux, tokens, grads, extra)| {
+                    self.commit(m, &mut sum, &grads, &extra, &mut added)?;
+                    Ok((value, aux, tokens))
+                });
                 if let Some(g) = gap {
                     model::TRIM_GAP.store(g, std::sync::atomic::Ordering::Relaxed);
                 }
-                let tried = tried.and_then(|(value, aux, tokens, grads)| {
-                    let next = sum.iter().zip(grads).map(|(acc, g)| -> Result<Option<Tensor>> {
-                        Ok(match (acc, g) {
-                            (Some(a), Some(g)) => Some((a + g)?),
-                            (a, g) => a.clone().or(g),
-                        })
-                    }).collect::<Result<Vec<_>>>()?;
-                    Ok((value, aux, tokens, next))
-                });
                 match tried {
                     Ok(r) => break r,
                     Err(e) if attempt == 0 && is_out_of_memory(&e) => {
                         attempt += 1;
                         drop(self.model.take_checkpoint_grads());
                         self.model.synchronize()?;
+                        let undone = added.len();
+                        Self::uncommit(&mut sum, &before_empty, added)?;
                         let marks = self.model.memory_marks(false);
-                        self.pending.push(format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped, the pools trimmed{}, trying it once more with a trim at every block",
-                            step + 1, first_line(&e), if marks.is_empty() { String::new() } else {
-                                format!(" (reserved now {})", marks.iter().map(|(_, r)| format!("{} MiB", r >> 20)).collect::<Vec<_>>().join(", ")) }));
+                        let line = format!("step {} micro-step {m}: out of device memory ({}); its tensors dropped{}, the pools trimmed{}, trying it once more with a trim at every block",
+                            step + 1, first_line(&e), if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
+                            if marks.is_empty() { String::new() } else {
+                                format!(" (reserved now {})", marks.iter().map(|(_, r)| format!("{} MiB", r >> 20)).collect::<Vec<_>>().join(", ")) });
+                        // (train() says it even when the retry fails too and the step ends the run)
+                        self.pending.push(line);
                     }
                     Err(e) => return Err(e),
                 }
             };
-            sum = next;
             loss_sum += value;
             if let Some(a) = aux {
                 aux_sum = Some(aux_sum.unwrap_or(0.0) + a);
             }
             self.tokens_seen += tokens;
+            // the backward pass's buffers are free now: let the devices' memory pools take them back
+            self.model.synchronize()?;
+            let marks = self.model.memory_marks(true);
+            let index = self.example_at(m);
+            if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
+                let mib = |b: u64| b >> 20;
+                let line = format!("step {} micro {m} tokens {} | {}\n", step + 1, self.data.train[index].tokens.len(),
+                    marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
+                use std::io::Write as _;
+                if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
         }
         // the mean gradient over the step's conversations, clipped by its norm over all adapters
         let mut norm_sq = 0.0f64;
@@ -938,10 +973,11 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     while step < total {
         let count = s.accumulation.min(total_micro - step * s.accumulation).max(1);
         let lr = hf_cosine_lr(s.lr, step, warmup, total);
-        let loss = run.step(step, count, lr)?;
+        let stepped = run.step(step, count, lr);
         for l in std::mem::take(&mut run.pending) {
             on_event(Event::Log(l));
         }
+        let loss = stepped?;
         losses.push(loss);
         step += 1;
         let done = (step - start_step) as f64;

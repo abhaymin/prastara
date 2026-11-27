@@ -950,6 +950,9 @@ pub enum Mask {
 /// freed pieces no new allocation fits: on the 56B-A5B it reserved 13.2 GB for 8.7 GB in use inside one micro-step and
 /// ran out of memory. `AM2_TRIM_GAP_MB` overrides it once (0: trim at every block).
 pub static TRIM_GAP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// A test hook: the N-th checkpoint replay from now (counting down; 0 or less: none) fails with a device
+/// out-of-memory error, as one raised inside the replay's backward pass would.
+pub static INJECT_REPLAY_OOM: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
 /// How many block-boundary trims ran (for the log and the tests).
 pub static TRIMS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// The default gap: 1 GiB.
@@ -1573,6 +1576,9 @@ impl CustomOp1 for CheckpointBlock {
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let err = |e: anyhow::Error| candle_core::Error::Msg(format!("checkpointed block: {e}"));
         trim_if_fragmented(arg.device());
+        if INJECT_REPLAY_OOM.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+            return Err(candle_core::Error::Msg("checkpointed block: injected for a test: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into()));
+        }
         let x = Var::from_tensor(&arg.detach())?;
         let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls), detach: Cell::new(self.detached), ..Ctx::default() };
         let block = match &self.stream {

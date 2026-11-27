@@ -12,9 +12,13 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 
 use candle_core::Device;
-use strata_workshop::finetune::{self, Event, TrainReport, TrainSettings, INJECT_OOM, INJECT_OOM_TIMES};
+use strata_workshop::finetune::{self, Event, TrainReport, TrainSettings, INJECT_COMMIT_AFTER, INJECT_COMMIT_OOM, INJECT_OOM, INJECT_OOM_TIMES};
+use strata_workshop::model::INJECT_REPLAY_OOM;
 use strata_workshop::layer_stream::StreamMode;
 use strata_workshop::model::{LoraSpec, Target};
+
+/// The hooks are process-wide: one test at a time.
+static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn settings(model: &Path, data: &Path, out: &Path) -> TrainSettings {
     let mut s = TrainSettings::new(model, data, out);
@@ -43,6 +47,7 @@ fn adapter(dir: &Path) -> BTreeMap<String, Vec<f32>> {
 
 #[test]
 fn an_out_of_memory_micro_step_is_retried_once_and_counted_once() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let (root, model, data) = common::model_and_data("oom-retry");
     for (tag, stream) in [("held", None), ("streamed", Some(StreamMode::Ram))] {
         let mut base = settings(&model, &data, &root.join(format!("{tag}-plain")));
@@ -71,6 +76,48 @@ fn an_out_of_memory_micro_step_is_retried_once_and_counted_once() {
     assert!(!finetune::is_out_of_memory(&anyhow::anyhow!("the loss became NaN")));
 }
 
+/// The same from inside a checkpoint replay's backward pass (an error raised in `CheckpointBlock::bwd`, through
+/// candle's backward), and while a micro-step's gradients are being added into the step's sums: retried, nothing
+/// counted twice. A second replay failure in the retry is logged before the run ends.
+#[test]
+fn an_out_of_memory_in_a_replay_or_while_adding_up_is_retried_too() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, model, data) = common::model_and_data("oom-replay");
+    let base = settings(&model, &data, &root.join("plain"));
+    let (a, _) = run(&base).unwrap();
+    // the 7th replay from the start: inside step 1 (3 micro-steps of 3 checkpointed blocks)
+    let mut replay = base.clone();
+    replay.out = root.join("replay");
+    INJECT_REPLAY_OOM.store(7, Ordering::SeqCst);
+    let (b, logs) = run(&replay).unwrap();
+    assert!(INJECT_REPLAY_OOM.load(Ordering::SeqCst) <= 0);
+    assert_eq!(a.losses, b.losses);
+    assert_eq!(adapter(&base.out), adapter(&replay.out));
+    assert!(logs.iter().any(|l| l.contains("out of device memory") && l.contains("checkpointed block")), "{logs:?}");
+    // while adding up: micro-step 3 is the first of step 2 (the sums empty before it, so taking it back is exact)
+    let mut adding = base.clone();
+    adding.out = root.join("adding");
+    INJECT_COMMIT_AFTER.store(5, Ordering::SeqCst);
+    INJECT_COMMIT_OOM.store(3, Ordering::SeqCst);
+    let (c, logs) = run(&adding).unwrap();
+    assert_eq!(INJECT_COMMIT_OOM.load(Ordering::SeqCst), usize::MAX);
+    assert_eq!(a.losses, c.losses);
+    assert_eq!(adapter(&base.out), adapter(&adding.out));
+    assert!(logs.iter().any(|l| l.contains("5 gradient parts taken back")), "{logs:?}");
+    // a replay that fails in the retry too: the run ends, and the retry was said first
+    let mut twice = base.clone();
+    twice.out = root.join("twice");
+    let mut logs = Vec::new();
+    INJECT_OOM_TIMES.store(1, Ordering::SeqCst);
+    INJECT_OOM.store(1, Ordering::SeqCst);
+    INJECT_REPLAY_OOM.store(4, Ordering::SeqCst);
+    let e = finetune::train(&twice, &mut |e| if let Event::Log(l) = e { logs.push(l) }, &|| false).err().expect("a second failure ends the run");
+    INJECT_OOM.store(usize::MAX, Ordering::SeqCst);
+    INJECT_REPLAY_OOM.store(0, Ordering::SeqCst);
+    assert!(finetune::is_out_of_memory(&e), "{e:#}");
+    assert!(logs.iter().any(|l| l.contains("micro-step 1: out of device memory")), "{logs:?}");
+}
+
 /// On the GPUs (`-- --ignored --test-threads=1`; AM2_TEST_DEVICES=cuda:1 or AM2_TEST_GPUS=2): a streamed bf16 looped
 /// MoE over conversations of varied length, with the block-boundary trim off, at its default gap and at every block:
 /// the same losses; with it, each micro-step's reserve stays nearer its use. Prints the pool's release threshold.
@@ -78,6 +125,7 @@ fn an_out_of_memory_micro_step_is_retried_once_and_counted_once() {
 #[test]
 #[ignore]
 fn on_the_gpus_block_boundary_trims_keep_the_steps_and_the_reserve_down() {
+    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     use strata_workshop::model::{make_looped, make_upcycled, LoopSpec, MoeSpec, TRIMS, TRIM_GAP};
     let devices: Vec<String> = match (std::env::var("AM2_TEST_DEVICES"), std::env::var("AM2_TEST_GPUS").as_deref()) {
         (Ok(l), _) => l.split(',').map(|d| d.trim().to_string()).collect(),
