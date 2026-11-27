@@ -3497,3 +3497,118 @@ fn a_running_chat_can_be_stopped_and_a_waiting_one_cancelled() {
     assert!(took < Duration::from_secs(8), "stopped early, not after the whole reply (160 tokens at 150 ms): {took:?}");
     assert_eq!(s.post("/api/queue/999999/cancel", &json!({})).0, 404, "a job that has ended");
 }
+
+/// A master and its worker's media: wait until the master has heard worker `i` (ready, its media kinds read), and
+/// return what it says of it.
+fn worker_seen(master: &Server, i: usize, kind: &str) -> Value {
+    let t0 = Instant::now();
+    loop {
+        let (_, c) = master.get("/api/cluster", true);
+        let w = c["workers"][i].clone();
+        if w["ready"] == true && w["media"].as_array().is_some_and(|m| m.iter().any(|k| k == kind)) {
+            return w;
+        }
+        assert!(t0.elapsed() < Duration::from_secs(20), "the worker was not heard: {c}");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+fn master_of(workers: &[(&str, &Server)], cluster: Value, extra: Value) -> Server {
+    let mut cl = cluster;
+    for (name, w) in workers {
+        cl["workers"][*name] = json!({"url": w.base, "key": KEY});
+    }
+    let m = Model { extra: json!({"cluster": cl}), ..Model::default() };
+    Server::start(&[m], &[ids("x")], extra)
+}
+
+fn song(s: &Server, body: Value) -> (u16, Option<String>, Option<String>, Value) {
+    let r = reqwest::blocking::Client::new().post(format!("{}/v1/audio/music", s.base)).bearer_auth(KEY).json(&body).send().unwrap();
+    let h = |k: &str| r.headers().get(k).and_then(|v| v.to_str().ok()).map(str::to_string);
+    let (code, worker, note) = (r.status().as_u16(), h("x-strata-worker"), h("x-strata-note"));
+    let v = if r.headers().get("content-type").is_some_and(|c| c.to_str().unwrap_or("").contains("json")) { r.json().unwrap_or(Value::Null) }
+            else { let b = r.bytes().unwrap(); json!({"bytes": b.len(), "riff": b.starts_with(b"RIFF")}) };
+    (code, worker, note, v)
+}
+
+/// A media job goes to a worker only when it has the memory for it (2026-11-27: a 16 GB Mac with 3.7 GB free was sent
+/// a song and ran out of Metal memory 35 minutes in). The worker says its free memory in the queue the master polls;
+/// one short of the kind's floor is skipped (another worker, else here) with an x-strata-note saying why; the run
+/// config overrides the floors; an older worker that says nothing is sent it as before.
+#[test]
+fn a_worker_short_of_memory_is_not_sent_a_song() {
+    let low = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("x")], json!({"mem_gb": 3.7}));
+    let roomy = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("x")], json!({"mem_gb": 64}));
+    let old = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("x")],
+                            json!({"mem_gb": 3.7, "env": {"AM2_TEST_OLD_WORKER": "1"}}));
+    // the status the master polls carries it
+    let q = low.get("/api/queue", true).1;
+    assert_eq!((q["memory"]["ram_free_gb"].as_f64(), q["memory"]["media_unloads_text"].as_bool()), (Some(3.7), Some(true)), "{q}");
+    assert!(old.get("/api/queue", true).1.get("memory").is_none());
+    let body = json!({"style": "calm piano", "lyrics": "[instrumental]", "duration": 10});
+    // this PC cannot make music (not downloaded) and its only worker is short: kept here, with the reason
+    let m1 = master_of(&[("macm4", &low)], json!({}), json!({"no_music": true}));
+    let w = worker_seen(&m1, 0, "music");
+    assert_eq!(w["memory"]["ram_free_gb"], 3.7, "{w}");
+    let (_, worker, note, v) = song(&m1, body.clone());
+    assert_eq!(worker, None, "{v}");
+    assert_eq!(note.as_deref(), Some("kept local: macm4 has 3.7 GB free, music needs 8 GB"), "{v}");
+    assert!(!low.get("/metrics", true).1["requests"].to_string().contains("\"song\""), "the worker made no song");
+    // two workers: the one with room makes it
+    let m2 = master_of(&[("macm4", &low), ("pc2", &roomy)], json!({}), json!({"no_music": true}));
+    worker_seen(&m2, 0, "music");
+    worker_seen(&m2, 1, "music");
+    let (code, worker, _, v) = song(&m2, body.clone());
+    assert_eq!((code, worker.as_deref(), &v["riff"]), (200, Some("pc2"), &json!(true)), "{v}");
+    // the master's floor for music raised past what pc2 has: kept here too
+    let m3 = master_of(&[("pc2", &roomy)], json!({"media_min_free_gb": {"music": 100}}), json!({"no_music": true}));
+    worker_seen(&m3, 0, "music");
+    let (_, worker, note, _) = song(&m3, body.clone());
+    assert_eq!((worker, note.as_deref()), (None, Some("kept local: pc2 has 64.0 GB free, music needs 100 GB")));
+    // an older worker that does not say its memory: sent it, as before
+    let m4 = master_of(&[("old", &old)], json!({}), json!({"no_music": true}));
+    let w = worker_seen(&m4, 0, "music");
+    assert!(w["memory"].is_null(), "{w}");
+    let (_, worker, note, v) = song(&m4, body);
+    assert_eq!((worker.as_deref(), note), (Some("old"), None), "{v}");
+}
+
+/// A routed song that runs the worker out of memory (Metal's "Insufficient Memory") is said to be the worker's memory,
+/// not a bare 502, and is made here once when this PC can make it ("strata_fallback": false keeps the error).
+#[test]
+fn a_song_that_runs_a_worker_out_of_memory_is_made_here() {
+    let worker = Server::start(&[Model { id: "mock-b", ..Model::default() }], &[ids("x")],
+                               json!({"mem_gb": 64, "env": {"MOCK_MEDIA_OOM": "1"}}));
+    let master = master_of(&[("macm4", &worker)], json!({}), json!({"mem_gb": 64, "media_delay_ms": 2500}));
+    worker_seen(&master, 0, "music");
+    // this PC busy with an image: the song goes to the idle worker
+    let busy = |s: &Server| {
+        let base = s.base.clone();
+        let h = std::thread::spawn(move || reqwest::blocking::Client::new().post(format!("{base}/v1/images/generations")).bearer_auth(KEY)
+            .json(&json!({"prompt": "a lighthouse", "size": "512x512", "steps": 2})).send().unwrap().status().as_u16());
+        let t0 = Instant::now();
+        while s.get("/api/queue", true).1["running"]["kind"] != "media" {
+            assert!(t0.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        h
+    };
+    let body = json!({"style": "calm piano", "lyrics": "[instrumental]", "duration": 10});
+    let img = busy(&master);
+    let (code, worker_h, note, v) = song(&master, body.clone());
+    assert_eq!(img.join().unwrap(), 200);
+    assert_eq!((code, worker_h, &v["riff"]), (200, None, &json!(true)), "made here: {v}");
+    assert_eq!(note.as_deref(), Some("worker macm4 ran out of memory making music; made here instead"));
+    let rec = std::fs::read_to_string(worker.dir.join("media-record.txt")).unwrap_or_default();
+    assert!(rec.lines().any(|l| l.contains("\"op\":\"song\"")), "the worker was asked first");
+    // "strata_fallback": false: the worker's memory is named, not a bare 502
+    let img = busy(&master);
+    let mut no = body;
+    no["strata_fallback"] = json!(false);
+    let (code, _, note, v) = song(&master, no);
+    img.join().unwrap();
+    assert_eq!((code, v["error"]["type"].as_str()), (503, Some("worker_out_of_memory")), "{v}");
+    let msg = v["error"]["message"].as_str().unwrap();
+    assert!(msg.contains("worker macm4 ran out of memory") && msg.contains("Insufficient Memory"), "{msg}");
+    assert_eq!(note.as_deref(), Some("worker macm4 ran out of memory"));
+}

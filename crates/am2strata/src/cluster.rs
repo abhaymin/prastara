@@ -55,6 +55,72 @@ pub const MEDIA_ROUTED: [(&str, &str); 7] = [
     ("/v1/media/videos/compose", "compose"), ("/v1/media/thumbnails", "compose"),
 ];
 
+/// The free memory (GB) a worker needs for a media job of each routed kind, beside what its text model would give
+/// back (a GPU media job unloads it). Above the queue's own estimate for a local media job (manager.rs MEDIA_JOB_GB +
+/// mem.rs MARGIN_GB = 4 GB), from what failed: ACE-Step ran a 16 GB Mac with 3.7 GB free out of Metal memory after
+/// 35 minutes (2026-11-27). The master's `"cluster": {"media_min_free_gb": {"music": 10}}` overrides them.
+pub const MEDIA_MIN_FREE_GB: [(&str, f64); 6] =
+    [("music", 8.0), ("image", 6.0), ("video", 10.0), ("tts", 3.0), ("stt", 3.0), ("compose", 1.0)];
+
+/// The run config's name for a kind (`"speech"`, `"transcription"`, `"thumbnails"` too) as MEDIA_ROUTED's.
+fn floor_kind(k: &str) -> &str {
+    match k {
+        "speech" => "tts",
+        "transcription" | "transcribe" => "stt",
+        "thumbnails" | "thumbnail" => "compose",
+        "images" => "image",
+        "videos" => "video",
+        k => k,
+    }
+}
+
+/// What a worker says of its memory (its /api/queue "memory", web.rs `memory_status`). An older worker says nothing:
+/// its memory is unknown and media go to it as before.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WorkerMem {
+    pub ram_free_gb: f64,
+    /// a Mac's unified memory: the GPU's free memory is the RAM's
+    pub unified: bool,
+    /// each NVIDIA GPU's free VRAM
+    pub gpu_free_gb: Vec<f64>,
+    pub resident_model: Option<String>,
+    /// what its resident text model took when it loaded (0 when it does not know)
+    pub resident_gb: f64,
+    /// a GPU media job unloads its text model there (its gpu_policy is not "keep")
+    pub unloads_text: bool,
+}
+
+impl WorkerMem {
+    pub fn of(v: &Value) -> Option<WorkerMem> {
+        let free = v["ram_free_gb"].as_f64()?;
+        Some(WorkerMem {
+            ram_free_gb: free,
+            unified: v["unified"] == true,
+            gpu_free_gb: v["gpus"].as_array().into_iter().flatten().filter_map(|g| g["free_gb"].as_f64()).collect(),
+            resident_model: v["resident_model"].as_str().map(str::to_string),
+            resident_gb: v["resident_gb"].as_f64().unwrap_or(0.0).max(0.0),
+            unloads_text: v["media_unloads_text"].as_bool().unwrap_or(true),
+        })
+    }
+
+    /// (free now, what the job would free) for a media job of `kind`: the RAM on a Mac or a machine without a GPU, else
+    /// the GPU with the most free VRAM (the job takes one card); the resident text model's memory when the job unloads
+    /// it (every kind but compose, which runs beside it).
+    pub fn for_media(&self, kind: &str) -> (f64, f64) {
+        let free = if self.unified || self.gpu_free_gb.is_empty() { self.ram_free_gb }
+                   else { self.gpu_free_gb.iter().cloned().fold(0.0, f64::max) };
+        let freeable = if kind != "compose" && self.unloads_text && self.resident_model.is_some() { self.resident_gb } else { 0.0 };
+        (free, freeable)
+    }
+}
+
+/// An error text a media engine gives when it ran out of memory (Metal's, CUDA's, candle's, the OS's).
+pub fn is_oom(text: &str) -> bool {
+    let t = text.to_ascii_lowercase();
+    ["out of memory", "outofmemory", "out_of_memory", "insufficient memory", "cannot allocate memory", "failed to allocate",
+     "memory allocation failed", "oom-kill", "oom killer"].iter().any(|p| t.contains(p))
+}
+
 /// The kinds a worker's capabilities say it can make now.
 pub fn media_kinds(caps: &Value) -> Vec<String> {
     let mut out: Vec<String> = caps["kinds"].as_object().map(|k| k.iter().filter(|(_, v)| v["usable"] == true)
@@ -94,6 +160,8 @@ struct Seen {
     media: Vec<String>,
     /// media requests this master sent it that have not finished yet (a worker's compose does not show in its queue)
     inflight: usize,
+    /// its free memory, from its queue (None: an older worker that does not say)
+    mem: Option<WorkerMem>,
 }
 
 pub struct Worker {
@@ -175,7 +243,23 @@ impl Worker {
                "transport": if self.tls_url.is_some() { "TLS 1.3, pinned certificates" } else { "plain HTTP: use a VPN" },
                "models": s.models, "loaded": s.current, "waiting": s.waiting, "running": s.running,
                "seen_s_ago": s.at.map(|t| t.elapsed().as_secs()), "error": s.error, "requests_routed": s.routed,
-               "media": s.media, "media_in_flight": s.inflight})
+               "media": s.media, "media_in_flight": s.inflight,
+               "memory": s.mem.as_ref().map(|m| json!({"ram_free_gb": m.ram_free_gb, "unified": m.unified, "gpu_free_gb": m.gpu_free_gb,
+                                                        "resident_model": m.resident_model, "resident_gb": m.resident_gb,
+                                                        "media_unloads_text": m.unloads_text}))})
+    }
+
+    /// Whether it has the memory for a media job of `kind` needing `floor` GB: Err says why not ("pc2 has 3.7 GB
+    /// free, music needs 8 GB"). A worker that does not say its memory has it (today's behaviour).
+    fn fits_media(&self, kind: &str, floor: f64) -> Result<(), String> {
+        let Some(m) = self.seen.lock().unwrap().mem.clone() else { return Ok(()) };
+        let (free, freeable) = m.for_media(kind);
+        if free + freeable >= floor {
+            return Ok(());
+        }
+        let what = if m.unified || m.gpu_free_gb.is_empty() { "" } else { " of VRAM" };
+        let back = if freeable > 0.0 { format!(" (+{freeable:.1} GB its text model would free)") } else { String::new() };
+        Err(format!("{} has {free:.1} GB free{what}{back}, {kind} needs {floor} GB", self.name))
     }
 }
 
@@ -222,6 +306,9 @@ pub struct Cluster {
     /// while this PC is busy, a chat may go to an idle worker's loaded model when no worker has the model asked for
     /// (run config `cluster.overflow`, on by default): the cluster answers in parallel instead of queueing
     pub overflow: bool,
+    /// the free memory (GB) a worker needs for each routed media kind (MEDIA_MIN_FREE_GB, overridden by the run
+    /// config's `cluster.media_min_free_gb`)
+    pub media_min_free: HashMap<String, f64>,
     // master side
     found: Mutex<HashMap<String, Found>>,
     polling: AtomicBool,
@@ -308,7 +395,8 @@ impl Cluster {
         Cluster { role: Role::Master, node: Node { id: String::new(), name: String::new() }, data_dir: None, identity: None,
                   tls_port: None, allow_plain: false, api_port: std::sync::atomic::AtomicU16::new(0),
                   workers: RwLock::new(Vec::new()), code: Mutex::new((new_code(), Instant::now())), fails: Mutex::new((0, None)),
-                  masters: RwLock::new(Vec::new()), found: Mutex::new(HashMap::new()), polling: AtomicBool::new(false), overflow: true }
+                  masters: RwLock::new(Vec::new()), found: Mutex::new(HashMap::new()), polling: AtomicBool::new(false), overflow: true,
+                  media_min_free: MEDIA_MIN_FREE_GB.iter().map(|(k, v)| (k.to_string(), *v)).collect() }
     }
 
     /// The run config's `"cluster"` and what was paired before (`<data>`).
@@ -316,6 +404,13 @@ impl Cluster {
         let mut c = Cluster::empty();
         let cfg = rest.get("cluster").cloned().unwrap_or(Value::Null);
         c.overflow = cfg["overflow"].as_bool().unwrap_or(true);
+        if let Some(o) = cfg.get("media_min_free_gb").filter(|v| !v.is_null()) {
+            let o = o.as_object().ok_or("config cluster.media_min_free_gb: expected {\"music\": 10, \"image\": 6, ...}")?;
+            for (k, v) in o {
+                let gb = v.as_f64().filter(|g| *g >= 0.0).ok_or(format!("config cluster.media_min_free_gb.{k}: expected GB, a number"))?;
+                c.media_min_free.insert(floor_kind(k).to_string(), gb);
+            }
+        }
         c.role = match cfg["role"].as_str() {
             None | Some("master") => Role::Master,
             Some("worker") => Role::Worker,
@@ -591,12 +686,26 @@ impl Cluster {
     /// A worker to make a media job of `kind`: a ready one that can make it, idle when `need_idle` (this PC is only
     /// busy), else the least loaded one (this PC cannot make it at all).
     pub fn pick_media(&self, kind: &str, need_idle: bool) -> Option<Arc<Worker>> {
+        self.pick_media_noted(kind, need_idle).0
+    }
+
+    /// `pick_media`, skipping a worker short of memory for `kind` (its free memory plus what its text model would free
+    /// under the kind's floor); the second part says which were skipped and why, for the answer's x-strata-note.
+    pub fn pick_media_noted(&self, kind: &str, need_idle: bool) -> (Option<Arc<Worker>>, Vec<String>) {
         let mut c: Vec<Arc<Worker>> = self.workers().into_iter().filter(|w| w.ready() && w.can(kind)).collect();
         if need_idle {
             c.retain(|w| w.idle());
         }
+        let floor = self.media_floor(kind);
+        let mut short = Vec::new();
+        c.retain(|w| w.fits_media(kind, floor).map_err(|e| short.push(e)).is_ok());
         c.sort_by_key(|w| { let s = w.seen.lock().unwrap(); s.inflight + s.waiting + s.running as usize });
-        c.into_iter().next()
+        (c.into_iter().next(), short)
+    }
+
+    /// The free memory (GB) a worker needs for a media job of `kind`.
+    pub fn media_floor(&self, kind: &str) -> f64 {
+        self.media_min_free.get(kind).copied().unwrap_or(4.0)
     }
 
     /// While this PC is busy and no worker has the model asked for: an idle worker and the model it has loaded, so
@@ -676,6 +785,7 @@ fn spawn_poller(w: Arc<Worker>) {
                         s.current = list.iter().find(|x| x["current"] == true).and_then(|x| x["id"].as_str().map(str::to_string));
                         s.waiting = q["waiting"].as_array().map(Vec::len).unwrap_or(0);
                         s.running = q["running"].is_object();
+                        s.mem = WorkerMem::of(&q["memory"]);
                         s.at = Some(Instant::now());
                         s.error = None;
                     }
@@ -933,7 +1043,16 @@ async fn route_media(s: crate::AppState, req: axum::extract::Request, next: axum
     if local_can && !busy {
         return here().await;
     }
-    let Some(w) = s.cluster.pick_media(kind, local_can) else { return here().await };
+    let (picked, short) = s.cluster.pick_media_noted(kind, local_can);
+    let Some(w) = picked else {
+        // a worker short of memory for it is not sent it (a 16 GB Mac ran out of Metal memory 35 minutes into a song)
+        if short.is_empty() {
+            return here().await;
+        }
+        let why = format!("kept local: {}", short.join("; "));
+        tracing::info!("{}: {why}", parts.uri.path());
+        return with_note(here().await, &why);
+    };
     let pq = parts.uri.path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
     let mon = s.mgr.monitor.clone();
     let rid = mon.remote_begin(&w.name, kind, &pq);
@@ -949,6 +1068,31 @@ async fn route_media(s: crate::AppState, req: axum::extract::Request, next: axum
             return here().await;
         }
     };
+    if kind != "compose" && !r.status().is_success() {
+        // an error (small): read, so a worker that ran out of memory is said plainly, and the job made here once
+        let status = r.status();
+        let (rp, body) = r.into_parts();
+        let raw = axum::body::to_bytes(body, 1 << 20).await.unwrap_or_default();
+        mon.remote_end(rid, "error");
+        drop(held);
+        let text = String::from_utf8_lossy(&raw).to_string();
+        if !is_oom(&text) {
+            return Response::from_parts(rp, Body::from(raw));
+        }
+        let said = serde_json::from_slice::<Value>(&raw).ok().and_then(|e| e["error"]["message"].as_str().map(str::to_string))
+            .unwrap_or_else(|| text.chars().take(400).collect());
+        // "strata_fallback": false keeps the worker's answer (as an out-of-memory error); by default it is made here once
+        let fallback = v["strata_fallback"].as_bool().unwrap_or(true);
+        tracing::warn!("worker {} ran out of memory making {kind} (HTTP {}): {said}", w.name, status.as_u16());
+        if fallback && local_can {
+            let note = format!("worker {} ran out of memory making {kind}; made here instead", w.name);
+            return with_note(here().await, &note);
+        }
+        let why = if !local_can { format!("this PC cannot make {kind}") } else { "strata_fallback is false, so it was not made here".into() };
+        let resp = crate::error(StatusCode::SERVICE_UNAVAILABLE, "worker_out_of_memory",
+                                format!("worker {} ran out of memory making {kind} (its memory, not the request): {said}; {why}", w.name));
+        return with_note(resp, &format!("worker {} ran out of memory", w.name));
+    }
     if kind != "compose" {
         // the file itself: streamed back, the row closed and the worker freed once it is all sent
         let ok = r.status().is_success();
@@ -981,6 +1125,15 @@ async fn route_media(s: crate::AppState, req: axum::extract::Request, next: axum
     axum::Json(answer).into_response()
 }
 
+/// `r` with an x-strata-note saying where it was made and why.
+fn with_note(mut r: Response, note: &str) -> Response {
+    let clean: String = note.chars().map(|c| if c.is_ascii() && !c.is_ascii_control() { c } else { ' ' }).take(600).collect();
+    if let Ok(v) = axum::http::HeaderValue::from_str(&clean) {
+        r.headers_mut().insert("x-strata-note", v);
+    }
+    r
+}
+
 /// A worker's media job followed until it is done, then its file read: (mime, bytes, meta).
 async fn follow(w: &Worker, id: &str) -> Result<(String, Vec<u8>, Value), String> {
     let start = Instant::now();
@@ -1003,7 +1156,12 @@ async fn follow(w: &Worker, id: &str) -> Result<(String, Vec<u8>, Value), String
         misses = 0;
         match v["state"].as_str() {
             Some("done") => break,
-            Some("error") => return Err(format!("on worker {}: {}", w.name, v["error"].as_str().unwrap_or("failed"))),
+            Some("error") => {
+                let e = v["error"].as_str().unwrap_or("failed");
+                // its memory, not the request: said so
+                let oom = if is_oom(e) { "ran out of memory: " } else { "" };
+                return Err(format!("on worker {}: {oom}{e}", w.name));
+            }
             _ => {}
         }
     }
@@ -1207,6 +1365,72 @@ mod tests {
         assert_eq!(c.pick_media("compose", false).map(|w| w.name.clone()).as_deref(), Some("mac"), "this PC cannot: the busy one still");
         drop(held);
         assert!(mac.idle());
+    }
+
+    #[test]
+    fn a_media_job_goes_only_to_a_worker_with_the_memory_for_it() {
+        let c = Cluster::empty();
+        c.add_test_worker("macm4", &["m"], true);
+        c.add_test_worker("pc2", &["m"], true);
+        c.add_test_worker("old", &["m"], true);
+        let set = |name: &str, mem: Value| {
+            let w = c.worker_by_name(name).unwrap();
+            let mut s = w.seen.lock().unwrap();
+            s.media = vec!["music".into(), "image".into(), "video".into(), "compose".into()];
+            s.mem = WorkerMem::of(&mem);
+        };
+        // the Mac of 2026-11-27: 3.7 GB free of unified memory, its text model's memory not known
+        set("macm4", json!({"ram_free_gb": 3.7, "ram_total_gb": 16.0, "unified": true, "gpus": [{"index": 0, "free_gb": 3.7}],
+                            "resident_model": "tiel", "resident_gb": null, "media_unloads_text": true}));
+        // a CUDA PC: little RAM but a card with room (the job takes one card: the freest)
+        set("pc2", json!({"ram_free_gb": 2.0, "unified": false, "gpus": [{"index": 0, "free_gb": 1.5}, {"index": 1, "free_gb": 7.0}]}));
+        set("old", Value::Null);
+        assert!(c.worker_by_name("old").unwrap().seen.lock().unwrap().mem.is_none(), "an older worker says nothing");
+        let only = |names: &[&str]| { let c2 = Cluster::empty(); *c2.workers.write().unwrap() = c.workers().into_iter()
+            .filter(|w| names.contains(&w.name.as_str())).collect(); c2 };
+        let mac = only(&["macm4"]);
+        let (w, why) = mac.pick_media_noted("music", false);
+        assert!(w.is_none());
+        assert_eq!(why, ["macm4 has 3.7 GB free, music needs 8 GB"]);
+        // compose needs 1 GB: sent
+        assert_eq!(mac.pick_media("compose", false).map(|w| w.name.clone()).as_deref(), Some("macm4"));
+        // its text model's memory counts once known: unloaded for the song, 5 GB back
+        mac.workers()[0].seen.lock().unwrap().mem.as_mut().unwrap().resident_gb = 5.0;
+        assert_eq!(mac.pick_media("music", false).map(|w| w.name.clone()).as_deref(), Some("macm4"));
+        // ... unless its gpu_policy keeps the text model loaded
+        mac.workers()[0].seen.lock().unwrap().mem.as_mut().unwrap().unloads_text = false;
+        let (w, why) = mac.pick_media_noted("music", false);
+        assert!(w.is_none() && why[0].contains("3.7 GB free"), "{why:?}");
+        // the CUDA PC: 7 GB on its freest card is enough for an image (6), not for a song (8)
+        let pc = only(&["pc2"]);
+        assert_eq!(pc.pick_media("image", false).map(|w| w.name.clone()).as_deref(), Some("pc2"));
+        assert_eq!(pc.pick_media_noted("music", false).1, ["pc2 has 7.0 GB free of VRAM, music needs 8 GB"]);
+        // the older worker is sent it as today; a short one is skipped for another
+        let both = only(&["macm4", "old"]);
+        let (w, why) = both.pick_media_noted("video", false);
+        assert_eq!((w.map(|w| w.name.clone()).as_deref(), why.len()), (Some("old"), 1));
+    }
+
+    #[test]
+    fn the_media_floors_have_defaults_and_the_run_config_overrides_them() {
+        let c = Cluster::empty();
+        assert_eq!([c.media_floor("music"), c.media_floor("image"), c.media_floor("video"), c.media_floor("tts"), c.media_floor("stt"),
+                    c.media_floor("compose")], [8.0, 6.0, 10.0, 3.0, 3.0, 1.0]);
+        let mut rest = std::collections::BTreeMap::new();
+        rest.insert("cluster".to_string(), json!({"media_min_free_gb": {"music": 10, "speech": 2.5, "thumbnails": 0.5}}));
+        let c = Cluster::from_config(&rest, None).unwrap();
+        assert_eq!((c.media_floor("music"), c.media_floor("tts"), c.media_floor("compose"), c.media_floor("image")), (10.0, 2.5, 0.5, 6.0));
+        rest.insert("cluster".to_string(), json!({"media_min_free_gb": {"music": "lots"}}));
+        assert!(Cluster::from_config(&rest, None).err().unwrap().contains("media_min_free_gb.music"));
+    }
+
+    #[test]
+    fn an_out_of_memory_error_is_known_by_its_words() {
+        assert!(is_oom("Metal error: Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"));
+        assert!(is_oom("DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")"));
+        assert!(is_oom("CUDA out of memory. Tried to allocate 2.00 GiB"));
+        assert!(!is_oom("the media engine returned no audio"));
+        assert!(!is_oom("mock failure"));
     }
 
     #[test]

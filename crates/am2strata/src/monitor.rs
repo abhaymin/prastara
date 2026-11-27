@@ -573,6 +573,17 @@ impl Monitor {
         })
     }
 
+    /// Each NVIDIA GPU's memory from the last hardware sample: (index, free GB, total GB). Empty on a machine without
+    /// one, before the first sample, and on a Mac (unified memory: the RAM figure is its GPU memory). Nothing is run.
+    pub fn gpu_memory(&self) -> Vec<(u64, f64, f64)> {
+        let tel = self.tel.lock().unwrap();
+        let gb = |v: &Value| v.as_f64().map(|b| b / 1073741824.0);
+        tel.now.get("gpus").and_then(Value::as_array).into_iter().flatten().enumerate().filter_map(|(i, g)| {
+            let (used, total) = (gb(&g["mem_used"])?, gb(&g["mem_total"])?);
+            (total > 0.0).then(|| (g["index"].as_f64().map(|x| x as u64).unwrap_or(i as u64), (total - used).max(0.0), total))
+        }).collect()
+    }
+
     /// This machine for GET /api/system and Settings: every GPU, the CPU, the memory, each with its load now.
     pub fn system(&self) -> Value {
         let tel = self.tel.lock().unwrap();

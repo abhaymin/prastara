@@ -284,7 +284,37 @@ pub async fn queue(State(s): State<AppState>, headers: HeaderMap) -> Response {
     if !crate::authorized_or_master(&s, &headers) {
         return error(StatusCode::UNAUTHORIZED, "authentication_error", "a valid API key is required");
     }
-    Json(s.mgr.queue.snapshot()).into_response()
+    let mut v = s.mgr.queue.snapshot();
+    // the free memory a master reads before it sends this machine a media job (cluster.rs, `WorkerMem`)
+    if std::env::var("AM2_TEST_OLD_WORKER").is_err() {
+        v["memory"] = memory_status(&s);
+    }
+    Json(v).into_response()
+}
+
+/// This machine's free memory for its masters: RAM free and total; each GPU's free VRAM (on a Mac with unified memory
+/// the GPU's is the RAM figure, flagged `unified`); the resident text model and the memory it took when it loaded,
+/// which a GPU media job frees (unless `gpu_policy` is "keep"). In the tests AM2_TEST_MEM_GB stands in for the RAM and
+/// AM2_TEST_GPU_FREE_GB ("a,b") for the GPUs (none when unset), so the machine's own cards never count.
+fn memory_status(s: &AppState) -> Value {
+    let r1 = |x: f64| (x * 10.0).round() / 10.0;
+    let unified = cfg!(all(target_os = "macos", target_arch = "aarch64"));
+    let (free, total) = (crate::mem::available_gb(), crate::mem::total_gb());
+    let gpus: Vec<Value> = if unified {
+        vec![json!({"index": 0, "free_gb": r1(free), "total_gb": r1(total), "unified": true})]
+    } else if std::env::var("AM2_TEST_MEM_GB").is_ok() {
+        std::env::var("AM2_TEST_GPU_FREE_GB").unwrap_or_default().split(',').filter_map(|x| x.trim().parse::<f64>().ok())
+            .enumerate().map(|(i, f)| json!({"index": i, "free_gb": r1(f), "total_gb": null})).collect()
+    } else {
+        s.mgr.monitor.gpu_memory().into_iter().map(|(i, f, t)| json!({"index": i, "free_gb": r1(f), "total_gb": r1(t)})).collect()
+    };
+    let resident = match s.mgr.queue.resident() {
+        crate::queue::Resident::Text(m) => Some(m),
+        _ => None,
+    };
+    let resident_gb = resident.as_deref().and_then(|m| s.mgr.needs.get(m)).map(r1);
+    json!({"ram_free_gb": r1(free), "ram_total_gb": r1(total), "unified": unified, "gpus": gpus,
+           "resident_model": resident, "resident_gb": resident_gb, "media_unloads_text": !s.media.keep_text_model})
 }
 
 /// POST /api/queue/{id}/cancel: a waiting job leaves the queue; the running chat is stopped where it is (while its

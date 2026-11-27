@@ -143,6 +143,11 @@ fn main() {
                 for s in 1..=8u64 {
                     emit(serde_json::json!({"event": "step", "step": s, "total": 8}));
                 }
+                // MOCK_MEDIA_OOM: a Mac short of unified memory, as ACE-Step failed on one (2026-11-27)
+                if std::env::var("MOCK_MEDIA_OOM").is_ok() {
+                    emit(serde_json::json!({"event": "error", "message": "Metal error: Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"}));
+                    continue;
+                }
                 // a 2 s stereo WAV at 48 kHz (a quiet tone); a continuation ("continue_from") answers as the engine
                 // does: its audio starts replaces_s before the source's end
                 let n = 96_000usize;
