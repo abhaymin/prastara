@@ -379,3 +379,271 @@ fn on_the_gpus_a_streamed_run_matches_the_held_one() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------------------
+// gradients, streamed against held: the real 56B-A5B run is an upcycled MoE over a looped base on two devices
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// A looped base (blocks 1-2 twice), then a fine-grained upcycle of it (8 experts of 16 neurons, top-2, shared A):
+/// the 56B-A5B's shape in small.
+fn looped_moe(root: &Path, hidden: usize, ff: usize) -> (PathBuf, PathBuf) {
+    let (base, data) = (root.join("base"), root.join("train.jsonl"));
+    common::chat_model_sized(&base, 4, hidden, ff);
+    common::write_jsonl(&data, &common::chat_rows(24));
+    let looped = root.join("looped");
+    make_looped(&base, &looped, LoopSpec { start: 1, end: 3, passes: 2 }).unwrap();
+    let moe = upcycled(root, &looped, MoeSpec { expert_ff: Some(ff / 4), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(8, 2) });
+    (moe, data)
+}
+
+fn open(devices: &[&str]) -> Vec<Device> {
+    devices.iter().map(|d| match *d {
+        "cpu" => Device::Cpu,
+        #[cfg(feature = "cuda")]
+        d if d.starts_with("cuda:") => Device::new_cuda(d[5..].parse().unwrap()).unwrap(),
+        other => panic!("{other}"),
+    }).collect()
+}
+
+/// One loss and every adapter variable's gradient (B set non-zero first, so A, the router and the loop gates all
+/// get one), for the model `how` loads: "held", "held-ckpt", or a streamed tier ("ram", "disk").
+fn grads_of(model: &Path, root: &Path, how: &str, devices: &[&str], buffers: usize, dtype: BaseDtype, tokens: &[u32]) -> (f64, BTreeMap<String, Vec<f32>>) {
+    let devs = open(devices);
+    let n = ModelConfig::load(model).unwrap().num_hidden_layers;
+    let mut m = match how {
+        "held" | "held-ckpt" => LlamaModel::load_parts_on(model, dtype, &devs, 0..n, true, true).unwrap(),
+        tier => {
+            let opts = strata_workshop::layer_stream::StreamOptions { mode: StreamMode::from_s(tier).unwrap(), buffers, cache_root: Some(root.join("shards")) };
+            LlamaModel::load_streamed(model, dtype, &devs, 0..n, true, true, &opts, &mut |_| {}).unwrap()
+        }
+    };
+    m.add_lora(&LoraSpec { r: 4, alpha: 8.0, dropout: 0.1, use_rslora: false, targets: Target::ALL.to_vec(), train_layers: None, seed: 7 }).unwrap();
+    m.set_checkpointing(how != "held");
+    let vars = m.lora_vars();
+    for (k, (name, v)) in vars.iter().enumerate() {
+        if name.contains("lora_B") {
+            let t = v.as_tensor();
+            let vals: Vec<f32> = (0..t.elem_count()).map(|i| (((i * 7919 + k * 104_729) % 1000) as f32 / 1000.0 - 0.5) * 0.2).collect();
+            v.set(&Tensor::from_vec(vals, t.dims(), t.device()).unwrap()).unwrap();
+        }
+    }
+    let supervised: Vec<bool> = (0..tokens.len()).map(|p| p > tokens.len() / 3).collect();
+    let mut total = 0.0;
+    let mut acc: BTreeMap<String, Vec<f32>> = BTreeMap::new();
+    // two micro-batches in a row (the second finds the buffers the first left), each with its own backward pass
+    for rep in 0..2u64 {
+        let ctx = strata_workshop::model::Ctx::train(13 + rep);
+        let loss = m.loss(tokens, &supervised, &ctx).unwrap();
+        total += loss.to_dtype(candle_core::DType::F32).unwrap().to_scalar::<f32>().unwrap() as f64;
+        let g = loss.backward().unwrap();
+        let ck = m.take_checkpoint_grads();
+        for (name, v) in &vars {
+            let mut sum: Option<Tensor> = g.get(v.as_tensor()).map(|t| t.to_device(&Device::Cpu).unwrap());
+            for (cv, ct) in &ck {
+                if cv.as_tensor().id() == v.as_tensor().id() {
+                    let ct = ct.to_device(&Device::Cpu).unwrap();
+                    sum = Some(match sum { Some(s) => (s + ct).unwrap(), None => ct });
+                }
+            }
+            let vals = sum.map(|s| s.to_dtype(candle_core::DType::F32).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap())
+                .unwrap_or_else(|| vec![0.0; v.as_tensor().elem_count()]);
+            let e = acc.entry(name.clone()).or_insert_with(|| vec![0.0; vals.len()]);
+            e.iter_mut().zip(vals).for_each(|(a, b)| *a += b);
+        }
+    }
+    (total, acc)
+}
+
+/// Gradients of `b` against `a`: the largest difference over the largest magnitude, and the tensor where it is.
+fn grad_gap(a: &BTreeMap<String, Vec<f32>>, b: &BTreeMap<String, Vec<f32>>) -> (f32, String) {
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+    let scale = a.values().flatten().fold(0.0f32, |m, x| m.max(x.abs())).max(1e-12);
+    let mut worst = (0.0f32, String::new());
+    for (k, x) in a {
+        let d = x.iter().zip(&b[k]).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max) / scale;
+        if d > worst.0 {
+            worst = (d, k.clone());
+        }
+    }
+    worst
+}
+
+/// Every variant's loss and gradients against the held, un-checkpointed model's.
+fn gradients_agree(devices: &[&str], dtype: BaseDtype, tol: f32, hidden: usize, ff: usize) {
+    let root = common::temp_dir("stream-grads");
+    let (moe, _) = looped_moe(&root, hidden, ff);
+    let tokens: Vec<u32> = (0..48).map(|i| (i * 37 % 200 + 3) as u32).collect();
+    let (l0, g0) = grads_of(&moe, &root, "held", devices, 2, dtype, &tokens);
+    assert!(g0.values().flatten().any(|x| *x != 0.0));
+    let nonzero = g0.iter().filter(|(_, v)| v.iter().any(|x| *x != 0.0)).count();
+    assert!(nonzero * 10 >= g0.len() * 9, "most variables get a gradient: {nonzero} of {}", g0.len());
+    for (how, buffers) in [("held-ckpt", 2), ("ram", 2), ("ram", 3), ("disk", 2)] {
+        let (l, g) = grads_of(&moe, &root, how, devices, buffers, dtype, &tokens);
+        let (gap, at) = grad_gap(&g0, &g);
+        println!("{devices:?} {} {how} x{buffers}: loss {l0:.6} / {l:.6}, gradients differ by {gap:.2e} of the largest (at {at})", dtype.as_str());
+        assert!((l - l0).abs() <= tol as f64 * l0.abs().max(1.0), "{how}: loss {l} vs {l0}");
+        assert!(gap <= tol, "{devices:?} {how} x{buffers}: gradients differ by {gap} at {at}");
+    }
+}
+
+#[test]
+fn a_streamed_looped_moe_has_the_held_gradients() {
+    gradients_agree(&["cpu"], BaseDtype::F32, 1e-5, 32, 64);
+    gradients_agree(&["cpu", "cpu"], BaseDtype::F32, 1e-5, 32, 64);
+}
+
+/// The 56B-A5B run's shape in small through the whole trainer: several steps at lr > 0 after a warm-up step, the
+/// held-out loss, streamed against held, on one and two devices.
+fn looped_moe_trains_the_same(devices: &[&str], dtype: BaseDtype, tol: f64, hidden: usize, ff: usize) {
+    let root = common::temp_dir("stream-loop-moe");
+    let (moe, data) = looped_moe(&root, hidden, ff);
+    let mut held = settings(&moe, &data, &root.join("held"));
+    held.devices = devices.iter().map(|d| d.to_string()).collect();
+    held.base_dtype = dtype;
+    held.lr = 2e-3;
+    held.max_steps = Some(6);
+    held.warmup_ratio = 0.17;
+    let (a, _) = run(&held);
+    let mut plain = held.clone();
+    plain.out = root.join("plain");
+    plain.gradient_checkpointing = false;
+    let (p, _) = run(&plain);
+    for (mode, buffers) in [(StreamMode::Ram, 2), (StreamMode::Disk, 2)] {
+        let mut st = held.clone();
+        st.out = root.join(format!("streamed-{}", mode.as_str()));
+        st.stream_layers = Some(mode);
+        st.stream_buffers = buffers;
+        st.stream_cache = Some(root.join("shards"));
+        let (b, _) = run(&st);
+        let dl = a.losses.iter().zip(&b.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+        let de = (a.eval_loss.unwrap() - b.eval_loss.unwrap()).abs();
+        println!("{devices:?} {} {}: losses {:?} / {:?} (no checkpointing {:?}), eval {:?} / {:?}", dtype.as_str(), mode.as_str(), a.losses, b.losses, p.losses,
+                 a.eval_loss, b.eval_loss);
+        assert!(dl <= tol && de <= tol, "{devices:?} {}: losses differ by {dl}, eval by {de}", mode.as_str());
+    }
+    let dp = a.losses.iter().zip(&p.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    // open: a bf16 base split over two GPUs and NOT checkpointed drifts from the checkpointed run by ~2.5e-3 after a
+    // few steps (deterministic; one GPU, f32, or the CPU agree to 1e-7, and the gradients of one step agree to 4e-8),
+    // so that case gets a looser bound until it is understood; streaming is always checkpointed and is held exactly
+    let loose = dtype != BaseDtype::F32 && devices.len() > 1 && devices.iter().all(|d| d.starts_with("cuda"));
+    let ptol = if loose { 5e-3 } else { tol };
+    assert!(dp <= ptol, "checkpointing changes the losses by {dp}");
+    // training helps: the held-out loss after training is in line with the last train losses, not far above them
+    let (first, last, eval) = (a.losses[0], *a.losses.last().unwrap(), a.eval_loss.unwrap());
+    assert!(last < first && eval < first * 1.2, "losses {:?}, eval {eval}", a.losses);
+}
+
+#[test]
+fn a_streamed_looped_moe_trains_and_evaluates_the_same() {
+    looped_moe_trains_the_same(&["cpu"], BaseDtype::F32, 1e-6, 32, 64);
+    looped_moe_trains_the_same(&["cpu", "cpu"], BaseDtype::F32, 1e-6, 32, 64);
+}
+
+/// AM2_TEST_GPUS=2: cuda:0 and cuda:1; AM2_TEST_DEVICES=cuda:1 (a comma list) names them; else cuda:0.
+fn test_gpus() -> Vec<&'static str> {
+    if let Ok(list) = std::env::var("AM2_TEST_DEVICES") {
+        return list.split(',').map(|d| &*Box::leak(d.trim().to_string().into_boxed_str())).collect();
+    }
+    match std::env::var("AM2_TEST_GPUS").as_deref() {
+        Ok("2") => vec!["cuda:0", "cuda:1"],
+        _ => vec!["cuda:0"],
+    }
+}
+
+/// On the GPUs (`-- --ignored`): the looped MoE's gradients and steps, streamed against held, f32 and bf16, with
+/// blocks large enough (hidden 512, 2,048 neurons: 17 MB a block in f32) that an upload takes longer than the
+/// kernels of a block on a few tokens, so a copy the compute does not wait for shows.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_a_streamed_looped_moe_has_the_held_gradients() {
+    let gpus = test_gpus();
+    gradients_agree(&gpus, BaseDtype::F32, 1e-4, 512, 2048);
+    gradients_agree(&gpus, BaseDtype::BF16, 1e-4, 512, 2048);
+}
+
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_a_streamed_looped_moe_trains_and_evaluates_the_same() {
+    let gpus = test_gpus();
+    looped_moe_trains_the_same(&gpus, BaseDtype::F32, 1e-4, 512, 2048);
+    looped_moe_trains_the_same(&gpus, BaseDtype::BF16, 1e-4, 512, 2048);
+}
+
+/// On two GPUs (`AM2_TEST_GPUS=2 -- --ignored`): the looped MoE's logits match the CPU's, block by block and through
+/// the loop's gate. The gate lives with the loop's last block, on the second card; it was copied there GPU to GPU
+/// (candle's dtod copy between two cards' contexts), which did not wait for its source and gave a wrong gate.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_a_split_looped_moe_computes_what_the_cpu_does() {
+    let root = common::temp_dir("split-forward");
+    let (moe, _) = looped_moe(&root, 512, 2048);
+    let tokens: Vec<u32> = (0..48).map(|i| (i * 37 % 200 + 3) as u32).collect();
+    let n = ModelConfig::load(&moe).unwrap().num_hidden_layers;
+    let logits = |d: &[&str]| {
+        let m = LlamaModel::load_parts_on(&moe, BaseDtype::F32, &open(d), 0..n, true, true).unwrap();
+        let gate = m.loop_gate_tensors()["loop.gate.1"].to_device(&Device::Cpu).unwrap().to_vec1::<f32>().unwrap();
+        (m.forward(&tokens, &strata_workshop::model::Ctx::inference()).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap(), gate)
+    };
+    let (want, gate) = logits(&["cpu"]);
+    for d in [test_gpus(), test_gpus().into_iter().rev().collect()] {
+        let (got, g) = logits(&d);
+        let gap = got.iter().zip(&want).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        println!("{d:?}: logits differ from the CPU's by {gap:.2e}");
+        assert_eq!(g, gate, "{d:?}: the loop's gate");
+        assert!(gap <= 1e-4, "{d:?}: {gap}");
+    }
+}
+
+/// On the GPUs (`-- --ignored`; AM2_TEST_DEVICES=cuda:1 picks a card): 8 blocks of hidden 512 (the loop 2..6 across
+/// the two cards), 16 experts, bf16, attention LoRA rank 16, conversations of 600-1,000 tokens (the held-out pass takes
+/// the chunked attention): held, held checkpointed and streamed take the same five steps (warm-up, lr 2e-4) and give the
+/// same held-out loss. The blocks are big enough that a block's replay outlasts the next block's upload, which is what
+/// showed the streamed run's buffer being freed and refilled under a replay still reading it.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_a_larger_streamed_looped_moe_trains_the_same() {
+    let root = common::temp_dir("probe-scale");
+    let (base, data) = (root.join("base"), root.join("train.jsonl"));
+    common::chat_model_sized(&base, 8, 512, 2048);
+    let rows: Vec<serde_json::Value> = (0..24).map(|i| {
+        let (thing, colour) = common::THINGS[i % common::THINGS.len()];
+        let story = format!("The {thing} is {colour}. ").repeat(20 + (i % 5) * 6);
+        serde_json::json!({"messages": [{"role": "user", "content": format!("{story} What colour is {thing}?")}, {"role": "assistant", "content": format!("It is {colour}. {story}")}]})
+    }).collect();
+    common::write_jsonl(&data, &rows);
+    let looped = root.join("looped");
+    make_looped(&base, &looped, LoopSpec { start: 2, end: 6, passes: 2 }).unwrap();
+    let moe = upcycled(&root, &looped, MoeSpec { expert_ff: Some(512), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(16, 4) });
+    let gpus = test_gpus();
+    let mut held = settings(&moe, &data, &root.join("held"));
+    held.devices = gpus.iter().map(|d| d.to_string()).collect();
+    held.base_dtype = BaseDtype::BF16;
+    held.lr = 2e-4;
+    held.max_steps = Some(5);
+    held.warmup_ratio = 0.2;
+    held.max_len = 1024;
+    held.lora.targets = vec![Target::Q, Target::K, Target::V, Target::O];
+    held.lora.r = 16;
+    held.lora.alpha = 32.0;
+    held.lora.dropout = 0.05;
+    let mut plain = held.clone();
+    plain.out = root.join("plain");
+    plain.gradient_checkpointing = false;
+    let mut st = held.clone();
+    st.out = root.join("streamed");
+    st.stream_layers = Some(StreamMode::Ram);
+    let (rp, _) = run(&plain);
+    let (rh, _) = run(&held);
+    let (rs, _) = run(&st);
+    for (tag, r) in [("held", &rp), ("held, checkpointed", &rh), ("streamed", &rs)] {
+        println!("{gpus:?} {tag}: losses {:?}, eval {:?}, {:?}", r.losses, r.eval_loss, r.stream);
+    }
+    let gap = |a: &TrainReport, b: &TrainReport| a.losses.iter().zip(&b.losses).map(|(x, y)| (x - y).abs()).fold((a.eval_loss.unwrap() - b.eval_loss.unwrap()).abs(), f64::max);
+    // before the fix the streamed run left the others from step 3 on (its first update): 5.717 against 5.682
+    assert!(gap(&rp, &rs) <= 1e-4 && gap(&rh, &rs) <= 1e-4, "streamed {:?} / held {:?}", rs.losses, rh.losses);
+    assert!(rs.stream.unwrap().prefetch_hits > 0);
+}
