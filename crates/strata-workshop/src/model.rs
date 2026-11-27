@@ -1852,7 +1852,17 @@ impl LlamaModel {
             }
             if let Some(b) = builder.as_mut() {
                 match b.tier() {
-                    Tier::Ram => b.put_ram(i, lin.iter_mut().map(|l| std::mem::replace(&mut l.w, placeholder.clone())).collect())?,
+                    Tier::Ram => {
+                        b.put_ram(i, lin.iter_mut().map(|l| std::mem::replace(&mut l.w, placeholder.clone())).collect())?;
+                        // the block is in the store now: its pages of the mapped checkpoint leave this process's
+                        // resident set (else the whole checkpoint stays resident beside its pinned copy until the
+                        // load ends: 15.5 GB on Qwen3-8B, a peak of about twice the base)
+                        for t in Target::ALL {
+                            if let Ok(view) = st.get(&p(&format!("{}.{}.weight", t.module(), t.as_str()))) {
+                                crate::layer_stream::release_mapped(view.data());
+                            }
+                        }
+                    }
                     Tier::Disk => b.put_disk(i)?,
                 }
             }
@@ -1889,13 +1899,15 @@ impl LlamaModel {
         let gate_dev = cfg.loop_.map_or(dev, |l| &devs[block_dev[l.end - 1]]);
         let mut loop_gates = Vec::new();
         if let Some(l) = cfg.loop_ {
-            let saved = if dir.join(LOOP_FILE).exists() { candle_core::safetensors::load(dir.join(LOOP_FILE), dev)? } else { HashMap::new() };
+            // read to the host and moved from there: a GPU-to-GPU `to_device` (candle's dtod copy between two cards'
+            // contexts) does not wait for the source and gave the second card a wrong gate (see [`move_to`])
+            let saved = if dir.join(LOOP_FILE).exists() { candle_core::safetensors::load(dir.join(LOOP_FILE), &Device::Cpu)? } else { HashMap::new() };
             for p in 1..l.passes {
                 let g = match saved.get(&format!("loop.gate.{p}")) {
                     Some(t) => { expect(t, &[cfg.hidden_size], "loop gate")?; t.to_dtype(DType::F32)? }
                     None => Tensor::zeros(cfg.hidden_size, DType::F32, gate_dev)?,
                 };
-                let g = g.to_device(gate_dev)?;
+                let g = move_to(&g, gate_dev)?;
                 loop_gates.push(Var::from_tensor(&g)?);
             }
         }
@@ -2116,7 +2128,8 @@ impl LlamaModel {
         let alpha = cfg["lora_alpha"].as_f64().ok_or_else(|| anyhow!("adapter_config.json has no lora_alpha"))?;
         let mut spec = LoraSpec { r, alpha, dropout: cfg["lora_dropout"].as_f64().unwrap_or(0.0), use_rslora: cfg["use_rslora"].as_bool().unwrap_or(false),
                                   targets: Vec::new(), train_layers: None, seed: 0 };
-        let tensors = candle_core::safetensors::load(dir.join("adapter_model.safetensors"), &self.dev)?;
+        // on the host: each tensor goes to its block's device from there ([`move_to`]; never GPU to GPU)
+        let tensors = candle_core::safetensors::load(dir.join("adapter_model.safetensors"), &Device::Cpu)?;
         let mut used = 0;
         let mut first = self.cfg.num_hidden_layers;
         let saved_moe = MoeSpec::from_json(&cfg["prastara_moe"])?;
@@ -2137,7 +2150,7 @@ impl LlamaModel {
                     bail!("{}: the router has shape {:?}, the model has {} experts of hidden size {h}", moe_router_name(i), router.dims(), m.experts);
                 }
                 let (fe, groups, re) = (m.ff_e(&cfg), m.groups(&cfg), m.rank(r));
-                let var = |t: &Tensor| -> Result<Var> { Ok(Var::from_tensor(&t.to_dtype(DType::F32)?.to_device(bdev)?)?) };
+                let var = |t: &Tensor| -> Result<Var> { Ok(Var::from_tensor(&move_to(&t.to_dtype(DType::F32)?, bdev)?)?) };
                 // a shared A: one variable per group and target, cloned into each copy
                 let mut shared: HashMap<(usize, usize), Var> = HashMap::new();
                 let mut experts = Vec::with_capacity(if re == 0 { 0 } else { m.experts });
@@ -2187,7 +2200,7 @@ impl LlamaModel {
                             spec.targets.push(t);
                         }
                         let bdev = &self.devs[self.block_dev[i]];
-                        Some(Lora { a: Var::from_tensor(&a.to_dtype(DType::F32)?.to_device(bdev)?)?, b: Var::from_tensor(&b.to_dtype(DType::F32)?.to_device(bdev)?)?,
+                        Some(Lora { a: Var::from_tensor(&move_to(&a.to_dtype(DType::F32)?, bdev)?)?, b: Var::from_tensor(&move_to(&b.to_dtype(DType::F32)?, bdev)?)?,
                                     scaling: spec.scaling(), dropout: spec.dropout })
                     }
                     (None, None) => None,
@@ -2201,7 +2214,7 @@ impl LlamaModel {
                     bail!("loop gate {p} has shape {:?}, the model's hidden size is {}", g.dims(), self.cfg.hidden_size);
                 }
                 let gdev = self.loop_gates[p - 1].as_tensor().device().clone();
-                self.loop_gates[p - 1] = Var::from_tensor(&g.to_dtype(DType::F32)?.to_device(&gdev)?)?;
+                self.loop_gates[p - 1] = Var::from_tensor(&move_to(&g.to_dtype(DType::F32)?, &gdev)?)?;
                 used += 1;
             }
         }

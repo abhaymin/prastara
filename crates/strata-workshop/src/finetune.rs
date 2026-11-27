@@ -580,6 +580,9 @@ impl Runner {
             }
             None => LlamaModel::load_parts_on(&s.model, s.base_dtype, &devs, skip..cfg.num_hidden_layers, skip == 0, true)?,
         };
+        if let (Some(_), Some(note)) = (s.stream_layers, crate::layer_stream::host_memory_note()) {
+            on_event(Event::Log(format!("host memory after the streamed load: {note}")));
+        }
         model.add_lora(&s.lora)?;
         if s.stream_layers.is_some() && !s.gradient_checkpointing {
             on_event(Event::Log("layer streaming turns gradient checkpointing on: the backward pass replays each block from its streamed weights".into()));
@@ -769,9 +772,10 @@ impl Runner {
                 .map(|(k, v)| format!("{k}: checkpoint {}, now {v}", state["settings"][k.as_str()])).collect();
             bail!("{} was made with other settings ({}); a resumed run must repeat them", dir.display(), differ.join("; "));
         }
-        let dev = self.model.device().clone();
-        let adapter = candle_core::safetensors::load(dir.join(ADAPTER_FILE), &dev)?;
-        let moments = candle_core::safetensors::load(dir.join(OPTIMIZER_FILE), &dev)?;
+        // on the host, then to each variable's device: a variable on the second card never gets a GPU-to-GPU copy
+        // (candle's dtod between two cards' contexts does not wait for its source; see `model::move_to`)
+        let adapter = candle_core::safetensors::load(dir.join(ADAPTER_FILE), &Device::Cpu)?;
+        let moments = candle_core::safetensors::load(dir.join(OPTIMIZER_FILE), &Device::Cpu)?;
         for (name, var) in self.names.iter().zip(&self.vars) {
             for (key, map) in [(name.clone(), &adapter), (format!("{name}.exp_avg"), &moments), (format!("{name}.exp_avg_sq"), &moments)] {
                 let t = map.get(&key).ok_or_else(|| anyhow!("{}: no tensor {key}", dir.display()))?;
@@ -783,9 +787,9 @@ impl Runner {
         let step = state["global_step"].as_u64().ok_or_else(|| anyhow!("{STATE_FILE}: no global_step"))? as usize;
         let adam = state["adam_step"].as_u64().ok_or_else(|| anyhow!("{STATE_FILE}: no adam_step"))? as usize;
         for (name, (theta, m, v)) in self.names.iter().zip(&self.opt.slots) {
-            theta.set(&adapter[name].to_device(theta.device())?)?;
-            m.set(&moments[&format!("{name}.exp_avg")].to_device(m.device())?)?;
-            v.set(&moments[&format!("{name}.exp_avg_sq")].to_device(v.device())?)?;
+            theta.set(&model::move_to(&adapter[name], theta.device())?)?;
+            m.set(&model::move_to(&moments[&format!("{name}.exp_avg")], m.device())?)?;
+            v.set(&model::move_to(&moments[&format!("{name}.exp_avg_sq")], v.device())?)?;
         }
         self.opt.step_t = adam;
         if let Some(r) = state["slot_reset"].as_array() {
@@ -904,6 +908,9 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     if let (Some(st), Some(ls)) = (&stream, run.model.stream()) {
         on_event(Event::Log(format!("layer streaming: {} block copies ({:.2} GB), {} of the runs found their block prefetched, {} waited for it ({} tier)",
                                     st.loads, st.bytes as f64 / 1e9, st.prefetch_hits, st.demand_loads, ls.tier.as_str())));
+        if let Some(note) = crate::layer_stream::host_memory_note() {
+            on_event(Event::Log(format!("host memory at the end: {note}")));
+        }
     }
     let report = TrainReport {
         out: s.out.clone(), steps_done: step, total_steps: total, stopped, losses: losses.clone(), eval_loss: eval, train_examples: n_train,

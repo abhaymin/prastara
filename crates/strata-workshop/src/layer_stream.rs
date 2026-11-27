@@ -19,8 +19,9 @@
 //! (cudarc's `alloc_pinned`, in the block's own device's context) as long as the pinned total stays under a limit
 //! (0.7 of the free RAM at load, or `AM2_STREAM_PIN_LIMIT` bytes); beyond it they stay pageable, said in the log. A
 //! second CUDA stream per device (cudarc `new_stream`) carries the copies: the next block's upload is queued there
-//! while the current block's kernels run on candle's stream, and cudarc's per-allocation events make the compute
-//! stream wait for the copy (and the copy's buffer outlive the kernels reading it). A pageable or disk-tier block is
+//! while the current block's kernels run on candle's stream, and the allocation's write event makes the compute
+//! stream wait for the copy. The buffer itself is allocated (and freed) on the compute stream, so it never returns to
+//! the pool before the kernels reading it have run (see [`LayerStream::upload`]). A pageable or disk-tier block is
 //! uploaded synchronously on the compute stream (no overlap). On the CPU (tests) a fill is a plain copy.
 //!
 //! **Order.** [`LayerStream::begin`] is told the order the blocks will run in (with a loop, its blocks again for each
@@ -136,6 +137,32 @@ pub struct StreamOptions {
 /// The streamed bytes of one block: its seven matrices in the base dtype (norms and biases stay on the device).
 pub fn block_stream_bytes(cfg: &ModelConfig, dtype: BaseDtype) -> u64 {
     (cfg.block_params() - cfg.block_small_params()) * dtype.bytes()
+}
+
+/// Drop the resident pages of a read-only file mapping (`bytes` points into a mapped checkpoint) from this process:
+/// the whole pages inside it, with `MADV_DONTNEED` (a private read-only file mapping reads them from the file again if
+/// they are touched; nothing is lost). A no-op off Unix, or on a slice smaller than a page.
+pub fn release_mapped(bytes: &[u8]) {
+    #[cfg(unix)]
+    {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as usize;
+        let start = (bytes.as_ptr() as usize).div_ceil(page) * page;
+        let end = (bytes.as_ptr() as usize + bytes.len()) / page * page;
+        if end > start {
+            unsafe { libc::madvise(start as *mut libc::c_void, end - start, libc::MADV_DONTNEED) };
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = bytes;
+}
+
+/// This process's resident memory by kind, for the log: `resident X GB (peak Y): anonymous A, file-backed F, shared or
+/// page-locked S` (Linux `/proc/self/status`; None elsewhere). Page-locked host memory counts as shared.
+pub fn host_memory_note() -> Option<String> {
+    let s = std::fs::read_to_string("/proc/self/status").ok()?;
+    let gb = |k: &str| -> Option<f64> { Some(s.lines().find(|l| l.starts_with(k))?.split_whitespace().nth(1)?.parse::<f64>().ok()? * 1024.0 / 1e9) };
+    Some(format!("resident {:.1} GB (peak {:.1}): anonymous {:.1}, file-backed {:.1}, shared or page-locked {:.1}",
+                 gb("VmRSS:")?, gb("VmHWM:")?, gb("RssAnon:")?, gb("RssFile:")?, gb("RssShmem:")?))
 }
 
 /// `MemAvailable` (bytes), 0 when the OS does not say.
@@ -548,11 +575,31 @@ impl LayerStream {
             HostTensor::Pinned(p, dims) => {
                 use candle_core::{op::BackpropOp, CudaStorage, Storage};
                 let Device::Cuda(cd) = dev else { bail!("a page-locked block on a device that is not CUDA") };
-                let stream = self.copy_streams[d].clone().unwrap_or_else(|| cd.cuda_stream());
+                // The block's device memory belongs to the compute stream: allocated there, and so freed there (in
+                // that stream's order, after every kernel already queued on it). Only the copy runs on the second
+                // stream, after the allocation point (an event) and before any kernel reads the result (the slice's
+                // write event). Allocating on the copy stream instead (as `clone_htod` there does) made a block's
+                // memory freed on the copy stream when the pool evicted it, ordered only by cudarc's read event,
+                // which some read in the backward pass does not record: the next block's upload then overwrote
+                // weights a replayed block was still reading, and the adapters' gradients came out wrong.
+                let compute = cd.cuda_stream();
+                macro_rules! up {
+                    ($p:expr) => {{
+                        let mut dst = unsafe { compute.alloc($p.len()) }.map_err(|e| anyhow!("upload: {e}"))?;
+                        if let Some(copy) = self.copy_streams[d].as_ref() {
+                            let at = compute.record_event(None).map_err(|e| anyhow!("upload: {e}"))?;
+                            copy.wait(&at).map_err(|e| anyhow!("upload: {e}"))?;
+                            copy.memcpy_htod($p, &mut dst).map_err(|e| anyhow!("upload: {e}"))?;
+                        } else {
+                            compute.memcpy_htod($p, &mut dst).map_err(|e| anyhow!("upload: {e}"))?;
+                        }
+                        CudaStorage::wrap_cuda_slice(dst, cd.clone())
+                    }};
+                }
                 let storage = match p {
-                    Pinned::BF16(p) => CudaStorage::wrap_cuda_slice(stream.clone_htod(p).map_err(|e| anyhow!("upload: {e}"))?, cd.clone()),
-                    Pinned::F16(p) => CudaStorage::wrap_cuda_slice(stream.clone_htod(p).map_err(|e| anyhow!("upload: {e}"))?, cd.clone()),
-                    Pinned::F32(p) => CudaStorage::wrap_cuda_slice(stream.clone_htod(p).map_err(|e| anyhow!("upload: {e}"))?, cd.clone()),
+                    Pinned::BF16(p) => up!(p),
+                    Pinned::F16(p) => up!(p),
+                    Pinned::F32(p) => up!(p),
                 };
                 Ok(Tensor::from_storage(Storage::Cuda(storage), dims.clone(), BackpropOp::none(), false))
             }
