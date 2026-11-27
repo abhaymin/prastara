@@ -647,3 +647,96 @@ fn on_the_gpus_a_larger_streamed_looped_moe_trains_the_same() {
     assert!(gap(&rp, &rs) <= 1e-4 && gap(&rh, &rs) <= 1e-4, "streamed {:?} / held {:?}", rs.losses, rh.losses);
     assert!(rs.stream.unwrap().prefetch_hits > 0);
 }
+
+/// On the GPUs (`-- --ignored`): the streamed buffers are made once and written in place, so the device's memory pool
+/// does not grow over many micro-steps of varying length: each micro-step's reserve (high-water mark, the pool trimmed
+/// in between as the trainer does) stays within that of the first rounds, and the pool holds only `buffers` blocks
+/// beyond the activations.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_the_stream_buffers_do_not_grow_the_pool() {
+    let root = common::temp_dir("stream-pool");
+    let (moe, _) = looped_moe(&root, 512, 2048);
+    let devs = open(&test_gpus());
+    let n = ModelConfig::load(&moe).unwrap().num_hidden_layers;
+    let opts = strata_workshop::layer_stream::StreamOptions { mode: StreamMode::Ram, buffers: 2, cache_root: None };
+    let mut m = LlamaModel::load_streamed(&moe, BaseDtype::BF16, &devs, 0..n, true, true, &opts, &mut |_| {}).unwrap();
+    m.add_lora(&LoraSpec { r: 4, alpha: 8.0, dropout: 0.0, use_rslora: false, targets: Target::ALL.to_vec(), train_layers: None, seed: 7 }).unwrap();
+    m.set_checkpointing(true);
+    let block = m.stream().unwrap().block_bytes();
+    let lengths = [40usize, 200, 90, 300, 20, 250, 130, 60];
+    let mut marks: Vec<Vec<(u64, u64)>> = Vec::new();
+    m.synchronize().unwrap();
+    m.memory_marks(true);
+    for round in 0..3 {
+        for (k, len) in lengths.iter().enumerate() {
+            let tokens: Vec<u32> = (0..*len).map(|i| ((i * 37 + k * 11 + round) % 200 + 3) as u32).collect();
+            let supervised: Vec<bool> = (0..tokens.len()).map(|p| p > tokens.len() / 2).collect();
+            let loss = m.loss(&tokens, &supervised, &strata_workshop::model::Ctx::train(k as u64)).unwrap();
+            let g = loss.backward().unwrap();
+            drop((g, m.take_checkpoint_grads(), loss));
+            m.synchronize().unwrap();
+            marks.push(m.memory_marks(true));
+        }
+    }
+    let per = lengths.len();
+    for d in 0..devs.len() {
+        let mib = |b: u64| b >> 20;
+        let first = marks[..per].iter().map(|v| v[d].1).max().unwrap();
+        let later = marks[per..].iter().map(|v| v[d].1).max().unwrap();
+        let slack = marks.iter().map(|v| v[d].1.saturating_sub(v[d].0)).max().unwrap();
+        println!("dev{d}: reserve-high first round {} MiB, later rounds {} MiB; reserve above use at most {} MiB (a block is {} MiB); {:?}",
+                 mib(first), mib(later), mib(slack), mib(block), marks.iter().map(|v| (mib(v[d].0), mib(v[d].1))).collect::<Vec<_>>());
+        assert!(later <= first + (first >> 5), "dev{d}: the pool's reserve grew from {first} to {later}");
+        assert!(slack <= 2 * block + (48 << 20), "dev{d}: the pool reserved {slack} bytes above its use");
+    }
+}
+
+/// On the GPUs (`-- --ignored`): after a streamed load the process holds the page-locked store and nothing of the
+/// mapped checkpoint (its pages are released block by block), and the kernel's count of the page-locked pages is
+/// double (file-backed and shared, through /dev/nvidiactl), which the log's note takes out.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_a_streamed_load_keeps_no_checkpoint_resident() {
+    let kb = |k: &str| -> u64 {
+        std::fs::read_to_string("/proc/self/status").unwrap().lines().find(|l| l.starts_with(k)).unwrap().split_whitespace().nth(1).unwrap().parse::<u64>().unwrap() * 1024
+    };
+    let root = common::temp_dir("stream-rss");
+    let base = root.join("base");
+    common::chat_model_sized(&base, 4, 2048, 8192);
+    let file: u64 = std::fs::read_dir(&base).unwrap().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "safetensors")).map(|e| e.metadata().unwrap().len()).sum();
+    let devs = open(&test_gpus());
+    for d in &devs {
+        Tensor::zeros(8, candle_core::DType::F32, d).unwrap().sum_all().unwrap();
+    }
+    let before = kb("VmRSS:") - kb("RssAnon:");
+    let opts = strata_workshop::layer_stream::StreamOptions { mode: StreamMode::Ram, buffers: 2, cache_root: None };
+    let m = LlamaModel::load_streamed(&base, BaseDtype::BF16, &devs, 0..4, true, true, &opts, &mut |_| {}).unwrap();
+    let pinned = m.stream().unwrap().pinned_bytes;
+    let twice = strata_workshop::layer_stream::driver_mapped_bytes();
+    // what is resident and not anonymous, beyond what was there before: the pinned store, counted twice
+    let after = kb("VmRSS:") - kb("RssAnon:");
+    let left = (after - before) as i64 - 2 * pinned as i64;
+    let note = strata_workshop::layer_stream::host_memory_note().unwrap();
+    println!("checkpoint {:.2} GB, pinned {:.2} GB, driver-mapped {:.2} GB, mapped beyond the pinned store {:.2} GB; {note}",
+             file as f64 / 1e9, pinned as f64 / 1e9, twice as f64 / 1e9, left as f64 / 1e9);
+    // the driver maps a little of its own per card (about 60 MB) beside the page-locked store
+    assert!(pinned > 0 && twice >= pinned && twice <= pinned + devs.len() as u64 * (128 << 20), "pinned {pinned}, driver-mapped {twice}");
+    assert!(left < (file / 10) as i64, "{left} bytes of the {file}-byte checkpoint still resident");
+    drop(m);
+}
+
+/// A short run (up to `SHORT_RUN_STEPS`) reports every step's loss, whatever `logging_steps` says.
+#[test]
+fn a_short_run_reports_every_step() {
+    let (root, model, data) = common::model_and_data("short-run-steps");
+    let mut s = settings(&model, &data, &root.join("o"));
+    s.logging_steps = 10;
+    s.max_steps = Some(5);
+    let mut steps = Vec::new();
+    finetune::train(&s, &mut |e| if let Event::Step { step, loss, .. } = e { steps.push((step, loss)) }, &|| false).unwrap();
+    assert_eq!(steps.iter().map(|(s, _)| *s).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+    assert!(steps.iter().all(|(_, l)| l.is_finite()));
+}

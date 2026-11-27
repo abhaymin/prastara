@@ -268,6 +268,9 @@ pub struct TrainReport {
     pub stream: Option<StreamStats>,
 }
 
+/// A run of at most this many steps reports every step's loss, whatever `logging_steps` says.
+pub const SHORT_RUN_STEPS: usize = 50;
+
 /// The process's peak resident memory (Linux `VmHWM`), when the OS says.
 pub fn peak_rss_bytes() -> Option<u64> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -876,7 +879,8 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         step += 1;
         let done = (step - start_step) as f64;
         let eta = t_steps.elapsed().as_secs_f64() / done * (total - step) as f64;
-        if s.logging_steps <= 1 || step % s.logging_steps == 0 || step == total || step == start_step + 1 {
+        // a short run (up to SHORT_RUN_STEPS) reports every step: its few losses are the whole story
+        if s.logging_steps <= 1 || total <= SHORT_RUN_STEPS || step % s.logging_steps == 0 || step == total || step == start_step + 1 {
             on_event(Event::Step { step, total, loss, lr, eta_seconds: eta, aux: run.last_aux });
         }
         if s.eval_steps > 0 && step % s.eval_steps == 0 && step < total {
@@ -921,7 +925,9 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     std::fs::write(s.out.join(REPORT_FILE), serde_json::to_string_pretty(&json!({
         "steps_done": step, "total_steps": total, "stopped": stopped, "losses": losses, "eval_loss": eval, "train_examples": n_train,
         "eval_examples": n_eval, "trainable_params": trainable, "seconds": report.seconds, "tokens_seen": report.tokens_seen,
-        "peak_rss_bytes": report.peak_rss_bytes, "private": run.private, "settings": fingerprint, "base_model": s.model.display().to_string(),
+        "peak_rss_bytes": report.peak_rss_bytes,
+        // page-locked memory the kernel counts twice in VmRSS / VmHWM (see layer_stream::driver_mapped_bytes)
+        "rss_counted_twice_bytes": crate::layer_stream::driver_mapped_bytes(), "private": run.private, "settings": fingerprint, "base_model": s.model.display().to_string(),
         "activation_cache": {"hits": hits, "written": misses, "bytes_written": bytes, "lower_blocks_in_memory": report.lower_in_memory},
         "layer_stream": stream.map(|st| json!({"tier": run.model.stream().map(|l| l.tier.as_str()), "buffers": s.stream_buffers, "block_copies": st.loads,
                                                "bytes_copied": st.bytes, "prefetch_hits": st.prefetch_hits, "demand_loads": st.demand_loads})),

@@ -2500,7 +2500,8 @@ impl LlamaModel {
     pub fn block_weight(&self, i: usize, t: Target) -> Option<Tensor> {
         let ti = Target::ALL.iter().position(|x| *x == t)?;
         if let Some(s) = self.stream.as_ref().filter(|s| s.has_block(i)) {
-            return s.acquire(i).ok().map(|w| w[ti].clone());
+            // a copy: the stream's buffer is refilled in place when another block needs it
+            return s.acquire(i).ok().and_then(|w| w[ti].copy().ok());
         }
         self.blocks.get(i)?.as_ref().map(|b| b.lin[ti].w.clone())
     }

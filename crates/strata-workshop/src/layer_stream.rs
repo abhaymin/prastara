@@ -9,19 +9,19 @@
 //! head stay on the device. This is written from scratch in Rust on candle; no code of Soup is used.
 //!
 //! **Buffers.** Each device keeps at most `buffers` (2 to 8) blocks' frozen weights at once ([`Pool`]): the block that
-//! runs and the one prefetched next. Soup pre-allocates the buffers and copies into them in place; candle's tensors
-//! cannot be written in place from the host, so each fill is a fresh device tensor of the same size, which candle's
-//! stream-ordered CUDA memory pool hands back from the block the evicted one freed. A slot that is evicted while a
-//! graph still holds its tensors therefore keeps them alive instead of being overwritten — a wrong gradient is not
-//! possible, only memory above the bound until that graph is dropped.
+//! runs and the one prefetched next. As in Soup, the buffers are made once (on CUDA, at a slot's first fill, on the
+//! compute stream) and written in place from then on: nothing is freed and allocated again per block, so the stream-
+//! ordered memory pool is not churned by 7 large allocations a block (on the 56B-A5B that let the pool's reserve climb
+//! to the card's size). A slot is refilled only after an event on the compute stream that follows every kernel that
+//! read its previous block; a tensor handed out from a slot is valid until that slot is refilled, which is why
+//! [`crate::model::LlamaModel::block_weight`] returns a copy. On the CPU (tests) each fill is a fresh copy.
 //!
 //! **Prefetch and pinning (CUDA).** In the RAM tier each block's matrices are copied once into page-locked host memory
 //! (cudarc's `alloc_pinned`, in the block's own device's context) as long as the pinned total stays under a limit
 //! (0.7 of the free RAM at load, or `AM2_STREAM_PIN_LIMIT` bytes); beyond it they stay pageable, said in the log. A
 //! second CUDA stream per device (cudarc `new_stream`) carries the copies: the next block's upload is queued there
-//! while the current block's kernels run on candle's stream, and the allocation's write event makes the compute
-//! stream wait for the copy. The buffer itself is allocated (and freed) on the compute stream, so it never returns to
-//! the pool before the kernels reading it have run (see [`LayerStream::upload`]). A pageable or disk-tier block is
+//! while the current block's kernels run on candle's stream; the compute stream waits for the copy's event before the
+//! slot's first use ([`LayerStream::fill_cuda`]). A pageable or disk-tier block is
 //! uploaded synchronously on the compute stream (no overlap). On the CPU (tests) a fill is a plain copy.
 //!
 //! **Order.** [`LayerStream::begin`] is told the order the blocks will run in (with a loop, its blocks again for each
@@ -156,13 +156,40 @@ pub fn release_mapped(bytes: &[u8]) {
     let _ = bytes;
 }
 
-/// This process's resident memory by kind, for the log: `resident X GB (peak Y): anonymous A, file-backed F, shared or
-/// page-locked S` (Linux `/proc/self/status`; None elsewhere). Page-locked host memory counts as shared.
+/// The resident bytes of this process's mappings of the NVIDIA driver's device files (`/dev/nvidia*`, from
+/// `/proc/self/smaps`): page-locked host memory (`cuMemHostAlloc`) is mapped through `/dev/nvidiactl`, and the kernel
+/// counts those pages twice, as file-backed (`RssFile`) and as shared (`RssShmem`); `VmRSS` and `VmHWM` include them
+/// twice too. Measured: 0.50 GB pinned showed as 0.55 GB of each while MemAvailable fell by 0.54 GB (the driver maps
+/// about 60 MB of its own per card there as well). 0 off Linux.
+pub fn driver_mapped_bytes() -> u64 {
+    let Ok(smaps) = std::fs::read_to_string("/proc/self/smaps") else { return 0 };
+    let mut driver = false;
+    let mut kb = 0u64;
+    for l in smaps.lines() {
+        let first = l.split_whitespace().next().unwrap_or("");
+        if first.contains('-') && !first.ends_with(':') {
+            driver = l.split_whitespace().nth(5).is_some_and(|p| p.starts_with("/dev/nvidia"));
+        } else if driver {
+            if let Some(v) = l.strip_prefix("Rss:") {
+                kb += v.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0);
+            }
+        }
+    }
+    kb * 1024
+}
+
+/// This process's memory by kind, for the log (Linux `/proc/self/status` and `smaps`; None elsewhere):
+/// `resident X GB as the kernel counts it (peak Y), of which P GB page-locked counted twice: in memory about X−P GB —
+/// anonymous A, page-locked P, files F` — the files being the mapped libraries and whatever of the checkpoint is still
+/// mapped, with the page-locked store taken out of the kernel's file-backed count.
 pub fn host_memory_note() -> Option<String> {
     let s = std::fs::read_to_string("/proc/self/status").ok()?;
     let gb = |k: &str| -> Option<f64> { Some(s.lines().find(|l| l.starts_with(k))?.split_whitespace().nth(1)?.parse::<f64>().ok()? * 1024.0 / 1e9) };
-    Some(format!("resident {:.1} GB (peak {:.1}): anonymous {:.1}, file-backed {:.1}, shared or page-locked {:.1}",
-                 gb("VmRSS:")?, gb("VmHWM:")?, gb("RssAnon:")?, gb("RssFile:")?, gb("RssShmem:")?))
+    let (rss, peak, anon, file, shmem) = (gb("VmRSS:")?, gb("VmHWM:")?, gb("RssAnon:")?, gb("RssFile:")?, gb("RssShmem:")?);
+    let twice = driver_mapped_bytes() as f64 / 1e9;
+    Some(format!("resident {rss:.1} GB as the kernel counts it (peak {peak:.1}), {twice:.1} GB of it page-locked memory counted twice (mapped through \
+                  /dev/nvidiactl): in memory about {:.1} GB — anonymous {anon:.1}, page-locked {shmem:.1}, files {:.1}",
+                 (rss - twice).max(0.0), (file - twice).max(0.0)))
 }
 
 /// `MemAvailable` (bytes), 0 when the OS does not say.
@@ -326,11 +353,25 @@ enum HostBlock {
 struct Pool {
     /// (block, its seven matrices on the device, last use)
     slots: Vec<Option<(usize, Vec<Tensor>, u64)>>,
+    /// CUDA: each slot's device memory, made once at its first fill and written in place from then on (never freed
+    /// and allocated again per block: that churned the stream-ordered pool, whose reserve then climbed to the card's
+    /// size on the 56B-A5B)
+    #[cfg(feature = "cuda")]
+    mem: Vec<Option<SlotMem>>,
     clock: u64,
     /// the slot the last acquire used (a prefetch never evicts it)
     current: Option<usize>,
     /// slots filled by a prefetch and not yet used
     prefetched: Vec<bool>,
+}
+
+/// A slot's device memory: the seven matrices as tensors over it, their device addresses, and the copy last queued
+/// into it (on the copy stream; the compute stream waits for it before the slot's first use after the fill).
+#[cfg(feature = "cuda")]
+struct SlotMem {
+    tensors: Vec<Tensor>,
+    ptrs: Vec<u64>,
+    ready: Option<candle_core::cuda_backend::cudarc::driver::CudaEvent>,
 }
 
 impl Pool {
@@ -496,7 +537,8 @@ impl StreamBuilder {
         } else {
             notes.push("uploads are synchronous on this backend".into());
         }
-        let pools = self.devs.iter().map(|_| Mutex::new(Pool { slots: vec![None; self.buffers], clock: 0, current: None, prefetched: vec![false; self.buffers] })).collect();
+        let pools = self.devs.iter().map(|_| Mutex::new(Pool { slots: vec![None; self.buffers], #[cfg(feature = "cuda")] mem: (0..self.buffers).map(|_| None).collect(),
+                                                               clock: 0, current: None, prefetched: vec![false; self.buffers] })).collect();
         Ok(LayerStream { tier: self.tier, buffers: self.buffers, blocks: self.blocks, shapes: self.shapes, dtype: self.dtype, devs: self.devs, block_dev: self.block_dev,
                          pools, #[cfg(feature = "cuda")] copy_streams, schedule: Mutex::new(Schedule::default()), stats: Mutex::new(StreamStats::default()),
                          pinned_bytes: self.pinned_bytes, pageable_bytes: self.pageable_bytes, shard_dir: self.shard_dir, notes })
@@ -542,68 +584,163 @@ impl LayerStream {
         self.blocks.get(i).is_some_and(Option::is_some)
     }
 
-    /// Copy block `i`'s matrices to its device now.
-    fn load(&self, i: usize) -> Result<Vec<Tensor>> {
+    /// The disk tier's block `i`, read from its shard now (in [`Target::ALL`] order).
+    fn read_shard(&self, path: &Path) -> Result<Vec<HostTensor>> {
+        let mut map = candle_core::safetensors::load(path, &Device::Cpu).with_context(|| format!("layer-stream shard {}", path.display()))?;
+        Target::ALL.iter().zip(&self.shapes).map(|(t, (o, inp))| {
+            let w = map.remove(t.as_str()).ok_or_else(|| anyhow!("{}: no {}", path.display(), t.as_str()))?;
+            if w.dims() != [*o, *inp] || w.dtype() != self.dtype {
+                bail!("{}: {} is {:?} {:?}, the model needs [{o}, {inp}] {:?} (delete the cache folder)", path.display(), t.as_str(), w.dims(), w.dtype(), self.dtype);
+            }
+            Ok(HostTensor::Cpu(w.contiguous()?))
+        }).collect()
+    }
+
+    /// Put block `i`'s matrices into slot `s` of its device's pool and return them as tensors. On CUDA the slot's
+    /// memory is written in place; elsewhere (the CPU, in tests) each fill is a fresh copy.
+    fn fill(&self, pool: &mut Pool, s: usize, i: usize) -> Result<Vec<Tensor>> {
         let d = self.block_dev[i];
-        let dev = &self.devs[d];
-        let out = match self.blocks.get(i).and_then(Option::as_ref).ok_or_else(|| anyhow!("block {i} is not in the layer stream"))? {
-            HostBlock::Ram(ts) => ts.iter().map(|h| self.upload(h, d)).collect::<Result<Vec<_>>>()?,
+        let owned;
+        let host: &[HostTensor] = match self.blocks.get(i).and_then(Option::as_ref).ok_or_else(|| anyhow!("block {i} is not in the layer stream"))? {
+            HostBlock::Ram(ts) => ts,
             HostBlock::Disk(path) => {
-                let mut map = candle_core::safetensors::load(path, &Device::Cpu).with_context(|| format!("layer-stream shard {}", path.display()))?;
-                Target::ALL.iter().zip(&self.shapes).map(|(t, (o, inp))| {
-                    let w = map.remove(t.as_str()).ok_or_else(|| anyhow!("{}: no {}", path.display(), t.as_str()))?;
-                    if w.dims() != [*o, *inp] || w.dtype() != self.dtype {
-                        bail!("{}: {} is {:?} {:?}, the model needs [{o}, {inp}] {:?} (delete the cache folder)", path.display(), t.as_str(), w.dims(), w.dtype(), self.dtype);
-                    }
-                    self.upload(&HostTensor::Cpu(w), d)
-                }).collect::<Result<Vec<_>>>()?
+                owned = self.read_shard(path)?;
+                &owned
             }
         };
-        let _ = dev;
-        let mut s = self.stats.lock().unwrap();
-        s.loads += 1;
-        s.bytes += self.block_bytes();
+        let out = match &self.devs[d] {
+            #[cfg(feature = "cuda")]
+            Device::Cuda(cd) => self.fill_cuda(pool, s, d, cd, host)?,
+            dev => host.iter().map(|h| match h {
+                HostTensor::Cpu(t) => Ok(if dev.is_cpu() { t.copy()? } else { t.to_device(dev)? }),
+                #[cfg(feature = "cuda")]
+                HostTensor::Pinned(..) => bail!("a page-locked block on a device that is not CUDA"),
+            }).collect::<Result<Vec<_>>>()?,
+        };
+        let _ = (pool, s);
+        let mut st = self.stats.lock().unwrap();
+        st.loads += 1;
+        st.bytes += self.block_bytes();
         Ok(out)
     }
 
-    fn upload(&self, h: &HostTensor, d: usize) -> Result<Tensor> {
-        let dev = &self.devs[d];
-        match h {
-            // a fresh copy on the CPU (the same path a GPU takes, minus the transfer), a plain upload elsewhere
-            HostTensor::Cpu(t) => Ok(if dev.is_cpu() { t.copy()? } else { t.to_device(dev)? }),
-            #[cfg(feature = "cuda")]
-            HostTensor::Pinned(p, dims) => {
-                use candle_core::{op::BackpropOp, CudaStorage, Storage};
-                let Device::Cuda(cd) = dev else { bail!("a page-locked block on a device that is not CUDA") };
-                // The block's device memory belongs to the compute stream: allocated there, and so freed there (in
-                // that stream's order, after every kernel already queued on it). Only the copy runs on the second
-                // stream, after the allocation point (an event) and before any kernel reads the result (the slice's
-                // write event). Allocating on the copy stream instead (as `clone_htod` there does) made a block's
-                // memory freed on the copy stream when the pool evicted it, ordered only by cudarc's read event,
-                // which some read in the backward pass does not record: the next block's upload then overwrote
-                // weights a replayed block was still reading, and the adapters' gradients came out wrong.
-                let compute = cd.cuda_stream();
-                macro_rules! up {
-                    ($p:expr) => {{
-                        let mut dst = unsafe { compute.alloc($p.len()) }.map_err(|e| anyhow!("upload: {e}"))?;
-                        if let Some(copy) = self.copy_streams[d].as_ref() {
-                            let at = compute.record_event(None).map_err(|e| anyhow!("upload: {e}"))?;
-                            copy.wait(&at).map_err(|e| anyhow!("upload: {e}"))?;
-                            copy.memcpy_htod($p, &mut dst).map_err(|e| anyhow!("upload: {e}"))?;
-                        } else {
-                            compute.memcpy_htod($p, &mut dst).map_err(|e| anyhow!("upload: {e}"))?;
-                        }
-                        CudaStorage::wrap_cuda_slice(dst, cd.clone())
+    /// The CUDA fill. Slot memory is allocated once, on the compute stream. A page-locked matrix is copied on the
+    /// copy stream, which first waits for an event recorded on the compute stream now: every kernel that could read
+    /// the slot's previous block (its forward, its checkpoint replay) is queued before that point, because a block's
+    /// weights are only read while it runs and the slot being refilled is never the one running. The compute stream
+    /// waits for the copy's own event when the slot is next acquired. A pageable matrix (over the pin limit, or from
+    /// the disk tier) is copied on the compute stream itself, in its order.
+    #[cfg(feature = "cuda")]
+    fn fill_cuda(&self, pool: &mut Pool, s: usize, d: usize, cd: &candle_core::CudaDevice, host: &[HostTensor]) -> Result<Vec<Tensor>> {
+        use candle_core::cuda_backend::cudarc::driver::{result, DevicePtr, HostSlice};
+        use candle_core::{op::BackpropOp, CpuStorage, CudaStorage, Storage};
+        let e = |e: candle_core::cuda_backend::cudarc::driver::DriverError| anyhow!("layer-stream upload: {e}");
+        let compute = cd.cuda_stream();
+        compute.context().bind_to_thread().map_err(e)?;
+        if pool.mem[s].is_none() {
+            let mut tensors = Vec::with_capacity(self.shapes.len());
+            let mut ptrs = Vec::with_capacity(self.shapes.len());
+            for (o, inp) in &self.shapes {
+                let n = o * inp;
+                macro_rules! slot {
+                    ($ty:ty) => {{
+                        let slice = unsafe { compute.alloc::<$ty>(n) }.map_err(e)?;
+                        ptrs.push(slice.device_ptr(&compute).0);
+                        CudaStorage::wrap_cuda_slice(slice, cd.clone())
                     }};
                 }
-                let storage = match p {
-                    Pinned::BF16(p) => up!(p),
-                    Pinned::F16(p) => up!(p),
-                    Pinned::F32(p) => up!(p),
+                let storage = match self.dtype {
+                    DType::BF16 => slot!(half::bf16),
+                    DType::F16 => slot!(half::f16),
+                    DType::F32 => slot!(f32),
+                    other => bail!("a {other:?} base is not streamed"),
                 };
-                Ok(Tensor::from_storage(Storage::Cuda(storage), dims.clone(), BackpropOp::none(), false))
+                tensors.push(Tensor::from_storage(Storage::Cuda(storage), (*o, *inp), BackpropOp::none(), false));
+            }
+            pool.mem[s] = Some(SlotMem { tensors, ptrs, ready: None });
+        }
+        let copy = self.copy_streams[d].as_ref();
+        let mut waited = false;
+        let mem = pool.mem[s].as_mut().unwrap();
+        // a prefetch into this slot that was never used: the compute stream's writes below come after it
+        if let Some(ev) = mem.ready.take() {
+            compute.wait(&ev).map_err(e)?;
+        }
+        for ((h, ptr), (o, inp)) in host.iter().zip(&mem.ptrs).zip(&self.shapes) {
+            let n = o * inp;
+            match h {
+                HostTensor::Pinned(p, _) if copy.is_some() => {
+                    let copy = copy.unwrap();
+                    if !waited {
+                        let at = compute.record_event(None).map_err(e)?;
+                        copy.wait(&at).map_err(e)?;
+                        waited = true;
+                    }
+                    macro_rules! up {
+                        ($p:expr) => {{
+                            if $p.len() != n {
+                                bail!("a page-locked matrix of {} values for a slot of {n}", $p.len());
+                            }
+                            let (src, _record) = unsafe { $p.stream_synced_slice(copy) };
+                            unsafe { result::memcpy_htod_async(*ptr, src, copy.cu_stream()) }.map_err(e)?;
+                        }};
+                    }
+                    match p {
+                        Pinned::BF16(p) => up!(p),
+                        Pinned::F16(p) => up!(p),
+                        Pinned::F32(p) => up!(p),
+                    }
+                }
+                HostTensor::Pinned(p, _) => {
+                    macro_rules! up {
+                        ($p:expr) => {{
+                            let (src, _record) = unsafe { $p.stream_synced_slice(&compute) };
+                            unsafe { result::memcpy_htod_async(*ptr, src, compute.cu_stream()) }.map_err(e)?;
+                        }};
+                    }
+                    match p {
+                        Pinned::BF16(p) => up!(p),
+                        Pinned::F16(p) => up!(p),
+                        Pinned::F32(p) => up!(p),
+                    }
+                }
+                HostTensor::Cpu(t) => {
+                    let t = t.to_dtype(self.dtype)?.contiguous()?;
+                    if t.elem_count() != n {
+                        bail!("a matrix of {} values for a slot of {n}", t.elem_count());
+                    }
+                    let (st, layout) = t.storage_and_layout();
+                    let start = layout.start_offset();
+                    // pageable memory: the driver stages it before the call returns, in the compute stream's order
+                    macro_rules! up {
+                        ($v:expr) => { unsafe { result::memcpy_htod_async(*ptr, &$v[start..start + n], compute.cu_stream()) }.map_err(e)? };
+                    }
+                    match &*st {
+                        Storage::Cpu(CpuStorage::BF16(v)) => up!(v),
+                        Storage::Cpu(CpuStorage::F16(v)) => up!(v),
+                        Storage::Cpu(CpuStorage::F32(v)) => up!(v),
+                        _ => bail!("only CPU f32, f16 and bf16 matrices are streamed"),
+                    }
+                }
             }
         }
+        mem.ready = match (waited, copy) {
+            (true, Some(copy)) => Some(copy.record_event(None).map_err(e)?),
+            _ => None,
+        };
+        Ok(mem.tensors.clone())
+    }
+
+    /// Before kernels read slot `s` on device `d`: make the compute stream wait for the copy last queued into it.
+    #[allow(unused_variables)]
+    fn ready(&self, pool: &mut Pool, s: usize, d: usize) -> Result<()> {
+        #[cfg(feature = "cuda")]
+        if let (Device::Cuda(cd), Some(mem)) = (&self.devs[d], pool.mem[s].as_mut()) {
+            if let Some(ev) = mem.ready.take() {
+                cd.cuda_stream().wait(&ev).map_err(|e| anyhow!("layer-stream upload: {e}"))?;
+            }
+        }
+        Ok(())
     }
 
     /// Block `i`'s frozen matrices on its device, for a run of it: from its buffer when it is resident (prefetched or
@@ -621,15 +758,17 @@ impl LayerStream {
             slot.2 = clock;
             let w = slot.1.clone();
             pool.current = Some(s);
+            self.ready(&mut pool, s, d)?;
             return Ok(w);
         }
         let s = pool.victim(None).ok_or_else(|| anyhow!("no stream buffer"))?;
         pool.slots[s] = None;
-        let w = self.load(i)?;
+        let w = self.fill(&mut pool, s, i)?;
         self.stats.lock().unwrap().demand_loads += 1;
         pool.slots[s] = Some((i, w.clone(), clock));
         pool.prefetched[s] = false;
         pool.current = Some(s);
+        self.ready(&mut pool, s, d)?;
         Ok(w)
     }
 
@@ -646,7 +785,7 @@ impl LayerStream {
         let keep = pool.current;
         let Some(s) = pool.victim(keep) else { return Ok(()) };
         pool.slots[s] = None;
-        let w = self.load(i)?;
+        let w = self.fill(&mut pool, s, i)?;
         pool.clock += 1;
         let clock = pool.clock;
         pool.slots[s] = Some((i, w, clock));
@@ -695,13 +834,25 @@ impl LayerStream {
 
     /// Drop every buffer (between phases, or before the model is dropped).
     pub fn clear(&self) {
-        for p in &self.pools {
+        for (d, p) in self.pools.iter().enumerate() {
             let mut p = p.lock().unwrap();
-            for s in p.slots.iter_mut() {
-                *s = None;
+            for s in 0..p.slots.len() {
+                p.slots[s] = None;
+                // a copy still queued into the slot finishes before its memory goes back (on the compute stream)
+                let _ = self.ready(&mut p, s, d);
+                #[cfg(feature = "cuda")]
+                {
+                    p.mem[s] = None;
+                }
             }
             p.current = None;
         }
+    }
+}
+
+impl Drop for LayerStream {
+    fn drop(&mut self) {
+        self.clear();
     }
 }
 
