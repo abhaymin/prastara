@@ -46,6 +46,10 @@ and `unsloth start` can use it as their endpoint.
 The Workshop's trainer (crates/strata-workshop: model.rs, finetune.rs, profile.rs, soup.rs) is modelled on Soup
 (https://github.com/MakazhanAlpamys/Soup, Apache-2.0, Copyright 2026 Makazhan Alpamys): Soup is the reference for the
 `soup.yaml` config format the trainer imports and for the idea of `profile` (estimate memory and time before training),
-`autopilot` (pick the settings from the model, the data and the machine) and the learning-rate range test. The trainer
-is written from scratch in Rust on candle; no code of Soup is used. Three small example configs written by Soup's own
+`autopilot` (pick the settings from the model, the data and the machine) and the learning-rate range test, and of the
+layer-by-layer training in crates/strata-workshop/src/layer_stream.rs, finetune.rs and profile.rs: layer streaming
+(Soup's `training.stream_layers`: the RAM and disk tiers, the 2-8 device buffers, page-locked memory and prefetch,
+the shard cache, the memory and PCIe arithmetic), LISA (layerwise importance sampling, clearing the optimizer state of
+re-frozen layers) and freezing the bottom layers. The trainer is written from scratch in Rust on candle; no code of
+Soup is used. Three small example configs written by Soup's own
 CLI are kept, unchanged, as test fixtures under crates/strata-workshop/tests/fixtures/soup/ (Apache-2.0).

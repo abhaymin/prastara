@@ -616,6 +616,39 @@ while it loads (page cache the system takes back when it needs it). That is the 
 `--train-layers 2` row. On this CPU an f16 base runs about twice as slow as bf16 (candle widens f16 slowly), so use
 bf16. For the same reason the time estimate is rough: a matrix-product benchmark of this CPU scaled by a measured share.
 
+**Layer by layer** (after Soup's `training.stream_layers`, `lisa` and `freeze_layers`, Apache-2.0):
+
+```
+am2strata-workshop train --model M --data D --devices cuda:0,cuda:1 --base-dtype bf16 --stream-layers ram --stream-buffers 2
+am2strata-workshop train --model M --data D --lisa-layers 4 --lisa-interval 20          # 4 sampled blocks train at a time
+am2strata-workshop train --model M --data D --freeze-bottom 12                           # = --train-layers <blocks - 12>
+am2strata-workshop profile --model M --devices cuda:0,cuda:1 --stream-layers ram [--stream-bandwidth 6.3,3.0]
+```
+
+- `--stream-layers ram|disk|auto` keeps every block's frozen matrices off the GPU: in RAM (page-locked as far as 0.7 of
+  the free RAM allows, `AM2_STREAM_PIN_LIMIT` bytes otherwise), or in a shard cache on disk (one file per block, made
+  once per model under `~/.cache/prastara/layer-stream`, `--stream-cache DIR`), `auto` picking RAM when the base fits
+  70 % of the free RAM. Each GPU holds `--stream-buffers` blocks (2 to 8) at a time: the block running and the next,
+  whose upload is queued on a second CUDA stream from the page-locked copy while the current one computes. Pageable
+  and disk-tier blocks upload synchronously. Gradient checkpointing is turned on (the backward pass replays each block
+  from its weights, copied again). It works with one or two GPUs, loops (a block is fetched again in each pass) and
+  upcycled models (an expert group's frozen slices are the block's matrices). On the CPU it changes nothing but runs
+  the same path: the tests check a streamed run takes the same steps, bit for bit, as one with the base held.
+- The cost is PCIe: each streamed block is read twice per conversation. `profile` prints it: per GPU what it holds,
+  the RAM (or disk) the base takes, the bytes a step moves over each card's link (from sysfs; a USB4-attached card is
+  taken at 3 GB/s) and the slowdown against the compute. For the upcycled 56B-A5B (Qwen3-8B, 120 experts of 1,024,
+  top-5, expert rank 4 with a shared A, rank 16 on the attention) on the two 16 GB cards: 8.6 GB on the busiest card
+  at 512 tokens and 10.5 GB at 1,024 (held, 15.4 and 17.3 GB), 15.1 GB of RAM, 27.8 GB over PCIe per conversation:
+  about 4.2x slower at 512 tokens and 2.1x at 1,024 than the compute alone (estimates; measure with a short run).
+- `--lisa-layers K --lisa-interval N [--lisa-seed S]`: every N steps K of the blocks with adapters are sampled (by the
+  seed and the interval alone, so a resumed run samples the same ones); only their adapters (an upcycled block's router
+  and experts too) train, the others are constants with no backward pass of their own, and AdamW's moments of a block
+  LISA stops training are cleared. A Soup config's `lisa_*` (whole-layer fine-tuning in Soup) maps to this with
+  `--soup-relax`; `stream_layers`, `stream_source`, `stream_buffers` and `freeze_layers` map as they are.
+- The server's `train` job and `POST /v1/workshop/estimate` take `"stream_layers"`, `"stream_buffers"`,
+  `"lisa_layers"`, `"lisa_interval"`, `"lisa_seed"` and `"freeze_bottom"`; the Workshop's Train card has a "Layer
+  streaming" select and the LISA fields; `am2strata-run workshop train <model> --data D --stream-layers ram ...`.
+
 **Not done** (the command says so too): a 4-bit base (QLoRA; `--base-dtype 4bit` is refused), training expert
 adapters of mixture-of-experts models, GPU or multi-GPU runs, vision and audio towers, full fine-tuning, DoRA,
 preference objectives (DPO and the like). Next: the server's train job and the Workshop "Train" card with GPU runs
