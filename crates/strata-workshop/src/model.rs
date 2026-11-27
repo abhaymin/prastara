@@ -1021,6 +1021,27 @@ impl PassLayout {
     }
 }
 
+/// What a packed pass scores: for each conversation (its rows `s .. s + n`), each supervised token `p` of it (`p >= 1`:
+/// the first token of a conversation is never predicted, least of all from the conversation before it) is predicted
+/// from row `s + p - 1`, weighted `1 / its supervised tokens`. Returns `(rows, targets, weights)`; the same rows and
+/// targets, conversation by conversation, as [`LlamaModel::loss_from_hidden`] scores alone.
+pub fn packed_targets(layout: &PassLayout, tokens: &[u32], supervised: &[bool]) -> Result<(Vec<u32>, Vec<u32>, Vec<f32>)> {
+    let (mut rows, mut targets, mut weights) = (Vec::new(), Vec::new(), Vec::new());
+    for (s, n) in layout.segments() {
+        let mine: Vec<usize> = (1..n).filter(|p| supervised[s + p]).collect();
+        if mine.is_empty() {
+            bail!("an example with no supervised token");
+        }
+        let w = 1.0 / mine.len() as f32;
+        for p in mine {
+            rows.push((s + p - 1) as u32);
+            targets.push(tokens[s + p]);
+            weights.push(w);
+        }
+    }
+    Ok((rows, targets, weights))
+}
+
 /// How a block's attention runs over the rows of a pass: each unit `(first row, rows, mask)` attends within itself
 /// (one unit for an unpacked pass: the whole input), and `segments` are the conversations (`None`: the whole input is
 /// one), over which the router losses are taken one by one.
@@ -2947,19 +2968,7 @@ impl LlamaModel {
         if tokens.len() != layout.rows() || supervised.len() != tokens.len() {
             bail!("a packed pass of {} rows given {} tokens and {} flags", layout.rows(), tokens.len(), supervised.len());
         }
-        let (mut rows, mut targets, mut weights) = (Vec::new(), Vec::new(), Vec::new());
-        for (s, n) in layout.segments() {
-            let mine: Vec<usize> = (1..n).filter(|p| supervised[s + p]).collect();
-            if mine.is_empty() {
-                bail!("an example with no supervised token");
-            }
-            let w = 1.0 / mine.len() as f32;
-            for p in mine {
-                rows.push((s + p - 1) as u32);
-                targets.push(tokens[s + p]);
-                weights.push(w);
-            }
-        }
+        let (rows, targets, weights) = packed_targets(layout, tokens, supervised)?;
         let n = rows.len();
         let hidden = self.upper_hidden_packed(h, layout, ctx)?;
         let hidden = hidden.index_select(&Tensor::from_vec(rows, (n,), hidden.device())?, 0)?;

@@ -785,12 +785,16 @@ impl Runner {
                     INJECT_COMMIT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
                     bail!("injected for a test: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")");
                 }
+                // the step's sums live in host memory: nothing the step keeps is allocated on a card mid-step, where it
+                // would pin the pool chunks a pass fragmented (the first packed 56B-A5B run's pools reserved 15.5 GB for
+                // 8 GB in use, and ran out of memory on that)
+                let g = if g.device().is_cpu() { g.clone() } else { g.to_device(&Device::Cpu)? };
                 let next = match &sum[slot] {
-                    Some(acc) => (acc + g)?,
+                    Some(acc) => (acc + &g)?,
                     None => g.clone(),
                 };
                 sum[slot] = Some(next);
-                added.push((slot, g.clone()));
+                added.push((slot, g));
             }
         }
         Ok(())
@@ -855,18 +859,23 @@ impl Runner {
             // sums take its gradients only after its backward pass has finished, so nothing is counted twice, and they
             // are added in place as always: no second set of gradients is held.
             let mut attempt = 0;
-            let mut n = self.seqs_per_pass.min(count - k).max(1);
-            // the passes this chunk of units runs as: one, or after an out-of-memory error with a single sequence, that
-            // sequence's conversations in two halves (each a pass of its own: the same sums, half the tokens at once)
-            let mut plan: Vec<Vec<Vec<usize>>> = vec![(m..m + n).map(|j| self.sched.unit(j).to_vec()).collect()];
+            let n = self.seqs_per_pass.min(count - k).max(1);
+            // the passes this chunk of units runs as, each with the retries it has had. After an out-of-memory error
+            // (and the release) a pass of several sequences becomes two of half as many (and so does the rest of the
+            // run), a single sequence two passes of half its conversations each, down to single conversations; a single
+            // conversation is tried once more, and a second failure ends the run.
+            let mut plan: Vec<(Vec<Vec<usize>>, u32)> = vec![((m..m + n).map(|j| self.sched.unit(j).to_vec()).collect(), 0)];
             let (mut value, mut aux, mut tokens, mut convs) = (0.0f64, None::<f64>, 0u64, 0usize);
+            let mut commit_s = 0.0f64;
             let mut p = 0;
             while p < plan.len() {
                 let before_empty: Vec<bool> = sum.iter().map(Option::is_none).collect();
                 let mut added = Vec::new();
-                let units = plan[p].clone();
+                let (units, tries) = plan[p].clone();
                 let tried = self.micro(step, m, &units, lr).and_then(|o| {
+                    let t0 = Instant::now();
                     self.commit(m, &mut sum, &o.grads, &o.extra, &mut added)?;
+                    commit_s += t0.elapsed().as_secs_f64();
                     Ok((o.value, o.aux, o.tokens, o.conversations))
                 });
                 match tried {
@@ -882,30 +891,32 @@ impl Runner {
                             self.model.synchronize()?;
                         }
                     }
-                    Err(e) if attempt == 0 && is_out_of_memory(&e) => {
-                        attempt += 1;
+                    Err(e) if is_out_of_memory(&e) && (tries == 0 || units.len() > 1 || units[0].len() > 1) => {
                         let undone = added.len();
                         Self::uncommit(&mut sum, &before_empty, added)?;
                         let before = self.model.memory_now();
                         self.release_after_oom(&mut sum)?;
-                        let what = if n > 1 {
-                            n = (n / 2).max(1);
-                            self.seqs_per_pass = n;
-                            plan = vec![(m..m + n).map(|j| self.sched.unit(j).to_vec()).collect()];
-                            format!(" with {n} sequences per pass instead of {} (for the rest of the run)", units.len())
+                        let what = if units.len() > 1 {
+                            let half = units.len() / 2;
+                            self.seqs_per_pass = self.seqs_per_pass.min(half).max(1);
+                            plan.splice(p..p + 1, [(units[..half].to_vec(), 0), (units[half..].to_vec(), 0)]);
+                            format!(" with {} sequences per pass instead of {} (for the rest of the run)", half, units.len())
                         } else if units[0].len() > 1 {
                             let c = &units[0];
                             let half = c.len() / 2;
-                            plan = vec![vec![c[..half].to_vec()], vec![c[half..].to_vec()]];
+                            plan.splice(p..p + 1, [(vec![c[..half].to_vec()], 0), (vec![c[half..].to_vec()], 0)]);
                             format!(" as two passes of {} and {} conversations (the sequence split between conversations)", half, c.len() - half)
                         } else {
+                            plan[p].1 += 1;
                             String::new()
                         };
                         // what the cards hold now (not the high-water marks): after the release the reserve should be
                         // back near the use, which is the run's fixed state (adapters, moments, stream buffers)
                         let now = self.model.memory_now();
                         let pools = |v: &[(u64, u64)]| v.iter().enumerate().map(|(d, (u, r))| format!("dev{d} {} MiB reserved, {} MiB in use", r >> 20, u >> 20)).collect::<Vec<_>>().join("; ");
-                        let line = format!("step {} micro-step {m}{}: out of device memory ({}); its tensors dropped{}, the pools released{}, trying it once more{what}",
+                        let again = if attempt == 0 { "trying it once more" } else { "trying again" };
+                        attempt += 1;
+                        let line = format!("step {} micro-step {m}{}: out of device memory ({}); its tensors dropped{}, the pools released{}, {again}{what}",
                             step + 1, if units.len() > 1 { format!(" (a pass of {})", units.len()) } else { String::new() }, first_line(&e),
                             if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
                             if now.is_empty() { String::new() } else {
@@ -923,14 +934,20 @@ impl Runner {
             }
             conversations += convs;
             self.tokens_seen += tokens;
-            // the backward pass's buffers are free now: let the devices' memory pools take them back
+            // the backward pass's buffers are free now, and its gradients summed in host memory: wait for the devices
+            // and let their pools give back everything unused (only the run's fixed state is alive between passes)
+            let t_release = Instant::now();
             self.model.synchronize()?;
+            let release_s = t_release.elapsed().as_secs_f64();
             let marks = self.model.memory_marks(true);
+            let after = self.model.memory_now();
             if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
                 let mib = |b: u64| b >> 20;
                 let which = if n > 1 { format!("{m}-{}", m + n - 1) } else { m.to_string() };
-                let line = format!("step {} micro {which} tokens {tokens} | {}\n", step + 1,
-                    marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
+                let line = format!("step {} micro {which} tokens {tokens} | {} ; gradients to the host {:.0} ms, release {:.0} ms, after it {}\n", step + 1,
+                    marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "),
+                    commit_s * 1e3, release_s * 1e3,
+                    after.iter().enumerate().map(|(i, (u, r))| format!("dev{i} {}/{} MiB reserved/in use", mib(*r), mib(*u))).collect::<Vec<_>>().join(", "));
                 use std::io::Write as _;
                 if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
                 if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
@@ -953,6 +970,12 @@ impl Runner {
             }
         }
         self.opt.params.lr = lr;
+        // the mean gradient to each variable's device, for the update only
+        for (g, v) in sum.iter_mut().zip(&self.vars) {
+            if let Some(t) = g.take() {
+                *g = Some(model::move_to(&t, v.as_tensor().device())?);
+            }
+        }
         self.opt.step_grads(&sum).map_err(|e| anyhow!("{e}"))?;
         drop(sum);
         self.model.synchronize()?;

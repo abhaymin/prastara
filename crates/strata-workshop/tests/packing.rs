@@ -456,3 +456,81 @@ fn an_out_of_memory_sequence_is_retried_in_halves() {
     println!("{line}\nlosses {:?} vs {:?}", clean.losses, r.losses);
     assert!(dl < 1e-5 && da < 1e-5, "losses differ by {dl}, the adapter by {da}");
 }
+
+/// The real tokenizer and template on real rows (the Mula base and the v3 data, when they are here; the weights are
+/// never loaded): each packed conversation's tokens, answer mask, positions and scored targets are its unpacked own.
+/// `AM2_REAL_MODEL` / `AM2_REAL_DATA` point elsewhere; without the files the test says so and passes.
+#[test]
+fn real_rows_pack_with_their_own_labels_and_positions() {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let model = std::env::var("AM2_REAL_MODEL").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(&home).join("Development/Strata-data/mula/mula-base-loop-v0.1-abliterated-moe120f1024x5"));
+    let data = std::env::var("AM2_REAL_DATA").map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from(&home).join("Development/Strata-data/workshop/datasets/v3/mula-train-v3.jsonl"));
+    if !model.join("tokenizer.json").exists() || !data.exists() {
+        println!("no real model or data here ({} / {}): skipped", model.display(), data.display());
+        return;
+    }
+    let root = common::temp_dir("pack-real");
+    // the first 64 rows, as the run reads them
+    let text = std::fs::read_to_string(&data).unwrap();
+    let rows: String = text.lines().take(64).map(|l| format!("{l}\n")).collect();
+    let small = root.join("rows.jsonl");
+    std::fs::write(&small, rows).unwrap();
+    let mut s = TrainSettings::new(&model, &small, root.join("out"));
+    s.max_len = 1024;
+    s.val_split = 0.0;
+    s.pack = true;
+    s.seed = 42;
+    let d = finetune::prepare_data(&s).unwrap();
+    let batch: Vec<Vec<usize>> = (0..2).flat_map(|st| finetune::step_batch(&s, &d, st)).take(4).collect();
+    assert!(batch.iter().any(|u| u.len() > 1), "real rows pack several to a sequence: {batch:?}");
+    let mut checked = 0;
+    for unit in &batch {
+        let layout = PassLayout { seqs: vec![unit.iter().map(|i| d.train[*i].tokens.len()).collect()] };
+        assert!(layout.rows() <= 1024, "{} tokens", layout.rows());
+        let tokens: Vec<u32> = unit.iter().flat_map(|i| d.train[*i].tokens.clone()).collect();
+        let sup: Vec<bool> = unit.iter().flat_map(|i| d.train[*i].supervised.clone()).collect();
+        let (rows, targets, weights) = strata_workshop::model::packed_targets(&layout, &tokens, &sup).unwrap();
+        let positions = layout.positions();
+        for ((s0, n), i) in layout.segments().into_iter().zip(unit) {
+            let ex = &d.train[*i];
+            assert_eq!(&tokens[s0..s0 + n], ex.tokens.as_slice(), "conversation {i}: its tokens");
+            assert_eq!(&sup[s0..s0 + n], ex.supervised.as_slice(), "conversation {i}: its answer mask");
+            assert_eq!(positions[s0..s0 + n].to_vec(), (0..n).collect::<Vec<_>>(), "conversation {i}: positions from 0");
+            // the rows and targets scored for it are those scored alone, shifted by its offset
+            let alone: Vec<(u32, u32)> = (1..n).filter(|p| ex.supervised[*p]).map(|p| ((p - 1) as u32, ex.tokens[p])).collect();
+            let packed: Vec<(u32, u32)> = rows.iter().zip(&targets).filter(|(r, _)| (**r as usize) >= s0 && (**r as usize) < s0 + n)
+                .map(|(r, t)| (*r - s0 as u32, *t)).collect();
+            assert_eq!(packed, alone, "conversation {i}: the scored targets");
+            let w: Vec<f32> = rows.iter().zip(&weights).filter(|(r, _)| (**r as usize) >= s0 && (**r as usize) < s0 + n).map(|(_, w)| *w).collect();
+            assert!(w.iter().all(|x| (*x - 1.0 / alone.len() as f32).abs() < 1e-9), "conversation {i}: each token 1 / its answer tokens");
+            assert!(!alone.is_empty() && ex.supervised_count() == alone.len());
+            checked += 1;
+        }
+    }
+    println!("{checked} real conversations in {} packed sequences: tokens, answer masks, positions and scored targets as unpacked", batch.len());
+}
+
+/// A retry that runs out of memory again splits further instead of ending the run: the same run.
+#[test]
+fn a_second_out_of_memory_splits_further() {
+    let _g = lock();
+    let (root, model, data) = moe_and_data("pack-oom-twice");
+    let mut s = settings(&model, &data, &root.join("clean"));
+    s.max_steps = Some(2);
+    s.seqs_per_pass = 1;
+    let (clean, _) = run(&s);
+    let mut o = s.clone();
+    o.out = root.join("oom");
+    finetune::INJECT_OOM_TIMES.store(2, std::sync::atomic::Ordering::Relaxed);
+    finetune::INJECT_OOM.store(5, std::sync::atomic::Ordering::Relaxed);
+    let (r, logs) = run(&o);
+    finetune::INJECT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+    let lines: Vec<&String> = logs.iter().filter(|l| l.contains("out of device memory")).collect();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[0].contains("trying it once more") && lines[1].contains("trying again"), "{lines:?}");
+    let dl = clean.losses.iter().zip(&r.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    let da = max_abs(&adapter(&s.out), &adapter(&o.out));
+    assert!(dl < 1e-5 && da < 1e-5, "losses differ by {dl}, the adapter by {da}");
+}
