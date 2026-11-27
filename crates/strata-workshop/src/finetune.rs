@@ -449,6 +449,8 @@ struct Runner {
     last_aux: Option<f64>,
     /// the data is a private dataset (crate::private_data): the adapter is marked `prastara_private`
     private: bool,
+    /// where each micro-step's memory high-water marks go on CUDA (`AM2_MEM_TRACE`, else `<out>/memory-trace.log`)
+    mem_trace: Option<PathBuf>,
 }
 
 impl Runner {
@@ -493,7 +495,8 @@ impl Runner {
         params.weight_decay = s.weight_decay;
         let opt = AdamWState::new(vars.clone(), params).map_err(|e| anyhow!("{e}"))?;
         Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, orders: HashMap::new(),
-                  tokens_seen: 0, lower_in_memory, last_aux: None, private: false })
+                  tokens_seen: 0, lower_in_memory, last_aux: None, private: false,
+                  mem_trace: std::env::var_os("AM2_MEM_TRACE").map(PathBuf::from).or_else(|| Some(s.out.join("memory-trace.log"))) })
     }
 
     fn hidden(&mut self, ex: &Example) -> Result<Tensor> {
@@ -550,6 +553,17 @@ impl Runner {
             drop((grads, extra, h));
             // the backward pass's buffers are free now: let the devices' memory pools take them back
             self.model.synchronize()?;
+            let marks = self.model.memory_marks(true);
+            if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
+                let mib = |b: u64| b >> 20;
+                let line = format!("step {} micro {m} tokens {} | {}\n", step + 1, ex.tokens.len(),
+                    marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "));
+                use std::io::Write as _;
+                if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
         }
         // the mean gradient over the step's conversations, clipped by its norm over all adapters
         let mut norm_sq = 0.0f64;

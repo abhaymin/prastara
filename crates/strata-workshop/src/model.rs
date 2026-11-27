@@ -1596,6 +1596,41 @@ impl LlamaModel {
     /// Waits for every device's queued work. On CUDA that is also when the stream's memory pool gives freed blocks
     /// back (its release threshold is 0): without it the pool only grows, and a two-GPU run of the looped Qwen3-8B
     /// went from 13.7 to 15.8 GB a card in 20 steps, then ran out of memory at step 10 of the real run.
+    /// Each CUDA device's memory-pool high-water marks since the last call, in bytes: (used, reserved). With
+    /// `reset` the marks start again from the current use. Empty off CUDA. (`AM2_MEM_TRACE` training traces.)
+    pub fn memory_marks(&self, reset: bool) -> Vec<(u64, u64)> {
+        #[cfg(feature = "cuda")]
+        {
+            use candle_core::cuda_backend::cudarc::driver::sys;
+            let mut out = Vec::new();
+            for d in &self.devs {
+                let Device::Cuda(cd) = d else { continue };
+                let stream = cd.cuda_stream();
+                let ctx = stream.context();
+                if ctx.bind_to_thread().is_err() { continue; }
+                unsafe {
+                    let mut pool: sys::CUmemoryPool = std::ptr::null_mut();
+                    if sys::cuDeviceGetDefaultMemPool(&mut pool, ctx.cu_device()) != sys::CUresult::CUDA_SUCCESS { continue; }
+                    let get = |a: sys::CUmemPool_attribute| { let mut v: u64 = 0; sys::cuMemPoolGetAttribute(pool, a, &mut v as *mut u64 as *mut _); v };
+                    let used = get(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH);
+                    let reserved = get(sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH);
+                    if reset {
+                        let mut z: u64 = 0;
+                        sys::cuMemPoolSetAttribute(pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_HIGH, &mut z as *mut u64 as *mut _);
+                        sys::cuMemPoolSetAttribute(pool, sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_HIGH, &mut z as *mut u64 as *mut _);
+                    }
+                    out.push((used, reserved));
+                }
+            }
+            out
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = reset;
+            Vec::new()
+        }
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         for d in &self.devs {
             d.synchronize()?;
