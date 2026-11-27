@@ -4789,7 +4789,7 @@ function wsAgo(t) {
 async function wsFiles() {
   try {
     const f = await wsFetch("v1/workshop/files");
-    ws.files = {hf: (f.hf_models || []).map(wsItem), adapters: (f.adapters || []).map(wsItem), gguf: (f.gguf || []).map(wsItem),
+    ws.files = {hf: (f.hf_models || []).map(wsItem), adapters: (f.adapters || []).map(wsItem), gguf: (f.gguf || []).map(wsItem), packs: (f.packs || []).map(wsItem),
                 datasets: (f.datasets || []).map(wsItem), prompts: (f.prompts || []).map(wsItem),
                 suites: (f.suites || []).map(wsItem), reports: (f.reports || []).map(wsItem)};
     const ds = ws.files.datasets.map((x) => x.path);
@@ -4806,7 +4806,7 @@ async function wsFiles() {
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", regress: "test", "grade-train": "grade"};
+const WS_STEP_OF = {datagen: "data", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", pack: "pack", regress: "test", "grade-train": "grade"};
 const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.model || r.seeds || (r.sources || [])[0] || (r.inputs || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
@@ -4825,13 +4825,13 @@ function wsJobCard(x) {
     line = `${p.done} of ${p.total}${p.message ? ` · ${p.message}` : ""}${eta != null && p.done < p.total ? ` · about ${wsDur(eta)} left` : ""}`;
   }
   const out = wsJobOut(x), inp = wsJobIn(x);
-  const name = x.kind === "strata" && x.result?.model ? x.result.model : wsBase(out) || wsBase(inp) || x.kind;
+  const name = (x.kind === "strata" || x.kind === "pack") && x.result?.model ? x.result.model : wsBase(out) || wsBase(inp) || x.kind;
   const size = x.result?.bytes ? fmtBytes(x.result.bytes) : "";
   const acts = [];
   if (x.state === "queued" || running) acts.push(`<button class="st-btn st-btn--danger" data-ws-cancel="${x.id}">Cancel</button>`);
   if (x.state === "done" && ["merge", "convert", "quantize", "loop", "upcycle", "export-moe", "abliterate", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
   if ((x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) || (x.kind === "clean" && x.state === "done")) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
-  if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
+  if (x.state === "done" && (x.kind === "strata" || (x.kind === "pack" && x.result?.model))) acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
   const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
   return `<article class="ws-job" data-state="${esc(x.state)}">
     <div class="ws-job__top"><span class="ws-job__kind">${esc(x.kind)}</span><span class="ws-job__id">#${x.id}</span>
@@ -4936,7 +4936,7 @@ $("ws-u-train").onclick = () => {
   wsUse("train", "ws-t-model", done?.result?.output || up?.path || "");
 };
 $("ws-export-moe").onclick = (e) => wsSubmit({kind: "export-moe", input: $("ws-x-in").value.trim(), adapter: $("ws-x-adapter").value.trim(),
-  type: $("ws-x-type").value, pre_tokenizer: $("ws-x-pre").value.trim(), output: $("ws-x-out").value.trim()}, e.currentTarget);
+  type: $("ws-x-type").value, pre_tokenizer: $("ws-x-pre").value.trim(), output: $("ws-x-out").value.trim(), pack: $("ws-x-pack").checked}, e.currentTarget);
 
 // LoRA upcycling: a model's size as a mixture, counted as the Workshop counts it (model.rs MoeSpec::params): each
 // block's feed-forward becomes `experts` experts of `ffE` neurons (the whole feed-forward at full width), `top_k` of
@@ -5045,7 +5045,10 @@ const wsXEstSoon = () => wsJobEstimateSoon("ws-x-srv-est", wsXReq, () => !!(ws.f
 for (const id of ["ws-x-in", "ws-x-adapter", "ws-x-type"]) $(id).addEventListener("change", wsXEstSoon);
 $("ws-merge").onclick = (e) => wsSubmit({kind: "merge", base: $("ws-m-base").value.trim(), adapter: $("ws-m-adapter").value.trim(), output: $("ws-m-out").value.trim()}, e.currentTarget);
 $("ws-convert").onclick = (e) => wsSubmit({kind: "convert", input: $("ws-c-in").value.trim(), outtype: $("ws-c-type").value, pre_tokenizer: $("ws-c-pre").value.trim(), output: $("ws-c-out").value.trim()}, e.currentTarget);
-$("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked}, e.currentTarget);
+$("ws-strata").onclick = (e) => wsSubmit({kind: "strata", input: $("ws-s-in").value.trim(), name: $("ws-s-name").value.trim(), display_name: $("ws-s-display").value.trim(), overwrite: $("ws-s-over").checked, pack: $("ws-s-pack").checked}, e.currentTarget);
+$("ws-pack").onclick = (e) => wsSubmit({kind: "pack", input: $("ws-p-in").value.trim(), name: $("ws-p-name").value.trim(), display_name: $("ws-p-display").value.trim(),
+  mmproj: $("ws-p-mmproj").value.trim(), profile: $("ws-p-profile").value.trim(), defaults: $("ws-p-defaults").value.trim(), output: $("ws-p-out").value.trim(),
+  install: $("ws-p-install").checked, overwrite: $("ws-p-over").checked}, e.currentTarget);
 $("ws-quantize").onclick = (e) => wsSubmit({kind: "quantize", input: $("ws-q-in").value.trim(), type: $("ws-q-type").value, output: $("ws-q-out").value.trim()}, e.currentTarget);
 
 // the rail: one step at a time (the last one chosen is remembered)
@@ -5091,7 +5094,7 @@ function wsOverview() {
       ${from(x.path) ? `<div class="ws-art__from">${esc(from(x.path))}</div>` : ""}
       <div class="ws-art__actions">${actions}</div></article>`;
   const tag = (t, cls = "") => `<span class="ws-tag${cls}">${esc(t)}</span>`;
-  const installed = ws.jobs.filter((x) => x.kind === "strata" && x.state === "done" && x.result?.model);
+  const installed = ws.jobs.filter((x) => (x.kind === "strata" || x.kind === "pack") && x.state === "done" && x.result?.model);
   const groups = [
     ["Installed models", installed.map((x) => `<article class="st-card ws-art"><div class="ws-art__name">${esc(x.result.display_name || x.result.model)}</div>
       <div class="ws-art__meta">${tag(x.result.architecture || "model")}<span>${esc(x.result.model)}</span></div>
@@ -5104,7 +5107,8 @@ function wsOverview() {
         + (x.loop ? "" : btn("Loop", "loop", "ws-lp-in", x.path)) + btn("Merge into", "merge", "ws-m-base", x.path)
         + (x.private ? "" : btn("Abliterate", "abliterate", "ws-a-in", x.path))))],
     ["Adapters", ws.files.adapters.map((x) => card(x, [tag("LoRA")], btn("Merge", "merge", "ws-m-adapter", x.path)))],
-    ["GGUF files", ws.files.gguf.map((x) => card(x, [tag("GGUF")], btn("Quantize", "quantize", "ws-q-in", x.path) + btn("Install", "install", "ws-s-in", x.path)))],
+    ["GGUF files", ws.files.gguf.map((x) => card(x, [tag("GGUF")], btn("Quantize", "quantize", "ws-q-in", x.path) + btn("Install", "install", "ws-s-in", x.path) + btn("Make pack", "pack", "ws-p-in", x.path)))],
+    ["Kosha packs", (ws.files.packs || []).map((x) => card(x, [tag("Kosha")], ""))],
     ["Datasets", ws.files.datasets.map((x) => card(x, [tag("JSONL")], `<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.path)}">Review</button>`))],
   ].filter(([, items]) => items.length);
   box.innerHTML = groups.length ? groups.map(([h, items]) => `<section class="ws-ov__group"><h4>${h} · ${items.length}</h4><div class="ws-ov__grid">${items.join("")}</div></section>`).join("")

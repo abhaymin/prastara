@@ -233,6 +233,123 @@ fn a_gguf_made_strata_ready_appears_in_the_model_list_and_is_not_overwritten() {
 }
 
 
+/// Kosha packs from the Workshop: a pack job checks its request before anything runs, builds a real .kosha of a tiny
+/// GGUF where the packs are kept (`<data>/aipacs`), installs it as `<name>-pack` on the Rust engine (with a copy of
+/// its config in `aipacs/configs`), carries an abliterated GGUF's marks to the entry, and `"pack": true` on a strata
+/// job queues the pack after it. Pack building is CPU and disk only.
+#[cfg(feature = "pack")]
+#[test]
+fn a_gguf_made_into_a_kosha_pack_is_installed_with_its_marks() {
+    let home = std::env::temp_dir().join(format!("am2-ws-pack-home-{}", std::process::id()));
+    let engine = home.join("crates/strata-hybrid/target/release/am2strata-hybrid");
+    std::fs::create_dir_all(engine.parent().unwrap()).unwrap();
+    std::fs::write(&engine, "#!/bin/sh\n").unwrap();
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_HOME": home}}));
+    let ws = s.dir.join("workshop");
+    std::fs::create_dir_all(&ws).unwrap();
+    let gguf = ws.join("small-llama.gguf");
+    small_llama_gguf(&gguf);
+    let notes = ws.join("notes.txt");
+    std::fs::write(&notes, "x").unwrap();
+
+    // refused before anything runs, each saying why
+    let with = |extra: Value| { let mut r = json!({"kind": "pack", "input": gguf}); r.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone()); r };
+    for (req, why) in [
+        (json!({"kind": "pack"}), "needs \"input\""),
+        (json!({"kind": "pack", "input": notes}), ".gguf file"),
+        (json!({"kind": "pack", "input": "/etc/passwd.gguf"}), "/etc"),
+        (with(json!({"install": "yes"})), "\"install\" is true or false"),
+        (with(json!({"output": ws.join("m.gguf")})), "ends in .kosha"),
+        (with(json!({"mmproj": ws.join("none.gguf")})), "does not exist"),
+        (with(json!({"profile": ws})), "\"profile\" is"),
+        (json!({"kind": "strata", "input": gguf, "pack": "yes"}), "\"pack\" is true or false"),
+        (json!({"kind": "export-moe", "input": ws, "pack": 1}), "\"pack\" is true or false"),
+    ] {
+        let (code, e) = s.post("/v1/workshop/jobs", &req);
+        assert_eq!(code, 400, "{req} -> {e}");
+        let m = e["error"]["message"].as_str().unwrap_or("");
+        assert!(m.contains(why), "{req}: {m}");
+    }
+
+    // a plain GGUF: built and installed as small-llama-pack, neither private nor uncensored
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "pack", "input": gguf}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let r = &done["result"];
+    let kosha = s.dir.join("aipacs/small-llama.kosha");
+    assert_eq!(r["output"].as_str(), kosha.to_str(), "{done}");
+    assert_eq!((r["model"].as_str(), r["installed"].as_bool(), r["architecture"].as_str()), (Some("small-llama-pack"), Some(true), Some("llama")), "{done}");
+    let p = am2pack::Pack::open(&kosha).expect("a pack that opens");
+    assert_eq!(p.index.manifest.architecture, "llama");
+    assert_eq!(p.index.tensors.len(), 1);
+    let cfg_path = s.dir.join("strata-small-llama-pack.json");
+    let cfg: Value = serde_json::from_slice(&std::fs::read(&cfg_path).unwrap()).unwrap();
+    let args: Vec<&str> = cfg["args"].as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
+    let at = args.iter().position(|a| *a == "--model").unwrap();
+    assert_eq!(args.get(at + 1).copied(), kosha.to_str(), "{cfg}");
+    assert!(!args.contains(&"--pack"), "a Kosha pack takes no --pack folder: {cfg}");
+    assert!(cfg["exe"].as_str().unwrap().ends_with("am2strata-hybrid"), "the Rust engine: {cfg}");
+    assert_eq!(cfg["display_name"], "Small Llama (pack)");
+    assert!(cfg.get("private").is_none() && cfg.get("uncensored").is_none(), "{cfg}");
+    assert!(std::path::Path::new(r["tokenizer"].as_str().unwrap()).join("tokenizer.json").exists(), "tokenizer folder");
+    let copy: Value = serde_json::from_slice(&std::fs::read(s.dir.join("aipacs/configs/strata-small-llama-pack.json")).unwrap()).unwrap();
+    assert_eq!(copy, cfg, "the copy beside the packs");
+    let (_, l) = s.get("/api/models", true);
+    let m = l["models"].as_array().unwrap().iter().find(|m| m["id"] == "small-llama-pack").cloned().expect("listed");
+    assert_eq!((&m["private"], &m["uncensored"]), (&json!(false), &json!(false)), "{m}");
+    let (_, f) = s.get("/v1/workshop/files", true);
+    assert!(f["packs"].as_array().unwrap().iter().any(|x| x["path"].as_str() == kosha.to_str()), "{f}");
+    // again: refused (the pack is there); with overwrite, built again in its place
+    let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "pack", "input": gguf}));
+    assert_eq!(code, 400);
+    assert!(e["error"]["message"].as_str().unwrap().contains("already exists"), "{e}");
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "pack", "input": gguf, "overwrite": true}));
+    assert_eq!(code, 202, "{j}");
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert!(am2pack::Pack::open(&kosha).is_ok() && !s.dir.join("aipacs/small-llama.rebuild.kosha").exists());
+    // build only: a pack in the Workshop folder, no entry
+    let only = ws.join("only.kosha");
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "pack", "input": gguf, "name": "only", "output": only, "install": false}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert_eq!(done["result"]["installed"], false);
+    assert!(only.exists() && !s.dir.join("strata-only-pack.json").exists());
+
+    // an abliterated GGUF: named -abliterated, the entry private, uncensored and abliterated (the minor-safety check)
+    let marked = ws.join("small-llama-marked.gguf");
+    small_llama_gguf_with(&marked, &[("prastara.private", true), ("prastara.abliterated", true)]);
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "pack", "input": marked, "name": "mula"}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    assert_eq!((done["result"]["model"].as_str(), done["result"]["private"].as_bool(), done["result"]["uncensored"].as_bool()),
+               (Some("mula-abliterated-pack"), Some(true), Some(true)), "{done}");
+    assert!(s.dir.join("aipacs/mula-abliterated.kosha").exists());
+    let cfg: Value = serde_json::from_slice(&std::fs::read(s.dir.join("strata-mula-abliterated-pack.json")).unwrap()).unwrap();
+    assert_eq!((&cfg["private"], &cfg["uncensored"], &cfg["abliterated"]), (&json!(true), &json!(true), &json!(true)), "{cfg}");
+    let copy: Value = serde_json::from_slice(&std::fs::read(s.dir.join("aipacs/configs/strata-mula-abliterated-pack.json")).unwrap()).unwrap();
+    assert_eq!(copy["uncensored"], json!(true));
+    let (_, l) = s.get("/api/models", true);
+    let m = l["models"].as_array().unwrap().iter().find(|m| m["id"] == "mula-abliterated-pack").cloned().expect("listed");
+    assert_eq!((&m["private"], &m["uncensored"]), (&json!(true), &json!(true)), "{m}");
+    // private only (not abliterated): private, not uncensored
+    let private = ws.join("small-private.gguf");
+    small_llama_gguf_with(&private, &[("prastara.private", true)]);
+    let (_, j) = s.post("/v1/workshop/jobs", &json!({"kind": "pack", "input": private}));
+    wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let cfg: Value = serde_json::from_slice(&std::fs::read(s.dir.join("strata-small-private-pack.json")).unwrap()).unwrap();
+    assert_eq!((&cfg["private"], cfg.get("uncensored")), (&json!(true), None), "{cfg}");
+
+    // one request: strata, then its pack
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "strata", "input": gguf, "name": "chain", "pack": true}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let pack_id = done["result"]["pack_job"].as_u64().unwrap_or_else(|| panic!("a pack job queued: {done}"));
+    let packed = wait_state(&s, pack_id, "done");
+    assert_eq!(packed["result"]["model"], "chain-pack", "{packed}");
+    assert!(s.dir.join("strata-chain.json").exists() && s.dir.join("strata-chain-pack.json").exists());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// A stand-in for `am2strata-workshop datagen`: notes its arguments and the server address and key it was given (in
 /// its environment), reports progress, and writes three records.
 fn fake_datagen(dir: &std::path::Path) -> std::path::PathBuf {

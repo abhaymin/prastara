@@ -233,3 +233,14 @@ to the GGUF.
      in `strata-hybrid`), on by default.
    - A binary built with the feature contains `am2pack`, so it is distributed under the AGPL's terms (its source
      offered, also to users over a network). Built with `--no-default-features` it is MIT alone and reads no packs.
+
+## From the Workshop (2026-11-27)
+
+A Workshop job makes packs, so every model the Workshop writes (dense, abliterated, the upcycled MoE of
+`export-moe`) can ship as one: `POST /v1/workshop/jobs {"kind": "pack", "input": m.gguf}` (or
+`am2strata-run workshop pack m.gguf`, or the Workshop's Package > Make a Kosha pack step). It builds
+`<data>/aipacs/<name>.kosha` in the server's own process (CPU and disk only, no GPU lease) and, unless
+`"install": false`, writes `strata-<name>-pack.json` beside the other run configs (strata-hub's writer for the
+Rust engine, `--model` the pack, no `--pack` folder) with a copy in `<data>/aipacs/configs/`. A GGUF marked
+`prastara.private` / `prastara.abliterated` gives the entry `private` / `uncensored` / `abliterated`, so the
+minor-safety check applies. `strata` and `export-moe` take `"pack": true` to queue the pack job after them.

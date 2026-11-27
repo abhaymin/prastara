@@ -224,6 +224,43 @@ pub fn write(models_dir: &Path, packs: &Path, model: &Path, g: &Gguf, mmproj: Op
     Ok(Written { config: path, tokenizer: pack.join("tokenizer") })
 }
 
+/// Whether the Rust engine (am2strata-hybrid) is the one [`write`] picks for `arch` here: the only engine that runs a
+/// Kosha pack (.kosha, docs/PACK-FORMAT.md).
+pub fn rust_engine_runs(arch: &str, models_dir: &Path) -> bool {
+    let no_poly = !models_dir.join("engine-poly").join(format!("strata-poly{}", std::env::consts::EXE_SUFFIX)).exists();
+    HYBRID_ARCHS.iter().any(|(a, _)| *a == arch) || (no_poly && bundled_engine().is_some() && RUST_FALLBACK_ARCHS.iter().any(|(a, _)| *a == arch))
+}
+
+/// The run config of a Kosha pack built from `gguf` (`g` its header, which the pack keeps verbatim): the same config
+/// [`write`] gives the GGUF on the Rust engine (exe, context, devices, expert profile, tokenizer folder), with
+/// `--model` naming the pack and no `--pack` folder (the engine refuses one with a Kosha pack). `id` is the entry's
+/// name, `<model>-pack` by convention, beside the GGUF's own entry. Refused for an architecture the Rust engine does
+/// not run here.
+#[allow(clippy::too_many_arguments)]
+pub fn write_pack(models_dir: &Path, packs: &Path, pack_file: &Path, gguf: &Path, g: &Gguf, mmproj: Option<&Path>,
+                  id: &str, display: &str) -> Result<Written, String> {
+    let arch = g.architecture().unwrap_or("").to_string();
+    if !rust_engine_runs(&arch, models_dir) {
+        return Err(format!("a Kosha pack runs on the Rust engine, which does not run '{arch}' here (it runs: {})",
+                           HYBRID_ARCHS.iter().map(|(a, _)| *a).collect::<Vec<_>>().join(", ")));
+    }
+    let w = write(models_dir, packs, pack_file, g, mmproj, None, id, display)?;
+    let mut cfg: Value = std::fs::read_to_string(&w.config).ok().and_then(|t| serde_json::from_str(&t).ok())
+        .ok_or_else(|| format!("{}: the run config just written cannot be read", w.config.display()))?;
+    if let Some(args) = cfg["args"].as_array_mut() {
+        if let Some(i) = args.iter().position(|a| a == "--pack") {
+            args.drain(i..(i + 2).min(args.len()));
+        }
+    }
+    // the picture encoder reads the GGUF's own header beside its projector
+    if cfg["vision"].is_object() {
+        cfg["vision"]["model"] = json!(gguf);
+    }
+    cfg["kosha"] = json!({"pack": pack_file, "source": gguf});
+    std::fs::write(&w.config, pretty1(&cfg)).map_err(|e| format!("{}: {e}", w.config.display()))?;
+    Ok(w)
+}
+
 /// JSON indented by one space, as PolyStrata's configs are (json.dumps(indent=1)).
 fn pretty1(v: &Value) -> String {
     use serde::Serialize;
@@ -396,6 +433,33 @@ mod tests {
             assert_eq!((v["mmproj"].as_str(), v["gpu"].as_bool()), (mm.to_str(), Some(false)), "{v}");
             assert!(!cfg.to_string().contains("llama-vision") && !cfg.to_string().contains("engine-poly"), "{cfg}");
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A Kosha pack's config: the Rust engine's, `--model` the pack, no `--pack` folder; refused where only
+    /// strata-poly runs the architecture.
+    #[test]
+    fn a_pack_config_names_the_pack_on_the_rust_engine() {
+        let d = std::env::temp_dir().join(format!("am2-write-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let models_dir = d.join("models");
+        std::fs::create_dir_all(&models_dir).unwrap();
+        let tiny = d.join("llama.gguf");
+        tiny_tokenized_gguf(&tiny, "llama");
+        let g = inspect(&tiny).unwrap();
+        let kosha = d.join("llama.kosha");
+        let w = write_pack(&models_dir, &d.join("packs"), &kosha, &tiny, &g, None, "llama-pack", "Llama (pack)").unwrap();
+        let cfg: Value = serde_json::from_str(&std::fs::read_to_string(&w.config).unwrap()).unwrap();
+        assert!(w.config.ends_with("strata-llama-pack.json"), "{}", w.config.display());
+        let args: Vec<&str> = cfg["args"].as_array().unwrap().iter().filter_map(|a| a.as_str()).collect();
+        assert_eq!(args[..2], ["--model", kosha.to_str().unwrap()], "{cfg}");
+        assert!(!args.contains(&"--pack"), "{cfg}");
+        assert!(cfg["exe"].as_str().unwrap().ends_with("am2strata-hybrid"), "{cfg}");
+        assert_eq!(cfg["kosha"]["source"].as_str(), tiny.to_str());
+        let lfm = d.join("lfm.gguf");
+        tiny_lfm2moe_gguf(&lfm);
+        let e = write_pack(&models_dir, &d.join("packs"), &d.join("lfm.kosha"), &lfm, &inspect(&lfm).unwrap(), None, "lfm-pack", "x").err().unwrap();
+        assert!(e.contains("Rust engine") && e.contains("lfm2moe"), "{e}");
         let _ = std::fs::remove_dir_all(&d);
     }
 

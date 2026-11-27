@@ -154,10 +154,11 @@ enum Cmd {
         check_experts: usize,
     },
     /// the Workshop through the running server (its jobs show in the web app's Workshop tab):
-    /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N]
+    /// convert <hf-folder> | quantize <gguf> --type q4_k | merge <base> <adapter> | strata <gguf> [--name N] [--pack]
+    /// | pack <gguf> [--name N] [--mmproj p.gguf] [--profile f.strp] [--no-install] (a Kosha pack, installed as <name>-pack)
     /// | loop <hf-folder> 12..24x2 (a looped copy: blocks 12-23 run twice, behind gates that start closed)
     /// | upcycle <hf-folder> 10x1 (a mixture of 10 experts, top-1, that starts as its base; train it, then export-moe)
-    /// | export-moe <upcycled-folder> [<adapter>] [--type q4_k] (the real qwen3moe GGUF, quantized as it is written)
+    /// | export-moe <upcycled-folder> [<adapter>] [--type q4_k] [--pack] (the real qwen3moe GGUF, quantized as it is written)
     /// | abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto] [--check 8] (a private copy)
     /// | datagen [<doc>] --source <doc> --recipe qa|chat|instruct|code|indic|translate --count 100 | upload <file>
     /// | dataset <jsonl> | library [<search>] | library-init <recipe>
@@ -1477,6 +1478,21 @@ struct DatagenOpts {
     offset: usize,
     #[arg(long, default_value_t = 10)]
     limit: usize,
+    /// pack: the image projector, an expert profile (hottest experts first) and run defaults (a JSON file) to keep in it
+    #[arg(long)]
+    mmproj: Option<String>,
+    #[arg(long)]
+    profile: Option<String>,
+    #[arg(long)]
+    defaults: Option<String>,
+    /// pack: make it a catalog model, <name>-pack (the default); --no-install only builds the .kosha
+    #[arg(long)]
+    install: bool,
+    #[arg(long, conflicts_with = "install")]
+    no_install: bool,
+    /// strata, export-moe: also build and install its Kosha pack once the GGUF is ready
+    #[arg(long)]
+    pack: bool,
 }
 
 /// `am2strata-run workshop ...`: the server's /v1/workshop API, as the Workshop tab uses it.
@@ -1534,9 +1550,16 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "output": out.clone().map(abs)})
             }
             "export-moe" => {
-                const USE: &str = "export-moe <upcycled-folder> [<adapter-folder>] [--type q4_k|q8_0|f16|f32]";
+                const USE: &str = "export-moe <upcycled-folder> [<adapter-folder>] [--type q4_k|q8_0|f16|f32] [--pack]";
                 serde_json::json!({"kind": "export-moe", "input": abs(first.clone().ok_or(USE)?), "adapter": second.clone().map(abs),
-                                   "type": ty.clone(), "pre_tokenizer": pre, "output": out.clone().map(abs)})
+                                   "type": ty.clone(), "pre_tokenizer": pre, "output": out.clone().map(abs), "pack": dg.pack})
+            }
+            "pack" => {
+                const USE: &str = "pack <gguf> [--name N] [--display-name D] [--out m.kosha] [--mmproj p.gguf] [--profile f.strp] [--defaults d.json] [--no-install] [--overwrite]";
+                serde_json::json!({"kind": "pack", "input": abs(first.clone().ok_or(USE)?), "output": out.clone().map(abs),
+                                   "mmproj": dg.mmproj.clone().map(abs), "profile": dg.profile.clone().map(abs), "defaults": dg.defaults.clone().map(abs),
+                                   "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2,
+                                   "install": dg.install || !dg.no_install})
             }
             "abliterate" => {
                 const USE: &str = "abliterate <hf-folder> --harmful a.txt --harmless b.txt [--layer auto|N] [--scale 1] [--check N]";
@@ -1572,8 +1595,9 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "cap_only": dg.cap_only.iter().cloned().map(abs).collect::<Vec<_>>(),
                                    "seed": dg.seed, "output": out.clone().map(abs)})
             }
-            "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N]")?),
-                                           "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2}),
+            "strata" => serde_json::json!({"kind": "strata", "input": abs(first.clone().ok_or("strata <gguf> [--name N] [--pack]")?),
+                                           "name": install.0.clone(), "display_name": install.1.clone(), "overwrite": install.2,
+                                           "pack": dg.pack}),
             "datagen" => {
                 let mut sources: Vec<String> = first.clone().into_iter().chain(dg.sources.iter().cloned()).map(abs).collect();
                 sources.dedup();
@@ -1647,7 +1671,7 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                 for l in j["log"].as_array().into_iter().flatten() { println!("  {}", l.as_str().unwrap_or("")); }
                 return Ok(());
             }
-            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, datagen, clean, upload, dataset, jobs, job, cancel, files")),
+            other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, pack, export-moe, datagen, clean, upload, dataset, jobs, job, cancel, files")),
         };
         let mut body = body;
         if let Some(o) = body.as_object_mut() { o.retain(|_, v| !v.is_null()); }

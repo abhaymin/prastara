@@ -20,14 +20,23 @@
 //!     and of the upcycled one at its start). The calibration runs on the CPU
 //!   - export-moe: `"input"` (an upcycled folder), `"adapter"`? (the adapter trained on it), `"type"`? (q4_k | q8_0 |
 //!     q6_k | q5_k | q4_0 | f16 | f32, default q4_k), `"pre_tokenizer"`?, `"output"`? (a .gguf) — the real qwen3moe
-//!     model, each expert's LoRA folded into its own copy of the feed-forward, quantized as it is written
+//!     model, each expert's LoRA folded into its own copy of the feed-forward, quantized as it is written;
+//!     `"pack"`? (bool) queues a `pack` job on the GGUF once it is written (GGUF -> Kosha -> the model list)
 //!   - abliterate: `"input"` (an HF model folder), `"harmful"` and `"harmless"` (text files in Workshop folders, one
 //!     prompt per line), `"layer"`? (auto | N | "N:P"), `"scale"`? (0-2, default 1), `"check"`? (held-out prompts to
 //!     answer before and after), `"devices"`?, `"output"`? (a folder; default `<stem>-abliterated`) — the refusal
 //!     direction removed from every matrix that writes the residual stream; the copy is marked `prastara_private`
 //!   - strata: `"input"` (a .gguf), `"name"`?, `"display_name"`?, `"overwrite"`? — make it a model the server runs: the
 //!     same run config and tokenizer folder a downloaded model gets (strata-hub's config writer, which picks the engine
-//!     for the architecture and refuses one no engine runs), so it appears in the model list
+//!     for the architecture and refuses one no engine runs), so it appears in the model list; `"pack"`? (bool) also
+//!     queues a `pack` job on the same GGUF, installed as `<name>-pack`
+//!   - pack: `"input"` (a .gguf), `"output"`? (a .kosha; default `<data>/aipacs/<stem>.kosha`, where the packs are
+//!     kept), `"mmproj"`?, `"profile"`? (an expert profile, STRP), `"defaults"`? (run defaults, a JSON file), `"name"`?,
+//!     `"display_name"`?, `"install"`? (bool, default true), `"overwrite"`? — a Kosha model pack (am2pack, in this
+//!     process: CPU and disk only, never the GPUs); installed, it is the catalog model `<name>-pack` on the Rust engine
+//!     (`strata-<name>-pack.json` beside the other run configs, a copy in `<data>/aipacs/configs/`), and a GGUF marked
+//!     `prastara.private` / `prastara.abliterated` gives the entry the same private / uncensored / abliterated marks
+//!     as `strata` does, so the minor-safety check applies to it
 //!   - datagen: `"recipe"` (qa | chat | instruct | code | indic | translate), `"sources"` (documents: files or
 //!     folders; needed for qa and chat, optional for code and translate), `"seeds"`? (a JSONL of example chats;
 //!     instruct), `"seed"`? and `"check_code"`? (the built-in recipes' draw, and compiling Rust answers),
@@ -83,7 +92,7 @@ use serde_json::{json, Value};
 
 use crate::{authorized, error, AppState};
 
-const KINDS: [&str; 13] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "datagen", "clean", "regress", "grade-train"];
+const KINDS: [&str; 14] = ["convert", "quantize", "merge", "loop", "upcycle", "export-moe", "abliterate", "train", "strata", "pack", "datagen", "clean", "regress", "grade-train"];
 
 /// The job kinds `POST /v1/workshop/estimate` estimates with their own command's `--estimate` (train uses `profile`).
 const ESTIMATED: [&str; 3] = ["abliterate", "upcycle", "export-moe"];
@@ -133,6 +142,8 @@ pub struct Workshop {
     out_dir: PathBuf,
     models_dir: PathBuf,
     packs_dir: PathBuf,
+    /// where Kosha packs (.kosha) and a copy of their run configs (`configs/`) are kept: `<data>/aipacs`
+    aipacs_dir: PathBuf,
     jobs: Mutex<Vec<Job>>,
     next: Mutex<u64>,
     /// jobs run one at a time, in order
@@ -310,8 +321,8 @@ impl Workshop {
                 None
             }
         }).collect();
-        let (models_dir, packs_dir) = (models_dir.to_path_buf(), data_dir.join("packs"));
-        WORKSHOP.get_or_init(|| Arc::new(Workshop { roots, out_dir, models_dir, packs_dir, jobs: Mutex::new(vec![]), next: Mutex::new(1),
+        let (models_dir, packs_dir, aipacs_dir) = (models_dir.to_path_buf(), data_dir.join("packs"), data_dir.join("aipacs"));
+        WORKSHOP.get_or_init(|| Arc::new(Workshop { roots, out_dir, models_dir, packs_dir, aipacs_dir, jobs: Mutex::new(vec![]), next: Mutex::new(1),
                                                     gate: tokio::sync::Mutex::new(()), server: Mutex::new(None),
                                                     mgr: Mutex::new(None) })).clone()
     }
@@ -511,6 +522,10 @@ impl Workshop {
         let kind = req["kind"].as_str().ok_or_else(|| format!("\"kind\" is one of {}", KINDS.join(", ")))?;
         let s = |k: &str| req[k].as_str().filter(|v| !v.is_empty());
         std::fs::create_dir_all(&self.out_dir).ok();
+        // strata and export-moe: a pack job after them (GGUF -> Kosha -> the model list)
+        if matches!(kind, "strata" | "export-moe") && !matches!(req["pack"], Value::Null | Value::Bool(_)) {
+            return Err("\"pack\" is true or false".into());
+        }
         match kind {
             "convert" => {
                 let input = self.allowed(s("input").ok_or("convert needs \"input\": a Hugging Face model folder")?, true)?;
@@ -834,6 +849,69 @@ impl Workshop {
                 }
                 Ok((kind.into(), vec![input.display().to_string(), id, s("display_name").unwrap_or("").to_string()], cfg))
             }
+            "pack" => {
+                if !cfg!(feature = "pack") {
+                    return Err("this server was built without Kosha packs (the am2pack feature)".into());
+                }
+                let input = self.allowed(s("input").ok_or("pack needs \"input\": a .gguf")?, true)?;
+                if !input.is_file() || input.extension().and_then(|e| e.to_str()) != Some("gguf") {
+                    return Err(format!("{}: \"input\" is a .gguf file", input.display()));
+                }
+                let file = |k: &str, what: &str| -> Result<Option<PathBuf>, String> {
+                    let Some(p) = s(k) else { return Ok(None) };
+                    let p = self.allowed(p, true)?;
+                    if !p.is_file() {
+                        return Err(format!("{}: \"{k}\" is {what}", p.display()));
+                    }
+                    Ok(Some(p))
+                };
+                let mmproj = file("mmproj", "the image projector's .gguf")?;
+                let profile = file("profile", "an expert profile file (as --expert-profile-save writes)")?;
+                let defaults = file("defaults", "a JSON file of run defaults")?;
+                let install = match &req["install"] {
+                    Value::Null => true,
+                    Value::Bool(b) => *b,
+                    _ => return Err("\"install\" is true or false".into()),
+                };
+                let overwrite = req["overwrite"] == true;
+                let g = strata_hub::config::inspect(&input).map_err(|e| format!("{}: {e}", input.display()))?;
+                let arch = g.architecture().unwrap_or("").to_string();
+                let name = input.file_name().and_then(|n| n.to_str()).unwrap_or("model.gguf");
+                let mut id = s("name").map(strata_hub::config::id_of).unwrap_or_else(|| strata_hub::config::id_of(name));
+                if id.is_empty() {
+                    return Err("\"name\" has no letters or digits".into());
+                }
+                // an abliterated model is named so, as `strata` names it
+                if marks_of(&g).abliterated && !id.contains("abliterated") {
+                    id = format!("{id}-abliterated");
+                }
+                let id = id.trim_end_matches("-pack").to_string();
+                let output = match s("output") {
+                    Some(o) => self.allowed(o, false)?,
+                    None => self.aipacs_dir.join(format!("{id}.kosha")),
+                };
+                if output.extension().and_then(|e| e.to_str()) != Some("kosha") {
+                    return Err(format!("{}: a pack's name ends in .kosha", output.display()));
+                }
+                if output.exists() && !overwrite {
+                    return Err(format!("{} already exists; set \"overwrite\" to build it again", output.display()));
+                }
+                let entry = format!("{id}-pack");
+                if install {
+                    if !strata_hub::config::rust_engine_runs(&arch, &self.models_dir) {
+                        return Err(format!("a Kosha pack runs on the Rust engine, which does not run '{arch}' here: build it with \"install\": false, \
+                                            or install the GGUF itself (strata)"));
+                    }
+                    let cfg = self.models_dir.join(format!("strata-{entry}.json"));
+                    if cfg.exists() && !overwrite {
+                        return Err(format!("a model named {entry} is already installed ({}); pick another \"name\" or set \"overwrite\"", cfg.display()));
+                    }
+                }
+                let p = |x: &Option<PathBuf>| x.as_ref().map(|p| p.display().to_string());
+                let plan = json!({"input": input, "output": output, "mmproj": p(&mmproj), "profile": p(&profile), "defaults": p(&defaults),
+                                  "id": id, "entry": entry, "display_name": s("display_name"), "install": install, "overwrite": overwrite});
+                Ok((kind.into(), vec![plan.to_string()], output))
+            }
             "datagen" => {
                 let recipe = s("recipe").unwrap_or("qa");
                 const RECIPES: [&str; 6] = ["qa", "chat", "instruct", "code", "indic", "translate"];
@@ -1130,7 +1208,8 @@ impl Workshop {
 
     pub fn submit(self: &Arc<Self>, req: Value) -> Result<Job, String> {
         let (kind, args, output) = self.plan(&req)?;
-        let exe = if kind == "strata" { PathBuf::new() } else {
+        // strata and pack run in this process; the rest are the am2strata-workshop command
+        let exe = if matches!(kind.as_str(), "strata" | "pack") { PathBuf::new() } else {
             exe().ok_or("the am2strata-workshop command is not beside the server: build it (cargo build --release -p strata-workshop) or set AM2STRATA_WORKSHOP_EXE")?
         };
         let id = { let mut n = self.next.lock().unwrap(); let id = *n; *n += 1; id };
@@ -1183,6 +1262,35 @@ impl Workshop {
                                            v["model"].as_str().unwrap_or(""), v["architecture"].as_str().unwrap_or("")));
                         if v["private"] == true {
                             j.log.push("it is marked private and uncensored (an abliterated model stays on this PC), and every chat with it goes through the minor-safety check".into());
+                        }
+                        j.result = Some(v);
+                        j.state = "done";
+                    }
+                    Err(e) => { j.error = Some(e); j.state = "failed"; }
+                }
+            });
+            self.then_pack(id);
+            return;
+        }
+        // a Kosha pack: built here, on the CPU and the disk (no GPU lease), then installed
+        if job.kind == "pack" {
+            self.update(id, |j| { j.state = "running"; j.started_at = Some(now()); });
+            let me = self.clone();
+            let plan: Value = serde_json::from_str(&job.args[0]).unwrap_or_default();
+            let r = tokio::task::spawn_blocking(move || me.pack_now(id, &plan)).await
+                .unwrap_or_else(|e| Err(if e.is_panic() { "cancelled".to_string() } else { e.to_string() }));
+            self.update(id, |j| {
+                j.finished_at = Some(now());
+                if j.state == "cancelled" {
+                    return;
+                }
+                match r {
+                    Ok(v) => {
+                        if let Some(m) = v["model"].as_str() {
+                            j.log.push(format!("{m} is installed: pick it in the model list to load it"));
+                        }
+                        if v["private"] == true {
+                            j.log.push("it is marked private (and uncensored when abliterated), and every chat with it goes through the minor-safety check".into());
                         }
                         j.result = Some(v);
                         j.state = "done";
@@ -1337,6 +1445,111 @@ impl Workshop {
         });
         tracing::info!("workshop: job {id} finished: {}", self.job(id).map(|j| j.state).unwrap_or("?"));
         Self::give_back(lease);
+        self.then_pack(id);
+    }
+
+    /// A strata or export-moe job asked for `"pack": true`: once it is done, a pack job on its GGUF is queued (and
+    /// installed), so one request goes GGUF -> Kosha -> the model list. Its id is kept in the job's result.
+    fn then_pack(self: &Arc<Self>, id: u64) {
+        let Some(j) = self.job(id) else { return };
+        if j.state != "done" || j.request["pack"] != true || !matches!(j.kind.as_str(), "strata" | "export-moe") {
+            return;
+        }
+        let mut req = json!({"kind": "pack", "install": true, "overwrite": j.request["overwrite"] == true});
+        if j.kind == "strata" {
+            req["input"] = json!(j.args[0]);
+            req["name"] = j.result.as_ref().map(|r| r["model"].clone()).unwrap_or_default();
+            if let Some(d) = j.request["display_name"].as_str().filter(|d| !d.is_empty()) {
+                req["display_name"] = json!(format!("{d} (pack)"));
+            }
+        } else {
+            req["input"] = j.result.as_ref().and_then(|r| r["output"].as_str().map(|o| json!(o))).unwrap_or_else(|| json!(j.output));
+        }
+        let r = self.submit(req);
+        self.update(id, |j| {
+            let res = j.result.get_or_insert_with(|| json!({}));
+            match r {
+                Ok(p) => {
+                    j.log.push(format!("pack job #{} queued: the Kosha pack of {}", p.id, p.request["input"].as_str().unwrap_or("")));
+                    res["pack_job"] = json!(p.id);
+                }
+                Err(e) => {
+                    j.log.push(format!("the pack job could not be queued: {e}"));
+                    res["pack_error"] = json!(e);
+                }
+            }
+        });
+    }
+
+    /// Build the pack a `pack` job planned (am2pack, every tensor's bytes copied unchanged) and, when asked, install
+    /// it: the Rust engine's run config for it (strata-hub's writer), with the GGUF's private / abliterated marks.
+    #[cfg(feature = "pack")]
+    fn pack_now(self: &Arc<Self>, id: u64, plan: &Value) -> Result<Value, String> {
+        let path = |k: &str| plan[k].as_str().map(PathBuf::from);
+        let gguf = path("input").ok_or("no input")?;
+        let out = path("output").ok_or("no output")?;
+        let stem = out.file_stem().and_then(|s| s.to_str()).unwrap_or("model").to_string();
+        if let Some(d) = out.parent() {
+            std::fs::create_dir_all(d).map_err(|e| format!("{}: {e}", d.display()))?;
+        }
+        // built beside, then moved over the old one: a failed rebuild keeps the pack that was there
+        let tmp = out.with_file_name(format!("{stem}.rebuild.kosha"));
+        let _ = std::fs::remove_file(&tmp);
+        let target = if out.exists() { tmp.clone() } else { out.clone() };
+        let o = am2pack::BuildOptions { model: gguf.clone(), mmproj: path("mmproj"), imatrix: None, profile: path("profile"),
+                                        defaults: path("defaults"), out: target.clone(), name: Some(stem) };
+        let t = std::time::Instant::now();
+        let me = self.clone();
+        let sum = am2pack::build(&o, &mut |line| {
+            me.update(id, |j| j.log.push(line.to_string()));
+            // cancelled: stop here (the writer removes its partial file as it unwinds)
+            if me.job(id).is_some_and(|j| j.state == "cancelled") {
+                std::panic::resume_unwind(Box::new("cancelled"));
+            }
+        })?;
+        if target != out {
+            std::fs::rename(&target, &out).map_err(|e| format!("{}: {e}", out.display()))?;
+        }
+        let gib = sum.bytes as f64 / (1u64 << 30) as f64;
+        self.update(id, |j| j.log.push(format!("{}: {gib:.2} GiB in {:.1} s; {} tensors, {} expert records ({} order), {} image tensors",
+                                                out.display(), t.elapsed().as_secs_f64(), sum.tensors, sum.expert_records, sum.expert_order, sum.image_tensors)));
+        let g = strata_hub::config::inspect(&gguf)?;
+        let marks = marks_of(&g);
+        let arch = g.architecture().unwrap_or("").to_string();
+        let mut v = json!({"output": out.display().to_string(), "kind": "kosha", "source": gguf.display().to_string(), "bytes": sum.bytes,
+                           "tensors": sum.tensors, "expert_records": sum.expert_records, "architecture": arch,
+                           "private": marks.private, "uncensored": marks.abliterated, "installed": false});
+        if plan["install"] != true {
+            return Ok(v);
+        }
+        let entry = plan["entry"].as_str().ok_or("no entry name")?.to_string();
+        let display = match plan["display_name"].as_str().filter(|d| !d.is_empty()) {
+            Some(d) => d.to_string(),
+            None => format!("{} (pack)", g.metadata.get("general.name").and_then(|v| v.as_str()).unwrap_or(plan["id"].as_str().unwrap_or(&entry))),
+        };
+        let display = if marks.abliterated && !display.to_lowercase().contains("abliterated") { format!("{display} (abliterated)") } else { display };
+        let mmproj = path("mmproj");
+        let w = strata_hub::config::write_pack(&self.models_dir, &self.packs_dir, &out, &gguf, &g, mmproj.as_deref(), &entry, &display)?;
+        if marks.private || marks.abliterated {
+            mark_config(&w.config, &marks)?;
+        }
+        // a copy beside the packs, where their configs are kept
+        let copies = self.aipacs_dir.join("configs");
+        std::fs::create_dir_all(&copies).map_err(|e| format!("{}: {e}", copies.display()))?;
+        let copy = copies.join(w.config.file_name().unwrap_or_default());
+        std::fs::copy(&w.config, &copy).map_err(|e| format!("{}: {e}", copy.display()))?;
+        v["installed"] = json!(true);
+        v["model"] = json!(entry);
+        v["config"] = json!(w.config.display().to_string());
+        v["config_copy"] = json!(copy.display().to_string());
+        v["tokenizer"] = json!(w.tokenizer.display().to_string());
+        v["display_name"] = json!(display);
+        Ok(v)
+    }
+
+    #[cfg(not(feature = "pack"))]
+    fn pack_now(self: &Arc<Self>, _id: u64, _plan: &Value) -> Result<Value, String> {
+        Err("this server was built without Kosha packs (the am2pack feature)".into())
     }
 
     /// The GPUs back to chats after a training run: the turn ends, and the model that was loaded before is loaded again.
@@ -1440,6 +1653,10 @@ impl Workshop {
             v.into_iter().map(|x| x.1).collect()
         };
         let datasets = listing(&self.out_dir.join("datasets"), &|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"));
+        // the Kosha packs where they are kept (a pack job's default output), and any in the Workshop folder
+        let kosha = |p: &Path| p.extension().and_then(|x| x.to_str()) == Some("kosha");
+        let mut packs = listing(&self.aipacs_dir, &kosha);
+        packs.extend(listing(&self.out_dir, &kosha));
         let uploads = listing(&self.uploads_dir(), &|_| true);
         // prompt lists for abliteration: text files, one prompt per line (the Workshop's abliterate folder first)
         let txt = |p: &Path| p.extension().and_then(|x| x.to_str()) == Some("txt");
@@ -1459,7 +1676,7 @@ impl Workshop {
             }).collect();
         reports.sort_by(|a, b| b.0.cmp(&a.0));
         let reports: Vec<Value> = reports.into_iter().map(|x| x.1).collect();
-        json!({"gguf": gguf, "hf_models": hf, "adapters": adapters, "datasets": datasets, "prompts": prompts, "suites": suites, "reports": reports, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
+        json!({"gguf": gguf, "packs": packs, "hf_models": hf, "adapters": adapters, "datasets": datasets, "prompts": prompts, "suites": suites, "reports": reports, "uploads": uploads, "folders": self.roots.iter().map(|r| r.display().to_string()).collect::<Vec<_>>(),
                "output_folder": self.out_dir.display().to_string(), "installed": exe().is_some()})
     }
 }

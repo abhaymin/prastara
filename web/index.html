@@ -524,6 +524,7 @@
           <button type="button" role="tab" data-ws-step="convert" aria-selected="false"><span>Convert to GGUF</span><i class="ws-dot" data-ws-dot="convert" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="quantize" aria-selected="false"><span>Quantize</span><i class="ws-dot" data-ws-dot="quantize" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="install" aria-selected="false"><span>Install</span><i class="ws-dot" data-ws-dot="install" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="pack" aria-selected="false"><span>Make a Kosha pack</span><i class="ws-dot" data-ws-dot="pack" aria-hidden="true"></i></button>
         </div>
         <details class="ws-folders small"><summary>Folders</summary><p class="muted small" id="ws-folders"></p></details>
         <p class="ws-rail__cli muted small">From a terminal: <code>am2strata-run workshop …</code> through this server, or
@@ -757,6 +758,7 @@
                   <input class="st-input mono" id="ws-x-pre" placeholder="e.g. qwen2"></div>
                 <div class="ws-field ws-field--wide"><label class="st-label" for="ws-x-out">Output file <output>optional</output></label>
                   <input class="st-input mono" id="ws-x-out" placeholder="in the Workshop folder"></div>
+                <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-x-pack"> Then make its Kosha pack and install it (<code>…-pack</code>)</label>
               </div>
               <div class="ws-est" id="ws-x-est" aria-live="polite"></div>
               <div class="ws-est" id="ws-x-srv-est" aria-live="polite"></div>
@@ -976,9 +978,37 @@
               <div class="ws-field"><label class="st-label" for="ws-s-display">Display name <output>optional</output></label>
                 <input class="st-input" id="ws-s-display" placeholder="My model Q4_K"></div>
               <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-s-over"> Replace a model with the same name</label>
+              <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-s-pack"> Also make its Kosha pack and install it (<code>…-pack</code>)</label>
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-strata">Install</button></div>
           </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="pack" hidden>
+          <header class="ws-panel__head"><h3>Make a Kosha pack</h3><p class="muted">One <code>.kosha</code> file holding the model (its tensor bytes copied unchanged, the experts one record each, hottest first with a profile) and its image projector, for a fast load on the Rust engine. Built on the CPU and the disk; the GPUs are not touched. Installed, it shows in the model list as <code>&lt;name&gt;-pack</code>, and a private or abliterated GGUF keeps its marks (the minor-safety check applies).</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block">
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-p-in">GGUF</label>
+                <input class="st-input mono" id="ws-p-in" data-ws-pick="gguf" autocomplete="off" placeholder="~/models/model-Q4_K.gguf"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-name">Name <output>optional</output></label>
+                <input class="st-input mono" id="ws-p-name" placeholder="from the file name"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-display">Display name <output>optional</output></label>
+                <input class="st-input" id="ws-p-display" placeholder="My model Q4_K (pack)"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-p-mmproj">Image projector <output>optional</output></label>
+                <input class="st-input mono" id="ws-p-mmproj" data-ws-pick="gguf" autocomplete="off" placeholder="mmproj-F16.gguf"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-profile">Expert profile <output>optional</output></label>
+                <input class="st-input mono" id="ws-p-profile" placeholder="expert-profile.strp"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-defaults">Run defaults <output>optional</output></label>
+                <input class="st-input mono" id="ws-p-defaults" placeholder="defaults.json"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-p-out">Output file <output>optional</output></label>
+                <input class="st-input mono" id="ws-p-out" placeholder="in the packs folder (aipacs)"></div>
+              <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-p-install" checked> Install it as a model Prastara runs</label>
+              <label class="ws-field--wide small ws-check"><input type="checkbox" id="ws-p-over"> Replace a pack and model with the same name</label>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-pack">Make pack</button></div>
+          </div>
+          <p class="muted small">From a terminal: <code>am2strata-run workshop pack &lt;gguf&gt; [--name N] [--mmproj p.gguf] [--profile f.strp] [--no-install]</code>, or by hand <code>am2strata-run pack build --model m.gguf --out m.kosha</code>.</p>
           </div>
         </section>
       </main>
