@@ -484,6 +484,14 @@ pub async fn submit(s: &AppState, ws: &Arc<Workshop>, mut req: Value) -> Respons
     let (k2, l2, o2) = (kind.clone(), local.clone(), output.clone());
     let private = tokio::task::spawn_blocking(move || named_paths(&ws2, &k2, &l2, &o2).iter().find_map(|p| private_reason(p)))
         .await.unwrap_or(None);
+    // a datagen job writes through the chat API of the machine it runs on, which may send chats on to a remote
+    // model: with private data it runs here only, even when a worker is named
+    if kind == "datagen" {
+        if let Some(why) = &private {
+            return error(StatusCode::BAD_REQUEST, "private_data",
+                         format!("{why}: a datagen job with private data runs on this machine only (its chats would go through the worker's own chat API)"));
+        }
+    }
     let worker: Arc<Worker> = if asked == "any" {
         if let Some(why) = private {
             return error(StatusCode::BAD_REQUEST, "private_data",
