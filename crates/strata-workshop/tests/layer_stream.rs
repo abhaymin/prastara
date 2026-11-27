@@ -1,0 +1,381 @@
+//! Layer by layer (after Soup's `stream_layers`, `lisa` and `freeze_layers`, Apache-2.0): a run with the base streamed
+//! block by block takes the same steps as one with the base held (dense, looped and upcycled tiny models, the RAM and
+//! disk tiers, one and two devices); LISA trains only the blocks it samples, anew every interval, the same ones for the
+//! same seed, and resumes exactly; `--freeze-bottom` is `--train-layers` counted from the bottom.
+
+mod common;
+
+use std::cell::Cell;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+
+use candle_core::{Device, Tensor};
+use strata_workshop::finetune::{self, lisa_sample, Event, Lisa, Resume, TrainReport, TrainSettings};
+use strata_workshop::layer_stream::StreamMode;
+use strata_workshop::model::{adapter_tensors, make_looped, make_upcycled, BaseDtype, LlamaModel, LoopSpec, LoraSpec, ModelConfig, MoeSpec, Target, MOE_INIT_FILE};
+
+fn settings(model: &Path, data: &Path, out: &Path) -> TrainSettings {
+    let mut s = TrainSettings::new(model, data, out);
+    // dropout on: the replay must draw the same masks from the streamed weights
+    s.lora = LoraSpec { r: 4, alpha: 8.0, dropout: 0.1, use_rslora: false, targets: Target::ALL.to_vec(), train_layers: None, seed: 7 };
+    s.lr = 2e-2;
+    s.epochs = 1.0;
+    s.max_steps = Some(4);
+    s.accumulation = 2;
+    s.max_len = 64;
+    s.val_split = 0.125;
+    s.save_steps = 0;
+    s.logging_steps = 1;
+    s.seed = 11;
+    s.gradient_checkpointing = true;
+    s
+}
+
+fn run(s: &TrainSettings) -> (TrainReport, Vec<String>) {
+    let mut logs = Vec::new();
+    let r = finetune::train(s, &mut |e| if let Event::Log(l) = e { logs.push(l) }, &|| false).unwrap();
+    (r, logs)
+}
+
+fn adapter(dir: &Path) -> BTreeMap<String, Vec<f32>> {
+    candle_core::safetensors::load(dir.join(finetune::ADAPTER_FILE), &Device::Cpu).unwrap().into_iter()
+        .map(|(k, v)| (k, v.flatten_all().unwrap().to_vec1::<f32>().unwrap())).collect()
+}
+
+fn max_diff(a: &BTreeMap<String, Vec<f32>>, b: &BTreeMap<String, Vec<f32>>) -> f32 {
+    assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>(), "the same tensors");
+    a.iter().map(|(k, x)| x.iter().zip(&b[k]).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max)).fold(0.0, f32::max)
+}
+
+/// The base held, then streamed as `mode` (`devices` CPU devices, `buffers`): the same losses and adapter.
+fn same_with_streaming(tag: &str, model: &Path, data: &Path, root: &Path, mode: StreamMode, devices: usize, buffers: usize) {
+    let mut held = settings(model, data, &root.join(format!("{tag}-held")));
+    held.devices = vec!["cpu".into(); devices];
+    let (a, _) = run(&held);
+    let mut streamed = held.clone();
+    streamed.out = root.join(format!("{tag}-streamed"));
+    streamed.stream_layers = Some(mode);
+    streamed.stream_buffers = buffers;
+    streamed.stream_cache = Some(root.join("shards"));
+    let (b, logs) = run(&streamed);
+    let dl = a.losses.iter().zip(&b.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    let da = max_diff(&adapter(&held.out), &adapter(&streamed.out));
+    println!("{tag}: losses {:?} / {:?}, max loss difference {dl:.2e}, adapter {da:.2e}", a.losses, b.losses);
+    assert_eq!(a.losses.len(), b.losses.len());
+    assert!(dl <= 1e-6 && da <= 1e-6, "{tag}: losses differ by {dl}, the adapter by {da}");
+    assert_eq!(a.eval_loss.map(|l| (l * 1e6).round()), b.eval_loss.map(|l| (l * 1e6).round()), "{tag}: the held-out loss");
+    let st = b.stream.expect("streamed stats");
+    assert!(st.loads > 0 && st.prefetch_hits > 0, "{tag}: {st:?}");
+    assert!(a.stream.is_none());
+    assert!(logs.iter().any(|l| l.contains("layer streaming (")), "{tag}: {logs:?}");
+    // the adapter is still a plain PEFT adapter: it loads on the held base and gives the same logits
+    let tokens: Vec<u32> = (1..20).collect();
+    let logits = |dir: &Path| {
+        let mut m = LlamaModel::load(model, BaseDtype::F32, &Device::Cpu).unwrap();
+        m.load_adapter(dir).unwrap();
+        m.forward(&tokens, &strata_workshop::model::Ctx::inference()).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    };
+    let (la, lb) = (logits(&held.out), logits(&streamed.out));
+    assert!(la.iter().zip(&lb).all(|(x, y)| (x - y).abs() <= 1e-5));
+}
+
+#[test]
+fn a_streamed_dense_model_trains_the_same() {
+    let (root, model, data) = common::model_and_data("stream-dense");
+    same_with_streaming("dense-ram", &model, &data, &root, StreamMode::Ram, 1, 2);
+    same_with_streaming("dense-disk", &model, &data, &root, StreamMode::Disk, 1, 3);
+    // the cache is made once: a second disk run finds it complete
+    let mut again = settings(&model, &data, &root.join("again"));
+    again.stream_layers = Some(StreamMode::Disk);
+    again.stream_cache = Some(root.join("shards"));
+    let (_, logs) = run(&again);
+    assert!(logs.iter().any(|l| l.contains("is complete")), "{logs:?}");
+    // two (CPU) devices: each with its own buffers
+    same_with_streaming("dense-two", &model, &data, &root, StreamMode::Auto, 2, 2);
+}
+
+#[test]
+fn a_streamed_looped_model_trains_the_same() {
+    let root = common::temp_dir("stream-loop");
+    let (base, data) = (root.join("base"), root.join("train.jsonl"));
+    common::chat_model_sized(&base, 4, 32, 64);
+    common::write_jsonl(&data, &common::chat_rows(24));
+    let looped = root.join("looped");
+    // blocks 1-2 run three times: the stream sees blocks again in the later passes
+    make_looped(&base, &looped, LoopSpec { start: 1, end: 3, passes: 3 }).unwrap();
+    same_with_streaming("loop", &looped, &data, &root, StreamMode::Ram, 1, 2);
+    same_with_streaming("loop-two", &looped, &data, &root, StreamMode::Ram, 2, 4);
+}
+
+/// A fine-grained upcycle whose neurons are shuffled (the streamed slices must be the permuted ones).
+fn upcycled(root: &Path, base: &Path, m: MoeSpec) -> PathBuf {
+    let out = root.join(format!("up-{}-{}", m.experts, m.expert_ff.unwrap_or(0)));
+    make_upcycled(base, &out, m).unwrap();
+    if m.expert_ff.is_some() {
+        let cfg = ModelConfig::load(&out).unwrap();
+        let f = out.join(MOE_INIT_FILE);
+        let mut t: HashMap<String, Tensor> = candle_core::safetensors::load(&f, &Device::Cpu).unwrap();
+        for b in 0..cfg.num_hidden_layers {
+            let perm: Vec<u32> = finetune::permutation(5, b as u64, cfg.intermediate_size).into_iter().map(|x| x as u32).collect();
+            t.insert(format!("perm.{b}"), Tensor::from_vec(perm, (cfg.intermediate_size,), &Device::Cpu).unwrap());
+        }
+        std::fs::remove_file(&f).unwrap();
+        candle_core::safetensors::save(&t, &f).unwrap();
+    }
+    out
+}
+
+#[test]
+fn a_streamed_upcycled_model_trains_the_same() {
+    let (root, model, data) = common::model_and_data("stream-moe");
+    // 56B-A5B's design in small: 8 experts of 16 neurons (4 groups), top-2, expert rank 2 with a shared A
+    let fine = upcycled(&root, &model, MoeSpec { expert_ff: Some(16), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(8, 2) });
+    same_with_streaming("moe-fine", &fine, &data, &root, StreamMode::Ram, 1, 2);
+    same_with_streaming("moe-fine-two", &fine, &data, &root, StreamMode::Disk, 2, 2);
+    // the full-width design (every expert the whole feed-forward)
+    let full = upcycled(&root, &model, MoeSpec::full(4, 2));
+    same_with_streaming("moe-full", &full, &data, &root, StreamMode::Ram, 1, 2);
+}
+
+#[test]
+fn a_bf16_base_streams_the_same() {
+    let (root, model, data) = common::model_and_data("stream-bf16");
+    let mut held = settings(&model, &data, &root.join("held"));
+    held.base_dtype = BaseDtype::BF16;
+    let (a, _) = run(&held);
+    let mut st = held.clone();
+    st.out = root.join("streamed");
+    st.stream_layers = Some(StreamMode::Ram);
+    let (b, _) = run(&st);
+    assert_eq!(a.losses, b.losses, "bit for bit");
+    assert_eq!(max_diff(&adapter(&held.out), &adapter(&st.out)), 0.0);
+}
+
+/// Streaming without asking for checkpointing turns it on (and says so); bad buffer counts are refused.
+#[test]
+fn streaming_checks_its_settings() {
+    let (root, model, data) = common::model_and_data("stream-settings");
+    let mut s = settings(&model, &data, &root.join("o"));
+    s.gradient_checkpointing = false;
+    s.stream_layers = Some(StreamMode::Ram);
+    s.max_steps = Some(1);
+    let (_, logs) = run(&s);
+    assert!(logs.iter().any(|l| l.contains("turns gradient checkpointing on")), "{logs:?}");
+    for bad in [1, 9] {
+        let mut b = s.clone();
+        b.stream_buffers = bad;
+        assert!(finetune::train(&b, &mut |_| {}, &|| false).is_err(), "{bad} buffers");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// LISA
+// ---------------------------------------------------------------------------------------------------------------------
+
+/// The adapter a run starts from (the same seed's fresh adapter), per tensor.
+fn fresh_adapter(model: &Path, spec: &LoraSpec) -> BTreeMap<String, Vec<f32>> {
+    let mut m = LlamaModel::load(model, BaseDtype::F32, &Device::Cpu).unwrap();
+    m.add_lora(spec).unwrap();
+    adapter_tensors(&m).into_iter().map(|(k, v)| (k, v.flatten_all().unwrap().to_vec1::<f32>().unwrap())).collect()
+}
+
+fn block_of(name: &str) -> Option<usize> {
+    let rest = &name[name.find("layers.")? + 7..];
+    rest[..rest.find('.')?].parse().ok()
+}
+
+/// The blocks whose adapter tensors moved from `start`.
+fn changed_blocks(start: &BTreeMap<String, Vec<f32>>, end: &BTreeMap<String, Vec<f32>>) -> Vec<usize> {
+    let mut out: Vec<usize> = end.iter().filter(|(k, v)| start[*k] != **v).filter_map(|(k, _)| block_of(k)).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn lisa_model(tag: &str) -> (common::Tmp, PathBuf, PathBuf) {
+    let root = common::temp_dir(tag);
+    let (model, data) = (root.join("model"), root.join("train.jsonl"));
+    common::chat_model_sized(&model, 6, 32, 64);
+    common::write_jsonl(&data, &common::chat_rows(24));
+    (root, model, data)
+}
+
+#[test]
+fn lisa_samples_the_same_blocks_for_a_seed_and_new_ones_each_interval() {
+    let blocks: Vec<usize> = (0..12).collect();
+    let a: Vec<Vec<usize>> = (0..10).map(|i| lisa_sample(3, i, &blocks, 2)).collect();
+    let b: Vec<Vec<usize>> = (0..10).map(|i| lisa_sample(3, i, &blocks, 2)).collect();
+    let c: Vec<Vec<usize>> = (0..10).map(|i| lisa_sample(4, i, &blocks, 2)).collect();
+    assert_eq!(a, b, "deterministic by seed");
+    assert_ne!(a, c, "another seed, other blocks");
+    assert!(a.iter().all(|s| s.len() == 2 && s[0] < s[1] && s.iter().all(|x| blocks.contains(x))));
+    assert!(a.windows(2).filter(|w| w[0] != w[1]).count() >= 7, "the sample changes from interval to interval: {a:?}");
+    // more than there are: all of them
+    assert_eq!(lisa_sample(1, 0, &[4, 5], 3), vec![4, 5]);
+}
+
+#[test]
+fn lisa_trains_only_the_sampled_blocks() {
+    let (root, model, data) = lisa_model("lisa");
+    let mut s = settings(&model, &data, &root.join("one"));
+    s.lisa = Some(Lisa { layers: 2, interval: 2, seed: 9 });
+    s.max_steps = Some(2);
+    let start = fresh_adapter(&model, &s.lora);
+    let all: Vec<usize> = (0..6).collect();
+    // one interval: only its two blocks moved, every other block's adapter is as it started, to the bit
+    let (_, logs) = run(&s);
+    let first = lisa_sample(9, 0, &all, 2);
+    assert_eq!(changed_blocks(&start, &adapter(&s.out)), first, "{logs:?}");
+    assert!(logs.iter().any(|l| l.starts_with("LISA: blocks")), "{logs:?}");
+    // three intervals: the blocks of each, and no others
+    let mut three = s.clone();
+    three.out = root.join("three");
+    three.max_steps = Some(6);
+    let (_, logs) = run(&three);
+    let mut want: Vec<usize> = (0..3).flat_map(|i| lisa_sample(9, i, &all, 2)).collect();
+    want.sort_unstable();
+    want.dedup();
+    assert_eq!(changed_blocks(&start, &adapter(&three.out)), want);
+    assert_eq!(logs.iter().filter(|l| l.starts_with("LISA: blocks")).count(), 3, "{logs:?}");
+    // with --train-layers 3 only the top three blocks are candidates
+    let mut top = s.clone();
+    top.out = root.join("top");
+    top.lora.train_layers = Some(3);
+    top.max_steps = Some(6);
+    run(&top);
+    let start_top = fresh_adapter(&model, &top.lora);
+    let moved = changed_blocks(&start_top, &adapter(&top.out));
+    assert!(!moved.is_empty() && moved.iter().all(|b| *b >= 3), "{moved:?}");
+}
+
+#[test]
+fn lisa_with_streaming_and_after_a_resume_takes_the_same_steps() {
+    let (root, model, data) = lisa_model("lisa-stream");
+    let mut s = settings(&model, &data, &root.join("plain"));
+    s.lisa = Some(Lisa { layers: 2, interval: 2, seed: 4 });
+    s.max_steps = Some(6);
+    let (a, _) = run(&s);
+    // streamed: the not-sampled blocks are read as constants, the same arithmetic otherwise
+    let mut st = s.clone();
+    st.out = root.join("streamed");
+    st.stream_layers = Some(StreamMode::Ram);
+    let (b, _) = run(&st);
+    let dl = a.losses.iter().zip(&b.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    assert!(dl <= 1e-6 && max_diff(&adapter(&s.out), &adapter(&st.out)) <= 1e-6, "{dl}");
+    // stopped at step 2 (an interval's end: the next step samples anew) and resumed: the uninterrupted run's steps
+    let mut part = s.clone();
+    part.out = root.join("resumed");
+    let steps = Cell::new(0);
+    let r = finetune::train(&part, &mut |e| if let Event::Step { .. } = e { steps.set(steps.get() + 1) }, &|| steps.get() >= 2).unwrap();
+    assert!(r.stopped && r.steps_done == 2);
+    part.resume = Some(Resume::Auto);
+    let (c, _) = run(&part);
+    assert_eq!(c.steps_done, 6);
+    let dl = a.losses.iter().zip(&c.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    let da = max_diff(&adapter(&s.out), &adapter(&part.out));
+    println!("LISA resumed: losses differ by {dl:.2e}, adapter by {da:.2e}");
+    assert!(dl <= 1e-6 && da <= 1e-6, "{dl} {da}");
+    // a checkpoint made without LISA is not resumed with it (another run's steps)
+    let mut other = s.clone();
+    other.lisa = Some(Lisa { layers: 3, interval: 2, seed: 4 });
+    other.out = part.out.clone();
+    other.resume = Some(Resume::Dir(part.out.join("checkpoint-2")));
+    assert!(finetune::train(&other, &mut |_| {}, &|| false).is_err());
+}
+
+#[test]
+fn lisa_on_an_upcycled_model_trains_the_sampled_routers_only() {
+    let (root, model, data) = common::model_and_data("lisa-moe");
+    let fine = upcycled(&root, &model, MoeSpec { expert_ff: Some(16), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(8, 2) });
+    let mut s = settings(&fine, &data, &root.join("o"));
+    s.lisa = Some(Lisa { layers: 1, interval: 3, seed: 2 });
+    s.max_steps = Some(3);
+    let start = fresh_adapter(&fine, &s.lora);
+    run(&s);
+    let end = adapter(&s.out);
+    let chosen = lisa_sample(2, 0, &[0, 1, 2], 1);
+    assert_eq!(changed_blocks(&start, &end), chosen);
+    let router = strata_workshop::model::moe_router_name(chosen[0]);
+    assert_ne!(start[&router], end[&router], "the sampled block's router trained");
+}
+
+#[test]
+fn freeze_bottom_is_train_layers_from_the_bottom() {
+    let (root, model, data) = common::model_and_data("freeze");
+    let mut s = settings(&model, &data, &root.join("o"));
+    s.freeze_bottom = Some(1);
+    s.apply_freeze_bottom(3).unwrap();
+    assert_eq!((s.lora.train_layers, s.freeze_bottom), (Some(2), None));
+    let mut zero = settings(&model, &data, &root.join("z"));
+    zero.freeze_bottom = Some(0);
+    zero.apply_freeze_bottom(3).unwrap();
+    assert_eq!(zero.lora.train_layers, None);
+    for (n, t) in [(3, None), (1, Some(1))] {
+        let mut bad = settings(&model, &data, &root.join("b"));
+        bad.freeze_bottom = Some(n);
+        bad.lora.train_layers = t;
+        assert!(bad.apply_freeze_bottom(3).is_err(), "{n} {t:?}");
+    }
+    // a run with it trains the top two blocks, as --train-layers 2 does
+    let mut a = settings(&model, &data, &root.join("fb"));
+    a.freeze_bottom = Some(1);
+    a.max_steps = Some(2);
+    let mut b = settings(&model, &data, &root.join("tl"));
+    b.lora.train_layers = Some(2);
+    b.max_steps = Some(2);
+    let (ra, _) = run(&a);
+    let (rb, _) = run(&b);
+    assert_eq!(ra.losses, rb.losses);
+    assert_eq!(max_diff(&adapter(&a.out), &adapter(&b.out)), 0.0);
+    assert!(adapter(&a.out).keys().all(|k| block_of(k).is_none_or(|b| b >= 1)));
+}
+
+#[test]
+fn a_soup_config_streams_freezes_and_with_relax_samples() {
+    let dir = common::temp_dir("soup-stream");
+    let yaml = "base: ./m\ndata:\n  train: d.jsonl\ntraining:\n  quantization: none\n  stream_layers: true\n  stream_source: disk\n  stream_buffers: 3\n  freeze_layers: 4\n  lora:\n    r: 8\n";
+    let imp = strata_workshop::soup::import(yaml, &dir, false).unwrap();
+    assert_eq!((imp.settings.stream_layers, imp.settings.stream_buffers, imp.settings.freeze_bottom), (Some(StreamMode::Disk), 3, Some(4)));
+    assert!(imp.settings.gradient_checkpointing);
+    let lisa = "base: ./m\ndata:\n  train: d.jsonl\ntraining:\n  quantization: none\n  lisa_enabled: true\n  lisa_num_layers: 3\n  lisa_interval_steps: 5\n";
+    assert!(strata_workshop::soup::import(lisa, &dir, false).is_err(), "Soup's LISA is whole-layer fine-tuning");
+    let relaxed = strata_workshop::soup::import(lisa, &dir, true).unwrap();
+    assert_eq!(relaxed.settings.lisa, Some(Lisa { layers: 3, interval: 5, seed: 42 }));
+    let bad = "base: ./m\ndata:\n  train: d.jsonl\ntraining:\n  quantization: none\n  stream_layers: true\n  stream_source: nvme\n";
+    assert!(strata_workshop::soup::import(bad, &dir, false).is_err());
+}
+
+/// On the GPUs (`--features cuda`, run with `-- --ignored`; never in the default run): a streamed run on cuda:0 (and on
+/// cuda:0,cuda:1 with AM2_TEST_GPUS=2) takes the steps a held one does there, within float noise, and its uploads were
+/// prefetched.
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_the_gpus_a_streamed_run_matches_the_held_one() {
+    let (root, model, data) = common::model_and_data("stream-gpu");
+    let devices: Vec<String> = match std::env::var("AM2_TEST_GPUS").as_deref() {
+        Ok("2") => vec!["cuda:0".into(), "cuda:1".into()],
+        _ => vec!["cuda:0".into()],
+    };
+    for dtype in [BaseDtype::F32, BaseDtype::BF16] {
+        let mut held = settings(&model, &data, &root.join(format!("held-{}", dtype.as_str())));
+        held.devices = devices.clone();
+        held.base_dtype = dtype;
+        let (a, _) = run(&held);
+        for mode in [StreamMode::Ram, StreamMode::Disk] {
+            let mut st = held.clone();
+            st.out = root.join(format!("streamed-{}-{}", dtype.as_str(), mode.as_str()));
+            st.stream_layers = Some(mode);
+            st.stream_cache = Some(root.join("shards"));
+            let (b, logs) = run(&st);
+            let dl = a.losses.iter().zip(&b.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+            let da = max_diff(&adapter(&held.out), &adapter(&st.out));
+            println!("{devices:?} {} {}: losses differ by {dl:.2e}, adapter by {da:.2e}; {:?}", dtype.as_str(), mode.as_str(), b.stream);
+            for l in logs.iter().filter(|l| l.contains("layer streaming")) {
+                println!("  {l}");
+            }
+            assert!(dl <= 1e-4 && da <= 1e-4, "{dl} {da}");
+            assert!(b.stream.unwrap().loads > 0);
+        }
+    }
+}

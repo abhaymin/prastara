@@ -36,9 +36,10 @@ use std::time::Instant;
 use clap::{Args, Parser, Subcommand};
 use serde_json::{json, Value};
 use strata_workshop::chatdata::{self, ChatTokenizer, DataFormat};
-use strata_workshop::finetune::{self, Event, FindLr, Resume, TrainSettings};
+use strata_workshop::finetune::{self, Event, FindLr, Lisa, Resume, TrainSettings};
+use strata_workshop::layer_stream::StreamMode;
 use strata_workshop::model::{BaseDtype, ModelConfig, Target};
-use strata_workshop::profile::{self, AutopilotInput, Machine, ProfileInput};
+use strata_workshop::profile::{self, AutopilotInput, Machine, ProfileInput, StreamProfile};
 use strata_workshop::{clean, convert, datagen, merge, quantize_gguf, soup};
 
 #[derive(Parser)]
@@ -667,6 +668,33 @@ struct RunArgs {
     /// recompute each trained block's activations in the backward pass (less memory, about a third more time)
     #[arg(long)]
     gradient_checkpointing: bool,
+    /// stream each block's frozen weights to the device just before it runs (after Soup's stream_layers): from host RAM
+    /// (page-locked on CUDA), from a shard cache on disk, or auto (RAM when the base fits 70 % of the free RAM).
+    /// Turns gradient checkpointing on.
+    #[arg(long, num_args = 0..=1, default_missing_value = "auto", value_name = "ram|disk|auto")]
+    stream_layers: Option<String>,
+    /// with --stream-layers: blocks held on each device at once, 2 to 8 (2: the one running and the next)
+    #[arg(long)]
+    stream_buffers: Option<usize>,
+    /// with --stream-layers disk: where the shard cache goes (default ~/.cache/prastara/layer-stream)
+    #[arg(long)]
+    stream_cache: Option<PathBuf>,
+    /// with --stream-layers: each GPU's host-to-device rate in GB/s for the estimate (one value, or one per card);
+    /// default from the PCIe link in sysfs
+    #[arg(long, value_delimiter = ',')]
+    stream_bandwidth: Vec<f64>,
+    /// LISA (after Soup): only K sampled blocks' adapters train at a time
+    #[arg(long, value_name = "K")]
+    lisa_layers: Option<usize>,
+    /// with --lisa-layers: sample the blocks anew every N optimizer steps (default 20, Soup's)
+    #[arg(long, value_name = "N")]
+    lisa_interval: Option<usize>,
+    /// with --lisa-layers: the sampling seed (default: --seed)
+    #[arg(long)]
+    lisa_seed: Option<u64>,
+    /// Soup's freeze_layers: no adapters in the bottom N blocks (the same as --train-layers <blocks - N>)
+    #[arg(long, value_name = "N")]
+    freeze_bottom: Option<usize>,
     #[arg(long)]
     lr: Option<f64>,
     #[arg(long)]
@@ -762,6 +790,35 @@ impl RunArgs {
         if let Some(r) = &self.resume { s.resume = Some(if r == "auto" { Resume::Auto } else { Resume::Dir(PathBuf::from(r)) }); }
         if let Some(c) = &self.chat_template { s.chat_template = Some(c.clone()); }
         if self.score_everything { s.score_everything = true; }
+        if let Some(m) = &self.stream_layers {
+            s.stream_layers = Some(StreamMode::from_s(m).map_err(|e| e.to_string())?);
+        }
+        if let Some(b) = self.stream_buffers {
+            if s.stream_layers.is_none() {
+                return Err("--stream-buffers needs --stream-layers".into());
+            }
+            s.stream_buffers = b;
+        }
+        if let Some(c) = &self.stream_cache { s.stream_cache = Some(c.clone()); }
+        if s.stream_layers.is_some() && !s.gradient_checkpointing {
+            notes.push("--stream-layers turns gradient checkpointing on (each block is replayed from its streamed weights in the backward pass)".into());
+            s.gradient_checkpointing = true;
+        }
+        match (self.lisa_layers, self.lisa_interval) {
+            (Some(k), n) => s.lisa = Some(Lisa { layers: k, interval: n.unwrap_or(20), seed: self.lisa_seed.unwrap_or(s.seed) }),
+            (None, Some(_)) => return Err("--lisa-interval needs --lisa-layers K".into()),
+            (None, None) if self.lisa_seed.is_some() => return Err("--lisa-seed needs --lisa-layers K".into()),
+            (None, None) => {}
+        }
+        if let Some(n) = self.freeze_bottom {
+            s.freeze_bottom = Some(n);
+        }
+        if s.freeze_bottom.is_some() {
+            // resolved now when the model's config is there (a --preset has none: profile resolves it)
+            if let Ok(cfg) = ModelConfig::load(&s.model) {
+                s.apply_freeze_bottom(cfg.num_hidden_layers).map_err(|e| e.to_string())?;
+            }
+        }
         if s.cache_dir.is_some() && s.lora.train_layers.is_none() {
             notes.push("--cache-activations needs --train-layers N: with every block training there is no frozen part to cache".into());
         }
@@ -806,7 +863,7 @@ fn data_stats(s: &TrainSettings) -> Result<(usize, usize, usize), String> {
 }
 
 /// The estimate's input for these settings: the data's size from the file when there is one.
-fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, avg_tokens: Option<usize>) -> Result<ProfileInput, String> {
+fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, avg_tokens: Option<usize>, bandwidth: &[f64]) -> Result<ProfileInput, String> {
     let (n, avg) = if s.data.as_os_str().is_empty() {
         (examples.unwrap_or(1000), avg_tokens.unwrap_or(s.max_len / 2))
     } else {
@@ -816,8 +873,25 @@ fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, a
         (examples.unwrap_or(n - held), avg_tokens.unwrap_or(avg))
     };
     let max_len = s.max_len.min(cfg.max_position_embeddings.max(8));
-    Ok(ProfileInput { checkpointing: s.gradient_checkpointing, devices: s.devices.len().max(1), lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
-                      cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg })
+    let mut s = s.clone();
+    s.apply_freeze_bottom(cfg.num_hidden_layers).map_err(|e| e.to_string())?;
+    let devices = s.devices.len().max(1);
+    let stream = s.stream_layers.map(|mode| {
+        let on_gpu = s.devices.iter().any(|d| d.starts_with("cuda"));
+        let skip = if s.cache_dir.is_some() { s.lora.first_trained(cfg.num_hidden_layers) } else { 0 };
+        let store = strata_workshop::layer_stream::block_stream_bytes(&cfg, s.base_dtype) * (cfg.num_hidden_layers - skip) as u64;
+        let (tier, _) = strata_workshop::layer_stream::choose_tier(mode, store, strata_workshop::layer_stream::ram_available());
+        let rates: Vec<f64> = if !bandwidth.is_empty() {
+            bandwidth.iter().map(|g| g * 1e9).collect()
+        } else {
+            // the cards the run names, by index (cuda:N), from the links in sysfs
+            let links = strata_workshop::layer_stream::gpu_link_rates();
+            s.devices.iter().filter_map(|d| d.strip_prefix("cuda:")?.parse::<usize>().ok()).map(|i| links.get(i).map_or(strata_workshop::layer_stream::DEFAULT_LINK_BYTES_S, |l| l.1)).collect()
+        };
+        StreamProfile { mode, tier, buffers: s.stream_buffers, rates, on_gpu }
+    });
+    Ok(ProfileInput { checkpointing: s.gradient_checkpointing || stream.is_some(), devices, lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
+                      cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg, stream })
 }
 
 fn os_threads() -> Option<u64> {
@@ -879,7 +953,7 @@ fn moe_training_plan(cfg: &ModelConfig) -> (Vec<String>, Value) {
     let cards = machine.gpus.len().max(1);
     let p = ProfileInput { cfg: cfg.clone(), lora: strata_workshop::model::LoraSpec { r: 16, alpha: 32.0, targets: Target::ALL.to_vec(), ..Default::default() },
                            base_dtype: BaseDtype::BF16, max_len: 1024, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: 512,
-                           checkpointing: true, devices: cards };
+                           checkpointing: true, devices: cards, stream: None };
     let e = profile::estimate(&p);
     let card = profile::card_bytes(&e);
     let mut lines = vec![format!("training (rank 16, all targets, 1,024 tokens, checkpointing, bf16 base, {cards} GPU(s)): about {} on the busiest card, {} trainable",
@@ -1137,10 +1211,14 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             }
             out.event(json!({"event": "log", "message": format!("the base is held in {}; a 4-bit base (QLoRA) is not done in this trainer", s.base_dtype.as_str())}));
             // the estimate first: a run that will not fit is refused before it loads anything
-            let p = profile_input(&s, cfg, None, None)?;
+            let p = profile_input(&s, cfg, None, None, &run.stream_bandwidth)?;
             let est = profile::estimate(&p);
             let machine = Machine::detect();
-            for l in profile::report_lines(&p, &est, &machine).into_iter().skip(1).take(4) {
+            let lines = profile::report_lines(&p, &est, &machine);
+            let streamed: Vec<String> = lines.iter().filter(|l| l.starts_with("layer streaming") || l.starts_with("PCIe") || l.starts_with("host RAM for")
+                                                              || l.starts_with("disk for the shard")).cloned().collect();
+            let first: Vec<String> = lines.into_iter().skip(1).take(4).filter(|l| !streamed.contains(l)).collect();
+            for l in first.into_iter().chain(streamed) {
                 out.event(json!({"event": "log", "message": l}));
             }
             let v = profile::verdict(&est, &machine);
@@ -1203,7 +1281,7 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                 return Err("--preset has no tokenizer to count --data with: give --examples and --avg-tokens".into());
             }
             let (s, notes) = run.settings(false)?;
-            let p = profile_input(&s, cfg, *examples, *avg_tokens)?;
+            let p = profile_input(&s, cfg, *examples, *avg_tokens, &run.stream_bandwidth)?;
             let est = profile::estimate(&p);
             let mut machine = Machine::detect();
             if let Some(g) = cpu_gflops {

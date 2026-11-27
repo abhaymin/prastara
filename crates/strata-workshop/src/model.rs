@@ -33,6 +33,8 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use candle_core::{CpuStorage, CustomOp1, CustomOp3, DType, Device, Layout, Shape, Tensor, Var, D};
 use serde_json::Value;
 
+use crate::layer_stream::{LayerStream, StreamBuilder, StreamOptions, Tier};
+
 /// The decoder families this forward pass covers (each checked against transformers).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Family {
@@ -1080,6 +1082,9 @@ pub struct Ctx {
     /// when set, every dense feed-forward pushes `(its input, silu(gate)·up)` here (detached): the calibration of a
     /// fine-grained upcycle ([`crate::moe_init`])
     pub probe: Option<RefCell<Vec<(Tensor, Tensor)>>>,
+    /// read the trained variables detached for the block running now (LISA: a block not sampled this interval keeps
+    /// its adapters as constants, so nothing is recorded for them); set and restored around each block
+    detach: Cell<bool>,
 }
 
 impl Ctx {
@@ -1092,7 +1097,7 @@ impl Ctx {
     }
     /// A trained variable as this pass reads it: detached under [`Ctx::no_grad`].
     fn var(&self, v: &Var) -> Tensor {
-        if self.no_grad { v.as_tensor().detach() } else { v.as_tensor().clone() }
+        if self.no_grad || self.detach.get() { v.as_tensor().detach() } else { v.as_tensor().clone() }
     }
     pub fn train(seed: u64) -> Self {
         Self { train: true, seed, ..Self::default() }
@@ -1435,6 +1440,29 @@ struct CheckpointBlock {
     /// the block's router losses ride in one extra row of the output (`[seq + 1, hidden]`, the values at `[seq, 0..2]`),
     /// so their gradient comes back through this node too
     with_aux: bool,
+    /// a streamed base: `block` holds no frozen matrices, the replay fetches them again ([`crate::layer_stream`])
+    stream: Option<StreamRef>,
+    /// the block is not sampled (LISA): the replay reads its adapters detached and returns only the input's gradient
+    detached: bool,
+}
+
+/// Where a streamed block's frozen matrices come from, and its place in the pass (for the prefetch).
+#[derive(Clone)]
+struct StreamRef {
+    s: std::sync::Arc<LayerStream>,
+    block: usize,
+    pos: Option<usize>,
+    generation: u64,
+}
+
+/// `template` with block `i`'s frozen matrices from the stream (its buffer, or loaded now).
+fn materialise(s: &LayerStream, i: usize, template: &Block) -> Result<Block> {
+    let ws = s.acquire(i)?;
+    let mut b = template.clone();
+    for (l, w) in b.lin.iter_mut().zip(ws) {
+        l.w = w;
+    }
+    Ok(b)
 }
 
 impl CustomOp1 for CheckpointBlock {
@@ -1459,8 +1487,18 @@ impl CustomOp1 for CheckpointBlock {
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let err = |e: anyhow::Error| candle_core::Error::Msg(format!("checkpointed block: {e}"));
         let x = Var::from_tensor(&arg.detach())?;
-        let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls), ..Ctx::default() };
-        let y = block_forward(&self.cfg, &self.block, x.as_tensor(), &self.rope, &self.mask, &ctx).map_err(err)?;
+        let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls), detach: Cell::new(self.detached), ..Ctx::default() };
+        let block = match &self.stream {
+            Some(r) => {
+                let b = materialise(&r.s, r.block, &self.block).map_err(err)?;
+                if let Some(p) = r.pos {
+                    r.s.after_replay(p, r.generation).map_err(err)?;
+                }
+                b
+            }
+            None => self.block.clone(),
+        };
+        let y = block_forward(&self.cfg, &block, x.as_tensor(), &self.rope, &self.mask, &ctx).map_err(err)?;
         let (seq, g) = (y.dim(0)?, grad_res.detach());
         let mut total = (y * g.narrow(0, 0, seq)?)?.sum_all()?;
         if self.with_aux {
@@ -1468,6 +1506,7 @@ impl CustomOp1 for CheckpointBlock {
             total = (total + (aux * g.get(seq)?.narrow(0, 0, 2)?)?.sum_all()?)?;
         }
         let grads = total.backward()?;
+        drop(block);
         let mut out = self.grads.lock().map_err(|_| candle_core::Error::Msg("checkpoint gradients: lock".into()))?;
         for v in self.block.lora_vars() {
             if let Some(g) = grads.get(&v) {
@@ -1478,16 +1517,23 @@ impl CustomOp1 for CheckpointBlock {
     }
 }
 
-/// See [`CheckpointBlock`].
-fn checkpointed(cfg: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx, grads: &CkptGrads) -> Result<Tensor> {
+/// See [`CheckpointBlock`]. `block` is the block as the model holds it; `run` is it with its frozen matrices (the
+/// same block unless the base is streamed, when `block` holds none and the node keeps only that).
+#[allow(clippy::too_many_arguments)]
+fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx, grads: &CkptGrads, active: bool,
+                stream: Option<StreamRef>) -> Result<Tensor> {
     let calls = ctx.calls.get();
-    let sub = Ctx { train: ctx.train, seed: ctx.seed, calls: Cell::new(calls), ..Ctx::default() };
-    let value = block_forward(cfg, block, &x.detach(), rope, mask, &sub)?.detach();
+    let sub = Ctx { train: ctx.train, seed: ctx.seed, calls: Cell::new(calls), detach: Cell::new(ctx.detach.get()), ..Ctx::default() };
+    let value = block_forward(cfg, run, &x.detach(), rope, mask, &sub)?.detach();
     ctx.calls.set(sub.calls.get());
     let aux = sub.aux.borrow_mut().pop().map(|a| a.detach());
-    if !x.track_op() && !block.has_lora() {
+    if !x.track_op() && !(block.has_lora() && active) {
         return Ok(value);
     }
+    if let Some(p) = stream.as_ref().and_then(|r| r.pos) {
+        stream.as_ref().unwrap().s.mark_replayed(p);
+    }
+    let kept = if stream.is_some() { block.clone() } else { run.clone() };
     let seq = value.dim(0)?;
     let packed = match &aux {
         Some(a) => {
@@ -1499,8 +1545,8 @@ fn checkpointed(cfg: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Te
     };
     // the input may not descend from a variable (the first trained block): give the node something to hang from
     let x_in = if x.track_op() { x.clone() } else { Var::from_tensor(&x.detach())?.as_tensor().clone() };
-    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: block.clone(), rope: rope.clone(), mask: mask.clone(),
-                                               train: ctx.train, seed: ctx.seed, calls, grads: grads.clone(), with_aux: aux.is_some() })?;
+    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: kept, rope: rope.clone(), mask: mask.clone(),
+                                               train: ctx.train, seed: ctx.seed, calls, grads: grads.clone(), with_aux: aux.is_some(), stream, detached: !active })?;
     if aux.is_none() {
         return Ok(out);
     }
@@ -1533,6 +1579,10 @@ pub struct LlamaModel {
     ckpt_grads: CkptGrads,
     /// run at most this many passes of the loop (1: the base's own pass only); `None`: all of them
     passes_cap: Option<usize>,
+    /// the frozen matrices of the blocks stream from host memory or disk ([`LlamaModel::load_streamed`])
+    stream: Option<std::sync::Arc<LayerStream>>,
+    /// LISA: the blocks whose adapters train now (`None`: all)
+    active: Option<Vec<bool>>,
 }
 
 /// Gradients of adapter variables found while recomputing checkpointed blocks: (variable, gradient).
@@ -1668,6 +1718,38 @@ impl LlamaModel {
     }
 
     pub fn load_parts_on(dir: &Path, base_dtype: BaseDtype, devs: &[Device], blocks_wanted: std::ops::Range<usize>, with_embeddings: bool, with_head: bool) -> Result<Self> {
+        Self::load_impl(dir, base_dtype, devs, blocks_wanted, with_embeddings, with_head, None)
+    }
+
+    /// As [`load_parts_on`](Self::load_parts_on), with the blocks' frozen matrices streamed ([`crate::layer_stream`]):
+    /// held in host memory (the RAM tier, page-locked on CUDA where it can be) or in a shard cache on disk (made
+    /// first when missing), and copied to the block's device only while it runs. Norms, biases, routers, adapters,
+    /// the final norm and the head stay on the devices. `on_log` hears the tier and how the copies run.
+    pub fn load_streamed(dir: &Path, base_dtype: BaseDtype, devs: &[Device], blocks_wanted: std::ops::Range<usize>, with_embeddings: bool, with_head: bool,
+                         opts: &StreamOptions, on_log: &mut dyn FnMut(String)) -> Result<Self> {
+        let cfg = ModelConfig::load(dir)?;
+        let store = crate::layer_stream::block_stream_bytes(&cfg, base_dtype) * blocks_wanted.len() as u64;
+        let (tier, note) = crate::layer_stream::choose_tier(opts.mode, store, crate::layer_stream::ram_available());
+        if let Some(n) = note {
+            on_log(n);
+        }
+        let shards = match tier {
+            Tier::Disk => {
+                let root = opts.cache_root.clone().unwrap_or_else(crate::layer_stream::default_cache_root);
+                Some(crate::layer_stream::build_shard_cache(dir, base_dtype, &root, on_log)?)
+            }
+            Tier::Ram => None,
+        };
+        let m = Self::load_impl(dir, base_dtype, devs, blocks_wanted, with_embeddings, with_head, Some((tier, opts.buffers, shards)))?;
+        if let Some(s) = &m.stream {
+            on_log(format!("layer streaming ({} tier, {} buffers a device, {:.1} MB a block): {}", s.tier.as_str(), s.buffers, s.block_bytes() as f64 / 1e6,
+                           s.notes.join("; ")));
+        }
+        Ok(m)
+    }
+
+    fn load_impl(dir: &Path, base_dtype: BaseDtype, devs: &[Device], blocks_wanted: std::ops::Range<usize>, with_embeddings: bool, with_head: bool,
+                 stream: Option<(Tier, usize, Option<PathBuf>)>) -> Result<Self> {
         if devs.is_empty() {
             bail!("no device to load the model on");
         }
@@ -1709,6 +1791,14 @@ impl LlamaModel {
             None => HashMap::new(),
         };
 
+        let mut builder = match stream {
+            Some((tier, buffers, shards)) => Some(StreamBuilder::new(&cfg, base_dtype.dtype(), tier, buffers, devs, &block_dev, shards)?),
+            None => None,
+        };
+        let streamed = builder.is_some();
+        let on_disk = builder.as_ref().is_some_and(|b| b.tier() == Tier::Disk);
+        // what a streamed block holds in place of a matrix (never computed with)
+        let placeholder = Tensor::zeros(0, base_dtype.dtype(), &Device::Cpu)?;
         let mut blocks = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
             if !blocks_wanted.contains(&i) {
@@ -1717,7 +1807,6 @@ impl LlamaModel {
             }
             let p = |k: &str| format!("{prefix}layers.{i}.{k}");
             let bdev = &devs[block_dev[i]];
-            let matrix = |name: &str| matrix_on(name, bdev);
             let vector = |name: &str| vector_on(name, bdev);
             let mut lin = Vec::with_capacity(7);
             let perm = match fine {
@@ -1730,17 +1819,28 @@ impl LlamaModel {
             };
             for t in Target::ALL {
                 let name = p(&format!("{}.{}.weight", t.module(), t.as_str()));
+                let (o, in_) = cfg.target_shape(t);
+                // streamed: the matrix stays in host memory (RAM tier) or in the shard cache (disk tier)
+                let host = if streamed { &Device::Cpu } else { bdev };
                 let w = match (&perm, t.module()) {
+                    _ if on_disk => {
+                        let view = st.get(&name).with_context(|| format!("{}: tensor {name}", dir.display()))?;
+                        if view.shape() != [o, in_] {
+                            bail!("{name} has shape {:?}, the config says {:?}", view.shape(), [o, in_]);
+                        }
+                        placeholder.clone()
+                    }
                     // the feed-forward's neurons in group order: gate and up rows, down columns (the same function)
                     (Some(perm), "mlp") => {
                         let w = st.load(&name, &Device::Cpu).with_context(|| format!("{}: tensor {name}", dir.display()))?;
                         let w = w.index_select(perm, if t == Target::Down { 1 } else { 0 })?;
-                        w.to_dtype(base_dtype.dtype())?.to_device(bdev)?
+                        w.to_dtype(base_dtype.dtype())?.to_device(host)?
                     }
-                    _ => matrix(&name)?,
+                    _ => matrix_on(&name, host)?,
                 };
-                let (o, in_) = cfg.target_shape(t);
-                expect(&w, &[o, in_], &name)?;
+                if !on_disk {
+                    expect(&w, &[o, in_], &name)?;
+                }
                 let bias_name = p(&format!("{}.{}.bias", t.module(), t.as_str()));
                 let bias = if names.contains_key(&bias_name) { Some(vector(&bias_name)?) } else { None };
                 lin.push(Linear { w, bias, lora: None });
@@ -1749,6 +1849,12 @@ impl LlamaModel {
             let (q_norm, k_norm) = (opt("self_attn.q_norm.weight")?, opt("self_attn.k_norm.weight")?);
             if cfg.family == Family::Qwen3 && (q_norm.is_none() || k_norm.is_none()) {
                 bail!("a Qwen3 model without self_attn.q_norm / k_norm in block {i}");
+            }
+            if let Some(b) = builder.as_mut() {
+                match b.tier() {
+                    Tier::Ram => b.put_ram(i, lin.iter_mut().map(|l| std::mem::replace(&mut l.w, placeholder.clone())).collect())?,
+                    Tier::Disk => b.put_disk(i)?,
+                }
             }
             let mut block = Block { lin, norm1: vector(&p("input_layernorm.weight"))?, norm2: vector(&p("post_attention_layernorm.weight"))?, q_norm, k_norm,
                                     moe: None, init_router: None };
@@ -1793,8 +1899,25 @@ impl LlamaModel {
                 loop_gates.push(Var::from_tensor(&g)?);
             }
         }
+        let stream = builder.map(|b| b.build()).transpose()?.map(std::sync::Arc::new);
         Ok(Self { cfg, base_dtype, embed, blocks, norm, lm_head, first_trained: 0, spec: None, dev: dev.clone(), loop_gates,
-                  devs: devs.to_vec(), block_dev, checkpoint: false, ckpt_grads: Default::default(), passes_cap: None })
+                  devs: devs.to_vec(), block_dev, checkpoint: false, ckpt_grads: Default::default(), passes_cap: None, stream, active: None })
+    }
+
+    /// The streamed base, when the model was loaded with [`load_streamed`](Self::load_streamed).
+    pub fn stream(&self) -> Option<&LayerStream> {
+        self.stream.as_deref()
+    }
+
+    /// LISA: only the adapters (and routers) of `blocks` train from now on; the others are read as constants, so no
+    /// gradient is recorded for them (and a block below every trained one needs no backward pass at all). `None`:
+    /// every block with adapters trains.
+    pub fn set_active_blocks(&mut self, blocks: Option<&[usize]>) {
+        self.active = blocks.map(|b| (0..self.cfg.num_hidden_layers).map(|i| b.contains(&i)).collect());
+    }
+
+    fn is_active(&self, i: usize) -> bool {
+        self.active.as_ref().is_none_or(|a| a.get(i).copied().unwrap_or(true))
     }
 
     pub fn device(&self) -> &Device {
@@ -2144,11 +2267,33 @@ impl LlamaModel {
         Ok((Tensor::from_vec(cos, (seq, hd), dev)?, Tensor::from_vec(sin, (seq, hd), dev)?))
     }
 
-    fn block_forward(&self, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
-        if !ctx.no_grad && (self.checkpoint && x.track_op() || self.checkpoint && block.has_lora()) {
-            return checkpointed(&self.cfg, block, x, rope, mask, ctx, &self.ckpt_grads);
-        }
-        block_forward(&self.cfg, block, x, rope, mask, ctx)
+    /// Block `i` (`block`), at position `pos` of the pass begun with generation `generation` when the base is
+    /// streamed: its frozen matrices fetched first and the next block's prefetched, its adapters detached when LISA
+    /// has not sampled it, checkpointed when that is on and anything here needs a gradient.
+    #[allow(clippy::too_many_arguments)]
+    fn block_forward(&self, i: usize, pos: Option<(usize, u64)>, block: &Block, x: &Tensor, rope: &(Tensor, Tensor), mask: &Mask, ctx: &Ctx) -> Result<Tensor> {
+        let active = self.is_active(i);
+        let sref = self.stream.as_ref().filter(|s| s.has_block(i))
+            .map(|s| StreamRef { s: s.clone(), block: i, pos: pos.map(|p| p.0), generation: pos.map_or(0, |p| p.1) });
+        let fetched;
+        let run = match &sref {
+            Some(r) => {
+                fetched = materialise(&r.s, i, block)?;
+                if let Some(p) = r.pos {
+                    r.s.after_forward(p)?;
+                }
+                &fetched
+            }
+            None => block,
+        };
+        let prev = ctx.detach.replace(!active);
+        let out = if !ctx.no_grad && self.checkpoint && (x.track_op() || block.has_lora() && active) {
+            checkpointed(&self.cfg, block, run, x, rope, mask, ctx, &self.ckpt_grads, active, sref)
+        } else {
+            block_forward(&self.cfg, run, x, rope, mask, ctx)
+        };
+        ctx.detach.set(prev);
+        out
     }
 }
 
@@ -2249,6 +2394,21 @@ impl LlamaModel {
                 per_dev[d] = Some((self.rope(seq, &self.devs[d])?, full, sw));
             }
         }
+        // a streamed base is told the order the blocks run in (the loop's again for each extra pass), to prefetch
+        let generation = self.stream.as_ref().map(|s| {
+            let mut order = Vec::new();
+            for i in range.clone() {
+                order.push(i);
+                if let Some(l) = self.cfg.loop_.filter(|l| i + 1 == l.end && range.start <= l.start) {
+                    let extra = self.passes_cap.map_or(self.loop_gates.len(), |c| c.saturating_sub(1)).min(self.loop_gates.len());
+                    for _ in 0..extra {
+                        order.extend(l.start..l.end);
+                    }
+                }
+            }
+            s.begin(order)
+        });
+        let position = Cell::new(0usize);
         // one block on its own device: the hidden state (and, backwards, its gradient) moves when the device changes
         let step = |j: usize, x: &Tensor| -> Result<Tensor> {
             let b = self.blocks[j].as_ref().ok_or_else(|| anyhow!("block {j} is not in memory (the activation cache stands in for it)"))?;
@@ -2257,7 +2417,8 @@ impl LlamaModel {
                 Some(m) if self.cfg.layer_sliding.get(j) == Some(&true) => m,
                 _ => full,
             };
-            self.block_forward(b, &move_to(x, &self.devs[self.block_dev[j]])?, rope, mask, ctx)
+            let pos = position.replace(position.get() + 1);
+            self.block_forward(j, generation.map(|g| (pos, g)), b, &move_to(x, &self.devs[self.block_dev[j]])?, rope, mask, ctx)
         };
         if let Some(l) = self.cfg.loop_ {
             if range.start > l.start && range.start < l.end {
@@ -2303,7 +2464,7 @@ impl LlamaModel {
         };
         let above = if ctx.no_grad { ATTENTION_CHUNK.load(std::sync::atomic::Ordering::Relaxed) } else { CHUNKED_ABOVE.load(std::sync::atomic::Ordering::Relaxed) };
         let mask = if seq > above { Mask::Causal { window } } else { Mask::Table(self.window_mask(seq, window, dev)?) };
-        self.block_forward(b, &move_to(x, dev)?, &self.rope(seq, dev)?, &mask, ctx)
+        self.block_forward(i, None, b, &move_to(x, dev)?, &self.rope(seq, dev)?, &mask, ctx)
     }
 
     /// The mean next-token cross-entropy of the final hidden state `x` (before the final norm) over the supervised
@@ -2325,6 +2486,9 @@ impl LlamaModel {
     /// block is in memory.
     pub fn block_weight(&self, i: usize, t: Target) -> Option<Tensor> {
         let ti = Target::ALL.iter().position(|x| *x == t)?;
+        if let Some(s) = self.stream.as_ref().filter(|s| s.has_block(i)) {
+            return s.acquire(i).ok().map(|w| w[ti].clone());
+        }
         self.blocks.get(i)?.as_ref().map(|b| b.lin[ti].w.clone())
     }
 

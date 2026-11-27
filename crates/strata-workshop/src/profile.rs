@@ -17,6 +17,15 @@
 //! - *cache fill*: before training, the activation cache is filled holding the embeddings, then one frozen block at a
 //!   time; the peak is the larger of that and the training itself.
 //!
+//! **Layer streaming** (after Soup's `training.stream_layers` planner, Apache-2.0): a device holds `buffers` blocks'
+//! frozen matrices instead of its share of the base, plus its blocks' norms, the adapters, AdamW, the gradients, the
+//! checkpointed activations and (the last) the head; host RAM holds the streamed base (the RAM tier) or the disk holds
+//! it as a shard cache (the disk tier). Each streamed block is read twice per conversation — forward and in the
+//! checkpoint replay — so a step moves `2 · blocks · block bytes · accumulation` over PCIe; over each card's link rate
+//! ([`crate::layer_stream::gpu_link_rates`], or `--stream-bandwidth`) that is the transfer time, which a pinned RAM
+//! tier overlaps with the compute (the slowdown is then max(compute, transfer) / compute) and the disk tier does not
+//! (compute + transfer).
+//!
 //! **Time** is rougher: floating-point operations (two per weight per token forward, twice that again backward
 //! through the trained part, the frozen part forward only, and only once per conversation with the cache) over a
 //! throughput in GFLOP/s — measured on this CPU by a short matrix product ([`measure_cpu_gflops`]), assumed for a GPU.
@@ -27,6 +36,7 @@ use anyhow::{bail, Result};
 use candle_core::{Device, Tensor};
 use serde_json::{json, Value};
 
+use crate::layer_stream::{StreamMode, Tier};
 use crate::model::{BaseDtype, Family, LoraSpec, ModelConfig, MoeSpec, Target};
 
 /// Share of a raw matrix-product benchmark that training really reaches on the CPU (the rest goes to memory traffic
@@ -68,6 +78,51 @@ pub struct ProfileInput {
     pub checkpointing: bool,
     /// how many devices the blocks are split over (1: one)
     pub devices: usize,
+    /// layer streaming (None: the base is held on the devices)
+    pub stream: Option<StreamProfile>,
+}
+
+/// How a streamed run is planned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamProfile {
+    /// as asked (`auto` is resolved into `tier` by the caller from the free RAM)
+    pub mode: StreamMode,
+    pub tier: Tier,
+    pub buffers: usize,
+    /// each device's host-to-device rate in bytes/s, in device order (missing ones: the last, or
+    /// [`crate::layer_stream::DEFAULT_LINK_BYTES_S`])
+    pub rates: Vec<f64>,
+    /// the devices are GPUs (on the CPU the "device" memory is the RAM too)
+    pub on_gpu: bool,
+}
+
+/// What a streamed run needs and costs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StreamEstimate {
+    pub mode: StreamMode,
+    pub tier: Tier,
+    pub buffers: usize,
+    /// one block's streamed matrices
+    pub block_bytes: u64,
+    /// each device's buffers (`buffers` blocks)
+    pub buffer_bytes: u64,
+    /// each device's need, without CUDA's own overhead
+    pub device_bytes: Vec<u64>,
+    /// host RAM the streamed base needs: the whole store (RAM tier), or one block in flight per device (disk tier); the
+    /// embedding table (kept in RAM on a GPU run) included
+    pub host_bytes: u64,
+    /// the disk tier's shard cache (0 for the RAM tier)
+    pub disk_bytes: u64,
+    /// bytes over PCIe per conversation (each block read forward and again in its replay) and per optimizer step
+    pub bytes_per_conversation: u64,
+    pub bytes_per_step: u64,
+    pub transfer_seconds_per_step: f64,
+    pub compute_seconds_per_step: f64,
+    /// (compute + transfer overlapped) / compute, and (compute + transfer one after the other) / compute
+    pub slowdown_overlapped: f64,
+    pub slowdown_serial: f64,
+    /// the slowdown to expect: overlapped for the RAM tier (page-locked, a second CUDA stream), serial for the disk tier
+    pub slowdown: f64,
 }
 
 /// The estimate, part by part.
@@ -95,6 +150,8 @@ pub struct Estimate {
     pub flops: f64,
     /// how the base is held (the CPU's speed depends on it)
     pub base_dtype: BaseDtype,
+    /// layer streaming's part (None: not streamed)
+    pub stream: Option<StreamEstimate>,
 }
 
 /// f32 values per token that one trained block keeps for the backward pass, counted from `model.rs`'s forward:
@@ -157,6 +214,14 @@ fn base_bytes(cfg: &ModelConfig, dtype: BaseDtype, blocks: usize, with_embedding
 
 /// The estimate for `p`. Pure arithmetic: no file, no machine.
 pub fn estimate(p: &ProfileInput) -> Estimate {
+    // streaming always checkpoints (the replay is what reads each block again)
+    let forced;
+    let p = if p.stream.is_some() && !p.checkpointing {
+        forced = ProfileInput { checkpointing: true, ..p.clone() };
+        &forced
+    } else {
+        p
+    };
     let cfg = &p.cfg;
     let layers = cfg.num_hidden_layers;
     let first = p.lora.first_trained(layers);
@@ -229,12 +294,107 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
         0
     };
 
-    Estimate {
+    let mut e = Estimate {
         total_params: cfg.total_params(), trainable_params: trainable, trained_blocks: trained, weights_bytes: weights, adapter_bytes: adapter,
         optimizer_bytes: 2 * adapter, gradient_bytes: 2 * adapter, activation_bytes: activations, widening_bytes: widening, fill_bytes: fill,
         total_bytes: total, per_device_bytes: per_device,
         cache_disk_bytes: if cached { (p.examples * p.avg_tokens.clamp(2, seq) * cfg.hidden_size * 4) as u64 } else { 0 },
-        steps, flops, base_dtype: p.base_dtype,
+        steps, flops, base_dtype: p.base_dtype, stream: None,
+    };
+    if let Some(sp) = &p.stream {
+        let parts = StreamParts { first, cached, seq, one_block, head, frozen, widening, chunk: chunk_bytes(cfg, seq) as u64 };
+        let st = stream_estimate(p, sp, &e, &parts);
+        // a GPU run: the cards hold what `device_bytes` says, the RAM the streamed base; on the CPU both are RAM
+        e.weights_bytes = st.host_bytes + st.buffer_bytes * p.devices.max(1) as u64;
+        e.per_device_bytes = st.device_bytes.iter().copied().max().unwrap_or(0);
+        e.total_bytes = if sp.on_gpu { st.host_bytes } else { st.host_bytes + st.device_bytes.iter().sum::<u64>() }.max(fill);
+        e.stream = Some(st);
+    }
+    e
+}
+
+/// The pieces of [`estimate`] a streamed plan reuses.
+struct StreamParts {
+    first: usize,
+    cached: bool,
+    seq: usize,
+    /// one checkpointed block's activations (recomputed at a time)
+    one_block: f64,
+    /// the head's loss slice
+    head: f64,
+    /// the frozen part's working set (no backward)
+    frozen: f64,
+    widening: u64,
+    chunk: u64,
+}
+
+/// Layer streaming's memory per device, host RAM, disk and PCIe time (see the module).
+fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &StreamParts) -> StreamEstimate {
+    let cfg = &p.cfg;
+    let layers = cfg.num_hidden_layers;
+    let d = p.devices.max(1);
+    let placement = crate::model::block_devices(cfg, d);
+    let block_bytes = crate::layer_stream::block_stream_bytes(cfg, p.base_dtype);
+    let small = cfg.block_small_params() * 4;
+    let loaded = if x.cached { x.first } else { 0 }..layers;
+    // how often each block runs a conversation: once, and once more per extra loop pass when it is in the loop
+    let runs = |i: usize| 1 + cfg.loop_.filter(|l| (l.start..l.end).contains(&i) && loaded.start <= l.start).map_or(0, |l| l.passes - 1);
+    let emb = (cfg.vocab_size * cfg.hidden_size) as u64 * p.base_dtype.bytes();
+    let trained_runs: usize = (x.first..layers).map(runs).sum::<usize>().max(1);
+    let mut dev = vec![0u64; d];
+    let mut reads = vec![0u64; d];
+    let mut has_trained = vec![false; d];
+    for i in loaded.clone() {
+        let k = placement[i];
+        dev[k] += small;
+        let r = runs(i) as u64;
+        // forward, and the replay of a trained block
+        reads[k] += r * block_bytes * if i >= x.first { 2 } else { 1 };
+        if i >= x.first {
+            has_trained[k] = true;
+            // its share of the adapters, AdamW and gradients (5 copies), and the inputs its checkpoints keep
+            dev[k] += (5 * e.adapter_bytes) * r / trained_runs as u64;
+            dev[k] += r * 4 * (x.seq * cfg.hidden_size) as u64;
+        }
+    }
+    for k in 0..d {
+        let blocks_here = loaded.clone().any(|i| placement[i] == k);
+        if blocks_here {
+            dev[k] += sp.buffers as u64 * block_bytes + x.widening + x.chunk;
+        }
+        if has_trained[k] {
+            dev[k] += x.one_block as u64;
+        }
+    }
+    if x.first > 0 && !x.cached {
+        dev[0] += x.frozen as u64;
+    }
+    // the head (and its loss slice) on the last device; a tied table is the head and sits on the first
+    dev[d - 1] += x.head as u64 + cfg.hidden_size as u64 * 4;
+    if cfg.tie_word_embeddings {
+        dev[0] += emb;
+    } else {
+        dev[d - 1] += emb;
+    }
+    let streamed = block_bytes * loaded.len() as u64;
+    // an untied table stays in RAM on a GPU run (only a few rows a step are looked up)
+    let table_in_ram = if !cfg.tie_word_embeddings && sp.on_gpu && loaded.start == 0 { emb } else { 0 };
+    let (host, disk) = match sp.tier {
+        Tier::Ram => (streamed + table_in_ram, 0),
+        Tier::Disk => (d as u64 * 2 * block_bytes + table_in_ram, streamed),
+    };
+    let micro: u64 = reads.iter().sum();
+    let rate = |k: usize| sp.rates.get(k).or(sp.rates.last()).copied().filter(|r| *r > 0.0).unwrap_or(crate::layer_stream::DEFAULT_LINK_BYTES_S);
+    let transfer_micro: f64 = (0..d).map(|k| reads[k] as f64 / rate(k)).sum();
+    let acc = p.accumulation.max(1) as f64;
+    let passes = (p.examples as f64 * p.epochs).max(1.0);
+    let compute_micro = e.flops / passes / (ASSUMED_GPU_GFLOPS * 1e9);
+    let (c, t) = (compute_micro * acc, transfer_micro * acc);
+    let (over, serial) = if c > 0.0 { (c.max(t) / c, (c + t) / c) } else { (1.0, 1.0) };
+    StreamEstimate {
+        mode: sp.mode, tier: sp.tier, buffers: sp.buffers, block_bytes, buffer_bytes: sp.buffers as u64 * block_bytes, device_bytes: dev, host_bytes: host,
+        disk_bytes: disk, bytes_per_conversation: micro, bytes_per_step: micro * p.accumulation.max(1) as u64, transfer_seconds_per_step: t,
+        compute_seconds_per_step: c, slowdown_overlapped: over, slowdown_serial: serial, slowdown: if sp.tier == Tier::Ram { over } else { serial },
     }
 }
 
@@ -410,17 +570,36 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
         format!("trained: {} adapter parameters ({:.3} % of the model) at rank {} on {} in the top {} of {} blocks",
                 e.trainable_params, 100.0 * e.trainable_params as f64 / e.total_params.max(1) as f64, p.lora.r,
                 p.lora.targets.iter().map(|t| t.as_str()).collect::<Vec<_>>().join(","), e.trained_blocks, p.cfg.num_hidden_layers),
-        format!("memory: weights {} + adapters {} + optimiser {} + gradients {} + activations at {} tokens {}{} = {}",
-                human_bytes(e.weights_bytes), human_bytes(e.adapter_bytes), human_bytes(e.optimizer_bytes), human_bytes(e.gradient_bytes), p.max_len,
-                human_bytes(e.activation_bytes), if e.widening_bytes > 0 { format!(" + widening one 16-bit matrix {}", human_bytes(e.widening_bytes)) } else { String::new() },
-                human_bytes(e.total_bytes)),
+        match &e.stream {
+            None => format!("memory: weights {} + adapters {} + optimiser {} + gradients {} + activations at {} tokens {}{} = {}",
+                            human_bytes(e.weights_bytes), human_bytes(e.adapter_bytes), human_bytes(e.optimizer_bytes), human_bytes(e.gradient_bytes), p.max_len,
+                            human_bytes(e.activation_bytes), if e.widening_bytes > 0 { format!(" + widening one 16-bit matrix {}", human_bytes(e.widening_bytes)) } else { String::new() },
+                            human_bytes(e.total_bytes)),
+            Some(st) => format!("memory (streamed): on the devices adapters {} + optimiser {} + gradients {} + checkpointed activations at {} tokens + {} buffers of one \
+                                 block {} each{}; the streamed base {} (below)", human_bytes(e.adapter_bytes), human_bytes(e.optimizer_bytes), human_bytes(e.gradient_bytes),
+                                p.max_len, st.buffers, human_bytes(st.block_bytes),
+                                if e.widening_bytes > 0 { format!(" + widening one 16-bit matrix {}", human_bytes(e.widening_bytes)) } else { String::new() },
+                                if st.tier == Tier::Ram { "in RAM" } else { "on disk" }),
+        },
     ];
     if let Some(m) = p.cfg.moe {
         let (total, active) = m.params(&p.cfg);
         out.push(format!("upcycled: {} experts, top-{} per token; exported it has {:.2} B parameters, {:.2} B active per token (the training holds the dense base and the experts' adapters)",
                          m.experts, m.top_k, total as f64 / 1e9, active as f64 / 1e9));
     }
-    if e.per_device_bytes > 0 {
+    if let Some(st) = &e.stream {
+        out.push(format!("layer streaming ({} tier{}, {} buffers): each device holds {} buffers of {} instead of its blocks; per device {}",
+                         st.tier.as_str(), if st.mode == StreamMode::Auto { ", chosen by auto" } else { "" }, st.buffers, st.buffers, human_bytes(st.block_bytes),
+                         st.device_bytes.iter().map(|b| human_bytes(*b)).collect::<Vec<_>>().join(" / ")));
+        out.push(match st.tier {
+            Tier::Ram => format!("host RAM for the streamed base: {} (page-locked where it can be)", human_bytes(st.host_bytes)),
+            Tier::Disk => format!("disk for the shard cache: {} (made once per model); host RAM in flight: {}", human_bytes(st.disk_bytes), human_bytes(st.host_bytes)),
+        });
+        out.push(format!("PCIe: {} a conversation ({} a step: each block forward and again in its replay), about {:.1} s a step against {:.1} s of compute: \
+                          {:.2}x slower overlapped, {:.2}x if not ({:.2}x expected for the {} tier)",
+                         human_bytes(st.bytes_per_conversation), human_bytes(st.bytes_per_step), st.transfer_seconds_per_step, st.compute_seconds_per_step,
+                         st.slowdown_overlapped, st.slowdown_serial, st.slowdown, st.tier.as_str()));
+    } else if e.per_device_bytes > 0 {
         out.push(format!("split over the devices: about {} on the busiest (the last, which also holds the head)", human_bytes(e.per_device_bytes)));
     }
     if e.cache_disk_bytes > 0 {
@@ -430,6 +609,7 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
     out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on 16 GB-class GPUs ({:.0} GFLOP/s, measured on a two-card RTX 5060 Ti run; train with --devices cuda:0[,cuda:1] in a cuda build)",
                      e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * cpu_training_efficiency(e.base_dtype), human_seconds(v.gpu_seconds), ASSUMED_GPU_GFLOPS));
     out.push(match v.fits_ram {
+        Some(true) if e.stream.is_some() => format!("fits the RAM: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         Some(true) => format!("fits: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         Some(false) => format!("DOES NOT FIT: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         None => format!("needs {} with headroom; this system does not say how much RAM is free", human_bytes(v.need_bytes)),
@@ -505,6 +685,11 @@ pub fn estimate_json(p: &ProfileInput, e: &Estimate, m: &Machine) -> Value {
         "card_bytes": v.card_bytes, "cuda_overhead_bytes": CUDA_OVERHEAD_BYTES, "per_device_bytes": e.per_device_bytes,
         "gpu_fit": suggest_gpu_fit(p, m).map(|(r, len, need)| json!({"rank": r, "max_len": len, "card_bytes": need})),
         "fits_gpu_idle": v.fits_gpu_idle.iter().map(|(i, f)| json!({"index": i, "fits": f})).collect::<Vec<_>>(),
+        "stream": e.stream.as_ref().map(|st| json!({"mode": st.mode.as_str(), "tier": st.tier.as_str(), "buffers": st.buffers, "block_bytes": st.block_bytes,
+            "buffer_bytes": st.buffer_bytes, "device_bytes": st.device_bytes, "host_bytes": st.host_bytes, "disk_bytes": st.disk_bytes,
+            "bytes_per_conversation": st.bytes_per_conversation, "bytes_per_step": st.bytes_per_step, "transfer_seconds_per_step": st.transfer_seconds_per_step,
+            "compute_seconds_per_step": st.compute_seconds_per_step, "slowdown_overlapped": st.slowdown_overlapped, "slowdown_serial": st.slowdown_serial,
+            "slowdown": st.slowdown})),
     })
 }
 
@@ -584,7 +769,7 @@ pub fn autopilot(a: &AutopilotInput) -> Result<Plan> {
                               train_layers: (train_layers < layers).then_some(train_layers), seed: 42 };
         // whenever blocks are frozen: besides the time over several epochs, it is what keeps them out of memory
         let cache = train_layers < layers;
-        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, checkpointing: false, devices: 1, epochs,
+        let e = estimate(&ProfileInput { cfg: a.cfg.clone(), lora: lora.clone(), base_dtype: dtype, max_len, accumulation, cache, examples: a.examples, checkpointing: false, devices: 1, epochs, stream: None,
                                          avg_tokens: a.avg_tokens.min(max_len) });
         (lora, cache, e)
     };
@@ -708,7 +893,7 @@ pub const DEFAULT_CARD_BYTES: u64 = 16_311 << 20;
 /// gradient checkpointing, a bf16 base, 4 conversations per step, the blocks split over `devices`.
 pub fn moe_profile(cfg: &ModelConfig, max_len: usize, devices: usize) -> ProfileInput {
     ProfileInput { cfg: cfg.clone(), lora: LoraSpec { r: 16, alpha: 32.0, targets: Target::ALL.to_vec(), ..Default::default() }, base_dtype: BaseDtype::BF16,
-                   max_len, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: max_len / 2, checkpointing: true, devices }
+                   max_len, accumulation: 4, cache: false, examples: 1000, epochs: 1.0, avg_tokens: max_len / 2, checkpointing: true, devices, stream: None }
 }
 
 /// The expert-training schemes for the upcycled `cfg` on `devices` cards of `card_total` bytes: expert ranks 16 to 2

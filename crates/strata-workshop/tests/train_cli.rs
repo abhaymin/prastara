@@ -235,3 +235,38 @@ fn a_soup_config_drives_the_trainer() {
     assert_eq!(events.last().unwrap()["steps"].as_u64(), Some(6));
     assert!(root.join("soup-out/adapter_config.json").exists());
 }
+
+/// Layer by layer from the command line: `--stream-layers` (bare: auto), `--lisa-*` and `--freeze-bottom` reach the
+/// estimate and the run; the flags that need another are refused without it.
+#[test]
+fn the_layer_by_layer_flags_estimate_and_train() {
+    let (root, model, data) = common::model_and_data("cli-layers");
+    let (events, ok) = run(&["profile", "--model", p(&model), "--data", p(&data), "--rank", "4", "--max-len", "64", "--stream-layers", "ram", "--stream-buffers", "3",
+                             "--freeze-bottom", "1", "--cpu-gflops", "50"]);
+    assert!(ok, "{events:?}");
+    let pr = of(&events, "profile")[0];
+    assert_eq!(pr["stream"]["tier"], "ram");
+    assert_eq!(pr["stream"]["buffers"], 3);
+    assert_eq!(pr["trained_blocks"], 2, "the bottom block frozen");
+    let lines: Vec<&str> = pr["lines"].as_array().unwrap().iter().filter_map(Value::as_str).collect();
+    assert!(lines.iter().any(|l| l.starts_with("PCIe:")) && lines.iter().any(|l| l.starts_with("layer streaming")), "{lines:?}");
+    // a run: streamed (bare flag = auto) with LISA, two steps
+    let out = root.join("adapter");
+    let mut args = vec!["train", "--model", p(&model), "--data", p(&data), "--out", p(&out), "--max-steps", "2", "--lisa-layers", "1", "--lisa-interval", "1",
+                        "--stream-layers"];
+    args.extend(SMALL);
+    let (events, ok) = run(&args);
+    assert!(ok, "{events:?}");
+    let logs: Vec<&str> = of(&events, "log").iter().filter_map(|e| e["message"].as_str()).collect();
+    assert!(logs.iter().any(|l| l.starts_with("layer streaming (ram tier")), "{logs:?}");
+    assert_eq!(logs.iter().filter(|l| l.starts_with("LISA: blocks")).count(), 2, "{logs:?}");
+    let report: Value = serde_json::from_str(&std::fs::read_to_string(out.join("training_report.json")).unwrap()).unwrap();
+    assert!(report["layer_stream"]["block_copies"].as_u64().unwrap() > 0 && report["lisa"]["layers"] == 1, "{report}");
+    for bad in [vec!["--stream-buffers", "3"], vec!["--lisa-interval", "4"], vec!["--stream-layers", "ram", "--stream-buffers", "1"], vec!["--freeze-bottom", "3"],
+                vec!["--stream-layers", "nvme"]] {
+        let mut a = vec!["profile", "--model", p(&model), "--data", p(&data)];
+        a.extend(bad.iter().copied());
+        let (events, ok) = run(&a);
+        assert!(!ok && !of(&events, "error").is_empty(), "{bad:?}: {events:?}");
+    }
+}

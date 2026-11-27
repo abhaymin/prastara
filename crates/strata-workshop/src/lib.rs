@@ -27,6 +27,7 @@ pub mod regress;
 pub mod engine;
 pub mod gradetrain;
 pub mod sandbox;
+pub mod layer_stream;
 pub mod library;
 pub mod lora;
 pub mod merge;

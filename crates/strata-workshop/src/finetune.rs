@@ -15,6 +15,12 @@
 //! as plain inference), and the activation cache ([`ActCache`]): the hidden state entering the first trained block is
 //! computed once per conversation and stored on disk, so later epochs never run the lower blocks — which can then
 //! leave memory, or never be loaded when the cache is already complete.
+//!
+//! **Layer by layer** (after Soup, Apache-2.0: its `training.stream_layers`, `lisa` and `freeze_layers`). Layer
+//! streaming ([`crate::layer_stream`], `--stream-layers ram|disk|auto`) keeps the frozen base off the device and copies
+//! each block in just before it runs; LISA (`--lisa-layers K --lisa-interval N`, [`lisa_sample`]) trains only K sampled
+//! blocks' adapters for N steps at a time and clears the moments of the blocks it re-freezes; `--freeze-bottom N` is
+//! Soup's name for training the top `blocks − N` ([`TrainSettings::apply_freeze_bottom`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +33,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::chatdata::{self, ChatTokenizer, DataFormat, Example};
+use crate::layer_stream::{StreamMode, StreamOptions, StreamStats};
 use crate::model::{self, BaseDtype, Ctx, LlamaModel, LoraSpec, ModelConfig};
 use crate::train::{hf_cosine_lr, AdamWState};
 
@@ -89,6 +96,37 @@ pub struct TrainSettings {
     /// recompute each trained block's activations in the backward pass instead of keeping them (less memory, about
     /// one more forward pass of work)
     pub gradient_checkpointing: bool,
+    /// stream the blocks' frozen matrices from host memory or disk ([`crate::layer_stream`]); turns checkpointing on
+    pub stream_layers: Option<StreamMode>,
+    /// device buffers per device for the streamed blocks (2 to 8)
+    pub stream_buffers: usize,
+    /// the disk tier's shard cache root (default [`crate::layer_stream::default_cache_root`])
+    pub stream_cache: Option<PathBuf>,
+    /// LISA: only a few sampled blocks train at a time
+    pub lisa: Option<Lisa>,
+    /// Soup's `freeze_layers`: the bottom N blocks carry no adapters (resolved into `lora.train_layers` once the model's
+    /// block count is known, [`TrainSettings::apply_freeze_bottom`])
+    pub freeze_bottom: Option<usize>,
+}
+
+/// LISA (Layerwise Importance Sampled AdamW, after Soup's `lisa`): every `interval` optimizer steps, `layers` of the
+/// blocks that carry adapters are sampled (by `seed` and the interval's number alone, so a resumed run samples the
+/// same ones); only their adapters (and an upcycled block's router and experts) train until the next sample, and the
+/// AdamW moments of the blocks that stop training are cleared. The loop's gates, when they train, train throughout
+/// (they are not a block's), as Soup keeps the embeddings and head on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Lisa {
+    pub layers: usize,
+    pub interval: usize,
+    pub seed: u64,
+}
+
+/// The blocks LISA trains in interval `interval`: `k` of `candidates` (all of them when k is more), sorted.
+pub fn lisa_sample(seed: u64, interval: usize, candidates: &[usize], k: usize) -> Vec<usize> {
+    let order = permutation(seed ^ 0x115A_5A11, interval as u64 + 1, candidates.len());
+    let mut chosen: Vec<usize> = order.into_iter().take(k.min(candidates.len())).map(|i| candidates[i]).collect();
+    chosen.sort_unstable();
+    chosen
 }
 
 /// The devices named by `--devices` (`cpu`, `cuda:N`, `metal[:N]`), opened.
@@ -125,7 +163,22 @@ impl TrainSettings {
             lora: LoraSpec::default(), base_dtype: BaseDtype::F32, lr: 2e-4, epochs: 3.0, max_steps: None, accumulation: 4, max_len: 2048,
             warmup_ratio: 0.03, weight_decay: 0.01, max_grad_norm: 1.0, seed: 42, cache_dir: None, save_steps: 100, eval_steps: 0,
             logging_steps: 10, resume: None, chat_template: None, score_everything: false, devices: Vec::new(), gradient_checkpointing: false,
+            stream_layers: None, stream_buffers: crate::layer_stream::DEFAULT_BUFFERS, stream_cache: None, lisa: None, freeze_bottom: None,
         }
+    }
+
+    /// Turn `freeze_bottom` into `lora.train_layers` for a model of `layers` blocks (a no-op without it).
+    pub fn apply_freeze_bottom(&mut self, layers: usize) -> Result<()> {
+        let Some(n) = self.freeze_bottom else { return Ok(()) };
+        if n >= layers {
+            bail!("--freeze-bottom {n}: the model has {layers} blocks; freeze 0 to {}", layers.saturating_sub(1));
+        }
+        match self.lora.train_layers {
+            Some(t) if t != layers - n => bail!("--freeze-bottom {n} and --train-layers {t} disagree on a {layers}-block model: give one of them"),
+            _ => self.lora.train_layers = (n > 0).then_some(layers - n),
+        }
+        self.freeze_bottom = None;
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -147,18 +200,31 @@ impl TrainSettings {
         if !(0.0..=0.5).contains(&self.warmup_ratio) {
             bail!("the warm-up ratio must be between 0 and 0.5");
         }
+        crate::layer_stream::validate_buffers(self.stream_buffers)?;
+        if let Some(l) = self.lisa {
+            if l.layers == 0 || l.interval == 0 {
+                bail!("LISA needs --lisa-layers and --lisa-interval of 1 or more");
+            }
+        }
         Ok(())
     }
 
     /// The facts a checkpoint must share with the run that resumes it, or the steps would not be the same steps.
     fn fingerprint(&self, n_train: usize, total_steps: usize) -> Value {
-        json!({
+        let mut v = json!({
             "lr": self.lr, "accumulation": self.accumulation, "max_len": self.max_len, "seed": self.seed, "warmup_ratio": self.warmup_ratio,
             "weight_decay": self.weight_decay, "max_grad_norm": self.max_grad_norm, "train_examples": n_train, "total_steps": total_steps,
             "r": self.lora.r, "alpha": self.lora.alpha, "dropout": self.lora.dropout, "use_rslora": self.lora.use_rslora,
             "targets": self.lora.targets.iter().map(|t| t.as_str()).collect::<Vec<_>>(), "train_layers": self.lora.train_layers,
             "base_dtype": self.base_dtype.as_str(), "score_everything": self.score_everything,
-        })
+        });
+        // LISA changes which steps are taken (streaming does not: the same arithmetic, other memory)
+        if let Some(l) = self.lisa {
+            v["lisa_layers"] = json!(l.layers);
+            v["lisa_interval"] = json!(l.interval);
+            v["lisa_seed"] = json!(l.seed);
+        }
+        v
     }
 }
 
@@ -198,6 +264,8 @@ pub struct TrainReport {
     /// the lower blocks were never loaded (the cache was complete) or were freed after filling it
     pub lower_in_memory: bool,
     pub peak_rss_bytes: Option<u64>,
+    /// what layer streaming copied (None: not streamed)
+    pub stream: Option<StreamStats>,
 }
 
 /// The process's peak resident memory (Linux `VmHWM`), when the OS says.
@@ -451,6 +519,25 @@ struct Runner {
     private: bool,
     /// where each micro-step's memory high-water marks go on CUDA (`AM2_MEM_TRACE`, else `<out>/memory-trace.log`)
     mem_trace: Option<PathBuf>,
+    lisa: Option<LisaRun>,
+    /// each trainable variable's block (None: the loop's gates, which are no block's)
+    var_block: Vec<Option<usize>>,
+    /// lines for the log from inside a step (LISA's samples)
+    pending: Vec<String>,
+}
+
+struct LisaRun {
+    settings: Lisa,
+    /// the blocks that carry adapters
+    candidates: Vec<usize>,
+    /// the interval sampled now, and its blocks
+    current: Option<(usize, Vec<usize>)>,
+}
+
+/// The block an adapter variable belongs to, from its name (`…layers.N.…`), as Soup finds a parameter's layer.
+fn block_of(name: &str) -> Option<usize> {
+    let rest = &name[name.find("layers.")? + "layers.".len()..];
+    rest[..rest.find('.')?].parse().ok()
 }
 
 impl Runner {
@@ -486,17 +573,63 @@ impl Runner {
         }
         let devs = open_devices(&s.devices)?;
         let skip = if cache.is_some() { first } else { 0 };
-        let mut model = LlamaModel::load_parts_on(&s.model, s.base_dtype, &devs, skip..cfg.num_hidden_layers, skip == 0, true)?;
+        let mut model = match s.stream_layers {
+            Some(mode) => {
+                let opts = StreamOptions { mode, buffers: s.stream_buffers, cache_root: s.stream_cache.clone() };
+                LlamaModel::load_streamed(&s.model, s.base_dtype, &devs, skip..cfg.num_hidden_layers, skip == 0, true, &opts, &mut |l| on_event(Event::Log(l)))?
+            }
+            None => LlamaModel::load_parts_on(&s.model, s.base_dtype, &devs, skip..cfg.num_hidden_layers, skip == 0, true)?,
+        };
         model.add_lora(&s.lora)?;
-        model.set_checkpointing(s.gradient_checkpointing);
+        if s.stream_layers.is_some() && !s.gradient_checkpointing {
+            on_event(Event::Log("layer streaming turns gradient checkpointing on: the backward pass replays each block from its streamed weights".into()));
+        }
+        model.set_checkpointing(s.gradient_checkpointing || s.stream_layers.is_some());
         let (names, vars): (Vec<String>, Vec<Var>) = model.lora_vars().into_iter().unzip();
+        let var_block: Vec<Option<usize>> = names.iter().map(|n| block_of(n)).collect();
+        let lisa = s.lisa.map(|l| {
+            let candidates: Vec<usize> = (first..cfg.num_hidden_layers).collect();
+            on_event(Event::Log(format!("LISA: {} of the {} blocks with adapters train at a time, sampled anew every {} steps (seed {})",
+                                        l.layers.min(candidates.len()), candidates.len(), l.interval, l.seed)));
+            LisaRun { settings: l, candidates, current: None }
+        });
         let mut params = ParamsAdamW::default();
         params.lr = s.lr;
         params.weight_decay = s.weight_decay;
         let opt = AdamWState::new(vars.clone(), params).map_err(|e| anyhow!("{e}"))?;
         Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, orders: HashMap::new(),
                   tokens_seen: 0, lower_in_memory, last_aux: None, private: false,
-                  mem_trace: std::env::var_os("AM2_MEM_TRACE").map(PathBuf::from).or_else(|| Some(s.out.join("memory-trace.log"))) })
+                  mem_trace: std::env::var_os("AM2_MEM_TRACE").map(PathBuf::from).or_else(|| Some(s.out.join("memory-trace.log"))), lisa, var_block,
+                  pending: Vec::new() })
+    }
+
+    /// LISA: the blocks of the interval step `step` is in. Moving to a new interval clears the moments of the blocks
+    /// that stop training and starts those that begin again from zero (`restart`; off when a resumed run takes up the
+    /// interval its checkpoint was in, whose moments it has just restored).
+    fn lisa_select(&mut self, step: usize, restart: bool) -> Result<()> {
+        let Some(l) = self.lisa.as_mut() else { return Ok(()) };
+        let interval = step / l.settings.interval;
+        if l.current.as_ref().is_some_and(|(c, _)| *c == interval) {
+            return Ok(());
+        }
+        let new = lisa_sample(l.settings.seed, interval, &l.candidates, l.settings.layers);
+        let old = l.current.take().map(|(_, b)| b);
+        if restart {
+            for (slot, b) in self.var_block.iter().enumerate() {
+                let Some(b) = b else { continue };
+                let (was, now) = (old.as_ref().is_some_and(|o| o.contains(b)), new.contains(b));
+                if was && !now {
+                    self.opt.clear_slot(slot).map_err(|e| anyhow!("{e}"))?;
+                } else if now && !was {
+                    self.opt.restart_slot(slot).map_err(|e| anyhow!("{e}"))?;
+                }
+            }
+        }
+        self.model.set_active_blocks(Some(&new));
+        let until = (interval + 1) * l.settings.interval;
+        self.pending.push(format!("LISA: blocks {new:?} train for steps {} to {until}", interval * l.settings.interval + 1));
+        l.current = Some((interval, new));
+        Ok(())
     }
 
     fn hidden(&mut self, ex: &Example) -> Result<Tensor> {
@@ -516,6 +649,7 @@ impl Runner {
     /// One optimizer step at rate `lr` over micro-batches `step·accumulation ..`, as many as `count`. Returns the mean
     /// loss before the update. A loss that is not a number stops the run without touching the adapters.
     fn step(&mut self, step: usize, count: usize, lr: f64) -> Result<f64> {
+        self.lisa_select(step, true)?;
         let mut sum: Vec<Option<Tensor>> = vec![None; self.vars.len()];
         let mut loss_sum = 0.0;
         let mut aux_sum: Option<f64> = None;
@@ -617,7 +751,10 @@ impl Runner {
             moments.insert(format!("{name}.exp_avg_sq"), v.as_tensor().detach());
         }
         candle_core::safetensors::save(&moments, dir.join(OPTIMIZER_FILE))?;
-        let state = json!({"global_step": step, "adam_step": self.opt.step_t, "settings": fingerprint, "losses": losses});
+        let mut state = json!({"global_step": step, "adam_step": self.opt.step_t, "settings": fingerprint, "losses": losses});
+        if self.lisa.is_some() {
+            state["slot_reset"] = json!(self.opt.slot_reset);
+        }
         std::fs::write(dir.join(STATE_FILE), serde_json::to_string_pretty(&state)?)?;
         Ok(())
     }
@@ -651,6 +788,17 @@ impl Runner {
             v.set(&moments[&format!("{name}.exp_avg_sq")].to_device(v.device())?)?;
         }
         self.opt.step_t = adam;
+        if let Some(r) = state["slot_reset"].as_array() {
+            if r.len() != self.opt.slot_reset.len() {
+                bail!("{STATE_FILE}: slot_reset has {} entries for {} variables", r.len(), self.opt.slot_reset.len());
+            }
+            self.opt.slot_reset = r.iter().map(|v| v.as_u64().unwrap_or(0) as usize).collect();
+        }
+        // LISA takes up the interval the checkpoint's last step was in, its moments as restored
+        if step > 0 {
+            self.lisa_select(step - 1, false)?;
+            self.pending.clear();
+        }
         let losses = state["losses"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
         Ok((step, losses))
     }
@@ -669,6 +817,14 @@ pub fn latest_checkpoint(out: &Path) -> Option<PathBuf> {
 /// Train a LoRA adapter. `on_event` hears the progress; `should_stop` is asked after every step, and a yes writes a
 /// checkpoint and ends the run (`stopped` in the report).
 pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &dyn Fn() -> bool) -> Result<TrainReport> {
+    let mut owned;
+    let s = if s.freeze_bottom.is_some() {
+        owned = s.clone();
+        owned.apply_freeze_bottom(ModelConfig::load(&s.model)?.num_hidden_layers)?;
+        &owned
+    } else {
+        s
+    };
     s.validate()?;
     let t0 = Instant::now();
     let data = prepare_data(s)?;
@@ -709,6 +865,9 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         let count = s.accumulation.min(total_micro - step * s.accumulation).max(1);
         let lr = hf_cosine_lr(s.lr, step, warmup, total);
         let loss = run.step(step, count, lr)?;
+        for l in std::mem::take(&mut run.pending) {
+            on_event(Event::Log(l));
+        }
         losses.push(loss);
         step += 1;
         let done = (step - start_step) as f64;
@@ -741,10 +900,15 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         run.save_adapter(&s.out, &s.model, &s.lora)?;
     }
     let (hits, misses, bytes) = run.cache.as_ref().map_or((0, 0, 0), |c| (c.hits, c.misses, c.bytes_written));
+    let stream = run.model.stream().map(|st| st.stats());
+    if let (Some(st), Some(ls)) = (&stream, run.model.stream()) {
+        on_event(Event::Log(format!("layer streaming: {} block copies ({:.2} GB), {} of the runs found their block prefetched, {} waited for it ({} tier)",
+                                    st.loads, st.bytes as f64 / 1e9, st.prefetch_hits, st.demand_loads, ls.tier.as_str())));
+    }
     let report = TrainReport {
         out: s.out.clone(), steps_done: step, total_steps: total, stopped, losses: losses.clone(), eval_loss: eval, train_examples: n_train,
         eval_examples: n_eval, trainable_params: trainable, seconds: t0.elapsed().as_secs_f64(), tokens_seen: run.tokens_seen, cache_hits: hits,
-        cache_misses: misses, cache_bytes: bytes, lower_in_memory: run.lower_in_memory, peak_rss_bytes: peak_rss_bytes(),
+        cache_misses: misses, cache_bytes: bytes, lower_in_memory: run.lower_in_memory, peak_rss_bytes: peak_rss_bytes(), stream: stream.clone(),
     };
     std::fs::create_dir_all(&s.out)?;
     std::fs::write(s.out.join(REPORT_FILE), serde_json::to_string_pretty(&json!({
@@ -752,6 +916,9 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
         "eval_examples": n_eval, "trainable_params": trainable, "seconds": report.seconds, "tokens_seen": report.tokens_seen,
         "peak_rss_bytes": report.peak_rss_bytes, "private": run.private, "settings": fingerprint, "base_model": s.model.display().to_string(),
         "activation_cache": {"hits": hits, "written": misses, "bytes_written": bytes, "lower_blocks_in_memory": report.lower_in_memory},
+        "layer_stream": stream.map(|st| json!({"tier": run.model.stream().map(|l| l.tier.as_str()), "buffers": s.stream_buffers, "block_copies": st.loads,
+                                               "bytes_copied": st.bytes, "prefetch_hits": st.prefetch_hits, "demand_loads": st.demand_loads})),
+        "lisa": s.lisa.map(|l| json!({"layers": l.layers, "interval": l.interval, "seed": l.seed})),
     }))?)?;
     Ok(report)
 }
@@ -830,6 +997,14 @@ pub fn suggest_lr(lrs: &[f64], losses: &[f64]) -> Result<LrSuggestion> {
 /// The learning-rate range test: a short run whose rate rises geometrically, recording each step's loss. Nothing is
 /// written; the adapters trained here are thrown away.
 pub fn find_lr(s: &TrainSettings, opts: FindLr, on_event: &mut dyn FnMut(Event)) -> Result<LrReport> {
+    let mut owned;
+    let s = if s.freeze_bottom.is_some() {
+        owned = s.clone();
+        owned.apply_freeze_bottom(ModelConfig::load(&s.model)?.num_hidden_layers)?;
+        &owned
+    } else {
+        s
+    };
     s.validate()?;
     if !(opts.start > 0.0 && opts.end > opts.start) || opts.steps < 4 {
         bail!("a range test needs 0 < start < end and at least 4 steps");

@@ -7,7 +7,9 @@
 //! What is read: `base`, `task: sft`, `data.{train, format, val_split, max_length, train_on_responses_only}`,
 //! `training.{epochs, lr, batch_size, gradient_accumulation_steps, seed, warmup_ratio, weight_decay, max_grad_norm,
 //! scheduler, optimizer, quantization, save_steps, logging_steps}`, `training.lora.{r, alpha, dropout, target_modules,
-//! use_rslora}` and `output`, with Soup's defaults for what is left out.
+//! use_rslora}`, `training.{stream_layers, stream_source, stream_buffers, freeze_layers}` (layer by layer: streaming
+//! and Soup's bottom-N freeze map as they are; Soup's `lisa_*`, which fine-tunes whole layers, maps to LISA over the
+//! sampled blocks' adapters with `relax` only) and `output`, with Soup's defaults for what is left out.
 //!
 //! **Everything else is refused, by name.** Soup has hundreds of settings (DPO, GRPO, DoRA, vision, quantised bases…);
 //! a config that sets one this trainer does not implement is not run as if it had not: [`import`] returns
@@ -21,7 +23,8 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::chatdata::DataFormat;
-use crate::finetune::TrainSettings;
+use crate::finetune::{Lisa, TrainSettings};
+use crate::layer_stream::StreamMode;
 use crate::model::{BaseDtype, LoraSpec, Target};
 
 /// Why a Soup config was not imported.
@@ -176,7 +179,8 @@ pub fn import(yaml: &str, dir: &Path, relax: bool) -> Result<SoupImport, SoupErr
     // training
     let t = &root["training"];
     r.unknown("training", t, &["epochs", "lr", "batch_size", "gradient_accumulation_steps", "seed", "warmup_ratio", "weight_decay", "max_grad_norm",
-                               "scheduler", "optimizer", "quantization", "save_steps", "logging_steps", "lora"]);
+                               "scheduler", "optimizer", "quantization", "save_steps", "logging_steps", "lora", "stream_layers", "stream_source",
+                               "stream_buffers", "freeze_layers", "lisa_enabled", "lisa_num_layers", "lisa_interval_steps", "lisa_reset_optimizer"]);
     s.epochs = r.num("training.epochs", &t["epochs"], 3.0);
     s.lr = r.num("training.lr", &t["lr"], 2e-5);
     let accumulation = r.num("training.gradient_accumulation_steps", &t["gradient_accumulation_steps"], 4.0) as usize;
@@ -274,6 +278,55 @@ pub fn import(yaml: &str, dir: &Path, relax: bool) -> Result<SoupImport, SoupErr
         r: rank.max(1), alpha: r.num(&format!("{lora_path}.alpha"), &lora["alpha"], 16.0), dropout: r.num(&format!("{lora_path}.dropout"), &lora["dropout"], 0.05),
         use_rslora: lora["use_rslora"].as_bool().unwrap_or(false), targets, train_layers: None, seed: s.seed,
     };
+
+    // layer by layer
+    match &t["stream_layers"] {
+        Value::Bool(true) => {
+            let src = t["stream_source"].as_str().unwrap_or("auto");
+            match StreamMode::from_s(src) {
+                Ok(m) => {
+                    s.stream_layers = Some(m);
+                    s.gradient_checkpointing = true;
+                    r.notes.push(format!("training.stream_layers: true — the base streams block by block from {} (gradient checkpointing on)",
+                                         if m == StreamMode::Auto { "RAM, or disk when it does not fit".to_string() } else { m.as_str().to_string() }));
+                }
+                Err(_) => r.refuse("training.stream_source", &t["stream_source"], "auto, ram or disk"),
+            }
+            if !t["stream_buffers"].is_null() {
+                s.stream_buffers = r.num("training.stream_buffers", &t["stream_buffers"], 2.0) as usize;
+            }
+        }
+        Value::Null | Value::Bool(false) => {
+            for k in ["stream_source", "stream_buffers"] {
+                if !t[k].is_null() {
+                    r.notes.push(format!("training.{k}: {} — stream_layers is off, ignored", short(&t[k])));
+                }
+            }
+        }
+        other => r.refuse("training.stream_layers", other, "true or false"),
+    }
+    if !t["freeze_layers"].is_null() {
+        let n = r.num("training.freeze_layers", &t["freeze_layers"], 0.0) as usize;
+        if n > 0 {
+            s.freeze_bottom = Some(n);
+            r.notes.push(format!("training.freeze_layers: {n} — no adapters in the bottom {n} blocks (--freeze-bottom {n})"));
+        }
+    }
+    match &t["lisa_enabled"] {
+        Value::Bool(true) if r.relax => {
+            let layers = r.num("training.lisa_num_layers", &t["lisa_num_layers"], 2.0) as usize;
+            let interval = r.num("training.lisa_interval_steps", &t["lisa_interval_steps"], 20.0) as usize;
+            s.lisa = Some(Lisa { layers, interval, seed: s.seed });
+            r.notes.push(format!("training.lisa_enabled: true — Soup's LISA fine-tunes whole layers; here the {layers} sampled blocks' LoRA adapters train, \
+                                  resampled every {interval} steps, their moments cleared when re-frozen"));
+            if t["lisa_reset_optimizer"] == Value::Bool(false) {
+                r.notes.push("training.lisa_reset_optimizer: false — the moments of re-frozen blocks are always cleared here".into());
+            }
+        }
+        Value::Bool(true) => r.refuse("training.lisa_enabled", &t["lisa_enabled"],
+                                      "Soup's LISA fine-tunes whole layers, which is not done here; --soup-relax trains the sampled blocks' adapters instead"),
+        _ => {}
+    }
 
     if let Some(m) = r.invalid {
         return Err(SoupError::Invalid(m));

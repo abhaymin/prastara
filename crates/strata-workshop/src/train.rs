@@ -130,6 +130,9 @@ pub struct AdamWState {
     pub step_t: usize,
     /// per trainable variable: (the variable, first moment `exp_avg`, second moment `exp_avg_sq`)
     pub slots: Vec<(Var, Var, Var)>,
+    /// per slot, the step its moments last started from zero ([`AdamWState::restart_slot`], LISA): its bias correction
+    /// counts the steps since then, as torch's per-parameter step does after its state is cleared. All 0 otherwise.
+    pub slot_reset: Vec<usize>,
 }
 
 impl AdamWState {
@@ -140,7 +143,24 @@ impl AdamWState {
             let s = Var::zeros(t.shape(), t.dtype(), t.device())?;
             Ok::<_, candle_core::Error>((v, m, s))
         }).collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { params, step_t: 0, slots })
+        let n = slots.len();
+        Ok(Self { params, step_t: 0, slots, slot_reset: vec![0; n] })
+    }
+
+    /// Zero a variable's moments (LISA re-freezes its block: its stale moments are dropped, as Soup clears them).
+    pub fn clear_slot(&mut self, i: usize) -> Res<()> {
+        let (_, m, v) = &self.slots[i];
+        m.set(&m.as_tensor().zeros_like()?)?;
+        v.set(&v.as_tensor().zeros_like()?)?;
+        Ok(())
+    }
+
+    /// Start a variable's moments again from zero at the current step: its next update is bias-corrected as a first
+    /// step (LISA samples its block again).
+    pub fn restart_slot(&mut self, i: usize) -> Res<()> {
+        self.clear_slot(i)?;
+        self.slot_reset[i] = self.step_t;
+        Ok(())
     }
 
     pub fn step(&mut self, grads: &candle_core::backprop::GradStore) -> Res<()> {
@@ -157,10 +177,11 @@ impl AdamWState {
         }
         self.step_t += 1;
         let p = &self.params;
-        let scale_m = 1f64 / (1f64 - p.beta1.powi(self.step_t as i32));
-        let scale_v = 1f64 / (1f64 - p.beta2.powi(self.step_t as i32));
-        for ((theta, m, v), g) in self.slots.iter().zip(grads) {
+        for (((theta, m, v), g), reset) in self.slots.iter().zip(grads).zip(&self.slot_reset) {
             if let Some(g) = g {
+                let t = self.step_t.saturating_sub(*reset).max(1) as i32;
+                let scale_m = 1f64 / (1f64 - p.beta1.powi(t));
+                let scale_v = 1f64 / (1f64 - p.beta2.powi(t));
                 let next_m = ((m.as_tensor() * p.beta1)? + (g * (1.0 - p.beta1))?)?;
                 let next_v = ((v.as_tensor() * p.beta2)? + (g.sqr()? * (1.0 - p.beta2))?)?;
                 let adjusted = ((&next_m * scale_m)? / ((&next_v * scale_v)?.sqrt()? + p.eps)?)?;
