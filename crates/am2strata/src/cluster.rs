@@ -762,6 +762,10 @@ pub async fn route(axum::extract::State(s): axum::extract::State<crate::AppState
         return crate::error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", "the request is too large");
     };
     let parsed = serde_json::from_slice::<Value>(&bytes).ok();
+    // "strata_local_only": answered by this PC alone, never a worker (a private-data job's requests)
+    if parsed.as_ref().is_some_and(|v| v["strata_local_only"] == true) {
+        return next.run(axum::extract::Request::from_parts(parts, axum::body::Body::from(bytes))).await;
+    }
     let model = parsed.as_ref().and_then(|v| v["model"].as_str().map(str::to_string))
         // a model this server resolves through its own settings is answered here, never by a worker's other model
         .filter(|m| !crate::remote::resolves_here(m));

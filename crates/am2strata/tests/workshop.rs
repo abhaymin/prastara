@@ -414,6 +414,16 @@ if [ "$1" = "--json" ] && { [ "$2" = "regress" ] || [ "$2" = "grade-train" ]; };
   fi
   exit 0
 fi
+if [ "$1" = "--json" ] && [ "$2" = "private-data" ]; then
+  echo "$@" > "$here/private-data-args.txt"
+  printf '%s\n%s\n' "$AM2STRATA_URL" "$AM2STRATA_API_KEY" > "$here/private-data-env.txt"
+  name=""; data=""; prev=""
+  for a in "$@"; do [ "$prev" = "--name" ] && name="$a"; [ "$prev" = "--data-dir" ] && data="$a"; prev="$a"; done
+  mkdir -p "$data/private/$name"
+  echo '{"event":"start","what":"private-data"}'
+  echo "{\"event\":\"done\",\"output\":\"$data/private/$name\",\"kind\":\"private-dataset\",\"private\":true,\"bytes\":1,\"seconds\":0.1}"
+  exit 0
+fi
 if [ "$1" = "--json" ] && [ "$2" = "abliterate" ]; then
   echo "$@" > "$here/abliterate-args.txt"
   out=""; prev=""
@@ -1162,4 +1172,52 @@ fn clean_jobs_check_their_inputs_and_pass_their_settings() {
     let args = std::fs::read_to_string(tools.join("args.txt")).unwrap();
     assert!(!args.contains("--model") && !args.contains("--lang-match") && !args.contains("--exclude"), "{args}");
     std::fs::remove_dir_all(&tools).ok();
+}
+
+// Unix only: the stand-in for am2strata-workshop is a `#!/bin/sh` script, which Windows cannot start as a program.
+#[cfg(unix)]
+#[test]
+fn private_data_jobs_check_their_sources_and_model_and_get_the_server_by_environment() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let tools = std::env::temp_dir().join(format!("am2-ws-private-{}", std::process::id()));
+    let exe = fake_datagen(&tools);
+    let s = Server::start(&[Model::default()], &[ids("hi")], json!({"env": {"AM2STRATA_WORKSHOP_EXE": exe}}));
+    // the owner's folder, inside the Workshop's folders, at first without its SOURCE.toml
+    let mine = s.dir.join("mine");
+    std::fs::create_dir_all(&mine).unwrap();
+    std::fs::write(mine.join("note.txt"), "a plain sentence about a garden").unwrap();
+    for (bad, why) in [(json!({"kind": "private-data", "sources": [mine]}), "\"name\""),
+                       (json!({"kind": "private-data", "name": "../up", "sources": [mine]}), "\"name\""),
+                       (json!({"kind": "private-data", "name": "set"}), "\"sources\""),
+                       (json!({"kind": "private-data", "name": "set", "sources": ["/etc"]}), "/etc"),
+                       (json!({"kind": "private-data", "name": "set", "sources": [mine]}), "SOURCE.toml")] {
+        let (code, e) = s.post("/v1/workshop/jobs", &bad);
+        assert_eq!(code, 400, "{bad}: {e}");
+        assert!(e["error"]["message"].as_str().unwrap().contains(why), "{bad}: {e}");
+    }
+    std::fs::write(mine.join("SOURCE.toml"), "owner_attests_adults_only = true\nowner_attests_consent = true\norigin = \"test\"\n").unwrap();
+    let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "private-data", "name": "set", "sources": [mine], "model": "openai/gpt-5.5"}));
+    assert_eq!(code, 400, "{e}");
+    assert!(e["error"]["message"].as_str().unwrap().contains("remote model"), "{e}");
+    let (code, e) = s.post("/v1/workshop/jobs", &json!({"kind": "private-data", "name": "set", "sources": [mine], "max_frames": 1000}));
+    assert_eq!(code, 400, "{e}");
+
+    let (code, j) = s.post("/v1/workshop/jobs", &json!({"kind": "private-data", "name": "set", "sources": [mine], "model": "m1",
+                                                        "text_count": 5, "every_s": 2.5}));
+    assert_eq!(code, 202, "{j}");
+    let done = wait_state(&s, j["id"].as_u64().unwrap(), "done");
+    let out = std::path::PathBuf::from(done["output"].as_str().unwrap());
+    assert!(out.ends_with("private/set"), "{}", out.display());
+    let root = out.parent().unwrap();
+    assert_eq!(std::fs::metadata(root).unwrap().permissions().mode() & 0o777, 0o700, "the private root is the owner's only");
+    // the server's address and key in its environment, never on its command line
+    let env = std::fs::read_to_string(tools.join("private-data-env.txt")).unwrap();
+    assert_eq!(env, format!("http://127.0.0.1:{}\n{KEY}\n", s.port));
+    let args = std::fs::read_to_string(tools.join("private-data-args.txt")).unwrap();
+    assert!(!args.contains(KEY), "{args}");
+    assert!(args.contains(&format!("--source {}", mine.canonicalize().unwrap().display())) && args.contains("--model m1")
+            && args.contains("--text-count 5") && args.contains("--every-s 2.5") && args.contains("--data-dir"), "{args}");
+    // the model list says each model's run config marks, for the job's model check
+    let (_, m) = s.get("/api/models", true);
+    assert!(m["models"].as_array().unwrap().iter().all(|x| x["marks"].is_array()), "{m}");
 }

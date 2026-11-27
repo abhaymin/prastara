@@ -1404,6 +1404,12 @@ struct DatagenOpts {
     /// datagen: the model to write with (any the server lists; default the loaded one)
     #[arg(long = "writer")]
     writer: Option<String>,
+    /// private-data (docs/internal/PRIVATE-DATA.md): videos give one frame every this many seconds, at most
+    /// --max-frames each
+    #[arg(long, hide = true)]
+    every_s: Option<f64>,
+    #[arg(long, hide = true)]
+    max_frames: Option<u64>,
     /// abliterate: the prompts the model refuses, and ordinary ones (text files, one prompt per line, in Workshop folders)
     #[arg(long)]
     harmful: Option<String>,
@@ -1606,6 +1612,19 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
                                    "per_chunk": dg.per_chunk, "chunk_chars": dg.chunk_chars, "temperature": dg.temperature,
                                    "min_score": dg.min_score, "topic": dg.topic.clone(), "language": dg.language.clone(),
                                    "seed": dg.seed, "check_code": dg.check_code, "model": dg.writer.clone()})
+            }
+            "private-data" => {
+                // a private dataset from the owner's own folders (each with its SOURCE.toml), by a local private model
+                const USE: &str = "private-data <folder> [--source more] --name <name> [--writer <local-model>] [--count N]";
+                let mut sources: Vec<String> = first.clone().into_iter().chain(dg.sources.iter().cloned()).map(abs).collect();
+                sources.dedup();
+                if sources.is_empty() {
+                    return Err(USE.into());
+                }
+                serde_json::json!({"kind": "private-data", "name": install.0.clone().ok_or(USE)?, "sources": sources,
+                                   "model": dg.writer.clone(), "text_count": dg.count, "per_chunk": dg.per_chunk,
+                                   "chunk_chars": dg.chunk_chars, "temperature": dg.temperature, "every_s": dg.every_s,
+                                   "max_frames": dg.max_frames})
             }
             "upload" => {
                 let file = first.clone().ok_or("upload <file>")?;

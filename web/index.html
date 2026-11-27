@@ -509,6 +509,7 @@
           <button type="button" role="tab" data-ws-step="data" aria-selected="false"><span>Generate data</span><i class="ws-dot" data-ws-dot="data" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="clean" aria-selected="false"><span>Clean data</span><i class="ws-dot" data-ws-dot="clean" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="review" aria-selected="false"><span>Review data</span><i class="ws-dot" data-ws-dot="review" aria-hidden="true"></i></button>
+          <button type="button" role="tab" data-ws-step="private" aria-selected="false"><span>Private data</span><i class="ws-dot" data-ws-dot="private" aria-hidden="true"></i></button>
           <button type="button" role="tab" data-ws-step="library" aria-selected="false"><span>Model library</span><i class="ws-dot" data-ws-dot="library" aria-hidden="true"></i></button>
           <p class="ws-rail__group">Build</p>
           <button type="button" role="tab" data-ws-step="loop" aria-selected="false"><span>Loop a model</span><i class="ws-dot" data-ws-dot="loop" aria-hidden="true"></i></button>
@@ -641,6 +642,46 @@
               </details>
             </div>
             <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-clean">Clean dataset</button></div>
+          </div>
+          </div>
+        </section>
+        <section class="ws-panel" data-ws-panel="private" hidden>
+          <header class="ws-panel__head"><h3>Private data</h3><p class="muted">A private dataset from your own folders, for your private
+            models only. A local model marked private, uncensored or abliterated describes each image (and frames of MP4 videos) and
+            writes a generation prompt from it, and writes chat rows from your text files. Nothing leaves this PC: remote models are
+            refused, and the dataset goes to <code>private/&lt;name&gt;</code> in the data folder, which only you can open.</p></header>
+          <div class="ws-panel__body">
+          <div class="st-card ws-block ws-private">
+            <div class="ws-form">
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-p-name">Name <output>letters, digits, - and _</output></label>
+                <input class="st-input mono" id="ws-p-name" autocomplete="off" placeholder="my-set"></div>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-p-sources">Your folders <output>one per line, inside the Workshop's folders</output></label>
+                <textarea class="st-input mono" id="ws-p-sources" rows="3" placeholder="~/Development/Strata-data/mula/my-photos"></textarea></div>
+              <details class="ws-more ws-field--wide small" open><summary>Each folder needs a <code>SOURCE.toml</code> you write</summary>
+                <pre class="mono small">owner_attests_adults_only = true
+owner_attests_consent = true
+origin = "my own photos, 2026"</pre>
+                <ul class="muted small">
+                  <li><strong>owner_attests_adults_only</strong>: everyone shown is an adult (18 or over).</li>
+                  <li><strong>owner_attests_consent</strong>: everyone shown agreed to it, or the media is fully synthetic or drawn.</li>
+                  <li><strong>origin</strong>: where the media came from, in your words (it goes on the dataset card).</li>
+                </ul>
+                <p class="muted small">A folder without it, or with either answer not <code>true</code>, is refused.</p>
+              </details>
+              <div class="ws-field ws-field--wide"><label class="st-label" for="ws-p-model">Model <output>default: the loaded one</output></label>
+                <input class="st-input mono" id="ws-p-model" autocomplete="off" placeholder="a local private model's name"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-count">Text rows</label>
+                <input class="st-input" id="ws-p-count" type="number" min="0" max="100000" value="100"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-every">Video: a frame every (s)</label>
+                <input class="st-input" id="ws-p-every" type="number" min="0.1" step="0.5" value="5"></div>
+              <div class="ws-field"><label class="st-label" for="ws-p-frames">Frames per video</label>
+                <input class="st-input" id="ws-p-frames" type="number" min="1" max="64" value="8"></div>
+              <p class="ws-field--wide muted small">Fixed checks you cannot turn off: anything the model writes that pairs a minor with
+                sexual content is dropped, and so is any image it does not judge clearly adult; their files are blocked for every later
+                run. Rows naming a real person are kept out of the generation prompts. The card counts what each check dropped and never
+                shows it. Models and datasets trained or cleaned from it are marked private too.</p>
+            </div>
+            <div class="ws-actions"><button type="button" class="st-btn st-btn--primary" id="ws-private">Build private dataset</button></div>
           </div>
           </div>
         </section>

@@ -715,6 +715,8 @@ impl Manager {
                     // the Workshop's marks (an abliterated model): it stays on this PC, and the minor-safety check
                     // reads every chat with it (crate::minor_safety)
                     "private": m.cfg.rest.get("private") == Some(&Value::Bool(true)),
+                    // the run config's own marks, as a private-data job needs them (docs/internal/PRIVATE-DATA.md)
+                    "marks": (["private", "uncensored", "abliterated"].iter().filter(|k| m.cfg.rest.get(**k) == Some(&Value::Bool(true))).collect::<Vec<_>>()),
                     "uncensored": crate::minor_safety::applies(&m.id, &m.cfg),
                     // a config `pull` marked unavailable shows its reason here (findings item 3); an empty model list is
                     // not one the server missed, so it stays null and this stays distinguishable from a real problem

@@ -447,6 +447,8 @@ struct Runner {
     lower_in_memory: bool,
     /// the last step's mean load-balancing loss (an upcycled model only)
     last_aux: Option<f64>,
+    /// the data is a private dataset (crate::private_data): the adapter is marked `prastara_private`
+    private: bool,
 }
 
 impl Runner {
@@ -491,7 +493,7 @@ impl Runner {
         params.weight_decay = s.weight_decay;
         let opt = AdamWState::new(vars.clone(), params).map_err(|e| anyhow!("{e}"))?;
         Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, orders: HashMap::new(),
-                  tokens_seen: 0, lower_in_memory, last_aux: None })
+                  tokens_seen: 0, lower_in_memory, last_aux: None, private: false })
     }
 
     fn hidden(&mut self, ex: &Example) -> Result<Tensor> {
@@ -587,6 +589,9 @@ impl Runner {
         let tensors: HashMap<String, Tensor> = model::adapter_tensors(&self.model).into_iter().collect();
         candle_core::safetensors::save(&tensors, dir.join(ADAPTER_FILE))?;
         std::fs::write(dir.join(CONFIG_FILE), serde_json::to_string_pretty(&model::adapter_config(spec, &self.model.cfg, &base.display().to_string()))?)?;
+        if self.private {
+            crate::private_data::mark_config_private(&dir.join(CONFIG_FILE))?;
+        }
         Ok(())
     }
 
@@ -662,6 +667,11 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     let warmup = (s.warmup_ratio * total as f64).ceil() as usize;
     let fingerprint = s.fingerprint(n_train, total);
     let mut run = Runner::new(s, data, on_event)?;
+    // trained on a private dataset: the adapter (and what is merged, converted and installed from it) is private too
+    run.private = crate::private_data::is_private_dataset(&s.data) || s.eval_data.as_deref().is_some_and(crate::private_data::is_private_dataset);
+    if run.private {
+        on_event(Event::Log("the data is private: the adapter is marked private (prastara_private), and so is what is made from it".into()));
+    }
     let trainable: u64 = run.vars.iter().map(|v| v.as_tensor().elem_count() as u64).sum();
     on_event(Event::Log(format!(
         "{} conversations to train on, {} held out; {} steps of {} ({} warm-up); {} adapter parameters in blocks {} to {} of a {} base",
@@ -726,7 +736,7 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     std::fs::write(s.out.join(REPORT_FILE), serde_json::to_string_pretty(&json!({
         "steps_done": step, "total_steps": total, "stopped": stopped, "losses": losses, "eval_loss": eval, "train_examples": n_train,
         "eval_examples": n_eval, "trainable_params": trainable, "seconds": report.seconds, "tokens_seen": report.tokens_seen,
-        "peak_rss_bytes": report.peak_rss_bytes, "settings": fingerprint, "base_model": s.model.display().to_string(),
+        "peak_rss_bytes": report.peak_rss_bytes, "private": run.private, "settings": fingerprint, "base_model": s.model.display().to_string(),
         "activation_cache": {"hits": hits, "written": misses, "bytes_written": bytes, "lower_blocks_in_memory": report.lower_in_memory},
     }))?)?;
     Ok(report)

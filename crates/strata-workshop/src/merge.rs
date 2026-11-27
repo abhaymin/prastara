@@ -145,6 +145,14 @@ impl<'a> Merger<'a> {
             }
         }
 
+        // an adapter trained on private data (crate::private_data) makes a private model: its config says so, and the
+        // GGUF converted from it carries prastara.private
+        let acfg: serde_json::Value = std::fs::read_to_string(self.adapter_dir.join(checkpoint::CONFIG_FILE)).ok()
+            .and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        if acfg["prastara_private"] == true && self.out_dir.join("config.json").exists() {
+            crate::private_data::mark_config_private(&self.out_dir.join("config.json"))?;
+        }
+
         // a looped model (Avarta): its gates are the adapter's when it trained them, else the base's as they were
         let base_gates = self.base_dir.join(crate::model::LOOP_FILE);
         let adps = candle_core::safetensors::load(self.adapter_dir.join(checkpoint::ADAPTER_FILE), &Device::Cpu)?;

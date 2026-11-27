@@ -15,6 +15,7 @@
 //! am2strata-workshop autopilot --model <hf-folder> --data <chat.jsonl> [--time-budget 2h] [--ram-budget 12GB]
 //! am2strata-workshop regress --model <hf-folder> [--adapter <dir>] [--passes 1,2] --suite <suite.json> --out <report-dir> [--against <report>]
 //! am2strata-workshop clean <in.jsonl>... --out <out.jsonl> [--model <hf-folder>] [--max-len 1024] [--min-answer-tokens N] [--max-repeat R] [--dedupe exact|near|off] [--lang-match] [--drop-cut] [--exclude held-out.jsonl] [--cap-per-language N [--cap-only in.jsonl]] [--report card.md]
+//! am2strata-workshop private-data --name <name> --source <folder>... [--model <local-model>] [--data-dir ~/Development/Strata-data]
 //! am2strata-workshop grade-train --model <hf-folder> --data <prompts.jsonl> --samples N --grader code|judge --rounds R --suite <suite.json> --out <dir>
 //! ```
 //!
@@ -282,6 +283,38 @@ enum Cmd {
         /// the model to write with (any the server lists, remote ones included); default: the loaded one
         #[arg(long)]
         model: Option<String>,
+    },
+    /// a private dataset built from the owner's own folders (each with its SOURCE.toml), described and written by a
+    /// local model marked private, uncensored or abliterated, through the server's chat API on this machine
+    /// (AM2STRATA_URL, AM2STRATA_API_KEY); into <data-dir>/private/<name>/ (0700). The safety gates cannot be turned off.
+    PrivateData {
+        /// the dataset's name: its folder under <data-dir>/private
+        #[arg(long)]
+        name: String,
+        /// a source folder (repeat it); each needs its own SOURCE.toml
+        #[arg(long = "source", required = true)]
+        sources: Vec<PathBuf>,
+        /// the local model (default: the loaded one); a <provider>/<model> name is refused
+        #[arg(long)]
+        model: Option<String>,
+        /// Prastara's data folder
+        #[arg(long, default_value = "~/Development/Strata-data")]
+        data_dir: String,
+        /// text sources: how many chat rows to aim for
+        #[arg(long, default_value_t = 100)]
+        text_count: usize,
+        #[arg(long, default_value_t = 3)]
+        per_chunk: usize,
+        #[arg(long, default_value_t = 3000)]
+        chunk_chars: usize,
+        #[arg(long, default_value_t = 0.4)]
+        temperature: f64,
+        /// videos: one frame every this many seconds
+        #[arg(long, default_value_t = 5.0)]
+        every_s: f64,
+        /// videos: at most this many frames each
+        #[arg(long, default_value_t = 8)]
+        max_frames: usize,
     },
     /// a chat dataset cleaned for training: duplicates and near-copies, answers that repeat themselves, are too short,
     /// empty, echo the prompt, are in the wrong script or carry template junk, prompts too long for --max-len, rows of
@@ -852,6 +885,20 @@ fn disk_free(p: &Path) -> Option<u64> {
     }
 }
 
+/// Whether a source folder holds images or videos (then the model must read images).
+fn walk_has_media(dir: &Path) -> bool {
+    fn walk(p: &Path, depth: usize) -> bool {
+        std::fs::read_dir(p).into_iter().flatten().flatten().any(|e| {
+            let q = e.path();
+            let media = q.extension().and_then(|x| x.to_str()).is_some_and(|x| {
+                ["png", "jpg", "jpeg", "webp", "mp4", "m4v", "mov", "mkv", "webm"].contains(&x.to_lowercase().as_str())
+            });
+            (q.is_file() && media) || (depth > 0 && q.is_dir() && !q.is_symlink() && walk(&q, depth - 1))
+        })
+    }
+    walk(dir, 3)
+}
+
 fn size_of(p: &Path) -> u64 {
     if p.is_dir() {
         std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| size_of(&e.path())).sum()
@@ -1397,6 +1444,46 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
                 "rounds": r.rounds.iter().map(|x| json!({"round": x.round, "sampled": x.sampled, "passing": x.passing, "kept": x.kept,
                     "regressions": x.regressions, "promoted": x.promoted, "note": x.note})).collect::<Vec<_>>()})))
         }
+        Cmd::PrivateData { name, sources, model, data_dir, text_count, per_chunk, chunk_chars, temperature, every_s, max_frames } => {
+            use strata_workshop::private_data as pd;
+            pd::check_name(name).map_err(|e| e.to_string())?;
+            if let Some(m) = model {
+                pd::refuse_remote_name(m).map_err(|e| e.to_string())?;
+            }
+            // every folder's attestation before the server is asked anything
+            for d in sources {
+                pd::read_source(d).map_err(|e| e.to_string())?;
+            }
+            let data = match data_dir.strip_prefix("~/") {
+                Some(rest) => std::env::var_os("HOME").map(PathBuf::from).ok_or("no HOME for ~")?.join(rest),
+                None => PathBuf::from(data_dir),
+            };
+            let mut s = pd::Settings::new(name, sources.clone(), pd::private_root(&data));
+            s.text_count = *text_count;
+            s.per_chunk = *per_chunk;
+            s.chunk_chars = *chunk_chars;
+            s.temperature = *temperature;
+            s.every_s = every_s.max(0.1);
+            s.max_frames = (*max_frames).clamp(1, 64);
+            s.media_exe = pd::find_media_exe();
+            let has_media = sources.iter().any(|d| walk_has_media(d));
+            let mut local = pd::Local::from_env().map_err(|e| e.to_string())?;
+            local.choose(model.as_deref(), has_media).map_err(|e| e.to_string())?;
+            out.event(json!({"event": "start", "what": format!("private dataset {name} with {} into {}", local.model, s.out_dir().display())}));
+            if s.media_exe.is_none() {
+                out.event(json!({"event": "log", "message": "no media engine (am2strata-media) found: videos will be skipped and counted"}));
+            }
+            #[cfg(unix)]
+            unsafe { libc::signal(libc::SIGTERM, on_term as extern "C" fn(libc::c_int) as libc::sighandler_t); }
+            let r = pd::run(&s, &local,
+                |done, total, msg| out.event(json!({"event": "progress", "done": done, "total": total, "message": msg})),
+                || TERM.load(std::sync::atomic::Ordering::SeqCst)).map_err(|e| format!("{e:#}"))?;
+            let dropped: usize = r.dropped.iter().filter(|(g, _)| **g != pd::gate::REAL_PERSON).map(|(_, n)| n).sum();
+            out.event(json!({"event": "log", "message": format!("{} vision rows, {} generation prompts, {} text rows; {} items dropped by the gates, {} hashes blocked; card: {}",
+                r.vision_rows, r.prompt_rows, r.text_rows, dropped, r.blocked.len(), s.out_dir().join(pd::CARD).display())}));
+            Ok((s.out_dir(), "private-dataset".into(), json!({"private": true, "vision_rows": r.vision_rows, "prompt_rows": r.prompt_rows,
+                "text_rows": r.text_rows, "dropped": r.dropped, "blocked": r.blocked.len()})))
+        }
         other => plain(run_tools(other, out)),
     }
 }
@@ -1461,7 +1548,7 @@ fn run_tools(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String), String> {
                 other => Err(format!("library {other:?}: list, show, init or import")),
             }
         }
-        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } => unreachable!("handled by run"),
+        Cmd::Train { .. } | Cmd::FindLr { .. } | Cmd::Profile { .. } | Cmd::Autopilot { .. } | Cmd::Abliterate { .. } | Cmd::Upcycle { .. } | Cmd::ExportMoe { .. } | Cmd::Prompts { .. } | Cmd::Regress { .. } | Cmd::GradeTrain { .. } | Cmd::PrivateData { .. } => unreachable!("handled by run"),
         Cmd::Info { path } => {
             out.event(json!({"event": "info", "info": info(path)?}));
             Ok((path.clone(), "info".into()))

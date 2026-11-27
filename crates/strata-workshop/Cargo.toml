@@ -17,6 +17,9 @@ prost.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 strata-pack.workspace = true
+# the minor-safety rules (private_data drops a row that matches them)
+strata-safety.workspace = true
+base64 = "0.22"
 strata-gguf.workspace = true
 # the Rust engine's line protocol (engine.rs: regress and grade-train answer through am2strata-hybrid --serve)
 strata-protocol.workspace = true
@@ -39,3 +42,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 cuda = ["candle-core/cuda", "candle-nn/cuda"]
 # training on Apple's GPU (candle's Metal backend; macOS only)
 metal = ["candle-core/metal", "candle-nn/metal"]
+
+[dev-dependencies]
+# private_data's tests make tiny PNGs
+image = { version = "0.25", default-features = false, features = ["png"] }
