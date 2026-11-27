@@ -180,6 +180,19 @@ fn mark_config(path: &Path, m: &Marks) -> Result<(), String> {
     std::fs::write(path, serde_json::to_string_pretty(&cfg).unwrap_or_default()).map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// Where private datasets go: `<data>/private`, made 0700 (only the owner may enter).
+pub fn private_root(data_dir: &Path) -> PathBuf {
+    let p = data_dir.join("private");
+    if std::fs::create_dir_all(&p).is_ok() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    p
+}
+
 /// A file or folder's name without its extension, for default output names.
 pub fn stem_of(p: &str) -> String {
     let p = std::path::Path::new(p.trim_end_matches('/'));
@@ -292,7 +305,9 @@ pub fn sensitive(p: &Path) -> Option<&'static str> {
 impl Workshop {
     pub fn init(models_dir: &Path, data_dir: &Path, rest: &std::collections::BTreeMap<String, Value>) -> Arc<Workshop> {
         let out_dir = data_dir.join("workshop");
-        let mut roots = vec![models_dir.to_path_buf(), out_dir.clone()];
+        // private datasets (private-data jobs) live in <data>/private, only the owner may enter (docs/internal/PRIVATE-DATA.md)
+        let private = private_root(data_dir);
+        let mut roots = vec![models_dir.to_path_buf(), out_dir.clone(), private];
         if let Some(dirs) = rest.get("workshop").and_then(|w| w.get("dirs")).and_then(|d| d.as_array()) {
             roots.extend(dirs.iter().filter_map(|d| d.as_str()).map(|d| crate::expand_path(d)));
         }
@@ -1124,6 +1139,7 @@ impl Workshop {
                 args.extend(["--out".into(), output.display().to_string()]);
                 Ok((kind.into(), args, output))
             }
+            "private-data" => self.plan_private(req),
             other => Err(format!("unknown kind {other:?}: {}", KINDS.join(", "))),
         }
     }
@@ -1224,7 +1240,7 @@ impl Workshop {
         // the server's address and key for a job that uses its API: in the environment, never on the command line
         cmd.env_remove("AM2STRATA_URL").env_remove("AM2STRATA_API_KEY");
         // datagen writes through the server's model; regress and grade-train ask it to judge
-        if matches!(job.kind.as_str(), "datagen" | "regress" | "grade-train") {
+        if matches!(job.kind.as_str(), "datagen" | "regress" | "grade-train" | "private-data") {
             if let Some((url, key)) = self.server.lock().unwrap().clone() {
                 cmd.env("AM2STRATA_URL", url);
                 if let Some(k) = key {
@@ -1866,6 +1882,60 @@ impl Workshop {
             return Err("a dataset is a .jsonl file".into());
         }
         self.allowed(p, true)
+    }
+
+    /// A private-data job (docs/internal/PRIVATE-DATA.md): `"name"`, `"sources"` (the owner's folders inside the
+    /// Workshop's folders, each with its SOURCE.toml), `"model"`? (a local model marked private, uncensored or
+    /// abliterated; a `<provider>/<model>` name is refused), `"text_count"`?, `"per_chunk"`?, `"chunk_chars"`?,
+    /// `"temperature"`?, `"every_s"`?, `"max_frames"`? -> `<data>/private/<name>/`.
+    fn plan_private(&self, req: &Value) -> Result<(String, Vec<String>, PathBuf), String> {
+        let name = req["name"].as_str().filter(|n| !n.is_empty()).ok_or("private-data needs \"name\": the dataset's name")?;
+        let ok = name.len() <= 64 && !name.starts_with('.') && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+        if !ok {
+            return Err("\"name\" is 1-64 letters, digits, '.', '_' or '-' (not starting with '.')".into());
+        }
+        let mut sources = vec![];
+        for v in req["sources"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            let p = self.allowed(v.as_str().filter(|p| !p.is_empty()).ok_or("\"sources\" is a list of folders")?, true)?;
+            if !p.is_dir() {
+                return Err(format!("{}: a private-data source is a folder", p.display()));
+            }
+            if !p.join("SOURCE.toml").is_file() {
+                return Err(format!("{}: refused, no SOURCE.toml: write {} with owner_attests_adults_only = true, \
+                                    owner_attests_consent = true and origin = \"...\"", p.display(), p.join("SOURCE.toml").display()));
+            }
+            sources.push(p);
+        }
+        if sources.is_empty() {
+            return Err("private-data needs \"sources\": your own folders, each with its SOURCE.toml".into());
+        }
+        let data_dir = self.out_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| self.out_dir.clone());
+        let output = private_root(&data_dir).join(name);
+        if output.join("dataset.card.md").exists() {
+            return Err(format!("{}: a private dataset of this name exists; pick another \"name\"", output.display()));
+        }
+        let mut args = vec!["private-data".to_string(), "--name".into(), name.into(), "--data-dir".into(), data_dir.display().to_string()];
+        for p in &sources {
+            args.extend(["--source".into(), p.display().to_string()]);
+        }
+        if let Some(m) = req["model"].as_str().filter(|m| !m.is_empty()) {
+            if m.contains('/') {
+                return Err(format!("{m:?}: refused, a <provider>/<model> name is a remote model; private data never leaves this machine"));
+            }
+            args.extend(["--model".into(), m.chars().take(200).collect()]);
+        }
+        for (k, flag, lo, hi, int) in [("text_count", "--text-count", 0.0, 100_000.0, true), ("per_chunk", "--per-chunk", 1.0, 20.0, true),
+                                       ("chunk_chars", "--chunk-chars", 500.0, 20_000.0, true), ("temperature", "--temperature", 0.0, 2.0, false),
+                                       ("every_s", "--every-s", 0.1, 3600.0, false), ("max_frames", "--max-frames", 1.0, 64.0, true)] {
+            match &req[k] {
+                Value::Null => {}
+                v => {
+                    let n = v.as_f64().filter(|n| (lo..=hi).contains(n)).ok_or_else(|| format!("\"{k}\" is a number from {lo} to {hi}"))?;
+                    args.extend([flag.into(), if int { (n as u64).to_string() } else { n.to_string() }]);
+                }
+            }
+        }
+        Ok(("private-data".into(), args, output))
     }
 
     /// True while a job is writing `p`.

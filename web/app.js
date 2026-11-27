@@ -4806,7 +4806,7 @@ async function wsFiles() {
 function wsError(m) { $("ws-error").textContent = m || ""; $("ws-error").hidden = !m; if (m) $("ws-work").scrollTo({top: 0, behavior: "smooth"}); }
 
 // which rail step a job belongs to, and what a job read and wrote
-const WS_STEP_OF = {datagen: "data", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", regress: "test", "grade-train": "grade"};
+const WS_STEP_OF = {datagen: "data", "private-data": "private", clean: "clean", loop: "loop", upcycle: "upcycle", "export-moe": "upcycle", abliterate: "abliterate", train: "train", merge: "merge", convert: "convert", quantize: "quantize", strata: "install", regress: "test", "grade-train": "grade"};
 const wsJobIn = (x) => { const r = x.request || {}; return r.input || r.base || r.model || r.seeds || (r.sources || [])[0] || (r.inputs || [])[0] || ""; };
 const wsJobOut = (x) => x.result?.output || x.output || "";
 function wsJobCard(x) {
@@ -5198,6 +5198,13 @@ $("ws-datagen").onclick = (e) => {
     if (body.recipe === "code") body.check_code = $("ws-d-check").checked;
   }
   wsSubmit(body, e.currentTarget);
+};
+
+// ------------------------------------------------------------------ Workshop: private data (docs/internal/PRIVATE-DATA.md)
+$("ws-private").onclick = (e) => {
+  const n = (id) => { const v = $(id).value.trim(); return v === "" ? "" : Number(v); };
+  wsSubmit({kind: "private-data", name: $("ws-p-name").value.trim(), sources: wsLines("ws-p-sources"), model: $("ws-p-model").value.trim(),
+    text_count: n("ws-p-count"), every_s: n("ws-p-every"), max_frames: n("ws-p-frames")}, e.currentTarget);
 };
 
 // ------------------------------------------------------------------ Workshop: cleaning a dataset
