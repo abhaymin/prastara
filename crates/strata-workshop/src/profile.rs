@@ -57,6 +57,24 @@ pub const ASSUMED_GPU_GFLOPS: f64 = 5600.0;
 /// slack. **Measured** on the same run: its busiest card peaked at 14.7 GiB (15.8 GB; nvidia-smi's MiB) where the
 /// estimate said 13.0 GB.
 pub const CUDA_OVERHEAD_BYTES: u64 = 2_800_000_000;
+/// What a GPU run's activations really take over what [`graph_floats_per_token`] counts (the checkpointed inputs
+/// and one block's replay), **measured** on the first packed run of the 56B-A5B (bf16, two RTX 5060 Ti, rank 16 on
+/// q and v, experts rank 4 with a shared A, max_len 1024, 2026-11-28): a pass of two ~1,017-token sequences peaked at
+/// 11,422 / 13,676 MiB in use where the plain count said 8,912 / 10,483 with the softmax backward's temporaries
+/// apart; an unpacked 812-token conversation peaked at 7.6 GB on the second card (this factor gives 7.8). The rest
+/// is the allocator's rounding and candle's intermediate copies (contiguous layouts, broadcasts, casts).
+pub const ACTIVATION_CALIBRATION: f64 = 1.43;
+
+/// The masked softmax's backward working set for one attention unit of `seq` tokens (one at a time): `g·y`, its row
+/// sums broadcast, the difference and its scaled copy, `[heads, seq, seq]` f32 each, three alive at once. Past
+/// [`crate::model::CHUNKED_ABOVE`] the chunked attention keeps no table (its working set is [`chunk_bytes`]).
+pub fn softmax_backward_bytes(cfg: &ModelConfig, seq: usize) -> u64 {
+    if seq > chunked_above() {
+        return 0;
+    }
+    3 * 4 * (cfg.num_attention_heads * seq * seq) as u64
+}
+
 /// Room left for the process itself, the tokenizer and the allocator on top of the estimate.
 pub const HEADROOM_BYTES: u64 = 512 << 20;
 
@@ -375,6 +393,8 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
     let runs = |i: usize| 1 + cfg.loop_.filter(|l| (l.start..l.end).contains(&i) && loaded.start <= l.start).map_or(0, |l| l.passes - 1);
     let emb = (cfg.vocab_size * cfg.hidden_size) as u64 * p.base_dtype.bytes();
     let trained_runs: usize = (x.first..layers).map(runs).sum::<usize>().max(1);
+    // measured on a GPU run (see ACTIVATION_CALIBRATION); the arithmetic as it is on the CPU
+    let cal = if sp.on_gpu { ACTIVATION_CALIBRATION } else { 1.0 };
     let mut dev = vec![0u64; d];
     let mut reads = vec![0u64; d];
     let mut has_trained = vec![false; d];
@@ -388,7 +408,7 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
             has_trained[k] = true;
             // its share of the adapters, AdamW and gradients (5 copies), and the inputs its checkpoints keep
             dev[k] += (5 * e.adapter_bytes) * r / trained_runs as u64;
-            dev[k] += r * 4 * (x.seq * cfg.hidden_size) as u64 * e.seqs_per_pass as u64;
+            dev[k] += (cal * (r * 4 * (x.seq * cfg.hidden_size) as u64 * e.seqs_per_pass as u64) as f64) as u64;
         }
     }
     for k in 0..d {
@@ -397,7 +417,7 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
             dev[k] += sp.buffers as u64 * block_bytes + x.widening + x.chunk;
         }
         if has_trained[k] {
-            dev[k] += x.one_block as u64;
+            dev[k] += (cal * x.one_block) as u64 + softmax_backward_bytes(cfg, x.seq);
         }
     }
     if x.first > 0 && !x.cached {

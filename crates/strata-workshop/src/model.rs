@@ -1133,6 +1133,26 @@ pub fn trim_if_fragmented(dev: &Device) -> bool {
 
 /// Sequences longer than this use [`chunked_attention`] (set lower in tests).
 pub static CHUNKED_ABOVE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2048);
+/// A packed sequence attends as one unit through a block-diagonal table (true) instead of a conversation at a time
+/// (false, the default: less memory). `AM2_PACK_ATTENTION=table` sets it ([`attention_settings_from_env`]).
+pub static PACK_TABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `AM2_CHUNKED_ABOVE=N` (attention units longer than N tokens go by the chunked rule, [`CHUNKED_ABOVE`]) and
+/// `AM2_PACK_ATTENTION=table|conversation` ([`PACK_TABLE`]), when set; returns what was set, for the log.
+pub fn attention_settings_from_env() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(n) = std::env::var("AM2_CHUNKED_ABOVE").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        CHUNKED_ABOVE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
+        out.push(format!("AM2_CHUNKED_ABOVE: attention past {} tokens goes a chunk of queries at a time", n.max(1)));
+    }
+    match std::env::var("AM2_PACK_ATTENTION").ok().as_deref().map(str::trim) {
+        Some("table") => { PACK_TABLE.store(true, std::sync::atomic::Ordering::Relaxed); out.push("AM2_PACK_ATTENTION=table: a packed sequence attends through one block-diagonal table".into()); }
+        Some("conversation") => PACK_TABLE.store(false, std::sync::atomic::Ordering::Relaxed),
+        _ => {}
+    }
+    out
+}
+
 /// Queries per chunk of [`chunked_attention`].
 pub static ATTENTION_CHUNK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(512);
 
@@ -2623,15 +2643,18 @@ impl LlamaModel {
         self.run_blocks_with(x, range, ctx, None, None)
     }
 
-    /// The attention units of a packed pass for a causal rule with `window` (see [`PassLayout`]): a sequence up to
-    /// `above` rows attends as one unit through a block-diagonal table; a longer one (which packing gives only when the
-    /// cap is above `above`) goes a conversation at a time, a long conversation by the chunked rule.
+    /// The attention units of a packed pass for a causal rule with `window` (see [`PassLayout`]): each conversation
+    /// attends as its own unit (its own causal table, or the chunked rule above `above` rows), so a packed pass's
+    /// attention holds `Σ len²` scores, what its conversations hold alone, not `(Σ len)²`. With [`PACK_TABLE`] a
+    /// sequence up to `above` rows attends as one unit through a block-diagonal table instead (the same values; the
+    /// first real packed run ran out of memory on those tables and their softmax's backward).
     fn packed_attn(&self, l: &PassLayout, window: usize, above: usize, dev: &Device) -> Result<Attn> {
         let mut units = Vec::new();
         let mut at = 0;
+        let table = PACK_TABLE.load(std::sync::atomic::Ordering::Relaxed);
         for lens in &l.seqs {
             let n: usize = lens.iter().sum();
-            if n <= above {
+            if table && n <= above {
                 units.push((at, n, Mask::Table(Tensor::from_vec(PassLayout::mask_values(lens, window), (n, n), dev)?)));
             } else {
                 let mut c0 = at;

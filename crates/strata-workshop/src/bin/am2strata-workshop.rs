@@ -801,6 +801,10 @@ struct RunArgs {
     /// the cards' free memory by the estimate
     #[arg(long, value_name = "N|auto")]
     seqs_per_pass: Option<String>,
+    /// attention over more than N tokens (one conversation, packed or not) goes a chunk of queries at a time with no
+    /// N x N table (default 2048; AM2_CHUNKED_ABOVE sets it too). Lower: less memory, a little more time
+    #[arg(long, value_name = "N")]
+    chunked_above: Option<usize>,
     #[arg(long)]
     warmup_ratio: Option<f64>,
     #[arg(long)]
@@ -897,6 +901,9 @@ impl RunArgs {
         if s.stream_layers.is_some() && !s.gradient_checkpointing {
             notes.push("--stream-layers turns gradient checkpointing on (each block is replayed from its streamed weights in the backward pass)".into());
             s.gradient_checkpointing = true;
+        }
+        if let Some(n) = self.chunked_above {
+            strata_workshop::model::CHUNKED_ABOVE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
         }
         s.pack = if self.no_pack { false } else { self.pack || s.stream_layers.is_some() };
         s.seqs_per_pass = match self.seqs_per_pass.as_deref() {
@@ -1478,7 +1485,8 @@ fn run(cmd: &Cmd, out: &Out) -> Result<(PathBuf, String, Value), String> {
             if preset.is_some() && run.data.is_some() {
                 return Err("--preset has no tokenizer to count --data with: give --examples and --avg-tokens".into());
             }
-            let (mut s, notes) = run.settings(false)?;
+            let (mut s, mut notes) = run.settings(false)?;
+            notes.extend(strata_workshop::model::attention_settings_from_env());
             let mut p = profile_input(&s, cfg, *examples, *avg_tokens, &run.stream_bandwidth)?;
             let mut machine = Machine::detect();
             if let Some(g) = cpu_gflops {

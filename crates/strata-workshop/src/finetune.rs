@@ -749,9 +749,9 @@ impl Runner {
     /// Its loss is the sum of each conversation's own, so the step divides by its conversations; the gradients are as
     /// the backward pass left them (the graph's store and the checkpoint replays' parts, no copies). Nothing of the
     /// run's state changes here, so a pass that fails can be run again.
-    fn micro(&mut self, step: usize, m: usize, n: usize, lr: f64) -> Result<PassOut> {
-        let units: Vec<Vec<usize>> = (m..m + n).map(|j| self.sched.unit(j).to_vec()).collect();
-        let pass = Pass::of(&self.data.train, &units);
+    fn micro(&mut self, step: usize, m: usize, units: &[Vec<usize>], lr: f64) -> Result<PassOut> {
+        let n = units.len();
+        let pass = Pass::of(&self.data.train, units);
         let h = self.hidden_pass(&pass)?;
         let mut dropout_seed = self.seed ^ (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let ctx = Ctx::train(splitmix(&mut dropout_seed));
@@ -814,6 +814,28 @@ impl Runner {
         Ok(())
     }
 
+    /// After a pass ran out of device memory: everything it held dropped (the checkpoint replays' gradient parts),
+    /// the devices waited for, and the step's running gradient sums moved to the host while the pools give back all
+    /// they hold unused, then put back (fresh, contiguous allocations: the sums no longer pin pool chunks the failed
+    /// pass had fragmented).
+    fn release_after_oom(&mut self, sum: &mut [Option<Tensor>]) -> Result<()> {
+        drop(self.model.take_checkpoint_grads());
+        self.model.synchronize()?;
+        let devs: Vec<Option<Device>> = sum.iter().map(|g| g.as_ref().map(|t| t.device().clone())).collect();
+        for g in sum.iter_mut() {
+            if let Some(t) = g.take() {
+                *g = Some(t.to_device(&Device::Cpu)?);
+            }
+        }
+        self.model.synchronize()?;
+        for (g, d) in sum.iter_mut().zip(devs) {
+            if let (Some(t), Some(d)) = (g.take(), d) {
+                *g = Some(model::move_to(&t, &d)?);
+            }
+        }
+        Ok(())
+    }
+
     /// One optimizer step at rate `lr` over units `step·accumulation ..`, as many as `count`, `seqs_per_pass` of them
     /// a pass. Returns the mean loss over the step's conversations before the update (and the gradient is the mean
     /// over them too: one conversation's tokens weigh what they weigh unpacked). A loss that is not a number stops
@@ -833,45 +855,71 @@ impl Runner {
             // sums take its gradients only after its backward pass has finished, so nothing is counted twice, and they
             // are added in place as always: no second set of gradients is held.
             let mut attempt = 0;
-            let (n, value, aux, tokens, convs) = loop {
-                let n = self.seqs_per_pass.min(count - k).max(1);
+            let mut n = self.seqs_per_pass.min(count - k).max(1);
+            // the passes this chunk of units runs as: one, or after an out-of-memory error with a single sequence, that
+            // sequence's conversations in two halves (each a pass of its own: the same sums, half the tokens at once)
+            let mut plan: Vec<Vec<Vec<usize>>> = vec![(m..m + n).map(|j| self.sched.unit(j).to_vec()).collect()];
+            let (mut value, mut aux, mut tokens, mut convs) = (0.0f64, None::<f64>, 0u64, 0usize);
+            let mut p = 0;
+            while p < plan.len() {
                 let before_empty: Vec<bool> = sum.iter().map(Option::is_none).collect();
                 let mut added = Vec::new();
-                let tried = self.micro(step, m, n, lr).and_then(|o| {
+                let units = plan[p].clone();
+                let tried = self.micro(step, m, &units, lr).and_then(|o| {
                     self.commit(m, &mut sum, &o.grads, &o.extra, &mut added)?;
                     Ok((o.value, o.aux, o.tokens, o.conversations))
                 });
                 match tried {
-                    Ok((value, aux, tokens, convs)) => break (n, value, aux, tokens, convs),
+                    Ok((v, a, t, c)) => {
+                        value += v;
+                        if let Some(a) = a {
+                            aux = Some(aux.unwrap_or(0.0) + a * c as f64);
+                        }
+                        tokens += t;
+                        convs += c;
+                        p += 1;
+                        if p < plan.len() {
+                            self.model.synchronize()?;
+                        }
+                    }
                     Err(e) if attempt == 0 && is_out_of_memory(&e) => {
                         attempt += 1;
-                        drop(self.model.take_checkpoint_grads());
-                        self.model.synchronize()?;
                         let undone = added.len();
                         Self::uncommit(&mut sum, &before_empty, added)?;
-                        let fewer = if n > 1 {
-                            self.seqs_per_pass = (n / 2).max(1);
-                            format!(" with {} sequences per pass instead of {n} (for the rest of the run)", self.seqs_per_pass)
+                        let before = self.model.memory_now();
+                        self.release_after_oom(&mut sum)?;
+                        let what = if n > 1 {
+                            n = (n / 2).max(1);
+                            self.seqs_per_pass = n;
+                            plan = vec![(m..m + n).map(|j| self.sched.unit(j).to_vec()).collect()];
+                            format!(" with {n} sequences per pass instead of {} (for the rest of the run)", units.len())
+                        } else if units[0].len() > 1 {
+                            let c = &units[0];
+                            let half = c.len() / 2;
+                            plan = vec![vec![c[..half].to_vec()], vec![c[half..].to_vec()]];
+                            format!(" as two passes of {} and {} conversations (the sequence split between conversations)", half, c.len() - half)
                         } else {
                             String::new()
                         };
-                        // what the cards hold now (not the high-water marks): after the trim, the reserve should be
-                        // back at the use, which is the run's fixed state (adapters, moments, stream buffers)
+                        // what the cards hold now (not the high-water marks): after the release the reserve should be
+                        // back near the use, which is the run's fixed state (adapters, moments, stream buffers)
                         let now = self.model.memory_now();
-                        let line = format!("step {} micro-step {m}{}: out of device memory ({}); its tensors dropped{}, the pools trimmed{}, trying it once more{fewer}",
-                            step + 1, if n > 1 { format!(" (a pass of {n})") } else { String::new() }, first_line(&e),
+                        let pools = |v: &[(u64, u64)]| v.iter().enumerate().map(|(d, (u, r))| format!("dev{d} {} MiB reserved, {} MiB in use", r >> 20, u >> 20)).collect::<Vec<_>>().join("; ");
+                        let line = format!("step {} micro-step {m}{}: out of device memory ({}); its tensors dropped{}, the pools released{}, trying it once more{what}",
+                            step + 1, if units.len() > 1 { format!(" (a pass of {})", units.len()) } else { String::new() }, first_line(&e),
                             if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
                             if now.is_empty() { String::new() } else {
-                                format!(" (now {})", now.iter().enumerate().map(|(d, (u, r))| format!("dev{d} {} MiB reserved, {} MiB in use", r >> 20, u >> 20)).collect::<Vec<_>>().join("; ")) });
+                                format!(" (now {}; before the release {})", pools(&now),
+                                        before.iter().enumerate().map(|(d, (u, r))| format!("card {d}: {}/{} MiB reserved/in use", r >> 20, u >> 20)).collect::<Vec<_>>().join(", ")) });
                         // (train() says it even when the retry fails too and the step ends the run)
                         self.pending.push(line);
                     }
                     Err(e) => return Err(e),
                 }
-            };
+            }
             loss_sum += value;
             if let Some(a) = aux {
-                aux_sum = Some(aux_sum.unwrap_or(0.0) + a * convs as f64);
+                aux_sum = Some(aux_sum.unwrap_or(0.0) + a);
             }
             conversations += convs;
             self.tokens_seen += tokens;
@@ -1046,6 +1094,9 @@ pub fn train(s: &TrainSettings, on_event: &mut dyn FnMut(Event), should_stop: &d
     }
     let (n_train, n_eval) = (data.train.len(), data.eval.len());
     let train_tokens: usize = data.train.iter().map(|e| e.tokens.len()).sum();
+    for l in model::attention_settings_from_env() {
+        on_event(Event::Log(l));
+    }
     if s.seqs_per_pass == 0 {
         on_event(Event::Log("--seqs-per-pass auto is resolved by the command from the cards' free memory; 1 here".into()));
     }

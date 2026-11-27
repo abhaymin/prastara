@@ -228,7 +228,9 @@ fn the_streamed_tiny_model_by_hand() {
     // the device: both blocks' norms 2 · 32 · 4, the adapters with AdamW and gradients 5 · 2048, each block's saved input 4 · 16 · 16,
     // two buffers, one block's activations (checkpointing: 2 · 4 · 16 tokens · 776), the head's loss slice 6144, the final norm 64 and
     // the untied head 32 · 16 · 4
-    assert_eq!(st.device_bytes, vec![256 + 10_240 + 2 * 1024 + 20_480 + 99_328 + 6_144 + 64 + 2_048]);
+    // (a GPU run: the saved inputs and the replay times the measured calibration, and the softmax backward's temporaries)
+    let cal = |b: u64| (profile::ACTIVATION_CALIBRATION * b as f64) as u64;
+    assert_eq!(st.device_bytes, vec![256 + 10_240 + 2 * cal(1024) + 20_480 + cal(99_328) + profile::softmax_backward_bytes(&cfg, 16) + 6_144 + 64 + 2_048]);
     assert_eq!(e.per_device_bytes, st.device_bytes[0]);
     // the RAM tier holds both blocks' matrices and the embedding table (looked up in RAM on a GPU)
     assert_eq!((st.host_bytes, st.disk_bytes), (20_480 + 2_048, 0));

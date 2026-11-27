@@ -432,3 +432,27 @@ fn an_out_of_memory_pass_is_retried_with_fewer_sequences() {
     let report: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(o.out.join(finetune::REPORT_FILE)).unwrap()).unwrap();
     assert_eq!(report["packing"]["seqs_per_pass"], 2, "{report}");
 }
+
+/// A single packed sequence that runs out of device memory is retried as two passes, its conversations split in
+/// halves: the same sums, so the same run.
+#[test]
+fn an_out_of_memory_sequence_is_retried_in_halves() {
+    let _g = lock();
+    let (root, model, data) = moe_and_data("pack-oom-split");
+    let mut s = settings(&model, &data, &root.join("clean"));
+    s.max_steps = Some(2);
+    s.seqs_per_pass = 1;
+    let (clean, _) = run(&s);
+    let mut o = s.clone();
+    o.out = root.join("oom");
+    finetune::INJECT_OOM_TIMES.store(1, std::sync::atomic::Ordering::Relaxed);
+    finetune::INJECT_OOM.store(5, std::sync::atomic::Ordering::Relaxed);
+    let (r, logs) = run(&o);
+    finetune::INJECT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
+    let line = logs.iter().find(|l| l.contains("out of device memory")).unwrap_or_else(|| panic!("{logs:?}"));
+    assert!(line.contains("micro-step 5") && line.contains("as two passes of"), "{line}");
+    let dl = clean.losses.iter().zip(&r.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
+    let da = max_abs(&adapter(&s.out), &adapter(&o.out));
+    println!("{line}\nlosses {:?} vs {:?}", clean.losses, r.losses);
+    assert!(dl < 1e-5 && da < 1e-5, "losses differ by {dl}, the adapter by {da}");
+}
