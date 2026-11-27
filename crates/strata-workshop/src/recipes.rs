@@ -426,8 +426,20 @@ pub fn compiles(rustc: &Path, code: &str) -> bool {
 
 /// `rustc` on the PATH (or `$RUSTC`), if there is one.
 pub fn find_rustc() -> Option<std::path::PathBuf> {
-    if let Ok(r) = std::env::var("RUSTC") { return Some(r.into()); }
-    std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("rustc")).find(|f| f.is_file()))
+    static FOUND: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    FOUND.get_or_init(|| {
+        let on_path = match std::env::var("RUSTC") {
+            Ok(r) => Some(std::path::PathBuf::from(r)),
+            Err(_) => std::env::var_os("PATH").and_then(|p| std::env::split_paths(&p).map(|d| d.join("rustc")).find(|f| f.is_file())),
+        }?;
+        // a rustup proxy (~/.cargo/bin/rustc) cannot pick a toolchain inside the sandbox (no HOME, no RUSTUP_HOME):
+        // the compiler it stands for, from its sysroot, asked once out here
+        let real = std::process::Command::new(&on_path).args(["--print", "sysroot"]).output().ok()
+            .filter(|o| o.status.success())
+            .map(|o| std::path::PathBuf::from(String::from_utf8_lossy(&o.stdout).trim()).join("bin").join(format!("rustc{}", std::env::consts::EXE_SUFFIX)))
+            .filter(|p| p.is_file());
+        Some(real.unwrap_or(on_path))
+    }).clone()
 }
 
 #[cfg(test)]
