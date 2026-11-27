@@ -158,7 +158,7 @@ pub struct Mapping {
     /// columns that hold JSON or a Python literal (`{'a': 'b'}`) as text: parsed into values first
     #[serde(default)]
     pub parse: Vec<String>,
-    /// tree: the children's key, the rank key (lowest first) and the most turns taken
+    /// tree: the children's key, the rank key (lowest first); tree and messages: the most turns taken
     #[serde(default)]
     pub children: Option<String>,
     #[serde(default)]
@@ -933,6 +933,11 @@ fn conversations(m: &Mapping, rec: &Value, d: &mut Draw) -> Result<Vec<Vec<(Stri
                     other => other.to_string(),
                 };
                 msgs.push((role, content));
+            }
+            // the first turns only (the system prompt does not count)
+            if let Some(n) = m.max_turns {
+                let sys = msgs.iter().take_while(|(r, _)| r == "system").count();
+                msgs.truncate(sys + n);
             }
             convs.push(msgs);
         }

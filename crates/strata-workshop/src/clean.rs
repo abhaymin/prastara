@@ -388,8 +388,12 @@ pub fn cut_tail(answer: &str) -> Option<String> {
     let last = a.lines().last().unwrap_or("").trim();
     let listy = last.starts_with(['-', '*', '•', '|', '#', '>']) || last.split_once(['.', ')']).is_some_and(|(n, _)| !n.is_empty() && n.len() <= 3 && n.chars().all(|c| c.is_ascii_digit()));
     // code: an indented or bracketed last line, or one with code punctuation
-    let codey = a.contains("```") || last.ends_with([';', '{', '}']) || answer.lines().last().is_some_and(|l| l.starts_with("    ") || l.starts_with('\t'));
-    if listy || codey {
+    let codey = a.contains("```") || last.ends_with([';', '{', '}']) || last.starts_with("//")
+        || answer.lines().last().is_some_and(|l| l.starts_with("    ") || l.starts_with('\t'));
+    // prose has sentence ends or clauses (a comma and a space) inside it; word lists, tags and phone strings have none and are not judged
+    let prose = a.char_indices().any(|(i, c)| matches!(c, '.' | '!' | '?' | '।' | '॥' | '。' | '؟' | '۔')
+        && a[i + c.len_utf8()..].chars().next().is_some_and(char::is_whitespace)) || a.contains(", ");
+    if listy || codey || !prose {
         return None;
     }
     let c = last.chars().last()?;
@@ -1099,6 +1103,9 @@ mod tests {
         assert!(cut_tail("The river rises in the hills and flows to the sea, passing many towns and").is_some());
         assert!(cut_tail("The river rises in the hills and flows to the sea, passing many towns on the way.").is_none());
         assert!(cut_tail("Paris").is_none(), "short answers need no full stop");
+        assert!(cut_tail("AH0 N IH0 N T ER0 AH1 P T AH0 B AH0 L and more phones here to pass twelve words").is_none(), "no sentence in it: not prose");
+        assert!(cut_tail("Finalmente/ADV ,/PUNCT sobreviene/VERB la/DET muerte/NOUN por/ADP parálisis/NOUN respiratoria/ADJ x/X y/X z/X w/X ./PUNCT").is_none());
+        assert!(cut_tail("It was late. The river rises in the hills and flows to the sea, passing many towns and").is_some());
         assert!(cut_tail("Here are the steps you can follow today:\n1. Open the box\n2. Take out the parts").is_none());
     }
 
