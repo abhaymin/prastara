@@ -4768,7 +4768,26 @@ async function wsFetch(path, opts = {}) {
   if (!r.ok) throw new Error(j.error?.message || (r.status === 401 ? "The Workshop needs the server's API key (Settings › Server and access)." : `HTTP ${r.status}`));
   return j;
 }
+// the cluster's machines for "Run on" (shown only when this server has workers)
+async function wsNodes() {
+  try {
+    const n = await wsFetch("api/cluster/workshop");
+    const sel = $("ws-node"), was = sel.value;
+    const opts = [`<option value="">This machine${n.this?.node ? ` (${esc(n.this.node)})` : ""}</option>`, `<option value="any">Any (the idlest that can)</option>`];
+    for (const w of n.workers || []) {
+      const c = w.caps, gpu = c?.gpu?.cuda ? "CUDA" : c?.gpu?.metal ? "Metal" : "CPU";
+      const why = !w.ready ? "not answering" : !c ? "no Workshop jobs" : !c.installed ? "no Workshop command" : `${gpu}, ${c.ram_free_gb} GB free`;
+      opts.push(`<option value="${esc(w.name)}"${w.ready && c?.installed ? "" : " disabled"}>${esc(w.name)} · ${esc(why)}</option>`);
+    }
+    sel.innerHTML = opts.join("");
+    sel.value = [...sel.options].some((o) => o.value === was && !o.disabled) ? was : "";
+    $("ws-runon").hidden = !(n.workers || []).length;
+    $("ws-keep-wrap").hidden = !sel.value || sel.value === "any";
+  } catch { $("ws-runon").hidden = true; }
+}
+$("ws-node").onchange = () => { $("ws-keep-wrap").hidden = !$("ws-node").value || $("ws-node").value === "any"; };
 async function loadWorkshop() {
+  wsNodes();
   await wsFiles();
   refreshJobs();
   wsCtxRefresh();
@@ -4832,10 +4851,11 @@ function wsJobCard(x) {
   if (x.state === "done" && ["merge", "convert", "quantize", "loop", "upcycle", "export-moe", "abliterate", "train"].includes(x.kind) && x.result) acts.push(`<button class="st-btn st-btn--secondary" data-ws-next="${x.id}">Use next</button>`);
   if ((x.kind === "datagen" && ["done", "cancelled"].includes(x.state)) || (x.kind === "clean" && x.state === "done")) acts.push(`<button class="st-btn st-btn--secondary" data-ws-review="${esc(x.output)}">Review</button>`);
   if (x.state === "done" && x.kind === "strata") acts.push(`<button class="st-btn st-btn--secondary" data-ws-load="${esc(x.result?.model || "")}">Load it</button>`);
-  const rows = [["Input", inp], ["Output", out], ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
+  const rows = [["Input", inp], ["Output", out], ["Node", x.node || ""], ["On the node", x.result?.remote_output || ""],
+                ["Queued", x.queued_at ? new Date(x.queued_at * 1000).toLocaleString() : ""]].filter((r) => r[1]);
   return `<article class="ws-job" data-state="${esc(x.state)}">
     <div class="ws-job__top"><span class="ws-job__kind">${esc(x.kind)}</span><span class="ws-job__id">#${x.id}</span>
-      <span class="st-badge ${badge}">${esc(x.state)}</span><span class="ws-job__time">${esc(time)}</span></div>
+      <span class="st-badge ${badge}">${esc(x.state)}</span>${x.node ? `<span class="st-badge st-badge--reading ws-job__node" title="runs on ${esc(x.node)}; its files travel by hash">${esc(x.node)}</span>` : ""}<span class="ws-job__time">${esc(time)}</span></div>
     <div class="ws-job__name" title="${esc(out || inp)}"><span>${esc(name)}</span><span class="muted">${esc(size)}</span></div>
     ${bar}${line && !x.error ? `<div class="ws-job__line" title="${esc(line)}">${esc(line)}</div>` : ""}
     ${x.error ? `<div class="ws-job__err" title="${esc(x.error)}">${esc(short(x.error))}</div>` : ""}
@@ -4921,8 +4941,10 @@ async function wsSubmit(body, btn) {
   const label = btn.textContent; btn.disabled = true;
   try {
     for (const k of Object.keys(body)) if (body[k] === "") delete body[k];
+    const node = $("ws-runon").hidden ? "" : $("ws-node").value;
+    if (node) { body.node = node; if (node !== "any" && $("ws-keep").checked) body.keep_on_node = true; }
     const j = await wsFetch("v1/workshop/jobs", {method: "POST", body: JSON.stringify(body)});
-    toast("success", `Job #${j.id} queued`, `${body.kind}: it shows under Jobs`);
+    toast("success", `Job #${j.id} queued`, `${body.kind}${j.node ? ` on ${j.node}` : j.picked ? ` on ${j.picked}` : ""}: it shows under Jobs`);
     refreshJobs();
   } catch (e) { wsError(e.message); }
   finally { btn.disabled = false; btn.textContent = label; }

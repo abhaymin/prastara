@@ -166,6 +166,7 @@ enum Cmd {
     /// | clean <in.jsonl> [--input more.jsonl] [--tokenizer <hf-folder>] [--max-len 1024] [--min-answer-tokens 4] [--max-repeat 0.5]
     ///   [--dedupe near|exact|off] [--lang-match] [--exclude held-out.jsonl] [--cap-per-language N] (a dataset cleaned, with its card)
     /// | jobs | job <id> | cancel <id> | files
+    /// Any job takes --node <worker>|any to run on another machine of the cluster (--keep-on-node leaves its outputs there)
     Workshop {
         action: String,
         /// convert/quantize/loop: the input; merge: the base model; job/cancel: the job id
@@ -1472,6 +1473,14 @@ struct DatagenOpts {
     /// clean: the inputs the cap draws from (repeat it); the others are kept whole
     #[arg(long)]
     cap_only: Vec<String>,
+    /// any job: the machine of the cluster to run it on: a paired worker's name (e.g. macm4), or "any" (the idlest
+    /// machine that can run it; never for private data). Without it: the server's own machine. Its inputs are copied
+    /// there and its outputs back, each checked by SHA-256
+    #[arg(long)]
+    node: Option<String>,
+    /// with --node: leave the outputs on that machine
+    #[arg(long)]
+    keep_on_node: bool,
     /// dataset: the first record to show, and how many
     #[arg(long, default_value_t = 0)]
     offset: usize,
@@ -1503,7 +1512,8 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
     };
     let show = |j: &serde_json::Value| {
         let res = j["result"]["output"].as_str().map(|o| format!(" -> {o}")).unwrap_or_default();
-        println!("#{} {} {}{}", j["id"], j["kind"].as_str().unwrap_or(""), j["state"].as_str().unwrap_or(""), res);
+        let on = j["node"].as_str().map(|n| format!(" on {n}")).unwrap_or_default();
+        println!("#{} {} {}{on}{}", j["id"], j["kind"].as_str().unwrap_or(""), j["state"].as_str().unwrap_or(""), res);
         if let Some(e) = j["error"].as_str() { println!("  error: {e}"); }
     };
     let result = (|| -> Result<(), String> {
@@ -1650,6 +1660,10 @@ fn workshop_cmd(action: &str, first: Option<String>, second: Option<String>, out
             other => return Err(format!("unknown action {other:?}: convert, quantize, merge, strata, datagen, clean, upload, dataset, jobs, job, cancel, files")),
         };
         let mut body = body;
+        if let Some(n) = &dg.node {
+            body["node"] = serde_json::json!(n);
+            if dg.keep_on_node { body["keep_on_node"] = serde_json::json!(true); }
+        }
         if let Some(o) = body.as_object_mut() { o.retain(|_, v| !v.is_null()); }
         let j = send(client.post(format!("{url}/v1/workshop/jobs")).json(&body))?;
         show(&j);
