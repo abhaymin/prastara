@@ -1878,6 +1878,11 @@ impl CustomOp1 for CheckpointBlock {
 #[allow(clippy::too_many_arguments)]
 fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, dev: &Device, rope: &(Tensor, Tensor), att: &Attn, ctx: &Ctx, grads: &CkptGrads, active: bool,
                 stream: Option<StreamRef>) -> Result<Tensor> {
+    // the node's input is on the block's own device (moved there, the move in the graph), unless it waits in host
+    // memory (offloaded checkpoints): a node hanging from the previous block's card would send its input's gradient
+    // back from the wrong one
+    let offload = OFFLOAD_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
+    let x = &if offload && x.device().is_cpu() { x.clone() } else { move_to(x, dev)? };
     let calls = ctx.calls.get();
     let sub = Ctx { train: ctx.train, seed: ctx.seed, calls: Cell::new(calls), detach: Cell::new(ctx.detach.get()), ..Ctx::default() };
     let value = block_forward(cfg, run, &move_to(&x.detach(), dev)?, rope, att, &sub)?.detach();
@@ -1905,7 +1910,6 @@ fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, dev: 
     // the input may not descend from a variable (the first trained block): give the node something to hang from. With
     // OFFLOAD_CHECKPOINTS the node hangs from a host copy: its saved input, and its output (the next block's input),
     // live in host memory, so between blocks a card holds nothing of the pass
-    let offload = OFFLOAD_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
     let x_in = if x.track_op() {
         // (offloading, a tracked input is a host one: the block before put it there)
         x.clone()

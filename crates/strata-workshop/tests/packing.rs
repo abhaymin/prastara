@@ -578,3 +578,43 @@ fn grouped_expert_lora_and_offloaded_checkpoints_equal_the_old_paths() {
         set(true, false);
     }
 }
+
+/// The GPUs given by `AM2_TEST_DEVICES` (default `cuda:0,cuda:1`).
+#[cfg(feature = "cuda")]
+fn test_devices() -> Vec<String> {
+    std::env::var("AM2_TEST_DEVICES").map(|l| l.split(',').map(|d| d.trim().to_string()).collect()).unwrap_or_else(|_| vec!["cuda:0".into(), "cuda:1".into()])
+}
+
+/// On two GPUs (`-- --ignored`): a tiny upcycled MoE and a looped one, split over the cards, streamed and packed (2
+/// sequences a pass), take the same steps as on the CPU, with the checkpoints on the cards and offloaded. The
+/// first real two-card packed run failed here: a checkpoint node hung from the previous card's tensor, and its
+/// input's gradient came back from the other card ("device mismatch in add").
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore]
+fn on_two_gpus_a_split_packed_streamed_moe_trains_as_on_the_cpu() {
+    let _g = lock();
+    let (root, looped_moe, data) = moe_and_data("pack-two-gpus");
+    let flat_moe = upcycle(&root, &root.join("dense"), MoeSpec { expert_ff: Some(16), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(8, 2) }, "flat-moe");
+    for (tag, model) in [("moe", &flat_moe), ("looped-moe", &looped_moe)] {
+        let mut cpu = settings(model, &data, &root.join(format!("{tag}-cpu")));
+        cpu.max_steps = Some(3);
+        cpu.seqs_per_pass = 2;
+        let (want, _) = run(&cpu);
+        for offload in [Some(false), Some(true)] {
+            let mut g = cpu.clone();
+            g.out = root.join(format!("{tag}-gpu-{offload:?}"));
+            g.devices = test_devices();
+            g.stream_layers = Some(StreamMode::Ram);
+            g.stream_cache = Some(root.join("shards"));
+            g.offload_checkpoints = offload;
+            let (got, _) = run(&g);
+            let dl = want.losses.iter().zip(&got.losses).map(|(a, b)| (a - b).abs() / a.abs().max(1.0)).fold(0.0, f64::max);
+            let da = max_abs(&adapter(&cpu.out), &adapter(&g.out));
+            println!("{tag} on {:?} (offload {offload:?}): losses {:?} vs the CPU's {:?} (rel {dl:.2e}), adapter {da:.2e}, eval {:?} vs {:?}",
+                     g.devices, got.losses, want.losses, got.eval_loss, want.eval_loss);
+            assert!(dl < 1e-4 && da < 1e-3, "{tag} offload {offload:?}: losses {dl}, adapter {da}");
+        }
+    }
+    strata_workshop::model::OFFLOAD_CHECKPOINTS.store(false, std::sync::atomic::Ordering::Relaxed);
+}
