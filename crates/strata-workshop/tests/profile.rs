@@ -308,13 +308,15 @@ fn packing_and_sequences_a_pass_in_the_estimate() {
     base.examples = 100_000;
     base.avg_tokens = 320;
     let one = profile::estimate(&base);
-    let packed = ProfileInput { batch: profile::BatchProfile { packed_sequences: Some(33_000), seqs_per_pass: 4 }, ..base.clone() };
+    let packed = ProfileInput { batch: profile::BatchProfile { packed_sequences: Some(33_000), seqs_per_pass: 4, offload: false }, ..base.clone() };
     let four = profile::estimate(&packed);
     let (a, b) = (one.stream.unwrap(), four.stream.clone().unwrap());
     assert_eq!(a.bytes_per_pass, b.bytes_per_pass, "a pass moves the base twice, whatever it holds");
     assert_eq!((a.passes_per_epoch, b.passes_per_epoch), (100_000, 33_000 / 4));
     assert_eq!(b.bytes_per_step, b.bytes_per_pass, "a step of 4 sequences is one pass");
-    assert!(b.epoch_seconds < a.epoch_seconds / 3.0, "{} vs {}", b.epoch_seconds, a.epoch_seconds);
+    // the PCIe time falls with the passes; the compute (the same tokens) stays
+    assert!(b.epoch_seconds < a.epoch_seconds / 2.0, "{} vs {}", b.epoch_seconds, a.epoch_seconds);
+    assert!(b.epoch_seconds >= b.compute_seconds_per_epoch * 0.999 && (a.transfer_seconds_per_epoch / b.transfer_seconds_per_epoch - a.passes_per_epoch as f64 / b.passes_per_epoch as f64).abs() < 0.01);
     assert!(b.device_bytes.iter().zip(&a.device_bytes).all(|(x, y)| x > y), "four sequences' activations");
     assert_eq!((four.units_per_epoch, four.seqs_per_pass, four.steps), (33_000, 4, 33_000 / 4));
     // auto: all four on empty 16 GB cards; on cards with almost nothing free, one

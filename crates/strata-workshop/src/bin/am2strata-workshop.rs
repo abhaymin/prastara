@@ -805,6 +805,14 @@ struct RunArgs {
     /// N x N table (default 2048; AM2_CHUNKED_ABOVE sets it too). Lower: less memory, a little more time
     #[arg(long, value_name = "N")]
     chunked_above: Option<usize>,
+    /// on: the checkpointed blocks' saved inputs wait in host memory between blocks (the cards' pools cannot fragment
+    /// within a pass; about five copies of the hidden state a block); off: on the cards; auto (default): off until a
+    /// pass runs out of device memory, then on
+    #[arg(long, value_name = "on|off|auto")]
+    offload_checkpoints: Option<String>,
+    /// TF32 tensor cores for the f32 matrix products on CUDA: faster, not bit-exact
+    #[arg(long)]
+    tf32: bool,
     #[arg(long)]
     warmup_ratio: Option<f64>,
     #[arg(long)]
@@ -905,6 +913,13 @@ impl RunArgs {
         if let Some(n) = self.chunked_above {
             strata_workshop::model::CHUNKED_ABOVE.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
         }
+        s.offload_checkpoints = match self.offload_checkpoints.as_deref() {
+            None | Some("auto") => None,
+            Some("on") => Some(true),
+            Some("off") => Some(false),
+            Some(o) => return Err(format!("--offload-checkpoints {o:?}: on, off or auto")),
+        };
+        s.tf32 = self.tf32;
         s.pack = if self.no_pack { false } else { self.pack || s.stream_layers.is_some() };
         s.seqs_per_pass = match self.seqs_per_pass.as_deref() {
             Some("auto") => 0,
@@ -1016,7 +1031,8 @@ fn profile_input(s: &TrainSettings, cfg: ModelConfig, examples: Option<usize>, a
     });
     Ok(ProfileInput { checkpointing: s.gradient_checkpointing || stream.is_some(), devices, lora: s.lora.clone(), base_dtype: s.base_dtype, max_len, accumulation: s.accumulation,
                       cache: s.cache_dir.is_some() && s.lora.first_trained(cfg.num_hidden_layers) > 0, examples: n, epochs: s.epochs, avg_tokens: avg.min(max_len), cfg, stream,
-                      batch: BatchProfile { packed_sequences, seqs_per_pass: s.seqs_per_pass.max(1) } })
+                      batch: BatchProfile { packed_sequences, seqs_per_pass: s.seqs_per_pass.max(1),
+                                           offload: s.offload_checkpoints == Some(true) && (s.gradient_checkpointing || s.stream_layers.is_some()) && s.devices.iter().any(|d| d.starts_with("cuda")) } })
 }
 
 /// `--seqs-per-pass auto`: the most units a pass that fit the free memory of the cards the run names (by the

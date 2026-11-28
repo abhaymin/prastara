@@ -1268,6 +1268,42 @@ pub fn chunked_attention(q: &Tensor, k: &Tensor, v: &Tensor, scale: f64, window:
     Ok(q.apply_op3(k, v, ChunkedAttention { y: Mutex::new(Some(value)), scale, window, chunk })?)
 }
 
+/// Checkpointed blocks keep their saved inputs (and pass their outputs on) in host memory, the adapters' gradients
+/// of their replays too: between blocks a card holds only the run's fixed state and the block running, so a pass's
+/// many differently sized allocations cannot fragment the device pool around long-lived ones (the packed 56B-A5B run
+/// reserved 15.6 GB for 8 GB in use within a pass). Costs a copy of the hidden state each way per block (16 MB at
+/// 1,024 tokens) and of the gradients once. The trainer sets it ([`crate::finetune::TrainSettings::offload_checkpoints`]).
+pub static OFFLOAD_CHECKPOINTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A replay's adapter gradients go to host memory at once (one copy a block), not after the whole backward pass.
+pub static HOST_REPLAY_GRADS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Per-section timing of the forward pass (a benchmark's switch, `AM2_PROFILE_OPS=1`): each timed section waits for
+/// its device before and after, so the times are the sections' own (and the whole runs slower).
+pub static PROFILE_OPS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static OP_TIMES: Mutex<BTreeMap<&'static str, (f64, u64)>> = Mutex::new(BTreeMap::new());
+
+/// `f`, timed under `name` when [`PROFILE_OPS`] is on.
+fn prof<T>(name: &'static str, dev: &Device, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !PROFILE_OPS.load(std::sync::atomic::Ordering::Relaxed) {
+        return f();
+    }
+    dev.synchronize()?;
+    let t = std::time::Instant::now();
+    let out = f()?;
+    dev.synchronize()?;
+    let mut m = OP_TIMES.lock().map_err(|_| anyhow!("op times: lock"))?;
+    let e = m.entry(name).or_insert((0.0, 0));
+    e.0 += t.elapsed().as_secs_f64();
+    e.1 += 1;
+    Ok(out)
+}
+
+/// The sections' times since the last call (seconds, calls), emptied.
+pub fn take_op_times() -> BTreeMap<&'static str, (f64, u64)> {
+    OP_TIMES.lock().map(|mut m| std::mem::take(&mut *m)).unwrap_or_default()
+}
+
 /// One LoRA adapter: `A` `[r, in]`, `B` `[out, r]`.
 #[derive(Debug, Clone)]
 pub struct Lora {
@@ -1407,7 +1443,13 @@ impl Linear {
 
 /// An adapter's term `s · B A drop(x)`.
 fn lora_delta(l: &Lora, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
-    let x = if ctx.train && l.dropout > 0.0 {
+    let x = dropped(l, x, ctx)?;
+    Ok((x.matmul(&ctx.var(&l.a).t()?)?.matmul(&ctx.var(&l.b).t()?)? * l.scaling)?)
+}
+
+/// `drop(x)` for adapter `l` (training with dropout: a fresh seeded mask; otherwise `x`).
+fn dropped(l: &Lora, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    Ok(if ctx.train && l.dropout > 0.0 {
         // our own mask (candle's CPU random numbers cannot be seeded): the same seed gives the same run
         let n = ctx.calls.get();
         ctx.calls.set(n + 1);
@@ -1417,9 +1459,34 @@ fn lora_delta(l: &Lora, x: &Tensor, ctx: &Ctx) -> Result<Tensor> {
         x.mul(&Tensor::from_vec(mask, x.shape(), x.device())?)?
     } else {
         x.clone()
-    };
-    Ok((x.matmul(&ctx.var(&l.a).t()?)?.matmul(&ctx.var(&l.b).t()?)? * l.scaling)?)
+    })
 }
+
+/// The experts' LoRA terms of one neuron group at once: `x` `[n, in]` holds the group's rows copy by copy (`spans`:
+/// `(expert, first row, rows)`), each row's term `s · B_e A_e drop(x)` by its own expert `e`. As three products for
+/// all the copies together instead of two per copy: `x A_catᵀ` (`[n, copies·r]`; with a shared A one `[n, r]` product,
+/// repeated), masked to each row's own copy's `r` columns, times `B_cat` (`[copies·r, out]`, each copy's `Bᵀ` stacked).
+/// The other copies' columns are exact zeros, so each row's value is its own expert's term; the gradients go to each
+/// copy's A and B from its own rows only. [`GROUPED_LORA`] off: copy by copy, as before.
+fn grouped_lora(m: &MoeBlock, which: usize, spans: &[(usize, usize, usize)], x: &Tensor, mask: &Tensor, ctx: &Ctx) -> Result<Tensor> {
+    let first = &m.experts[spans[0].0][which];
+    let r = first.a.as_tensor().dim(0)?;
+    let x = dropped(first, x, ctx)?;
+    let c = spans.len();
+    let xa = if m.shared_a {
+        let one = x.matmul(&ctx.var(&first.a).t()?)?;
+        one.unsqueeze(1)?.broadcast_as((one.dim(0)?, c, r))?.reshape((one.dim(0)?, c * r))?
+    } else {
+        let a = Tensor::cat(&spans.iter().map(|(e, _, _)| ctx.var(&m.experts[*e][which].a)).collect::<Vec<_>>(), 0)?;
+        x.matmul(&a.t()?)?
+    };
+    let b = Tensor::cat(&spans.iter().map(|(e, _, _)| ctx.var(&m.experts[*e][which].b).t()).collect::<candle_core::Result<Vec<_>>>()?, 0)?;
+    Ok(((xa * mask)?.matmul(&b)? * first.scaling)?)
+}
+
+/// The fine-grained mixture's experts' LoRA terms go a neuron group at a time ([`grouped_lora`]), not a copy at a
+/// time (the same values; about a tenth of the kernels). Off: the old path, for the tests that compare them.
+pub static GROUPED_LORA: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// An upcycled block's feed-forward: the router and each expert's adapters on gate, up and down; the experts share
 /// the block's frozen gate, up and down weights (fine-grained: each its group's slice of them).
@@ -1530,7 +1597,8 @@ fn combine(all: Tensor, pos: Vec<u32>, probs: &Tensor, chosen: &[Vec<usize>], k:
     if k == 1 {
         w = (w + (&sel - sel.detach())?)?;
     }
-    Ok(picked.broadcast_mul(&w.unsqueeze(2)?)?.sum(1)?)
+    // [seq, 1, k] x [seq, k, hidden]: one batched product (candle's sum over a middle dimension was a tenth of the block)
+    Ok(w.unsqueeze(1)?.contiguous()?.matmul(&picked.contiguous()?)?.squeeze(1)?)
 }
 
 /// The mixture on `h` `[seq, hidden]` (the block's post-attention norm): the router's softmax picks each token's
@@ -1582,9 +1650,12 @@ fn moe_ffn(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx, segs: Option<&[(u
 fn moe_ffn_grouped(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx, segs: Option<&[(usize, usize)]>) -> Result<Tensor> {
     let seq = h.dim(0)?;
     let (n_exp, k, groups, fe, dev) = (m.router.as_tensor().dim(0)?, m.top_k, m.groups, m.ff_e, h.device().clone());
-    let logits = h.matmul(&ctx.var(&m.router).t()?)?;
-    let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
-    let chosen = top_k_rows(&probs.detach().to_device(&Device::Cpu)?.to_vec2::<f32>()?, k);
+    let (logits, probs) = prof("moe.router", &dev, || {
+        let logits = h.matmul(&ctx.var(&m.router).t()?)?;
+        let probs = candle_nn::ops::softmax(&logits, D::Minus1)?;
+        Ok((logits, probs))
+    })?;
+    let chosen = prof("moe.route-to-host", &dev, || Ok(top_k_rows(&probs.detach().to_device(&Device::Cpu)?.to_vec2::<f32>()?, k)))?;
     let copies = n_exp / groups;
     let mut outs = Vec::new();
     let mut pos = vec![0u32; seq * k];
@@ -1610,31 +1681,53 @@ fn moe_ffn_grouped(block: &Block, m: &MoeBlock, h: &Tensor, ctx: &Ctx, segs: Opt
             continue;
         }
         let n = rows.len();
-        let he = h.index_select(&Tensor::from_vec(rows, (n,), &dev)?, 0)?;
+        let he = prof("moe.gather", &dev, || Ok(h.index_select(&Tensor::from_vec(rows, (n,), &dev)?, 0)?))?;
         let slice = |i: usize, dim: usize| -> Result<Linear> { Ok(Linear { w: block.lin[i].w.narrow(dim, g * fe, fe)?, bias: None, lora: None }) };
         let (wg, wu, wd) = (slice(4, 0)?, slice(5, 0)?, slice(6, 1)?);
         // each copy's LoRA term on its own rows, stacked in row order
+        let grouped = GROUPED_LORA.load(std::sync::atomic::Ordering::Relaxed) && spans.len() > 1 && !m.experts.is_empty();
+        // which copy's r columns each row keeps (the same for the three projections)
+        let span_mask = if grouped {
+            let r = m.experts[spans[0].0][0].a.as_tensor().dim(0)?;
+            let c = spans.len();
+            let mut v = vec![0f32; n * c * r];
+            for (ci, (_, s0, l)) in spans.iter().enumerate() {
+                for row in *s0..s0 + l {
+                    v[row * c * r + ci * r..row * c * r + (ci + 1) * r].fill(1.0);
+                }
+            }
+            Some(Tensor::from_vec(v, (n, c * r), &dev)?)
+        } else {
+            None
+        };
         let deltas = |which: usize, x: &Tensor| -> Result<Option<Tensor>> {
             if m.experts.is_empty() {
                 return Ok(None);
+            }
+            if let Some(mask) = &span_mask {
+                return Ok(Some(grouped_lora(m, which, &spans, x, mask, ctx)?));
             }
             let parts = spans.iter().map(|(e, s, l)| lora_delta(&m.experts[*e][which], &x.narrow(0, *s, *l)?, ctx)).collect::<Result<Vec<_>>>()?;
             Ok(Some(if parts.len() == 1 { parts.into_iter().next().unwrap() } else { Tensor::cat(&parts, 0)? }))
         };
         let plus = |base: Tensor, d: Option<Tensor>| -> Result<Tensor> { Ok(match d { Some(d) => (base + d)?, None => base }) };
-        let gt = plus(wg.frozen(&he)?, deltas(0, &he)?)?;
-        let ut = plus(wu.frozen(&he)?, deltas(1, &he)?)?;
-        let act = (candle_nn::ops::silu(&gt)? * ut)?;
-        let mut y = plus(wd.frozen(&act)?, deltas(2, &act)?)?;
+        let (bg, bu) = prof("moe.base-gate-up", &dev, || Ok((wg.frozen(&he)?, wu.frozen(&he)?)))?;
+        let (dg, du) = prof("moe.lora-gate-up", &dev, || Ok((deltas(0, &he)?, deltas(1, &he)?)))?;
+        let act = prof("moe.act", &dev, || Ok((candle_nn::ops::silu(&plus(bg, dg)?)? * plus(bu, du)?)?))?;
+        let bd = prof("moe.base-down", &dev, || wd.frozen(&act))?;
+        let dd = prof("moe.lora-down", &dev, || deltas(2, &act))?;
+        let mut y = plus(bd, dd)?;
         if m.out_scale != 1.0 {
             y = (y * m.out_scale)?;
         }
         outs.push(y);
         offset += n;
     }
-    let all = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
-    let out = combine(all, pos, &probs, &chosen, k)?;
-    push_router_losses(ctx, &probs, &chosen, if m.groups > 1 { Some(&logits) } else { None }, segs)?;
+    let out = prof("moe.combine", &dev, || {
+        let all = if outs.len() == 1 { outs.pop().unwrap() } else { Tensor::cat(&outs, 0)? };
+        combine(all, pos, &probs, &chosen, k)
+    })?;
+    prof("moe.router-losses", &dev, || push_router_losses(ctx, &probs, &chosen, if m.groups > 1 { Some(&logits) } else { None }, segs))?;
     Ok(out)
 }
 
@@ -1675,6 +1768,8 @@ struct CheckpointBlock {
     block: Block,
     rope: (Tensor, Tensor),
     att: Attn,
+    /// the device the block runs on (its input may wait in host memory: [`OFFLOAD_CHECKPOINTS`])
+    dev: Device,
     train: bool,
     seed: u64,
     calls: u64,
@@ -1729,11 +1824,12 @@ impl CustomOp1 for CheckpointBlock {
 
     fn bwd(&self, arg: &Tensor, _res: &Tensor, grad_res: &Tensor) -> candle_core::Result<Option<Tensor>> {
         let err = |e: anyhow::Error| candle_core::Error::Msg(format!("checkpointed block: {e}"));
-        trim_if_fragmented(arg.device());
+        trim_if_fragmented(&self.dev);
         if INJECT_REPLAY_OOM.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) == 1 {
             return Err(candle_core::Error::Msg("checkpointed block: injected for a test: DriverError(CUDA_ERROR_OUT_OF_MEMORY, \"out of memory\")".into()));
         }
-        let x = Var::from_tensor(&arg.detach())?;
+        let to_dev = |t: &Tensor| -> candle_core::Result<Tensor> { move_to(t, &self.dev).map_err(err) };
+        let x = Var::from_tensor(&to_dev(&arg.detach())?)?;
         let ctx = Ctx { train: self.train, seed: self.seed, calls: Cell::new(self.calls), detach: Cell::new(self.detached), ..Ctx::default() };
         let block = match &self.stream {
             Some(r) => {
@@ -1746,7 +1842,7 @@ impl CustomOp1 for CheckpointBlock {
             None => self.block.clone(),
         };
         let y = block_forward(&self.cfg, &block, x.as_tensor(), &self.rope, &self.att, &ctx).map_err(err)?;
-        let (seq, g) = (y.dim(0)?, grad_res.detach());
+        let (seq, g) = (y.dim(0)?, to_dev(&grad_res.detach())?);
         let mut total = (y * g.narrow(0, 0, seq)?)?.sum_all()?;
         if let Some(dims) = &self.with_aux {
             let aux = ctx.aux.borrow_mut().pop().ok_or_else(|| candle_core::Error::Msg("checkpointed block: no load-balancing loss in the replay".into()))?;
@@ -1754,24 +1850,37 @@ impl CustomOp1 for CheckpointBlock {
         }
         let grads = total.backward()?;
         drop(block);
+        let offloaded = arg.device().is_cpu() && !self.dev.is_cpu();
         let mut out = self.grads.lock().map_err(|_| candle_core::Error::Msg("checkpoint gradients: lock".into()))?;
-        for v in self.block.lora_vars() {
-            if let Some(g) = grads.get(&v) {
-                out.push((v, g.clone()));
+        let parts: Vec<(Var, Tensor)> = self.block.lora_vars().into_iter().filter_map(|v| grads.get(&v).cloned().map(|g| (v, g))).collect();
+        if (offloaded || !self.dev.is_cpu() && HOST_REPLAY_GRADS.load(std::sync::atomic::Ordering::Relaxed)) && !parts.is_empty() {
+            // the adapters' gradients wait in host memory (where the step sums them), in one copy: allocated on the card
+            // in the middle of the backward pass they would pin the pool around the replays' transients
+            let flat = Tensor::cat(&parts.iter().map(|(_, g)| g.flatten_all()).collect::<candle_core::Result<Vec<_>>>()?, 0)?.to_device(&Device::Cpu)?;
+            let mut at = 0;
+            for (v, g) in parts {
+                let n = g.elem_count();
+                out.push((v, flat.narrow(0, at, n)?.reshape(g.shape())?));
+                at += n;
             }
+        } else {
+            out.extend(parts);
         }
-        Ok(grads.get(&x).cloned())
+        match grads.get(&x) {
+            Some(g) if offloaded => Ok(Some(g.to_device(&Device::Cpu)?)),
+            g => Ok(g.cloned()),
+        }
     }
 }
 
 /// See [`CheckpointBlock`]. `block` is the block as the model holds it; `run` is it with its frozen matrices (the
 /// same block unless the base is streamed, when `block` holds none and the node keeps only that).
 #[allow(clippy::too_many_arguments)]
-fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, rope: &(Tensor, Tensor), att: &Attn, ctx: &Ctx, grads: &CkptGrads, active: bool,
+fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, dev: &Device, rope: &(Tensor, Tensor), att: &Attn, ctx: &Ctx, grads: &CkptGrads, active: bool,
                 stream: Option<StreamRef>) -> Result<Tensor> {
     let calls = ctx.calls.get();
     let sub = Ctx { train: ctx.train, seed: ctx.seed, calls: Cell::new(calls), detach: Cell::new(ctx.detach.get()), ..Ctx::default() };
-    let value = block_forward(cfg, run, &x.detach(), rope, att, &sub)?.detach();
+    let value = block_forward(cfg, run, &move_to(&x.detach(), dev)?, rope, att, &sub)?.detach();
     ctx.calls.set(sub.calls.get());
     let aux = sub.aux.borrow_mut().pop().map(|a| a.detach());
     if !x.track_op() && !(block.has_lora() && active) {
@@ -1793,10 +1902,20 @@ fn checkpointed(cfg: &ModelConfig, block: &Block, run: &Block, x: &Tensor, rope:
         }
         None => value,
     };
-    // the input may not descend from a variable (the first trained block): give the node something to hang from
-    let x_in = if x.track_op() { x.clone() } else { Var::from_tensor(&x.detach())?.as_tensor().clone() };
+    // the input may not descend from a variable (the first trained block): give the node something to hang from. With
+    // OFFLOAD_CHECKPOINTS the node hangs from a host copy: its saved input, and its output (the next block's input),
+    // live in host memory, so between blocks a card holds nothing of the pass
+    let offload = OFFLOAD_CHECKPOINTS.load(std::sync::atomic::Ordering::Relaxed);
+    let x_in = if x.track_op() {
+        // (offloading, a tracked input is a host one: the block before put it there)
+        x.clone()
+    } else if offload {
+        Var::from_tensor(&x.detach().to_device(&Device::Cpu)?)?.as_tensor().clone()
+    } else {
+        Var::from_tensor(&x.detach())?.as_tensor().clone()
+    };
     let dims = aux.as_ref().map(|a| a.dims().to_vec());
-    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: kept, rope: rope.clone(), att: att.clone(),
+    let out = x_in.apply_op1(CheckpointBlock { y: Mutex::new(Some(packed)), cfg: cfg.clone(), block: kept, rope: rope.clone(), att: att.clone(), dev: dev.clone(),
                                                train: ctx.train, seed: ctx.seed, calls, grads: grads.clone(), with_aux: dims.clone(), stream, detached: !active })?;
     let Some(dims) = dims else { return Ok(out) };
     ctx.aux.borrow_mut().push(unpack_aux(&out, seq, &dims)?);
@@ -1948,6 +2067,14 @@ impl LlamaModel {
             let _ = reset;
             Vec::new()
         }
+    }
+
+    /// Wait for every device (no trim).
+    pub fn wait(&self) -> Result<()> {
+        for d in &self.devs {
+            d.synchronize()?;
+        }
+        Ok(())
     }
 
     pub fn synchronize(&self) -> Result<()> {
@@ -2575,10 +2702,11 @@ impl LlamaModel {
             None => block,
         };
         let prev = ctx.detach.replace(!active);
+        let dev = &self.devs[self.block_dev[i]];
         let out = if !ctx.no_grad && self.checkpoint && (x.track_op() || block.has_lora() && active) {
-            checkpointed(&self.cfg, block, run, x, rope, att, ctx, &self.ckpt_grads, active, sref)
+            checkpointed(&self.cfg, block, run, x, dev, rope, att, ctx, &self.ckpt_grads, active, sref)
         } else {
-            block_forward(&self.cfg, run, x, rope, att, ctx)
+            block_forward(&self.cfg, run, &move_to(x, dev)?, rope, att, ctx)
         };
         ctx.detach.set(prev);
         out
@@ -2605,9 +2733,10 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
             let rot = Tensor::cat(&[&x2.neg()?, &x1], D::Minus1)?;
             Ok((t.broadcast_mul(&rope.0)? + rot.broadcast_mul(&rope.1)?)?)
         };
-        let q = rotate(&heads(block.lin[0].forward(&h, ctx)?, nh, &block.q_norm)?)?;
-        let k = rotate(&heads(block.lin[1].forward(&h, ctx)?, nkv, &block.k_norm)?)?;
-        let v = heads(block.lin[2].forward(&h, ctx)?, nkv, &None)?;
+        let dev = x.device();
+        let (q, k, v) = prof("attn.qkv", dev, || Ok((rotate(&heads(block.lin[0].forward(&h, ctx)?, nh, &block.q_norm)?)?,
+                                                     rotate(&heads(block.lin[1].forward(&h, ctx)?, nkv, &block.k_norm)?)?,
+                                                     heads(block.lin[2].forward(&h, ctx)?, nkv, &None)?)))?;
         // grouped-query attention: each key/value head serves heads/kv_heads query heads
         let rep = nh / nkv;
         let spread = |t: Tensor| -> Result<Tensor> {
@@ -2622,7 +2751,7 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
             })
         };
         // a packed pass: each unit (a sequence, or one long conversation) attends within itself only
-        let attended = match att.units.as_slice() {
+        let attended = prof("attn.core", dev, || Ok(match att.units.as_slice() {
             [(0, n, mask)] if *n == seq => attend(&q, &k, &v, mask)?,
             units => {
                 let parts = units.iter().map(|(r0, n, mask)| {
@@ -2631,13 +2760,13 @@ fn block_forward(c: &ModelConfig, block: &Block, x: &Tensor, rope: &(Tensor, Ten
                 }).collect::<Result<Vec<_>>>()?;
                 Tensor::cat(&parts, 1)?
             }
-        };
+        }))?;
         let out = attended.transpose(0, 1)?.reshape((seq, nh * hd))?;
-        let x = (x + block.lin[3].forward(&out, ctx)?)?;
+        let x = prof("attn.o", dev, || Ok((x + block.lin[3].forward(&out, ctx)?)?))?;
 
         let h = rms_norm(&x, &block.norm2, c.rms_norm_eps)?;
         if let (Some(m), false) = (&block.moe, ctx.dense_ffn) {
-            return Ok((x + moe_ffn(block, m, &h, ctx, att.segments.as_deref())?)?);
+            return Ok((x + prof("moe", dev, || moe_ffn(block, m, &h, ctx, att.segments.as_deref()))?)?);
         }
         let gated = (candle_nn::ops::silu(&block.lin[4].forward(&h, ctx)?)? * block.lin[5].forward(&h, ctx)?)?;
         if let Some(p) = &ctx.probe {
@@ -2763,7 +2892,7 @@ impl LlamaModel {
                 _ => full,
             };
             let pos = position.replace(position.get() + 1);
-            self.block_forward(j, generation.map(|g| (pos, g)), b, &move_to(x, &self.devs[self.block_dev[j]])?, rope, mask, ctx)
+            self.block_forward(j, generation.map(|g| (pos, g)), b, x, rope, mask, ctx)
         };
         if let Some(l) = self.cfg.loop_ {
             if range.start > l.start && range.start < l.end {
@@ -2787,7 +2916,7 @@ impl LlamaModel {
                             }
                         }
                         let y = move_to(&y, x.device())?;
-                        x = (&x + (y - &x)?.broadcast_mul(&ctx.var(g))?)?;
+                        x = (&x + (y - &x)?.broadcast_mul(&move_to(&ctx.var(g), x.device())?)?)?;
                     }
                 }
                 _ => {}

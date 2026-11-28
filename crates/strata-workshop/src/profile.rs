@@ -53,6 +53,20 @@ pub fn cpu_training_efficiency(dtype: BaseDtype) -> f64 {
 /// 672 steps of 4 conversations, 1.31 M tokens, in 5.1 h, where this formula's FLOPs over 1,500 said 19 h). The two
 /// cards run the blocks one after the other, so this is the speed of the pair, not of each.
 pub const ASSUMED_GPU_GFLOPS: f64 = 5600.0;
+/// One 16 GB-class card's training throughput on a block of the fine-grained 56B-A5B (Qwen3-8B's block upcycled to 120
+/// experts of 1,024 neurons, top-5, expert rank 4 with a shared A, rank 16 on q and v, bf16 base, checkpointed: forward,
+/// replay and backward), **measured on the synthetic one-block benchmark** (`examples/moe_block_bench.rs`, RTX 5060 Ti,
+/// 768 tokens in 3 conversations, 2026-11-28): 143 ms a block-pass for this file's 660 GFLOP, with the experts' LoRA
+/// grouped by neuron group and the replays' gradients sent to host memory (the copy-by-copy path took 168 ms, and
+/// before the combine fix about 176). TF32 (`--tf32`) took 123 ms. The cards run the blocks one after the other, so
+/// it is the pair's rate too. It does not include the streamed copies (counted apart), nor offloaded checkpoints.
+pub const MOE_GPU_GFLOPS: f64 = 4600.0;
+
+/// The GPU rate this estimate uses for `cfg`: [`MOE_GPU_GFLOPS`] for a fine-grained mixture, else
+/// [`ASSUMED_GPU_GFLOPS`].
+pub fn gpu_gflops(cfg: &ModelConfig) -> f64 {
+    if cfg.moe.is_some_and(|m| m.fine(cfg)) { MOE_GPU_GFLOPS } else { ASSUMED_GPU_GFLOPS }
+}
 /// What a CUDA device holds beyond the estimate's tensors: the context, cuBLAS's workspace and the memory pool's
 /// slack. **Measured** on the same run: its busiest card peaked at 14.7 GiB (15.8 GB; nvidia-smi's MiB) where the
 /// estimate said 13.0 GB.
@@ -110,11 +124,15 @@ pub struct BatchProfile {
     pub packed_sequences: Option<usize>,
     /// units a pass (at most `accumulation` are used)
     pub seqs_per_pass: usize,
+    /// the checkpointed inputs wait in host memory ([`crate::model::OFFLOAD_CHECKPOINTS`]): each block-run copies its
+    /// hidden state over PCIe about five times (in and out forward; in, its gradient in, the input's gradient out
+    /// backward), on the compute stream (not overlapped)
+    pub offload: bool,
 }
 
 impl Default for BatchProfile {
     fn default() -> Self {
-        Self { packed_sequences: None, seqs_per_pass: 1 }
+        Self { packed_sequences: None, seqs_per_pass: 1, offload: false }
     }
 }
 
@@ -157,6 +175,8 @@ pub struct StreamEstimate {
     /// units (sequences, or conversations) a pass, and passes an epoch
     pub seqs_per_pass: usize,
     pub passes_per_epoch: usize,
+    /// the offloaded checkpoints' copies a pass (serial)
+    pub offload_seconds_per_pass: f64,
     /// one epoch: the transfer, the compute (at [`ASSUMED_GPU_GFLOPS`]) and the time to expect (per pass the larger
     /// of the two for the RAM tier, overlapped; their sum for the disk tier)
     pub transfer_seconds_per_epoch: f64,
@@ -198,6 +218,8 @@ pub struct Estimate {
     pub base_dtype: BaseDtype,
     /// layer streaming's part (None: not streamed)
     pub stream: Option<StreamEstimate>,
+    /// the GPU rate the time is taken at ([`gpu_gflops`])
+    pub gpu_gflops: f64,
     /// training units an epoch (packed sequences, or conversations) and units a pass
     pub units_per_epoch: usize,
     pub seqs_per_pass: usize,
@@ -351,7 +373,7 @@ pub fn estimate(p: &ProfileInput) -> Estimate {
         optimizer_bytes: 2 * adapter, gradient_bytes: 2 * adapter, activation_bytes: activations, widening_bytes: widening, fill_bytes: fill,
         total_bytes: total, per_device_bytes: per_device,
         cache_disk_bytes: if cached { (p.examples * p.avg_tokens.clamp(2, seq) * cfg.hidden_size * 4) as u64 } else { 0 },
-        steps, flops, base_dtype: p.base_dtype, stream: None, units_per_epoch: units, seqs_per_pass: per_pass as usize,
+        steps, flops, base_dtype: p.base_dtype, stream: None, gpu_gflops: gpu_gflops(cfg), units_per_epoch: units, seqs_per_pass: per_pass as usize,
     };
     if let Some(sp) = &p.stream {
         let parts = StreamParts { first, cached, seq, one_block, head, frozen, widening, chunk: chunk_bytes(cfg, seq) as u64 };
@@ -408,7 +430,10 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
             has_trained[k] = true;
             // its share of the adapters, AdamW and gradients (5 copies), and the inputs its checkpoints keep
             dev[k] += (5 * e.adapter_bytes) * r / trained_runs as u64;
-            dev[k] += (cal * (r * 4 * (x.seq * cfg.hidden_size) as u64 * e.seqs_per_pass as u64) as f64) as u64;
+            // (offloaded: the inputs wait in host memory)
+            if !p.batch.offload {
+                dev[k] += (cal * (r * 4 * (x.seq * cfg.hidden_size) as u64 * e.seqs_per_pass as u64) as f64) as u64;
+            }
         }
     }
     for k in 0..d {
@@ -446,10 +471,17 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
     let passes_per_step = acc.div_ceil(n);
     let steps_per_epoch = e.units_per_epoch.div_ceil(acc).max(1);
     let passes_per_epoch = steps_per_epoch * passes_per_step;
-    let compute_epoch = e.flops / p.epochs.max(1e-9) / (ASSUMED_GPU_GFLOPS * 1e9);
+    let compute_epoch = e.flops / p.epochs.max(1e-9) / (gpu_gflops(cfg) * 1e9);
     let transfer_epoch = transfer_pass * passes_per_epoch as f64;
     let compute_pass = compute_epoch / passes_per_epoch as f64;
-    let epoch_seconds = if sp.tier == Tier::Ram { passes_per_epoch as f64 * compute_pass.max(transfer_pass) } else { compute_epoch + transfer_epoch };
+    // offloaded checkpoints: the hidden state's copies, serial with the compute
+    let offload_pass: f64 = if p.batch.offload {
+        let state = 5.0 * 4.0 * (x.seq * cfg.hidden_size * n) as f64;
+        loaded.clone().map(|i| runs(i) as f64 * state / rate(placement[i])).sum()
+    } else {
+        0.0
+    };
+    let epoch_seconds = if sp.tier == Tier::Ram { passes_per_epoch as f64 * (compute_pass.max(transfer_pass) + offload_pass) } else { compute_epoch + transfer_epoch + offload_pass * passes_per_epoch as f64 };
     let (c, t) = (compute_pass * passes_per_step as f64, transfer_pass * passes_per_step as f64);
     let (over, serial) = if c > 0.0 { (c.max(t) / c, (c + t) / c) } else { (1.0, 1.0) };
     // conversations a pass: the units' share of the examples
@@ -457,7 +489,7 @@ fn stream_estimate(p: &ProfileInput, sp: &StreamProfile, e: &Estimate, x: &Strea
     StreamEstimate {
         mode: sp.mode, tier: sp.tier, buffers: sp.buffers, block_bytes, buffer_bytes: sp.buffers as u64 * block_bytes, device_bytes: dev, host_bytes: host,
         disk_bytes: disk, bytes_per_conversation: (micro as f64 / conv_per_pass) as u64, bytes_per_pass: micro, bytes_per_step: micro * passes_per_step as u64,
-        seqs_per_pass: n, passes_per_epoch, transfer_seconds_per_epoch: transfer_epoch, compute_seconds_per_epoch: compute_epoch, epoch_seconds,
+        seqs_per_pass: n, passes_per_epoch, offload_seconds_per_pass: offload_pass, transfer_seconds_per_epoch: transfer_epoch, compute_seconds_per_epoch: compute_epoch, epoch_seconds,
         transfer_seconds_per_step: t, compute_seconds_per_step: c, slowdown_overlapped: over, slowdown_serial: serial, slowdown: if sp.tier == Tier::Ram { over } else { serial },
     }
 }
@@ -568,6 +600,10 @@ pub fn cpu_seconds(e: &Estimate, cpu_gflops: f64) -> f64 {
     e.flops / (cpu_gflops.max(0.01) * cpu_training_efficiency(e.base_dtype) * 1e9)
 }
 
+fn gpu_gflops_of(e: &Estimate) -> f64 {
+    e.gpu_gflops
+}
+
 pub fn verdict(e: &Estimate, m: &Machine) -> Verdict {
     let need = need_bytes(e);
     let card = card_bytes(e);
@@ -578,7 +614,7 @@ pub fn verdict(e: &Estimate, m: &Machine) -> Verdict {
         fits_gpu: m.gpus.iter().map(|g| (g.index, card <= g.free_bytes)).collect(),
         fits_gpu_idle: m.gpus.iter().map(|g| (g.index, card <= g.total_bytes)).collect(),
         cpu_seconds: cpu_seconds(e, m.cpu_gflops),
-        gpu_seconds: e.flops / (ASSUMED_GPU_GFLOPS * 1e9),
+        gpu_seconds: e.flops / (gpu_gflops_of(e) * 1e9),
     }
 }
 
@@ -664,9 +700,11 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
                          human_bytes(st.bytes_per_pass), st.seqs_per_pass, if p.batch.packed_sequences.is_some() { "sequences" } else { "conversations" },
                          human_bytes(st.bytes_per_conversation), human_bytes(st.bytes_per_step), st.transfer_seconds_per_step, st.compute_seconds_per_step,
                          st.slowdown_overlapped, st.slowdown_serial, st.slowdown, st.tier.as_str()));
-        out.push(format!("an epoch: {} passes; PCIe {} and compute {} (at {:.0} GFLOP/s): about {} an epoch, {} for {} epoch(s) (an estimate: the compute rate is the dense two-card run's)",
-                         st.passes_per_epoch, human_seconds(st.transfer_seconds_per_epoch), human_seconds(st.compute_seconds_per_epoch), ASSUMED_GPU_GFLOPS,
-                         human_seconds(st.epoch_seconds), human_seconds(st.epoch_seconds * p.epochs), p.epochs));
+        out.push(format!("an epoch: {} passes; PCIe {} and compute {} (at {:.0} GFLOP/s){}: about {} an epoch, {} for {} epoch(s) (an estimate: {})",
+                         st.passes_per_epoch, human_seconds(st.transfer_seconds_per_epoch), human_seconds(st.compute_seconds_per_epoch), gpu_gflops(&p.cfg),
+                         if st.offload_seconds_per_pass > 0.0 { format!(", the offloaded checkpoints {:.1} s a pass", st.offload_seconds_per_pass) } else { String::new() },
+                         human_seconds(st.epoch_seconds), human_seconds(st.epoch_seconds * p.epochs), p.epochs,
+                         if p.cfg.moe.is_some_and(|m| m.fine(&p.cfg)) { "the compute rate is the synthetic one-block benchmark's" } else { "the compute rate is the dense two-card run's" }));
     } else if e.per_device_bytes > 0 {
         out.push(format!("split over the devices: about {} on the busiest (the last, which also holds the head)", human_bytes(e.per_device_bytes)));
     }
@@ -681,7 +719,7 @@ pub fn report_lines(p: &ProfileInput, e: &Estimate, m: &Machine) -> Vec<String> 
                          human_bytes(e.cache_disk_bytes), p.cfg.num_hidden_layers - e.trained_blocks, human_bytes(e.fill_bytes)));
     }
     out.push(format!("time: {} steps; about {} on this CPU ({:.0} GFLOP/s measured, {:.0} % of it reached in training); about {} on 16 GB-class GPUs ({:.0} GFLOP/s, measured on a two-card RTX 5060 Ti run; train with --devices cuda:0[,cuda:1] in a cuda build)",
-                     e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * cpu_training_efficiency(e.base_dtype), human_seconds(v.gpu_seconds), ASSUMED_GPU_GFLOPS));
+                     e.steps, human_seconds(v.cpu_seconds), m.cpu_gflops, 100.0 * cpu_training_efficiency(e.base_dtype), human_seconds(v.gpu_seconds), gpu_gflops(&p.cfg)));
     out.push(match v.fits_ram {
         Some(true) if e.stream.is_some() => format!("fits the RAM: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),
         Some(true) => format!("fits: needs {} with headroom, {} of RAM is free", human_bytes(v.need_bytes), human_bytes(m.ram_available)),

@@ -117,6 +117,15 @@ pub struct TrainSettings {
     /// by one (dropout's masks aside: they are drawn per pass). 0: auto, which the command resolves from the cards'
     /// free memory ([`crate::profile::auto_seqs_per_pass`]); here it is 1. At most `accumulation` are used.
     pub seqs_per_pass: usize,
+    /// checkpointed blocks keep their saved inputs and outputs in host memory ([`crate::model::OFFLOAD_CHECKPOINTS`]):
+    /// the device pool holds only the run's fixed state and the block running, and cannot fragment within a pass.
+    /// Costs about five copies of the hidden state a block (measured on the synthetic block at 768 tokens: +76 ms on
+    /// the USB4 card against a 133 ms block). None (auto, the default): off until a pass runs out of device memory,
+    /// then on for the rest of the run.
+    pub offload_checkpoints: Option<bool>,
+    /// TF32 tensor cores for the f32 products on CUDA (about 15 % faster per block measured; not bit-exact: inputs
+    /// rounded to 10 bits of mantissa, as PyTorch's `allow_tf32`)
+    pub tf32: bool,
 }
 
 /// LISA (Layerwise Importance Sampled AdamW, after Soup's `lisa`): every `interval` optimizer steps, `layers` of the
@@ -174,7 +183,7 @@ impl TrainSettings {
             warmup_ratio: 0.03, weight_decay: 0.01, max_grad_norm: 1.0, seed: 42, cache_dir: None, save_steps: 100, eval_steps: 0,
             logging_steps: 10, resume: None, chat_template: None, score_everything: false, devices: Vec::new(), gradient_checkpointing: false,
             stream_layers: None, stream_buffers: crate::layer_stream::DEFAULT_BUFFERS, stream_cache: None, lisa: None, freeze_bottom: None,
-            pack: false, seqs_per_pass: 1,
+            pack: false, seqs_per_pass: 1, offload_checkpoints: None, tf32: false,
         }
     }
 
@@ -236,6 +245,9 @@ impl TrainSettings {
             v["lisa_seed"] = json!(l.seed);
         }
         // packing changes the steps (sequences per pass does not: the same sums, other memory)
+        if self.tf32 {
+            v["tf32"] = json!(true);
+        }
         if self.pack {
             v["pack"] = json!(true);
             v["packed_sequences"] = json!(units);
@@ -578,6 +590,9 @@ struct PassOut {
     conversations: usize,
     grads: candle_core::backprop::GradStore,
     extra: Vec<(Var, Tensor)>,
+    /// the forward pass (to the loss) and the backward pass (the replays included), seconds
+    forward_s: f64,
+    backward_s: f64,
 }
 
 /// A loaded model with its adapters, optimizer and data: what `train` and `find_lr` both drive.
@@ -597,6 +612,8 @@ struct Runner {
     seqs_per_pass: usize,
     /// pack the held-out conversations too (the same mean, fewer passes)
     pack_eval: bool,
+    /// turn [`crate::model::OFFLOAD_CHECKPOINTS`] on at the first out-of-memory error
+    offload_auto: bool,
     max_len: usize,
     tokens_seen: u64,
     lower_in_memory: bool,
@@ -675,6 +692,12 @@ impl Runner {
             on_event(Event::Log("layer streaming turns gradient checkpointing on: the backward pass replays each block from its streamed weights".into()));
         }
         model.set_checkpointing(s.gradient_checkpointing || s.stream_layers.is_some());
+        model::OFFLOAD_CHECKPOINTS.store(s.offload_checkpoints == Some(true) && (s.gradient_checkpointing || s.stream_layers.is_some()), std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "cuda")]
+        candle_core::cuda::set_gemm_reduced_precision_f32(s.tf32);
+        if s.tf32 {
+            on_event(Event::Log("TF32 products: the f32 matrix products use the tensor cores (not bit-exact)".into()));
+        }
         let (names, vars): (Vec<String>, Vec<Var>) = model.lora_vars().into_iter().unzip();
         let var_block: Vec<Option<usize>> = names.iter().map(|n| block_of(n)).collect();
         let lisa = s.lisa.map(|l| {
@@ -691,6 +714,7 @@ impl Runner {
         let sched = Schedule::new(&lens, s.seed, s.epochs, s.max_len, s.pack);
         Ok(Self { model, names, vars, opt, data, cache, seed: s.seed, accumulation: s.accumulation, max_grad_norm: s.max_grad_norm, sched,
                   seqs_per_pass: s.seqs_per_pass.clamp(1, s.accumulation.max(1)), pack_eval: s.pack || s.seqs_per_pass > 1, max_len: s.max_len,
+                  offload_auto: s.offload_checkpoints.is_none() && (s.gradient_checkpointing || s.stream_layers.is_some()),
                   tokens_seen: 0, lower_in_memory, last_aux: None, private: false,
                   mem_trace: std::env::var_os("AM2_MEM_TRACE").map(PathBuf::from).or_else(|| Some(s.out.join("memory-trace.log"))), lisa, var_block,
                   pending: Vec::new() })
@@ -752,15 +776,20 @@ impl Runner {
     fn micro(&mut self, step: usize, m: usize, units: &[Vec<usize>], lr: f64) -> Result<PassOut> {
         let n = units.len();
         let pass = Pass::of(&self.data.train, units);
+        let t0 = Instant::now();
         let h = self.hidden_pass(&pass)?;
         let mut dropout_seed = self.seed ^ (m as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
         let ctx = Ctx::train(splitmix(&mut dropout_seed));
         let loss = self.model.loss_packed(&h, &pass.layout, &pass.tokens, &pass.supervised, &ctx)?;
         let value = loss.to_scalar::<f32>()? as f64;
+        let forward_s = t0.elapsed().as_secs_f64();
         if !value.is_finite() {
             bail!("the loss became {value} at step {} (rate {lr:.3e}): lower the learning rate", step + 1);
         }
+        let t1 = Instant::now();
         let grads = loss.backward()?;
+        self.model.wait()?;
+        let backward_s = t1.elapsed().as_secs_f64();
         let hook = INJECT_OOM.load(std::sync::atomic::Ordering::Relaxed);
         if (m..m + n).contains(&hook) {
             if INJECT_OOM_TIMES.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) <= 1 {
@@ -771,7 +800,7 @@ impl Runner {
         // with checkpointing, the adapters inside a recomputed block get their gradient there
         let extra = self.model.take_checkpoint_grads();
         drop((loss, h));
-        Ok(PassOut { value, aux: ctx.aux_loss(), tokens: pass.tokens.len() as u64, conversations: pass.examples.len(), grads, extra })
+        Ok(PassOut { value, aux: ctx.aux_loss(), tokens: pass.tokens.len() as u64, conversations: pass.examples.len(), grads, extra, forward_s, backward_s })
     }
 
     /// Add a micro-step's gradient parts into the step's sums, one part at a time, as the trainer always has (the
@@ -867,6 +896,7 @@ impl Runner {
             let mut plan: Vec<(Vec<Vec<usize>>, u32)> = vec![((m..m + n).map(|j| self.sched.unit(j).to_vec()).collect(), 0)];
             let (mut value, mut aux, mut tokens, mut convs) = (0.0f64, None::<f64>, 0u64, 0usize);
             let mut commit_s = 0.0f64;
+            let mut phase_s = (0.0f64, 0.0f64);
             let mut p = 0;
             while p < plan.len() {
                 let before_empty: Vec<bool> = sum.iter().map(Option::is_none).collect();
@@ -876,6 +906,8 @@ impl Runner {
                     let t0 = Instant::now();
                     self.commit(m, &mut sum, &o.grads, &o.extra, &mut added)?;
                     commit_s += t0.elapsed().as_secs_f64();
+                    phase_s.0 += o.forward_s;
+                    phase_s.1 += o.backward_s;
                     Ok((o.value, o.aux, o.tokens, o.conversations))
                 });
                 match tried {
@@ -896,6 +928,12 @@ impl Runner {
                         Self::uncommit(&mut sum, &before_empty, added)?;
                         let before = self.model.memory_now();
                         self.release_after_oom(&mut sum)?;
+                        // auto: from the first out-of-memory error on, the checkpoints wait in host memory
+                        let offloading = if self.offload_auto && !model::OFFLOAD_CHECKPOINTS.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            "; the checkpointed inputs wait in host memory from now on"
+                        } else {
+                            ""
+                        };
                         let what = if units.len() > 1 {
                             let half = units.len() / 2;
                             self.seqs_per_pass = self.seqs_per_pass.min(half).max(1);
@@ -916,6 +954,7 @@ impl Runner {
                         let pools = |v: &[(u64, u64)]| v.iter().enumerate().map(|(d, (u, r))| format!("dev{d} {} MiB reserved, {} MiB in use", r >> 20, u >> 20)).collect::<Vec<_>>().join("; ");
                         let again = if attempt == 0 { "trying it once more" } else { "trying again" };
                         attempt += 1;
+                        let what = format!("{what}{offloading}");
                         let line = format!("step {} micro-step {m}{}: out of device memory ({}); its tensors dropped{}, the pools released{}, {again}{what}",
                             step + 1, if units.len() > 1 { format!(" (a pass of {})", units.len()) } else { String::new() }, first_line(&e),
                             if undone > 0 { format!(", {undone} gradient parts taken back") } else { String::new() },
@@ -944,9 +983,9 @@ impl Runner {
             if let Some(path) = self.mem_trace.as_ref().filter(|_| !marks.is_empty()) {
                 let mib = |b: u64| b >> 20;
                 let which = if n > 1 { format!("{m}-{}", m + n - 1) } else { m.to_string() };
-                let line = format!("step {} micro {which} tokens {tokens} | {} ; gradients to the host {:.0} ms, release {:.0} ms, after it {}\n", step + 1,
+                let line = format!("step {} micro {which} tokens {tokens} | {} ; forward {:.2} s, backward {:.2} s, gradients to the host {:.0} ms, release {:.0} ms, after it {}\n", step + 1,
                     marks.iter().enumerate().map(|(i, (u, r))| format!("dev{i} used-high {} MiB reserved-high {} MiB", mib(*u), mib(*r))).collect::<Vec<_>>().join(" | "),
-                    commit_s * 1e3, release_s * 1e3,
+                    phase_s.0, phase_s.1, commit_s * 1e3, release_s * 1e3,
                     after.iter().enumerate().map(|(i, (u, r))| format!("dev{i} {}/{} MiB reserved/in use", mib(*r), mib(*u))).collect::<Vec<_>>().join(", "));
                 use std::io::Write as _;
                 if let Some(d) = path.parent() { let _ = std::fs::create_dir_all(d); }

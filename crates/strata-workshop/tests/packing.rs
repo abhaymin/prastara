@@ -451,6 +451,8 @@ fn an_out_of_memory_sequence_is_retried_in_halves() {
     finetune::INJECT_OOM.store(usize::MAX, std::sync::atomic::Ordering::Relaxed);
     let line = logs.iter().find(|l| l.contains("out of device memory")).unwrap_or_else(|| panic!("{logs:?}"));
     assert!(line.contains("micro-step 5") && line.contains("as two passes of"), "{line}");
+    assert!(line.contains("wait in host memory from now on"), "auto offload: {line}");
+    strata_workshop::model::OFFLOAD_CHECKPOINTS.store(false, std::sync::atomic::Ordering::Relaxed);
     let dl = clean.losses.iter().zip(&r.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
     let da = max_abs(&adapter(&s.out), &adapter(&o.out));
     println!("{line}\nlosses {:?} vs {:?}", clean.losses, r.losses);
@@ -533,4 +535,46 @@ fn a_second_out_of_memory_splits_further() {
     let dl = clean.losses.iter().zip(&r.losses).map(|(x, y)| (x - y).abs()).fold(0.0, f64::max);
     let da = max_abs(&adapter(&s.out), &adapter(&o.out));
     assert!(dl < 1e-5 && da < 1e-5, "losses differ by {dl}, the adapter by {da}");
+}
+
+/// The experts' LoRA terms a neuron group at a time (one masked product for all its copies) equal the old copy-by-copy
+/// path, values and gradients (shared and per-copy A, a loop too); and the checkpoints kept in host memory change
+/// nothing.
+#[test]
+fn grouped_expert_lora_and_offloaded_checkpoints_equal_the_old_paths() {
+    let _g = lock();
+    let root = common::temp_dir("pack-grouped");
+    let dense = root.join("dense");
+    common::chat_model_sized(&dense, 3, 32, 64);
+    let looped = root.join("looped");
+    make_looped(&dense, &looped, LoopSpec { start: 1, end: 3, passes: 2 }).unwrap();
+    let shared = upcycle(&root, &dense, MoeSpec { expert_ff: Some(16), shared_a: true, expert_rank: Some(2), ..MoeSpec::full(12, 3) }, "shared");
+    let own = upcycle(&root, &looped, MoeSpec { expert_ff: Some(16), shared_a: false, expert_rank: Some(2), ..MoeSpec::full(12, 3) }, "own");
+    use strata_workshop::model::{GROUPED_LORA, OFFLOAD_CHECKPOINTS};
+    let set = |g: bool, o: bool| {
+        GROUPED_LORA.store(g, std::sync::atomic::Ordering::Relaxed);
+        OFFLOAD_CHECKPOINTS.store(o, std::sync::atomic::Ordering::Relaxed);
+    };
+    for dir in [&shared, &own] {
+        let m = load(dir, None);
+        let convs = conversations(m.cfg.vocab_size, &LENS, 0xBEEF);
+        let layout = PassLayout { seqs: vec![vec![LENS[0], LENS[1], LENS[2]], vec![LENS[3], LENS[4], LENS[5]]] };
+        let tokens: Vec<u32> = convs.iter().flat_map(|c| c.0.clone()).collect();
+        let sup: Vec<bool> = convs.iter().flat_map(|c| c.1.clone()).collect();
+        let pass = || {
+            let ctx = Ctx::train(5);
+            let loss = m.loss_packed(&m.lower_packed(&tokens, &layout).unwrap(), &layout, &tokens, &sup, &ctx).unwrap();
+            (loss.to_scalar::<f32>().unwrap() as f64, grads_of(&m, &loss))
+        };
+        set(false, false);
+        let (l0, g0) = pass();
+        for (g, o) in [(true, false), (false, true), (true, true)] {
+            set(g, o);
+            let (l, gr) = pass();
+            let d = rel_diff(&gr, &g0);
+            println!("{}: grouped {g} offload {o}: loss {l:.6} vs {l0:.6}, gradients rel {d:.2e}", dir.file_name().unwrap().to_string_lossy());
+            assert!((l - l0).abs() < 1e-5 * l0.abs().max(1.0) && d < 1e-5, "grouped {g} offload {o}: loss {l} vs {l0}, gradients {d}");
+        }
+        set(true, false);
+    }
 }
