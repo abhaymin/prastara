@@ -78,7 +78,7 @@ nav .links { margin-left: auto; display: flex; gap: 6px; font-size: 15px; align-
 nav .links a { min-height: 44px; display: inline-flex; align-items: center; padding: 0 8px; border-radius: 8px; }
 .navbtn { font: inherit; font-size: 14px; min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
           padding: 0 10px; border-radius: 10px; border: 1px solid var(--line2); background: var(--card); color: var(--ink); cursor: pointer; }
-.navbtn:hover { border-color: var(--accent); }
+.navbtn:hover { border-color: var(--accent); text-decoration: none; }
 .navbtn svg { width: 18px; height: 18px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
 .ctrls { display: flex; gap: 6px; margin-left: 8px; }
 @media (max-width: 420px) { .ctrls { margin-left: 2px; gap: 4px; } nav .wrap { gap: 8px; } }
@@ -86,8 +86,9 @@ nav .links a { min-height: 44px; display: inline-flex; align-items: center; padd
 nav .links a { color: var(--muted); white-space: nowrap; }
 @media (max-width: 1180px) { .navbtn .t { display: none; } }
 nav .links a:hover { color: var(--ink); text-decoration: none; }
-@media (max-width: 760px) { nav .links a.hide-sm { display: none; } nav .links { gap: 0; } }
-@media (max-width: 420px) { nav .links a.hide-xs { display: none; } }
+@media (max-width: 1023px) { nav .links a.hide-sm { display: none; } nav .links { gap: 0; } }
+@media (max-width: 640px) { nav .links a.hide-xs { display: none; } }
+@media (max-width: 359px) { nav .links a[href="#install"] { display: none; } }
 
 /* hero */
 .hero { position: relative; overflow: hidden; border-bottom: 1px solid var(--line); isolation: isolate; }
@@ -144,7 +145,7 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 
 
 /* features */
-.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(300px, 100%), 1fr)); gap: 20px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 26px; box-shadow: var(--shadow); }
 .card .ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 16px;
              background: color-mix(in srgb, var(--c, var(--teal)) 16%, transparent); border: 1px solid color-mix(in srgb, var(--c, var(--teal)) 40%, transparent); }
@@ -183,7 +184,7 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 @media (max-width: 480px) { .row { grid-template-columns: 112px 1fr 46px; font-size: 14px; } }
 
 /* gallery (screens and infographics): every image opens in the viewer */
-.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 22px; }
+.shots { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(330px, 100%), 1fr)); gap: 22px; }
 .shot { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; box-shadow: var(--shadow); }
 .shot button { all: unset; display: block; width: 100%; cursor: zoom-in; position: relative; }
 .shot button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
@@ -194,7 +195,7 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 .shot:hover .zoom, .shot button:focus-visible .zoom { opacity: 1; transform: none; }
 figcaption { padding: 13px 16px; font-size: 15px; color: var(--muted); }
 figcaption b { color: var(--ink); font-weight: 600; }
-.info { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 22px; }
+.info { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(340px, 100%), 1fr)); gap: 22px; }
 .info .shot img { aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; background: var(--bg); }
 
 /* text versions of pictures */
@@ -202,13 +203,13 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .textver summary { cursor: pointer; font-weight: 600; min-height: 44px; display: flex; align-items: center; }
 .textver p { color: var(--muted); }
 /* glossary */
-.gloss { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 4px 28px; margin: 0; }
+.gloss { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(320px, 100%), 1fr)); gap: 4px 28px; margin: 0; }
 .gloss div { padding: 10px 0; border-bottom: 1px solid var(--line); }
 .gloss dt { font-weight: 600; }
 .gloss dd { margin: 2px 0 0; color: var(--muted); }
 
 /* cluster */
-.pairs { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 28px; }
+.pairs { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(220px, 100%), 1fr)); gap: 16px; margin-bottom: 28px; }
 .pair { padding: 20px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); }
 .pair b { display: block; font-size: 18px; margin-bottom: 4px; }
 .pair span { color: var(--muted); font-size: 15px; }
@@ -216,7 +217,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
 
 /* videos */
 .vh { font-size: 21px; margin: 32px 0 16px; }
-.vids { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 20px; }
+.vids { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); gap: 20px; }
 .vid { display: flex; flex-direction: column; gap: 6px; color: var(--ink); background: var(--card); border: 1px solid var(--line); border-radius: 18px;
        overflow: hidden; box-shadow: var(--shadow); padding-bottom: 16px; }
 .vid:hover { text-decoration: none; }
@@ -243,7 +244,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .copy { position: absolute; top: 6px; right: 8px; font: inherit; font-size: 14px; min-width: 64px; min-height: 44px; padding: 6px 12px; border-radius: 10px;
         border: 1px solid var(--line2); background: var(--card); color: var(--ink); cursor: pointer; }
 .copy:hover { border-color: var(--teal); }
-.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; margin-top: 30px; }
+.steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(260px, 100%), 1fr)); gap: 20px; margin-top: 30px; }
 .steps .card p code { color: var(--ink); }
 
 /* platforms */
@@ -256,7 +257,7 @@ tr:last-child td { border-bottom: 0; }
 .yes { color: var(--accent); font-weight: 600; }
 
 /* principles */
-.pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
+.pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 20px; }
 .pillar { padding: 24px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
 .pillar b { display: block; font-size: 19px; margin-bottom: 6px; }
 .pillar span { color: var(--muted); font-size: 16px; }
@@ -342,9 +343,10 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
       <a class="hide-sm" href="#screens">Screens</a>
       <a class="hide-sm" href="#videos">Videos</a>
       <a href="#install">Install</a>
-      <a href="#name">The name</a>
+      <a class="hide-xs" href="#name">The name</a>
       <a class="hide-xs" href="https://github.com/abhaymin/prastara">GitHub</a>
       <div class="ctrls">
+        <a class="navbtn" href="https://github.com/sponsors/abhaymin" aria-label="Sponsor Prastara on GitHub"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 21s-7-4.4-9.3-9A5 5 0 0 1 12 6a5 5 0 0 1 9.3 6c-2.3 4.6-9.3 9-9.3 9z"/></svg><span class="t">Sponsor</span></a>
         <button class="navbtn" id="theme-btn" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg><span class="t" id="theme-t">Auto</span></button>
         <button class="navbtn" id="motion-btn" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6v12M15 6v12"/></svg><span class="t" id="motion-t">Pause motion</span></button>
       </div>
