@@ -354,6 +354,45 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   :root:not([data-motion="on"]) .reveal { opacity: 1; translate: none; }
   :root:not([data-motion="on"]) .spark { display: none; }
 }
+
+/* Polish (2026-11-28): the strata stack and the speed chart carry the colour; the chrome stays quiet.
+   One accent (teal), solid headings, sentence-case labels, weights 400-600, and only the sparks loop
+   (they show experts rising from the SSD). Text colours are unchanged, so the AAA contrast holds. */
+.grad { background: none; color: var(--accent); -webkit-text-fill-color: currentColor; }
+.hero h1, .stat .n { font-weight: 600; }
+h2, h3, b, strong, dt, .brand, .row.us, .slab .lbl, .eyebrow b, .skip { font-weight: 600; }
+.kicker, .chart .grp, .adslot .adlbl, .adline .adlbl2 { text-transform: none; letter-spacing: 0; }
+.kicker { font-size: 15px; font-weight: 600; }
+.chart .grp { font-size: 15px; font-weight: 600; }
+.pair .n { font-weight: 600; letter-spacing: 0; }
+.slab .lbl { letter-spacing: 0; }
+.vid .new { display: none; }
+
+/* no glows, no hue gradients on surfaces */
+.brand svg { filter: none; }
+.hero .glow, .hero .floor { display: none; }
+.btn.primary { background-image: none; box-shadow: none; }
+.card, .tier { background: var(--card); }
+.tier .bar { background: var(--c); box-shadow: none; }
+.row.us .f { background: var(--teal-ui); }
+.pillar b::before { display: none; }
+.slab { box-shadow: inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent); }
+.slab .cells i.on { box-shadow: none; }
+
+/* hover: surface and colour changes only; nothing lifts, tilts or zooms */
+.btn:hover { transform: none; }
+.tilt, .tilt:hover { transform: none; }
+.tilt:hover { box-shadow: var(--shadow); border-color: var(--line2); }
+.tilt::after { display: none; }
+.shot:hover img, .vid:hover img { transform: none; }
+.card .ico, .card h3, .card p, .card .tag { transform: none; }
+
+/* motion: the slabs hold still and the cells stop blinking; the sparks keep rising */
+.slab, .slab .cells i.on { animation: none; }
+.gloss dt { font-weight: 600; }
+/* nav: one line at laptop widths; the theme and motion buttons drop their words before the links wrap */
+nav .links a { white-space: nowrap; }
+@media (max-width: 1180px) { .navbtn .t { display: none; } }
 </style>
 <noscript><style>.reveal { opacity: 1; translate: none; } .row .f { width: var(--w); }</style></noscript>
 </head>
@@ -388,14 +427,13 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   <div class="wrap">
     <div>
       <a class="eyebrow" href="#ram"><b>New</b> Models bigger than your RAM, 2.5x llama.cpp on a 16 GB Mac</a>
-      <h1>Your own AI server, <span class="grad">in layers.</span></h1>
+      <h1>Your own AI server, <span class="grad">in layers</span></h1>
       <p class="lead">Prastara runs AI models on your own PC, even ones bigger than its memory. Chat with them, plug in the apps
         and coding agents you already use, let an agent use a browser or a sandbox computer, and pair your other machines into
         one cluster.</p>
       <div class="cta">
         <a class="btn primary" href="#install">Install in one line</a>
         <a class="btn" href="https://github.com/abhaymin/prastara">View on GitHub</a>
-        <a class="btn" href="#videos">Watch the demos</a>
       </div>
       <div class="badges">
         <span class="badge">Free and open source · MIT</span>
@@ -427,32 +465,32 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
     <h2 class="reveal">One server on your machine, one address for every app.</h2>
     <p class="sub reveal">Your models, your data and your keys stay with you.</p>
     <div class="grid">
-      <div class="card tilt new reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7h18M3 12h12M3 17h18"/></svg></div>
+      <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7h18M3 12h12M3 17h18"/></svg></div>
         <h3>Bigger than RAM <span class="tag">Rust engine</span></h3>
         <p>The weights every token uses stay in GPU memory or RAM, the hot experts are pinned in RAM, and cold experts are read
           from the SSD only when they are picked. A 17.5 GB model runs on a 16 GB Mac at 2.5x llama.cpp's speed.</p></div>
-      <div class="card tilt new reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
-        <h3>Browser use <span class="tag">any OS</span></h3>
+      <div class="card tilt reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
+        <h3>Browser use</h3>
         <p>The model drives a real browser: it scrapes tables into datasets, fills forms and asks you before it sends anything.
           From the chat, the command line, or any coding agent through MCP.</p></div>
-      <div class="card tilt new reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h4"/></svg></div>
+      <div class="card tilt reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h4"/></svg></div>
         <h3>Cluster <span class="tag">mutual TLS</span></h3>
         <p>Pair a Mac or another PC by a 6-digit code. Workers answer requests and serve small models as extra "brains" the main
           model can ask, over mutual TLS 1.3 with pinned certificates.</p></div>
       <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></div>
-        <h3>Compatible APIs <span class="tag">any OS</span></h3>
+        <h3>Compatible APIs</h3>
         <p>OpenAI, Anthropic, Responses and Gemini-compatible endpoints, streaming and tools included, so existing apps connect
           with just a base URL and a key.</p></div>
       <div class="card tilt reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8"/></svg></div>
-        <h3>Coding agents <span class="tag">any OS</span></h3>
+        <h3>Coding agents</h3>
         <p>Claude Code, Codex, opencode, Qwen Code, Aider, Goose, the Gemini CLI and more, connected to your own models in
           one command.</p></div>
       <div class="card tilt reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 21h8"/></svg></div>
-        <h3>Web app <span class="tag">any OS</span></h3>
+        <h3>Web app</h3>
         <p>Chat with a live canvas for HTML, diagrams and Python in a sandbox; a Monitor for speed, GPUs and the queue;
           settings for everything else.</p></div>
       <div class="card tilt reveal" style="--c: var(--pink)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg></div>
-        <h3>Workshop <span class="tag">any OS</span></h3>
+        <h3>Workshop</h3>
         <p>Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result. Turn your documents
           into training data and fine-tune, sized to your machine.</p></div>
       <div class="card tilt reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M9 20h6M12 16v4M9 9l2 2 4-4"/></svg></div>
@@ -464,7 +502,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
         <p>Watch the agent's desktop live, take control with your own mouse and keyboard, and copy and paste across. Rules
           you choose decide what it may do.</p></div>
       <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
-        <h3>Secure by default <span class="tag">any OS</span></h3>
+        <h3>Secure by default</h3>
         <p>HTTPS and secure WebSockets with a self-signed, your own or a Tailscale certificate. API keys with limits and
           expiry, and usage per key and per model.</p></div>
       <div class="card tilt reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
@@ -472,7 +510,7 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
         <p>Songs that sing their lyrics in 50+ languages, voices, images, video and speech to text, all on your own GPU.
           Video frames are read without ffmpeg.</p></div>
       <div class="card tilt reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12h4l3 8 4-16 3 8h2"/></svg></div>
-        <h3>One live connection <span class="tag">any OS</span></h3>
+        <h3>One live connection</h3>
         <p>The web app talks to the server over one WebSocket: answers stream over it, and status, the queue and jobs are
           pushed the moment they change.</p></div>
     </div>
