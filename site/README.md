@@ -1,6 +1,6 @@
 # The Prastara showcase page
 
-A static page served at https://am2strata.am2.ai by the Cloudflare Worker `am2strata-site` (static assets, no build step;
+A static page served at https://prastara.am2.ai (and the old https://am2strata.am2.ai) by the Cloudflare Worker `am2strata-site` (static assets, no build step;
 `wrangler.toml` at the repo root points it at this folder; deploy with `npx wrangler deploy` from the root). `_headers` sets the security and cache headers.
 
 Images are copies of `docs/media/` sized for the web (the infographics are SVG, so they stay sharp in the viewer), and the hero background was made with Prastara's media engine. Every screenshot and infographic opens in a full-screen viewer (zoom, pan, keys); the 3D stack holds still under reduced motion. Cards do not tilt or lift; only the sparks on the stack loop (2026-11-28 polish: solid headings, one teal accent, sentence-case labels, weights up to 600).
