@@ -1,0 +1,17 @@
+# Prastara
+
+> Prastara is a free, open-source (MIT) AI server written in Rust that runs on your own PC. It runs mixture-of-experts models bigger than the machine's RAM, serves OpenAI-, Anthropic-, Responses- and Gemini-compatible APIs, and includes a web app, browser and computer use, a model Workshop and clustering of your own machines. It was called am2Strata until version 0.2.0.
+
+Key facts:
+- Bigger than RAM: hot experts pinned in RAM, cold experts read from the SSD on demand. Measured: a 17.5 GB model (GLM-4.7-Flash) on a 16 GB Mac mini M4 at 2.5x llama.cpp's generation speed (8.9 vs 3.6 tokens per second), with no swap written.
+- Platforms: Linux x64 and Arm, macOS (Apple silicon and Intel), Windows x64 and Arm. Computer tab: Linux. Sandbox VM: Linux with KVM.
+- Install: a one-line installer that checks SHA-256 and needs no admin rights.
+- Coding agents: Claude Code, Codex, opencode, Qwen Code, Aider, Goose and the Gemini CLI connect in one command.
+- Privacy: models run on your hardware; nothing leaves your PC unless you send it. Cluster links use mutual TLS 1.3 with pinned certificates.
+- Name: Prastara (प्रस्तर) is Sanskrit for a layer spread out, the oldest form of the word "strata".
+
+## Links
+
+- [Home page](https://prastara.am2.ai/): features, the engine and its benchmark, cluster, screenshots, videos, install, platforms
+- [Source code and releases](https://github.com/abhaymin/prastara)
+- [Speed measurements](https://github.com/abhaymin/prastara/blob/main/docs/HYBRID-SPEED.md)
