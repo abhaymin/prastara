@@ -1,0 +1,11 @@
+# The showcase page (site/) as a Cloudflare Worker with static assets, no build step.
+# Deploy from the repo root:  npx wrangler deploy
+# It serves am2strata.am2.ai; add prastara.am2.ai as a second custom domain when the name moves.
+name = "am2strata-site"
+compatibility_date = "2026-11-01"
+account_id = "19097c6a8e8dc98a3d5feb7c0f2bd4e2"
+routes = [ { pattern = "am2strata.am2.ai", custom_domain = true } ]
+workers_dev = false
+preview_urls = false
+[assets]
+directory = "./site"
