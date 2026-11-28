@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://prastara.am2.ai/sitemap.xml
