@@ -18,6 +18,7 @@
   if (t === "light" || t === "dark") d.dataset.theme = t;
   d.dataset.motion = m === "on" || m === "off" ? m : (matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on");
 } catch (e) { document.documentElement.dataset.motion = matchMedia("(prefers-reduced-motion: reduce)").matches ? "off" : "on"; }</script>
+<script src="ga.js" defer></script>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230a1020'/%3E%3Cpath d='M7 10h18M7 16h13M7 22h18' stroke='%235eead4' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <style>
 @font-face { font-family: "Outfit"; src: url("fonts/outfit-latin-wght.woff2") format("woff2"); font-weight: 100 900; font-display: swap; }
