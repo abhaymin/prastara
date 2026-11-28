@@ -516,6 +516,63 @@ impl Workshop {
             a.push("--gradient-checkpointing".into());
         }
         a.extend(Self::layer_args(req)?);
+        a.extend(Self::run_args(req)?);
+        if let Some(r) = s("resume") {
+            a.extend(["--resume".into(), self.allowed(r, true)?.display().to_string()]);
+        }
+        Ok(a)
+    }
+
+    /// The long-run part of a training request: `warmup_ratio` (0 to 0.5), `save_steps` and `eval_steps` (checkpoints and
+    /// held-out measures every N steps), and for streamed runs `pack` (true/false), `seqs_per_pass` (1 to 64 or "auto"),
+    /// `offload_checkpoints` ("on", "off", "auto") and `tf32` (true: faster f32 products, not bit-exact).
+    fn run_args(req: &Value) -> Result<Vec<String>, String> {
+        let mut a = Vec::new();
+        match &req["warmup_ratio"] {
+            Value::Null => {}
+            v => {
+                let n = v.as_f64().filter(|n| (0.0..=0.5).contains(n)).ok_or("\"warmup_ratio\" is a number from 0 to 0.5")?;
+                a.extend(["--warmup-ratio".into(), n.to_string()]);
+            }
+        }
+        for (k, flag) in [("save_steps", "--save-steps"), ("eval_steps", "--eval-steps")] {
+            match &req[k] {
+                Value::Null => {}
+                v => {
+                    let n = v.as_u64().filter(|n| (1..=10_000_000).contains(n)).ok_or_else(|| format!("\"{k}\" is a whole number from 1 to 10000000"))?;
+                    a.extend([flag.into(), n.to_string()]);
+                }
+            }
+        }
+        let streamed = !matches!(&req["stream_layers"], Value::Null | Value::Bool(false)) && req["stream_layers"] != "off" && req["stream_layers"] != "";
+        let needs_stream = |k: &str| -> Result<(), String> {
+            if streamed { Ok(()) } else { Err(format!("\"{k}\" needs \"stream_layers\"")) }
+        };
+        match &req["pack"] {
+            Value::Null => {}
+            Value::Bool(true) => a.push("--pack".into()),
+            Value::Bool(false) => a.push("--no-pack".into()),
+            _ => return Err("\"pack\" is true or false".into()),
+        }
+        match &req["seqs_per_pass"] {
+            Value::Null => {}
+            Value::String(x) if x == "auto" => { needs_stream("seqs_per_pass")?; a.extend(["--seqs-per-pass".into(), "auto".into()]); }
+            v => {
+                needs_stream("seqs_per_pass")?;
+                let n = v.as_u64().filter(|n| (1..=64).contains(n)).ok_or("\"seqs_per_pass\" is a whole number from 1 to 64, or \"auto\"")?;
+                a.extend(["--seqs-per-pass".into(), n.to_string()]);
+            }
+        }
+        match &req["offload_checkpoints"] {
+            Value::Null => {}
+            Value::String(m) if ["on", "off", "auto"].contains(&m.as_str()) => { needs_stream("offload_checkpoints")?; a.extend(["--offload-checkpoints".into(), m.clone()]); }
+            _ => return Err("\"offload_checkpoints\" is on, off or auto".into()),
+        }
+        match &req["tf32"] {
+            Value::Null | Value::Bool(false) => {}
+            Value::Bool(true) => a.push("--tf32".into()),
+            _ => return Err("\"tf32\" is true or false".into()),
+        }
         Ok(a)
     }
 
@@ -2529,6 +2586,19 @@ pub async fn dataset_post(State(s): State<AppState>, headers: HeaderMap, Json(re
 #[cfg(test)]
 mod tests {
     use super::safe_name;
+
+    #[test]
+    fn long_run_settings_become_arguments() {
+        use serde_json::json;
+        let a = super::Workshop::run_args(&json!({"stream_layers": "auto", "seqs_per_pass": 2, "tf32": true, "pack": true,
+            "offload_checkpoints": "auto", "warmup_ratio": 0.03, "save_steps": 250, "eval_steps": 500})).unwrap();
+        assert_eq!(a.join(" "), "--warmup-ratio 0.03 --save-steps 250 --eval-steps 500 --pack --seqs-per-pass 2 --offload-checkpoints auto --tf32");
+        assert!(super::Workshop::run_args(&json!({"seqs_per_pass": 2})).is_err(), "seqs_per_pass needs streaming");
+        assert!(super::Workshop::run_args(&json!({"stream_layers": "auto", "seqs_per_pass": 0})).is_err());
+        assert!(super::Workshop::run_args(&json!({"stream_layers": "auto", "offload_checkpoints": "always"})).is_err());
+        assert!(super::Workshop::run_args(&json!({"warmup_ratio": 0.9})).is_err());
+        assert!(super::Workshop::run_args(&json!({})).unwrap().is_empty());
+    }
 
     #[test]
     fn upload_names_are_made_safe() {
