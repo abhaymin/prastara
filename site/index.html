@@ -25,36 +25,21 @@
 /* Colours: Catppuccin Mocha (dark) and Latte (light). Text colours reach WCAG AAA, 7:1, on every background they sit
    on (checked by tools/site/contrast.py); the bright Catppuccin hues (the -ui ones) are only for decoration. */
 :root {
-  --bg: #1e1e2e; --bg2: #181825; --card: #28283b; --card2: #2e2f44; --line: #45475a; --line2: #585b70; --crust: #11111b;
-  --ink: #cdd6f4; --muted: #b1b7cf; --faint: #b1b7cf;
-  --teal: #94e2d5; --cyan: #89dceb; --blue: #90b9fa; --indigo: #b4befe; --violet: #cca8f7; --pink: #f5c2e7;
-  --teal-ui: #94e2d5; --cyan-ui: #89dceb; --blue-ui: #89b4fa; --indigo-ui: #b4befe; --violet-ui: #cba6f7; --pink-ui: #f5c2e7;
-  --accent: var(--teal); --accent-ink: #11111b; --code-bg: #11111b; --code-ink: #cdd6f4; --scrim: rgba(30, 30, 46, .86);
-  --shadow: 0 30px 60px -20px rgba(0, 0, 0, .55), 0 10px 24px -12px rgba(0, 0, 0, .5);
-  --glass: rgba(40, 40, 59, .78); --grid: rgba(148, 226, 213, .09); --sheen: rgba(255, 255, 255, .08);
-  color-scheme: dark;
+  --bg: light-dark(#eff1f5, #1e1e2e); --bg2: light-dark(#e6e9ef, #181825); --card: light-dark(#ffffff, #28283b);
+  --line: light-dark(#bcc0cc, #45475a); --line2: light-dark(#9ca0b0, #585b70); --ink: light-dark(#303246, #cdd6f4);
+  --muted: light-dark(#42445b, #b1b7cf); --faint: light-dark(#42445b, #b1b7cf); --teal: light-dark(#0c4d50, #94e2d5);
+  --cyan: light-dark(#024b67, #89dceb); --blue: light-dark(#073ca6, #90b9fa); --indigo: light-dark(#0323d5, #b4befe);
+  --violet: light-dark(#590fbb, #cca8f7); --pink: light-dark(#801463, #f5c2e7); --teal-ui: light-dark(#179299, #94e2d5);
+  --blue-ui: light-dark(#1e66f5, #89b4fa); --violet-ui: light-dark(#8839ef, #cba6f7); --accent: var(--teal);
+  --accent-ink: light-dark(#ffffff, #11111b); --code-bg: light-dark(#dce0e8, #11111b); --code-ink: light-dark(#303246, #cdd6f4);
+  --scrim: light-dark(rgba(239, 241, 245, .9), rgba(30, 30, 46, .86)); --glass: light-dark(rgba(255, 255, 255, .85), rgba(40, 40, 59, .78));
+  --shadow: 0 30px 60px -20px light-dark(rgba(76, 79, 105, .25), rgba(0, 0, 0, .55)), 0 10px 24px -12px light-dark(rgba(76, 79, 105, .2), rgba(0, 0, 0, .5));
+  color-scheme: light dark;
 }
-@media (prefers-color-scheme: light) { :root:not([data-theme="dark"]) {
-  --bg: #eff1f5; --bg2: #e6e9ef; --card: #ffffff; --card2: #f7f8fb; --line: #bcc0cc; --line2: #9ca0b0; --crust: #dce0e8;
-  --ink: #303246; --muted: #42445b; --faint: #42445b;
-  --teal: #0c4d50; --cyan: #024b67; --blue: #073ca6; --indigo: #0323d5; --violet: #590fbb; --pink: #801463;
-  --teal-ui: #179299; --cyan-ui: #04a5e5; --blue-ui: #1e66f5; --indigo-ui: #7287fd; --violet-ui: #8839ef; --pink-ui: #ea76cb;
-  --accent: var(--teal); --accent-ink: #ffffff; --code-bg: #dce0e8; --code-ink: #303246; --scrim: rgba(239, 241, 245, .9);
-  --shadow: 0 30px 60px -24px rgba(76, 79, 105, .25), 0 10px 24px -14px rgba(76, 79, 105, .2);
-  --glass: rgba(255, 255, 255, .85); --grid: rgba(23, 146, 153, .12); --sheen: rgba(255, 255, 255, .5);
-  color-scheme: light;
-} }
-:root[data-theme="light"] {
-  --bg: #eff1f5; --bg2: #e6e9ef; --card: #ffffff; --card2: #f7f8fb; --line: #bcc0cc; --line2: #9ca0b0; --crust: #dce0e8;
-  --ink: #303246; --muted: #42445b; --faint: #42445b;
-  --teal: #0c4d50; --cyan: #024b67; --blue: #073ca6; --indigo: #0323d5; --violet: #590fbb; --pink: #801463;
-  --teal-ui: #179299; --cyan-ui: #04a5e5; --blue-ui: #1e66f5; --indigo-ui: #7287fd; --violet-ui: #8839ef; --pink-ui: #ea76cb;
-  --accent: var(--teal); --accent-ink: #ffffff; --code-bg: #dce0e8; --code-ink: #303246; --scrim: rgba(239, 241, 245, .9);
-  --shadow: 0 30px 60px -24px rgba(76, 79, 105, .25), 0 10px 24px -14px rgba(76, 79, 105, .2);
-  --glass: rgba(255, 255, 255, .85); --grid: rgba(23, 146, 153, .12); --sheen: rgba(255, 255, 255, .5);
-  color-scheme: light;
-}
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 * { box-sizing: border-box; }
+h2, h3, b, strong { font-weight: 600; }
 html { scroll-behavior: smooth; scroll-padding-top: 84px; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 17px/1.6 "Outfit", system-ui, -apple-system, "Segoe UI", sans-serif;
        -webkit-font-smoothing: antialiased; overflow-x: hidden; }
@@ -64,20 +49,19 @@ p a, .note a, footer a { text-decoration: underline; text-underline-offset: 3px;
 img { max-width: 100%; display: block; }
 code, pre { font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace; font-size: .9em; }
 :focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; border-radius: 8px; }
-.skip { position: absolute; left: 12px; top: -80px; z-index: 50; background: var(--accent); color: var(--accent-ink); padding: 12px 18px; border-radius: 10px; font-weight: 700; }
+.skip { position: absolute; left: 12px; top: -80px; z-index: 50; background: var(--accent); color: var(--accent-ink); padding: 12px 18px; border-radius: 10px; font-weight: 600; }
 .skip:focus { top: 12px; text-decoration: none; }
 .sr { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
 .wrap { max-width: 1180px; margin: 0 auto; padding: 0 20px; }
-.grad { background: linear-gradient(100deg, var(--teal), var(--cyan) 35%, var(--indigo) 70%, var(--violet)); -webkit-background-clip: text;
-        background-clip: text; color: transparent; }
+.grad { color: var(--accent); }
 
 /* nav */
 nav { position: sticky; top: 0; z-index: 20; backdrop-filter: blur(14px) saturate(140%); -webkit-backdrop-filter: blur(14px) saturate(140%);
       background: color-mix(in srgb, var(--bg) 72%, transparent); border-bottom: 1px solid color-mix(in srgb, var(--line) 70%, transparent); }
 nav .wrap { display: flex; align-items: center; gap: 22px; height: 62px; }
-.brand { font-weight: 700; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; min-height: 44px; }
+.brand { font-weight: 600; font-size: 20px; color: var(--ink); display: flex; align-items: center; gap: 10px; min-height: 44px; }
 .brand:hover { text-decoration: none; }
-.brand svg { width: 28px; height: 28px; filter: drop-shadow(0 4px 12px rgba(94, 234, 212, .35)); }
+.brand svg { width: 28px; height: 28px; }
 nav .links { margin-left: auto; display: flex; gap: 6px; font-size: 15px; align-items: center; }
 nav .links a { min-height: 44px; display: inline-flex; align-items: center; padding: 0 8px; border-radius: 8px; }
 .navbtn { font: inherit; font-size: 14px; min-height: 44px; min-width: 44px; display: inline-flex; align-items: center; justify-content: center; gap: 6px;
@@ -87,7 +71,8 @@ nav .links a { min-height: 44px; display: inline-flex; align-items: center; padd
 .ctrls { display: flex; gap: 6px; margin-left: 8px; }
 @media (max-width: 420px) { .ctrls { margin-left: 2px; gap: 4px; } nav .wrap { gap: 8px; } }
 @media (max-width: 760px) { .navbtn .t { display: none; } }
-nav .links a { color: var(--muted); }
+nav .links a { color: var(--muted); white-space: nowrap; }
+@media (max-width: 1180px) { .navbtn .t { display: none; } }
 nav .links a:hover { color: var(--ink); text-decoration: none; }
 @media (max-width: 760px) { nav .links a.hide-sm { display: none; } nav .links { gap: 0; } }
 @media (max-width: 420px) { nav .links a.hide-xs { display: none; } }
@@ -97,27 +82,18 @@ nav .links a:hover { color: var(--ink); text-decoration: none; }
 .hero .bgimg { position: absolute; inset: 0; background: url("assets/hero.webp") center / cover no-repeat; opacity: .16; z-index: -3; }
 .hero .scrim { position: absolute; inset: 0; z-index: -1; background: linear-gradient(90deg, var(--scrim) 0%, var(--scrim) 52%, transparent 80%); }
 @media (max-width: 920px) { .hero .scrim { background: var(--scrim); } }
-.hero .glow { position: absolute; inset: -20% -10% auto auto; width: 70vw; height: 70vw; max-width: 900px; max-height: 900px; z-index: -2;
-              background: radial-gradient(closest-side, rgba(94, 234, 212, .22), rgba(129, 140, 248, .12) 55%, transparent 72%); filter: blur(10px); }
-.hero .floor { position: absolute; left: -10%; right: -10%; bottom: -2px; height: 46%; z-index: -1; transform-origin: 50% 100%;
-               transform: perspective(600px) rotateX(62deg); opacity: .9;
-               background-image: linear-gradient(var(--grid) 1px, transparent 1px), linear-gradient(90deg, var(--grid) 1px, transparent 1px);
-               background-size: 54px 54px; mask-image: linear-gradient(to top, #000 10%, transparent 92%);
-               -webkit-mask-image: linear-gradient(to top, #000 10%, transparent 92%); animation: floor 9s linear infinite; }
-@keyframes floor { to { background-position: 0 54px, 0 0; } }
 .hero .wrap { display: grid; grid-template-columns: 1.05fr .95fr; align-items: center; gap: 30px; padding-top: 84px; padding-bottom: 92px; }
 @media (max-width: 920px) { .hero .wrap { grid-template-columns: 1fr; padding-top: 56px; } }
 .eyebrow { display: inline-flex; align-items: center; gap: 8px; font-size: 15px; color: var(--ink); min-height: 44px; padding: 6px 14px 6px 8px; border-radius: 99px;
            border: 1px solid var(--line); background: var(--glass); backdrop-filter: blur(6px); margin-bottom: 22px; }
-.eyebrow b { background: var(--accent); color: var(--accent-ink); border-radius: 99px; padding: 1px 9px; font-size: 12px; font-weight: 700; }
-.hero h1 { font-size: clamp(46px, 7.4vw, 88px); line-height: .98; margin: 0 0 20px; letter-spacing: -.03em; font-weight: 800; }
+.eyebrow b { background: var(--accent); color: var(--accent-ink); border-radius: 99px; padding: 1px 9px; font-size: 12px; font-weight: 600; }
+.hero h1 { font-size: clamp(46px, 7.4vw, 88px); line-height: .98; margin: 0 0 20px; letter-spacing: -.03em; font-weight: 600; }
 .hero p.lead { font-size: clamp(19px, 2.2vw, 23px); color: var(--ink); max-width: 56ch; margin: 0 0 32px; }
 .cta { display: flex; flex-wrap: wrap; gap: 12px; }
 .btn { display: inline-flex; align-items: center; gap: 8px; padding: 12px 20px; border-radius: 12px; font-weight: 600; border: 1px solid var(--line2);
        color: var(--ink); background: var(--glass); backdrop-filter: blur(8px); transition: transform .2s, border-color .2s, box-shadow .2s; }
-.btn:hover { text-decoration: none; border-color: var(--accent); transform: translateY(-2px); }
-.btn.primary { background-color: var(--teal); background-image: linear-gradient(135deg, var(--teal), var(--cyan)); color: var(--accent-ink); border-color: transparent;
-               box-shadow: 0 10px 30px -8px color-mix(in srgb, var(--cyan-ui) 55%, transparent); }
+.btn:hover { text-decoration: none; border-color: var(--accent); }
+.btn.primary { background-color: var(--teal); color: var(--accent-ink); border-color: transparent; }
 .badges { margin-top: 28px; display: flex; flex-wrap: wrap; gap: 8px; }
 .badge { font-size: 14px; color: var(--ink) !important; padding: 4px 11px; border-radius: 99px; border: 1px solid var(--line); color: var(--muted); background: var(--glass); }
 
@@ -131,19 +107,16 @@ nav .links a:hover { color: var(--ink); text-decoration: none; }
          transform: rotateX(calc(58deg + var(--ty, 0deg))) rotateZ(calc(-34deg + var(--tx, 0deg))); transition: transform .5s cubic-bezier(.2, .7, .2, 1); }
 .slab { position: absolute; inset: 0; border-radius: 26px; transform-style: preserve-3d; border: 1.5px solid var(--c);
         background: linear-gradient(135deg, color-mix(in srgb, var(--c) 30%, transparent), color-mix(in srgb, var(--c) 8%, transparent));
-        box-shadow: 0 0 40px -6px color-mix(in srgb, var(--c) 55%, transparent), inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent);
-        animation: bob 6s ease-in-out infinite; } /* no backdrop-filter: it would flatten the slab and the sparks' 3D rise */
+        box-shadow: inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent); } /* no backdrop-filter: it would flatten the slab and the sparks' 3D rise */
 .slab.s1 { --c: var(--teal-ui); --z: 150px; transform: translateZ(var(--z)); animation-delay: 0s; }
 .slab.s2 { --c: var(--blue-ui); --z: 75px; transform: translateZ(var(--z)); animation-delay: -2s; }
 .slab.s3 { --c: var(--violet-ui); --z: 0px; transform: translateZ(var(--z)); animation-delay: -4s; }
-@keyframes bob { 50% { transform: translateZ(calc(var(--z) + 12px)); } }
-.slab .lbl { position: absolute; left: 20px; bottom: 16px; font-size: 15px; font-weight: 700; color: var(--ink); letter-spacing: .02em; }
+.slab .lbl { position: absolute; left: 20px; bottom: 16px; font-size: 15px; font-weight: 600; color: var(--ink); }
 .slab .lbl small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
 .slab .cells { position: absolute; right: 16px; top: 16px; display: grid; grid-template-columns: repeat(6, 16px); gap: 6px; }
 .slab .cells i { width: 16px; height: 16px; border-radius: 4px; background: color-mix(in srgb, var(--c) 22%, transparent);
                  border: 1px solid color-mix(in srgb, var(--c) 40%, transparent); }
-.slab .cells i.on { background: var(--c); box-shadow: 0 0 12px var(--c); animation: blink 3.2s ease-in-out infinite; }
-@keyframes blink { 50% { opacity: .45; } }
+.slab .cells i.on { background: var(--c); }
 .spark { position: absolute; width: 12px; height: 12px; border-radius: 50%; background: var(--teal-ui); box-shadow: 0 0 16px var(--teal-ui), 0 0 4px #fff;
          left: var(--x); top: var(--y); transform: translateZ(0); animation: rise 4.2s cubic-bezier(.45, 0, .2, 1) infinite; animation-delay: var(--d); opacity: 0; }
 @keyframes rise { 0% { transform: translateZ(4px); opacity: 0; } 12% { opacity: 1; } 80% { opacity: 1; } 100% { transform: translateZ(160px); opacity: 0; } }
@@ -152,47 +125,36 @@ nav .links a:hover { color: var(--ink); text-decoration: none; }
 /* sections */
 section { padding: 96px 0; position: relative; }
 section.alt { background: linear-gradient(180deg, var(--bg2), var(--bg)); border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
-.kicker { font-size: 13px; letter-spacing: .14em; text-transform: uppercase; font-weight: 700; color: var(--accent); margin: 0 0 10px; }
+.kicker { font-size: 15px; font-weight: 600; color: var(--accent); margin: 0 0 10px; }
 h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; letter-spacing: -.02em; }
 .sub { color: var(--muted); max-width: 68ch; margin: 0 0 44px; font-size: 18px; }
 .note { font-size: 14px; color: var(--faint); margin-top: 20px; }
 
-/* 3D tilt surfaces */
-.tilt { transform-style: preserve-3d; transform: perspective(900px) rotateX(var(--rx, 0deg)) rotateY(var(--ry, 0deg)) translateZ(0);
-        transition: transform .35s cubic-bezier(.2, .7, .2, 1), box-shadow .35s, border-color .35s; will-change: transform; position: relative; }
-.tilt::after { content: ""; position: absolute; inset: 0; border-radius: inherit; pointer-events: none; opacity: 0; transition: opacity .3s;
-               background: radial-gradient(420px circle at var(--mx, 50%) var(--my, 50%), var(--sheen), transparent 45%); }
-.tilt:hover::after { opacity: 1; }
-.tilt:hover { box-shadow: 0 40px 70px -24px rgba(0, 0, 0, .6), 0 0 0 1px color-mix(in srgb, var(--accent) 45%, transparent); }
 
 /* features */
 .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 20px; }
-.card { background: linear-gradient(180deg, var(--card2), var(--card)); border: 1px solid var(--line); border-radius: 20px; padding: 26px; box-shadow: var(--shadow); }
-.card .ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 16px; transform: translateZ(30px);
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 26px; box-shadow: var(--shadow); }
+.card .ico { width: 42px; height: 42px; border-radius: 12px; display: grid; place-items: center; margin-bottom: 16px;
              background: color-mix(in srgb, var(--c, var(--teal)) 16%, transparent); border: 1px solid color-mix(in srgb, var(--c, var(--teal)) 40%, transparent); }
 .card .ico svg { width: 22px; height: 22px; stroke: var(--c, var(--teal)); fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
-.card h3 { margin: 0 0 8px; font-size: 21px; display: flex; align-items: center; justify-content: space-between; gap: 10px; transform: translateZ(20px); }
+.card h3 { margin: 0 0 8px; font-size: 21px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .card .tag { font-size: 13px; font-weight: 600; color: var(--c, var(--accent)); border: 1px solid color-mix(in srgb, var(--c, var(--accent)) 50%, transparent);
              border-radius: 99px; padding: 2px 9px; white-space: nowrap; }
-.card p { margin: 0; color: var(--muted); font-size: 16px; transform: translateZ(10px); }
-.card.new { border-color: color-mix(in srgb, var(--c, var(--teal)) 45%, var(--line)); }
-.card.new h3::after { content: "new"; font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--accent-ink);
-                      background: var(--c, var(--teal)); border-radius: 99px; padding: 1px 8px; margin-left: auto; }
-.card.new h3 .tag { margin-left: 0; }
+.card p { margin: 0; color: var(--muted); font-size: 16px; }
 
 /* bigger than RAM */
 .split { display: grid; grid-template-columns: 1fr 1fr; gap: 28px; align-items: start; }
 @media (max-width: 920px) { .split { grid-template-columns: 1fr; } }
 .tiers { display: grid; gap: 14px; perspective: 900px; }
 .tier { display: grid; grid-template-columns: 10px 1fr; gap: 18px; padding: 20px 22px; border-radius: 18px; border: 1px solid var(--line);
-        background: linear-gradient(135deg, color-mix(in srgb, var(--c) 12%, var(--card)), var(--card)); box-shadow: var(--shadow); }
-.tier .bar { border-radius: 6px; background: linear-gradient(180deg, var(--c), color-mix(in srgb, var(--c) 40%, transparent)); box-shadow: 0 0 16px -2px var(--c); }
+        background: var(--card); box-shadow: var(--shadow); }
+.tier .bar { border-radius: 6px; background: var(--c); }
 .tier b { display: block; font-size: 19px; }
 .tier span { color: var(--muted); font-size: 16px; }
 .stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 18px; }
 @media (max-width: 560px) { .stats { grid-template-columns: 1fr; } }
 .stat { padding: 20px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
-.stat .n { font-size: clamp(28px, 2.9vw, 40px); white-space: nowrap; font-weight: 800; line-height: 1; letter-spacing: -.02em; }
+.stat .n { font-size: clamp(28px, 2.9vw, 40px); white-space: nowrap; font-weight: 600; line-height: 1; letter-spacing: -.02em; }
 .stat .l { color: var(--muted); font-size: 14px; margin-top: 8px; }
 .chart { padding: 24px; border-radius: 20px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
 .chart h3 { margin: 0 0 4px; font-size: 18px; }
@@ -201,11 +163,11 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 .row .t { height: 14px; border-radius: 99px; background: color-mix(in srgb, var(--line) 70%, transparent); overflow: hidden; }
 .row .f { height: 100%; width: 0; border-radius: 99px; background: color-mix(in srgb, var(--muted) 55%, transparent); transition: width 1.4s cubic-bezier(.2, .7, .2, 1); }
 .chart.in .f { width: var(--w); }
-.row.us .f { background: linear-gradient(90deg, var(--teal-ui), var(--cyan-ui)); }
-.row.us { font-weight: 700; }
+.row.us .f { background: var(--teal-ui); }
+.row.us { font-weight: 600; }
 .row .v { text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
 .row.us .v { color: var(--accent); }
-.chart .grp { font-size: 14px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .08em; margin: 18px 0 2px; }
+.chart .grp { font-size: 15px; font-weight: 600; color: var(--muted); margin: 18px 0 2px; }
 @media (max-width: 480px) { .row { grid-template-columns: 112px 1fr 46px; font-size: 14px; } }
 
 /* gallery (screens and infographics): every image opens in the viewer */
@@ -213,8 +175,7 @@ h2 { font-size: clamp(32px, 4.2vw, 46px); line-height: 1.08; margin: 0 0 14px; l
 .shot { margin: 0; background: var(--card); border: 1px solid var(--line); border-radius: 18px; overflow: hidden; box-shadow: var(--shadow); }
 .shot button { all: unset; display: block; width: 100%; cursor: zoom-in; position: relative; }
 .shot button:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.shot img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
-.shot:hover img { transform: scale(1.04); }
+.shot img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; }
 .shot .zoom { position: absolute; right: 12px; top: 12px; width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
               background: rgba(7, 13, 28, .72); border: 1px solid rgba(255, 255, 255, .16); opacity: 0; transform: translateY(-4px); transition: .25s; }
 .shot .zoom svg { width: 18px; height: 18px; stroke: #fff; fill: none; stroke-width: 2; }
@@ -231,7 +192,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
 /* glossary */
 .gloss { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 4px 28px; margin: 0; }
 .gloss div { padding: 10px 0; border-bottom: 1px solid var(--line); }
-.gloss dt { font-weight: 700; }
+.gloss dt { font-weight: 600; }
 .gloss dd { margin: 2px 0 0; color: var(--muted); }
 
 /* cluster */
@@ -239,7 +200,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .pair { padding: 20px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); }
 .pair b { display: block; font-size: 18px; margin-bottom: 4px; }
 .pair span { color: var(--muted); font-size: 15px; }
-.pair .n { font-size: 13px; font-weight: 800; color: var(--accent); letter-spacing: .1em; }
+.pair .n { font-size: 13px; font-weight: 600; color: var(--accent); }
 
 /* videos */
 .vh { font-size: 21px; margin: 32px 0 16px; }
@@ -248,8 +209,7 @@ figcaption b { color: var(--ink); font-weight: 600; }
        overflow: hidden; box-shadow: var(--shadow); padding-bottom: 16px; }
 .vid:hover { text-decoration: none; }
 .vid .thumb { position: relative; display: block; overflow: hidden; }
-.vid img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; transition: transform .6s cubic-bezier(.2, .7, .2, 1); }
-.vid:hover img { transform: scale(1.05); }
+.vid img { aspect-ratio: 16 / 9; object-fit: cover; width: 100%; height: auto; }
 .vid.short img { aspect-ratio: 9 / 16; max-height: 360px; object-position: center; }
 .vid .dur { position: absolute; right: 8px; bottom: 8px; background: #11111b; color: #ffffff; font-size: 13px; padding: 1px 6px; border-radius: 6px; }
 .vid .play { position: absolute; inset: 0; margin: auto; width: 58px; height: 58px; border-radius: 50%; background: rgba(7, 13, 28, .6);
@@ -260,8 +220,6 @@ figcaption b { color: var(--ink); font-weight: 600; }
 .vid .desc { padding: 0 16px; color: var(--muted); font-size: 15px; }
 .vid.feature { grid-column: span 2; }
 @media (max-width: 620px) { .vid.feature { grid-column: auto; } }
-.vid .new { position: absolute; left: 10px; top: 10px; font-size: 12px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
-            background: var(--accent); color: var(--accent-ink); border-radius: 99px; padding: 2px 9px; }
 
 /* install */
 .tabs { display: flex; gap: 8px; margin-bottom: 14px; flex-wrap: wrap; }
@@ -289,15 +247,13 @@ tr:last-child td { border-bottom: 0; }
 .pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
 .pillar { padding: 24px; border-radius: 18px; border: 1px solid var(--line); background: var(--card); box-shadow: var(--shadow); }
 .pillar b { display: block; font-size: 19px; margin-bottom: 6px; }
-.pillar b::before { content: ""; display: block; width: 32px; height: 4px; border-radius: 4px; margin-bottom: 14px;
-                    background: linear-gradient(90deg, var(--teal-ui), var(--indigo-ui)); }
 .pillar span { color: var(--muted); font-size: 16px; }
 
 footer { padding: 52px 0 64px; color: var(--muted); font-size: 15px; border-top: 1px solid var(--line); background: var(--bg2); }
 /* ads: two quiet, labelled slots; fixed size, no motion, no pop-ups */
 .adslot { margin: 34px auto 0; max-width: 760px; min-height: 92px; border: 1px dashed var(--line2); border-radius: 16px; padding: 14px 16px;
           display: flex; align-items: center; gap: 14px; background: color-mix(in srgb, var(--card) 60%, transparent); position: relative; }
-.adslot .adlbl { position: absolute; top: -10px; left: 14px; font-size: 12px; letter-spacing: .1em; text-transform: uppercase; color: var(--faint);
+.adslot .adlbl { position: absolute; top: -10px; left: 14px; font-size: 12px; color: var(--faint);
                  background: var(--bg); padding: 0 6px; }
 .adslot.house a.house { display: flex; align-items: center; gap: 14px; color: var(--ink); width: 100%; }
 .adslot.house a.house:hover { text-decoration: none; }
@@ -309,7 +265,7 @@ footer { padding: 52px 0 64px; color: var(--muted); font-size: 15px; border-top:
 .adslot .hgo { margin-left: auto; flex: none; font-size: 14px; color: var(--accent); white-space: nowrap; }
 @media (max-width: 560px) { .adslot .hgo { display: none; } }
 .adline { font-size: 14px; color: var(--faint); margin-top: 18px; min-height: 20px; }
-.adline .adlbl2 { text-transform: uppercase; letter-spacing: .1em; font-size: 12px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 4px; margin-right: 6px; }
+.adline .adlbl2 { font-size: 12px; border: 1px solid var(--line2); border-radius: 4px; padding: 0 4px; margin-right: 6px; }
 /* EthicalAds' own markup, toned to the page */
 .adslot [data-ea-publisher] { width: 100%; }
 .adslot .ea-content { background: transparent !important; box-shadow: none !important; margin: 0 !important; }
@@ -318,7 +274,6 @@ footer .cols { display: flex; flex-wrap: wrap; gap: 30px; justify-content: space
 footer p { margin: 6px 0; max-width: 68ch; }
 
 /* reveal on scroll */
-/* the rise uses `translate`, so it never fights a tilt's `transform` */
 .reveal { opacity: 0; translate: 0 26px; transition: opacity .7s ease, translate .7s cubic-bezier(.2, .7, .2, 1), transform .35s cubic-bezier(.2, .7, .2, 1), box-shadow .35s; }
 .reveal.in { opacity: 1; translate: 0 0; }
 
@@ -356,44 +311,6 @@ dialog.viewer::backdrop { background: rgba(3, 7, 16, .7); backdrop-filter: blur(
   :root:not([data-motion="on"]) .spark { display: none; }
 }
 
-/* Polish (2026-11-28): the strata stack and the speed chart carry the colour; the chrome stays quiet.
-   One accent (teal), solid headings, sentence-case labels, weights 400-600, and only the sparks loop
-   (they show experts rising from the SSD). Text colours are unchanged, so the AAA contrast holds. */
-.grad { background: none; color: var(--accent); -webkit-text-fill-color: currentColor; }
-.hero h1, .stat .n { font-weight: 600; }
-h2, h3, b, strong, dt, .brand, .row.us, .slab .lbl, .eyebrow b, .skip { font-weight: 600; }
-.kicker, .chart .grp, .adslot .adlbl, .adline .adlbl2 { text-transform: none; letter-spacing: 0; }
-.kicker { font-size: 15px; font-weight: 600; }
-.chart .grp { font-size: 15px; font-weight: 600; }
-.pair .n { font-weight: 600; letter-spacing: 0; }
-.slab .lbl { letter-spacing: 0; }
-.vid .new { display: none; }
-
-/* no glows, no hue gradients on surfaces */
-.brand svg { filter: none; }
-.hero .glow, .hero .floor { display: none; }
-.btn.primary { background-image: none; box-shadow: none; }
-.card, .tier { background: var(--card); }
-.tier .bar { background: var(--c); box-shadow: none; }
-.row.us .f { background: var(--teal-ui); }
-.pillar b::before { display: none; }
-.slab { box-shadow: inset 0 0 40px -10px color-mix(in srgb, var(--c) 45%, transparent); }
-.slab .cells i.on { box-shadow: none; }
-
-/* hover: surface and colour changes only; nothing lifts, tilts or zooms */
-.btn:hover { transform: none; }
-.tilt, .tilt:hover { transform: none; }
-.tilt:hover { box-shadow: var(--shadow); border-color: var(--line2); }
-.tilt::after { display: none; }
-.shot:hover img, .vid:hover img { transform: none; }
-.card .ico, .card h3, .card p, .card .tag { transform: none; }
-
-/* motion: the slabs hold still and the cells stop blinking; the sparks keep rising */
-.slab, .slab .cells i.on { animation: none; }
-.gloss dt { font-weight: 600; }
-/* nav: one line at laptop widths; the theme and motion buttons drop their words before the links wrap */
-nav .links a { white-space: nowrap; }
-@media (max-width: 1180px) { .navbtn .t { display: none; } }
 </style>
 <noscript><style>.reveal { opacity: 1; translate: none; } .row .f { width: var(--w); }</style></noscript>
 </head>
@@ -424,7 +341,7 @@ nav .links a { white-space: nowrap; }
 </nav>
 
 <header class="hero" id="top">
-  <div class="bgimg" aria-hidden="true"></div><div class="glow" aria-hidden="true"></div><div class="floor" aria-hidden="true"></div><div class="scrim" aria-hidden="true"></div>
+  <div class="bgimg" aria-hidden="true"></div><div class="scrim" aria-hidden="true"></div>
   <div class="wrap">
     <div>
       <a class="eyebrow" href="#ram"><b>New</b> Models bigger than your RAM, 2.5x llama.cpp on a 16 GB Mac</a>
@@ -466,51 +383,51 @@ nav .links a { white-space: nowrap; }
     <h2 class="reveal">One server on your machine, one address for every app.</h2>
     <p class="sub reveal">Your models, your data and your keys stay with you.</p>
     <div class="grid">
-      <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7h18M3 12h12M3 17h18"/></svg></div>
+      <div class="card reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M3 7h18M3 12h12M3 17h18"/></svg></div>
         <h3>Bigger than RAM <span class="tag">Rust engine</span></h3>
         <p>The weights every token uses stay in GPU memory or RAM, the hot experts are pinned in RAM, and cold experts are read
           from the SSD only when they are picked. A 17.5 GB model runs on a 16 GB Mac at 2.5x llama.cpp's speed.</p></div>
-      <div class="card tilt reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
+      <div class="card reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"/></svg></div>
         <h3>Browser use</h3>
         <p>The model drives a real browser: it scrapes tables into datasets, fills forms and asks you before it sends anything.
           From the chat, the command line, or any coding agent through MCP.</p></div>
-      <div class="card tilt reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h4"/></svg></div>
+      <div class="card reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="8" height="6" rx="1.5"/><rect x="13" y="14" width="8" height="6" rx="1.5"/><path d="M7 10v4a2 2 0 0 0 2 2h4"/></svg></div>
         <h3>Cluster <span class="tag">mutual TLS</span></h3>
         <p>Pair a Mac or another PC by a 6-digit code. Workers answer requests and serve small models as extra "brains" the main
           model can ask, over mutual TLS 1.3 with pinned certificates.</p></div>
-      <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></div>
+      <div class="card reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M8 9l-4 3 4 3M16 9l4 3-4 3M14 5l-4 14"/></svg></div>
         <h3>Compatible APIs</h3>
         <p>OpenAI, Anthropic, Responses and Gemini-compatible endpoints, streaming and tools included, so existing apps connect
           with just a base URL and a key.</p></div>
-      <div class="card tilt reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8"/></svg></div>
+      <div class="card reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 17l6-6-6-6M12 19h8"/></svg></div>
         <h3>Coding agents</h3>
         <p>Claude Code, Codex, opencode, Qwen Code, Aider, Goose, the Gemini CLI and more, connected to your own models in
           one command.</p></div>
-      <div class="card tilt reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 21h8"/></svg></div>
+      <div class="card reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M3 9h18M8 21h8"/></svg></div>
         <h3>Web app</h3>
         <p>Chat with a live canvas for HTML, diagrams and Python in a sandbox; a Monitor for speed, GPUs and the queue;
           settings for everything else.</p></div>
-      <div class="card tilt reveal" style="--c: var(--pink)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg></div>
+      <div class="card reveal" style="--c: var(--pink)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z"/></svg></div>
         <h3>Workshop</h3>
         <p>Convert a Hugging Face model to GGUF, quantize it, merge a LoRA adapter, and install the result. Turn your documents
           into training data and fine-tune, sized to your machine.</p></div>
-      <div class="card tilt reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M9 20h6M12 16v4M9 9l2 2 4-4"/></svg></div>
+      <div class="card reveal" style="--c: var(--blue)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="12" rx="2"/><path d="M9 20h6M12 16v4M9 9l2 2 4-4"/></svg></div>
         <h3>Sandbox VM <span class="tag">Linux · KVM</span></h3>
         <p>Computer use in its own small Debian virtual machine: the agent installs and runs what it needs inside, and your
           PC is untouched. It pauses when idle and resumes in about a second.</p></div>
-      <div class="card tilt reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M5 3l14 7-6 2-2 6z"/></svg></div>
+      <div class="card reveal" style="--c: var(--indigo)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M5 3l14 7-6 2-2 6z"/></svg></div>
         <h3>Computer tab <span class="tag">Linux</span></h3>
         <p>Watch the agent's desktop live, take control with your own mouse and keyboard, and copy and paste across. Rules
           you choose decide what it may do.</p></div>
-      <div class="card tilt reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
+      <div class="card reveal" style="--c: var(--teal)"><div class="ico"><svg viewBox="0 0 24 24"><rect x="5" y="11" width="14" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg></div>
         <h3>Secure by default</h3>
         <p>HTTPS and secure WebSockets with a self-signed, your own or a Tailscale certificate. API keys with limits and
           expiry, and usage per key and per model.</p></div>
-      <div class="card tilt reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
+      <div class="card reveal" style="--c: var(--violet)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg></div>
         <h3>Media <span class="tag">build from source</span></h3>
         <p>Songs that sing their lyrics in 50+ languages, voices, images, video and speech to text, all on your own GPU.
           Video frames are read without ffmpeg.</p></div>
-      <div class="card tilt reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12h4l3 8 4-16 3 8h2"/></svg></div>
+      <div class="card reveal" style="--c: var(--cyan)"><div class="ico"><svg viewBox="0 0 24 24"><path d="M4 12h4l3 8 4-16 3 8h2"/></svg></div>
         <h3>One live connection</h3>
         <p>The web app talks to the server over one WebSocket: answers stream over it, and status, the queue and jobs are
           pushed the moment they change.</p></div>
@@ -526,20 +443,20 @@ nav .links a { white-space: nowrap; }
       those close and leaves the rest on the SSD, so a model larger than your memory runs without swapping.</p>
     <div class="split">
       <div class="tiers">
-        <div class="tier tilt reveal" style="--c: var(--teal-ui)"><div class="bar"></div><div><b>GPU memory and RAM</b>
+        <div class="tier reveal" style="--c: var(--teal-ui)"><div class="bar"></div><div><b>GPU memory and RAM</b>
           <span>Attention, shared experts and the output head: the weights every token uses, always resident.</span></div></div>
-        <div class="tier tilt reveal" style="--c: var(--blue-ui)"><div class="bar"></div><div><b>Hot experts, pinned in RAM</b>
+        <div class="tier reveal" style="--c: var(--blue-ui)"><div class="bar"></div><div><b>Hot experts, pinned in RAM</b>
           <span>A learned profile ranks the experts; the hot ones are pinned so the OS cannot evict them. 98% of routing lands here.</span></div></div>
-        <div class="tier tilt reveal" style="--c: var(--violet-ui)"><div class="bar"></div><div><b>Cold experts on the SSD</b>
+        <div class="tier reveal" style="--c: var(--violet-ui)"><div class="bar"></div><div><b>Cold experts on the SSD</b>
           <span>Read only when the router picks them, all of a step's experts at once. Prompts are grouped by expert, so each is read once per chunk.</span></div></div>
         <p class="note reveal">Hand-written SIMD kernels (AVX2 on x86, NEON on Apple silicon) give exactly the same results as the
           plain ones; tokens are checked against llama.cpp.</p>
       </div>
       <div>
         <div class="stats">
-          <div class="stat tilt reveal"><div class="n grad">2.5x</div><div class="l">llama.cpp's generation speed, past the memory limit</div></div>
-          <div class="stat tilt reveal"><div class="n grad">0 GB</div><div class="l">swap written (llama.cpp's default: about 98 GB)</div></div>
-          <div class="stat tilt reveal"><div class="n grad">17.5 GB</div><div class="l">model on a 16 GB Mac mini M4</div></div>
+          <div class="stat reveal"><div class="n grad">2.5x</div><div class="l">llama.cpp's generation speed, past the memory limit</div></div>
+          <div class="stat reveal"><div class="n grad">0 GB</div><div class="l">swap written (llama.cpp's default: about 98 GB)</div></div>
+          <div class="stat reveal"><div class="n grad">17.5 GB</div><div class="l">model on a 16 GB Mac mini M4</div></div>
         </div>
         <div class="chart reveal" id="chart">
           <h3>GLM-4.7-Flash on a 16 GB Mac mini M4</h3>
@@ -567,10 +484,10 @@ nav .links a { white-space: nowrap; }
     <p class="sub reveal">A PC as the master, a Mac mini as a worker: paired once, then every request between them is encrypted
       both ways. Apps keep talking to one address.</p>
     <div class="pairs">
-      <div class="pair tilt reveal"><div class="n">01</div><b>Show a code</b><span>The worker shows a 6-digit pairing code.</span></div>
-      <div class="pair tilt reveal"><div class="n">02</div><b>Pair once</b><span>The master sends it; the two swap certificate pins.</span></div>
-      <div class="pair tilt reveal"><div class="n">03</div><b>Mutual TLS 1.3</b><span>From then on, only pinned, encrypted connections.</span></div>
-      <div class="pair tilt reveal"><div class="n">04</div><b>Many brains</b><span>Workers answer requests and serve small models as experts.</span></div>
+      <div class="pair reveal"><div class="n">01</div><b>Show a code</b><span>The worker shows a 6-digit pairing code.</span></div>
+      <div class="pair reveal"><div class="n">02</div><b>Pair once</b><span>The master sends it; the two swap certificate pins.</span></div>
+      <div class="pair reveal"><div class="n">03</div><b>Mutual TLS 1.3</b><span>From then on, only pinned, encrypted connections.</span></div>
+      <div class="pair reveal"><div class="n">04</div><b>Many brains</b><span>Workers answer requests and serve small models as experts.</span></div>
     </div>
     <details class="textver reveal" id="cluster-text"><summary>What each machine keeps (the diagram as text)</summary>
       <p><b>Master</b> (for example the Linux PC with the big GPUs): its main API key, its certificate (node-tls.json, which is its
@@ -583,11 +500,11 @@ nav .links a { white-space: nowrap; }
         remove a worker: Settings › Cluster › Remove; its key stops working at once.</p>
     </details>
     <div class="info">
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup-dark.svg" data-themed="cluster-setup" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
+      <figure class="shot reveal"><button type="button" data-view="assets/cluster-setup-dark.svg" data-themed="cluster-setup" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
         <img src="assets/cluster-setup-dark.svg" data-themed="cluster-setup" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Setup.</b> What each machine needs, and which keys exist (never shown). <a href="#cluster-text">Read it as text</a>.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster.webp" data-cap="Settings › Cluster" data-sub="A Mac mini M4 paired as a worker">
+      <figure class="shot reveal"><button type="button" data-view="assets/cluster.webp" data-cap="Settings › Cluster" data-sub="A Mac mini M4 paired as a worker">
         <img src="assets/cluster.webp" alt="Settings, Cluster: a Mac mini M4 paired as a worker, answering, encrypted" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Live.</b> The Mac mini answering as a worker, encrypted.</figcaption></figure>
@@ -603,46 +520,46 @@ nav .links a { white-space: nowrap; }
       zoom in and move around.</p>
     <h3 class="vh reveal">Infographics</h3>
     <div class="info">
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-overview-dark.svg" data-themed="info-overview" data-cap="What is in Prastara" data-sub="Twelve parts at a glance">
+      <figure class="shot reveal"><button type="button" data-view="assets/info-overview-dark.svg" data-themed="info-overview" data-cap="What is in Prastara" data-sub="Twelve parts at a glance">
         <img src="assets/info-overview-dark.svg" data-themed="info-overview" alt="Prastara: twelve features at a glance" loading="lazy" width="1600" height="1060">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Overview.</b> Twelve parts of Prastara at a glance. <a href="#features">Read it as text</a>.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/info-tiers-dark.svg" data-themed="info-tiers" data-cap="Bigger than your RAM" data-sub="The three tiers, and the Mac measurement">
+      <figure class="shot reveal"><button type="button" data-view="assets/info-tiers-dark.svg" data-themed="info-tiers" data-cap="Bigger than your RAM" data-sub="The three tiers, and the Mac measurement">
         <img src="assets/info-tiers-dark.svg" data-themed="info-tiers" alt="How the engine keeps hot experts in RAM and cold ones on the SSD, with measured speeds" loading="lazy" width="1600" height="960">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Bigger than RAM.</b> The three tiers and the 16 GB Mac measurement. <a href="#ram">Read it as text</a>.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/cluster-setup-dark.svg" data-themed="cluster-setup" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
+      <figure class="shot reveal"><button type="button" data-view="assets/cluster-setup-dark.svg" data-themed="cluster-setup" data-cap="A cluster in four steps" data-sub="Keys are named, never shown">
         <img src="assets/cluster-setup-dark.svg" data-themed="cluster-setup" alt="A diagram of pairing a worker with a master in four steps" loading="lazy" width="1200" height="760">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Cluster setup.</b> Pairing a worker with the master. <a href="#cluster">Read it as text</a>.</figcaption></figure>
     </div>
     <h3 class="vh reveal">The web app</h3>
     <div class="shots">
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/browser.webp" data-cap="Browser use" data-sub="Wikipedia's largest cities, saved as a dataset">
+      <figure class="shot reveal"><button type="button" data-view="assets/browser.webp" data-cap="Browser use" data-sub="Wikipedia's largest cities, saved as a dataset">
         <img src="assets/browser.webp" alt="The chat asking the browser to save Wikipedia's list of largest cities as a dataset" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Browser use.</b> A Wikipedia table saved as a dataset, from one sentence.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/chat.webp" data-cap="Chat" data-sub="Streamed at 68 tokens per second">
+      <figure class="shot reveal"><button type="button" data-view="assets/chat.webp" data-cap="Chat" data-sub="Streamed at 68 tokens per second">
         <img src="assets/chat.webp" alt="A question and its answer, streamed at 68 tokens per second" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Chat.</b> Answers stream as they are written, with the model's thinking alongside.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/canvas.webp" data-cap="Canvas" data-sub="An HTML page the model wrote, running live">
+      <figure class="shot reveal"><button type="button" data-view="assets/canvas.webp" data-cap="Canvas" data-sub="An HTML page the model wrote, running live">
         <img src="assets/canvas.webp" alt="A digital clock the model wrote, running in the canvas" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Canvas.</b> An HTML page the model wrote, running live beside the chat.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/python.webp" data-cap="Python, sandboxed" data-sub="No network, home folder hidden">
+      <figure class="shot reveal"><button type="button" data-view="assets/python.webp" data-cap="Python, sandboxed" data-sub="No network, home folder hidden">
         <img src="assets/python.webp" alt="Python from the chat run in a sandbox with no network" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Python, sandboxed.</b> Code from the chat runs with no network and your home folder hidden.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/whiteboard.webp" data-cap="Flows and whiteboard" data-sub="Diagrams open by themselves">
+      <figure class="shot reveal"><button type="button" data-view="assets/whiteboard.webp" data-cap="Flows and whiteboard" data-sub="Diagrams open by themselves">
         <img src="assets/whiteboard.webp" alt="A Mermaid flow and shapes drawn on the whiteboard" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Flows and whiteboard.</b> Diagrams open by themselves when an answer has one.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/monitor.webp" data-cap="Monitor" data-sub="Every request, with speed, GPU and memory">
+      <figure class="shot reveal"><button type="button" data-view="assets/monitor.webp" data-cap="Monitor" data-sub="Every request, with speed, GPU and memory">
         <img src="assets/monitor.webp" alt="The Monitor's request history" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Monitor.</b> Every request, with speed, GPU, memory and what came back.</figcaption></figure>
-      <figure class="shot tilt reveal"><button type="button" data-view="assets/agents.webp" data-cap="Coding agents" data-sub="Settings › Connect">
+      <figure class="shot reveal"><button type="button" data-view="assets/agents.webp" data-cap="Coding agents" data-sub="Settings › Connect">
         <img src="assets/agents.webp" alt="Settings, Connect: the coding agents and what each supports" loading="lazy" width="1200" height="675">
         <span class="zoom" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4M11 8v6M8 11h6"/></svg></span></button>
         <figcaption><b>Coding agents.</b> Connect the agents you use to your own models in one command.</figcaption></figure>
@@ -658,30 +575,30 @@ nav .links a { white-space: nowrap; }
     <p class="sub reveal">Demos recorded on one PC, and music, pictures and voices made with Prastara itself. They open on YouTube.</p>
     <h3 class="vh reveal">Demos and what's new</h3>
     <div class="vids">
-      <a class="vid feature tilt reveal" href="https://www.youtube.com/watch?v=ByP6i4dtRdk" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/ByP6i4dtRdk.webp" alt="" loading="lazy" width="640" height="360"><span class="new">New</span><span class="dur">2:48</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid feature reveal" href="https://www.youtube.com/watch?v=ByP6i4dtRdk" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/ByP6i4dtRdk.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:48</span><span class="play" aria-hidden="true"></span></span>
         <b>Browser Use: Scrape Tables, Fill Forms, Ask Before Sending</b><span class="desc">A Wikipedia table saved as a dataset of 85 cities, a form filled field by field with your OK before it sends, and the same from the command line.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=Y3IcKNq0uqI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/Y3IcKNq0uqI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">5:16</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=Y3IcKNq0uqI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/Y3IcKNq0uqI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">5:16</span><span class="play" aria-hidden="true"></span></span>
         <b>Prastara v0.1.8: Model Workshop, Sandbox VM, HTTPS and API Keys</b><span class="desc">The Workshop, the sandbox VM and Computer tab, HTTPS and secure WebSockets, API keys, one live channel.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=OIHOplZPTmE" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/OIHOplZPTmE.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">9:59</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=OIHOplZPTmE" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/OIHOplZPTmE.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">9:59</span><span class="play" aria-hidden="true"></span></span>
         <b>Run AI on Your Own PC: the 10-minute tour</b><span class="desc">Install, chat, canvas, Python, memory, web search, images, voice, coding agents, three APIs and the Monitor.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=GeH_M_lEaRI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/GeH_M_lEaRI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">8:50</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=GeH_M_lEaRI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/GeH_M_lEaRI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">8:50</span><span class="play" aria-hidden="true"></span></span>
         <b>This Home PC Speaks 11 Languages, Writes Code and Paints</b><span class="desc">Voices in eleven languages, code and pictures, all on one PC with no cloud.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=HP4ztKaqOyo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/HP4ztKaqOyo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">4:06</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=HP4ztKaqOyo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/HP4ztKaqOyo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">4:06</span><span class="play" aria-hidden="true"></span></span>
         <b>Songs That Sing Your Lyrics (v0.1.4)</b><span class="desc">Songs that follow their lyrics, native voices, MCP tool servers from the app, and the server's tools for every app.</span><span class="sr"> (opens in a new tab)</span></a>
     </div>
     <h3 class="vh reveal">Made with Prastara</h3>
     <div class="vids">
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=UFR9rY0KoRg" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/UFR9rY0KoRg.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=UFR9rY0KoRg" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/UFR9rY0KoRg.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
         <b>The Moon Woman Singing to Maven</b><span class="desc">A cinematic ballad sung across the empty space to Earth.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=uJLNWaZfMzM" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/uJLNWaZfMzM.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">58:45</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=uJLNWaZfMzM" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/uJLNWaZfMzM.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">58:45</span><span class="play" aria-hidden="true"></span></span>
         <b>Lofi for Coding: 1 Hour of Deep Focus</b><span class="desc">Twenty original instrumental tracks for programming and study.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=5HYZeAQZiyI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/5HYZeAQZiyI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:51</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=5HYZeAQZiyI" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/5HYZeAQZiyI.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:51</span><span class="play" aria-hidden="true"></span></span>
         <b>Moonlight on the Sea</b><span class="desc">A slow, calm song to let the day go.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=wIeYGCmnyms" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/wIeYGCmnyms.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=wIeYGCmnyms" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/wIeYGCmnyms.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">2:31</span><span class="play" aria-hidden="true"></span></span>
         <b>Little Moon, Goodnight</b><span class="desc">A gentle lullaby for sleep.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid tilt reveal" href="https://www.youtube.com/watch?v=37CjQ2mGrWo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/37CjQ2mGrWo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">3:22</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid reveal" href="https://www.youtube.com/watch?v=37CjQ2mGrWo" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/37CjQ2mGrWo.webp" alt="" loading="lazy" width="640" height="360"><span class="dur">3:22</span><span class="play" aria-hidden="true"></span></span>
         <b>Peace and Harmony</b><span class="desc">A calm song about kindness and living as one.</span><span class="sr"> (opens in a new tab)</span></a>
-      <a class="vid short tilt reveal" href="https://www.youtube.com/shorts/dqreY5Ffk3M" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/dqreY5Ffk3M.webp" alt="" loading="lazy" width="360" height="640"><span class="dur">0:58</span><span class="play" aria-hidden="true"></span></span>
+      <a class="vid short reveal" href="https://www.youtube.com/shorts/dqreY5Ffk3M" target="_blank" rel="noopener"><span class="thumb"><img src="assets/videos/dqreY5Ffk3M.webp" alt="" loading="lazy" width="360" height="640"><span class="dur">0:58</span><span class="play" aria-hidden="true"></span></span>
         <b>The Moon Woman Singing to Maven (Short)</b><span class="desc">The ballad's chorus, vertical.</span><span class="sr"> (opens in a new tab)</span></a>
     </div>
     <p class="note">More on the channel: <a href="https://www.youtube.com/channel/UCFI5M2Zw-qRLO6LcNtxSYfw" target="_blank" rel="noopener">Prastara on YouTube<span class="sr"> (opens in a new tab)</span></a>.</p>
@@ -702,9 +619,9 @@ nav .links a { white-space: nowrap; }
     <div class="code" id="cmd-unix">curl -fsSL https://github.com/abhaymin/prastara/releases/latest/download/install.sh | sh<button class="copy" type="button">Copy</button></div>
     <div class="code" id="cmd-win" hidden>irm https://github.com/abhaymin/prastara/releases/latest/download/install.ps1 | iex<button class="copy" type="button">Copy</button></div>
     <div class="steps">
-      <div class="card tilt reveal"><h3>1 · Get a model</h3><p>Pull a small one to start:<br><code>am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M</code></p></div>
-      <div class="card tilt reveal"><h3>2 · Start it</h3><p>Run <code>am2strata</code> and open <code>http://127.0.0.1:8000</code> in your browser.</p></div>
-      <div class="card tilt reveal"><h3>3 · Check your PC</h3><p><code>am2strata-run doctor</code> lists each optional feature and exactly what this machine still needs for it.</p></div>
+      <div class="card reveal"><h3>1 · Get a model</h3><p>Pull a small one to start:<br><code>am2strata pull mistralai/Ministral-3-3B-Instruct-2512-GGUF Q4_K_M</code></p></div>
+      <div class="card reveal"><h3>2 · Start it</h3><p>Run <code>am2strata</code> and open <code>http://127.0.0.1:8000</code> in your browser.</p></div>
+      <div class="card reveal"><h3>3 · Check your PC</h3><p><code>am2strata-run doctor</code> lists each optional feature and exactly what this machine still needs for it.</p></div>
     </div>
   </div>
 </section>
@@ -736,10 +653,10 @@ nav .links a { white-space: nowrap; }
     <p class="kicker reveal">Principles</p>
     <h2 class="reveal">Built to stay yours</h2>
     <div class="pillars" style="margin-top:34px">
-      <div class="pillar tilt reveal"><b>Local first</b><span>Models run on your hardware. Nothing leaves your PC unless you send it.</span></div>
-      <div class="pillar tilt reveal"><b>Light on the machine</b><span>Jobs queue for the GPU one at a time; the sandbox VM only gets CPU nothing else is using.</span></div>
-      <div class="pillar tilt reveal"><b>Open</b><span>MIT licensed and written in Rust, with a regression suite that checks every route on every change.</span></div>
-      <div class="pillar tilt reveal"><b>Your rules</b><span>An agent on your desktop asks before anything that sends, deletes, installs, buys or publishes.</span></div>
+      <div class="pillar reveal"><b>Local first</b><span>Models run on your hardware. Nothing leaves your PC unless you send it.</span></div>
+      <div class="pillar reveal"><b>Light on the machine</b><span>Jobs queue for the GPU one at a time; the sandbox VM only gets CPU nothing else is using.</span></div>
+      <div class="pillar reveal"><b>Open</b><span>MIT licensed and written in Rust, with a regression suite that checks every route on every change.</span></div>
+      <div class="pillar reveal"><b>Your rules</b><span>An agent on your desktop asks before anything that sends, deletes, installs, buys or publishes.</span></div>
     </div>
   </div>
 </section>
@@ -876,7 +793,6 @@ nav .links a { white-space: nowrap; }
     motionBtn.setAttribute("aria-pressed", String(still()));
     motionT.textContent = still() ? "Play motion" : "Pause motion";
     motionBtn.setAttribute("aria-label", still() ? "Play motion: animations and tilt are paused" : "Pause motion: stop animations and tilt");
-    if (still()) for (const el of document.querySelectorAll(".tilt")) { el.style.setProperty("--rx", "0deg"); el.style.setProperty("--ry", "0deg"); }
   };
   motionBtn.addEventListener("click", () => {
     root.dataset.motion = still() ? "on" : "off";
@@ -916,18 +832,6 @@ nav .links a { white-space: nowrap; }
   setTimeout(sweep, 400);
   if (still()) for (const el of document.querySelectorAll(".reveal")) show1(el);
 
-  // 3D tilt on cards and screens (mouse and pen only)
-  if (fine) for (const el of document.querySelectorAll(".tilt")) {
-    el.addEventListener("pointermove", e => {
-      if (still()) return;
-      const r = el.getBoundingClientRect(), x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
-      el.style.setProperty("--ry", ((x - .5) * 10).toFixed(2) + "deg");
-      el.style.setProperty("--rx", ((.5 - y) * 8).toFixed(2) + "deg");
-      el.style.setProperty("--mx", (x * 100).toFixed(1) + "%");
-      el.style.setProperty("--my", (y * 100).toFixed(1) + "%");
-    });
-    el.addEventListener("pointerleave", () => { el.style.setProperty("--rx", "0deg"); el.style.setProperty("--ry", "0deg"); });
-  }
 
   // the hero's stack follows the pointer
   const stack = document.getElementById("stack");
